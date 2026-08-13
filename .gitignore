@@ -1,0 +1,26 @@
+# Binary native lớn trong vendor/ — không đưa vào git (chép thủ công khi build).
+# Giữ lại README + cấu trúc thư mục.
+vendor/**/*.dll
+vendor/**/*.exe
+vendor/**/*.so
+vendor/**/*.dylib
+
+# Model tải về trong models/ — không đưa vào git (chạy tools/prefetch_*.py để tải lại).
+# Giữ lại README + cấu trúc thư mục.
+models/**
+!models/README.md
+!models/*/
+!models/**/.gitkeep
+
+# Build artifacts tự sinh (model prefetch, PyInstaller...).
+build_cache/
+build/
+dist/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

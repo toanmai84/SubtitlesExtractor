@@ -1,0 +1,120 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "subtitles-extractor"
+version = "3.23.399"
+description = "Subtitle Studio — trích xuất, dịch, lồng tiếng và xuất bản phụ đề video (Clean Architecture)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Subtitles Extractor Team" }]
+keywords = ["subtitles", "ocr", "paddleocr", "video", "vietnamese"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Text Processing",
+]
+dependencies = [
+    # GUI
+    "PySide6>=6.6",  # LGPL v3 — an toàn thương mại (thay PyQt6 GPL)
+    # OCR
+    "paddlepaddle>=2.6",
+    "paddleocr>=2.9",
+    # Video / Image
+    "opencv-python>=4.9",
+    "numpy>=1.24",
+    "soundfile>=0.12",
+    # Settings
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    # Logging (v2.29) — Plug & Play, thread-safe, auto color
+    "loguru>=0.7.0",
+    # Tách từ tiếng Trung cho STT (v3.23) — rjieba (bản Rust, nhanh, có fallback)
+    "rjieba>=0.1.11",
+    # Sửa JSON hỏng từ LLM (v3.23.143) — thuần Python, zero phụ thuộc bắt buộc; xử lý
+    # thiếu phẩy/ngoặc/nháy, cắt cụt, prose thừa... mạnh hơn bộ vá nội bộ.
+    "json-repair>=0.39",
+]
+
+[project.optional-dependencies]
+stt = [
+    # Trích phụ đề từ âm thanh (WhisperX) — chạy ở tiến trình con để cô lập khỏi
+    # paddle (tránh xung đột cuDNN/cuBLAS DLL). Cần torch khớp CUDA của máy.
+    "whisperx>=3.1",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-qt>=4.4",
+    "pytest-mock>=3.12",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "black>=24.0",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+subtitles-extractor = "subtitles_extractor.composition.bootstrap:bootstrap_for_gui"
+
+[project.gui-scripts]
+subtitles-extractor-gui = "main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"subtitles_extractor" = ["data/*.json"]
+
+# ── Code quality ──────────────────────────────────────────────────────────
+
+[tool.black]
+line-length = 90
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 90
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle + pyflakes
+    "I",             # isort
+    "N",             # pep8-naming
+    "UP",            # pyupgrade
+    "B",             # flake8-bugbear
+    "SIM",           # flake8-simplify
+    "RUF",           # ruff-specific
+]
+ignore = [
+    "B008",  # Do not perform function call in argument defaults (cho pydantic Field)
+    "N818",  # Exception name should end with Error (đã đặt đúng nhưng có vài alias)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]  # cho phép assert trong tests
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+
+[[tool.mypy.overrides]]
+module = ["paddleocr.*", "paddle.*", "cv2.*", "PySide6.*", "shiboken6.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.4"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+markers = [
+    "slow: chậm — bỏ qua khi không có flag --runslow",
+    "gpu: yêu cầu GPU",
+    "qt: cần PySide6",
+]

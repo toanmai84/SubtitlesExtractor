@@ -1,0 +1,54 @@
+# ── Giao diện Desktop ──
+PySide6>=6.6  # LGPL v3 — an toàn thương mại (thay PyQt6 GPL)
+
+# ── OCR Engine ──
+paddlepaddle>=2.6
+paddleocr>=2.9
+
+# ── Video player & decoder phần cứng ──
+# python-mpv: embed mpv vào widget Qt, hỗ trợ NVDEC/VAAPI/VideoToolbox/D3D11VA/Vulkan
+# Yêu cầu mpv binary đã cài (apt install mpv libmpv-dev / brew install mpv).
+# Trên Windows ứng dụng tự tải libmpv-2.dll từ Subtitle Edit GitHub mirror.
+python-mpv>=1.0
+
+# ── PyNvVideoCodec (NVIDIA-only, tuỳ chọn) ──
+# Adapter frame_decoder_backend='pynvvideocodec' yêu cầu package này + CUDA driver.
+# Cài thêm bằng tay nếu cần: pip install pynvvideocodec
+# Bỏ comment dòng dưới để cài tự động (chỉ trên máy có GPU NVIDIA):
+# pynvvideocodec>=2.0
+
+# ── Xử lý video / ảnh ──
+opencv-python>=4.9
+numpy>=1.24
+soundfile>=0.12
+
+# ── PyAV (libav) — decode nhanh hơn OpenCV 2-3× cho H.264/H.265 ──
+# frame_decoder_backend='pyav'
+av>=12.0
+
+# ── Cấu hình ──
+pydantic>=2.5
+pydantic-settings>=2.1
+
+# ── Fuzzy string matching ──
+# Thay thế difflib (chậm, ngưỡng boost CJK sai). RapidFuzz dùng C++ backend
+# nhanh hơn ~10×, hỗ trợ score_cutoff (early exit) cho vòng lặp Viterbi,
+# và Jaro-Winkler ưu tiên prefix match — phù hợp với câu phụ đề ngắn.
+rapidfuzz>=3.0
+
+# ── Dịch phụ đề bằng AI (trang "Dịch phụ đề") ──
+# Bộ dịch đa giai đoạn dùng Google Gemini. Import lazy: nếu thiếu, trang Dịch
+# chỉ ở chế độ không khả dụng, phần còn lại của ứng dụng vẫn chạy bình thường.
+google-genai>=0.3
+
+# ── Sửa JSON hỏng từ LLM (v3.23.143) ──
+# Thuần Python, zero phụ thuộc bắt buộc. Import tuỳ chọn: nếu thiếu, tự lùi về bộ
+# vá cắt cụt nội bộ nên ứng dụng vẫn chạy bình thường.
+json-repair>=0.39
+charset-normalizer>=3.0  # thay chardet LGPL (an toàn thương mại)
+loguru>=0.7          # logging (app dùng 22 file — BẮT BUỘC)
+scipy>=1.11          # xử lý tín hiệu audio (signal/special/io — 4 file)
+librosa>=0.10        # time-stretch giữ cao độ ISC (thay pedalboard GPL — 2 file)
+rjieba>=0.1.11       # tách từ tiếng Trung cho STT (MIT)
+pydub>=0.25          # chuyển MP3->WAV cho worker Edge TTS (MIT)
+pyloudnorm>=0.1      # đo LUFS chuẩn hoá âm lượng (MIT, tùy chọn nhưng nên có)

@@ -1,0 +1,109 @@
+# [v3.23.302] KHONG dat --extra-index-url o day nua!
+# Ly do: pip se hoi CA HAI index cho MOI goi -> may chu paddlepaddle.org.cn (Trung Quoc)
+# cham/timeout tu VN -> hang loat WARNING ReadTimeoutError + build cham hang chuc phut.
+# Thay vao do, build_windows.bat cai LAM 2 BUOC:
+#   1) pip install -r requirements-gpu.txt --index-url https://pypi.org/simple
+#   2) pip install paddlepaddle-gpu==3.3.1 --index-url <kho Paddle cu129>
+# Neu cai TAY (khong qua build script), chay dung 2 lenh tren.
+
+# ── Giao diện Desktop ──
+PySide6  # LGPL v3 — an toàn thương mại (thay PyQt6 GPL)
+
+# [v3.23.390] GHIM setuptools<80: paddlepaddle-gpu 3.3.1 import 'setuptools.command.easy_install'
+# (dùng cho JIT/cpp_extension), nhưng module này bị XÓA khỏi setuptools>=80. Không ghim thì
+# modelscope/paddlex kéo setuptools 84 → bản đóng gói thiếu easy_install → 'import paddle' lỗi
+# "No module named 'setuptools.command.easy_install'". 79.x là bản cuối còn easy_install và vẫn
+# thoả pyinstaller>=42, modelscope, paddlex.
+setuptools<80
+
+# ── OCR Engine ──
+# paddlepaddle-gpu==3.3.1  <- CAI RIENG o buoc 2 (xem ghi chu dau file / build_windows.bat)
+paddleocr
+
+# ── Video player & decoder phần cứng ──
+# python-mpv: embed mpv vào widget Qt, hỗ trợ NVDEC/VAAPI/VideoToolbox/D3D11VA/Vulkan
+# Yêu cầu mpv binary đã cài (apt install mpv libmpv-dev / brew install mpv).
+# Trên Windows ứng dụng tự tải libmpv-2.dll từ Subtitle Edit GitHub mirror.
+python-mpv
+
+# ── PyNvVideoCodec (NVIDIA-only, tuỳ chọn) ──
+# Adapter frame_decoder_backend='pynvvideocodec' yêu cầu package này + CUDA driver.
+# Cài thêm bằng tay nếu cần: pip install pynvvideocodec
+# Bỏ comment dòng dưới để cài tự động (chỉ trên máy có GPU NVIDIA):
+pynvvideocodec
+
+# [v3.23.288] CuPy: BAT BUOC cho NVDEC GPU-First (xu ly frame GPU). Thieu CuPy -> app tu
+# fallback PyAV (van nhanh, on dinh). Bo comment de bat NVDEC toc do cao:
+# cupy-cuda12x  # khop CUDA 12.x (paddlepaddle-gpu cu129 dung CUDA 12.9)
+
+# [v3.23.292] VieNeu-TTS: engine TTS tieng Viet OFFLINE (Apache 2.0 — an toan thuong mai).
+# CPU torch-free (chi ONNX Runtime). Model tai runtime lan dau tu HuggingFace.
+vieneu           # SDK chinh (keo theo sea-g2p, onnxruntime, soxr, tokenizers, hf_hub)
+sea-g2p>=0.7.11  # phonemizer Rust torch-free
+onnxruntime>=1.20.0  # chay ONNX v3 Turbo
+soxr             # resampling cho voice cloning
+tokenizers>=0.20 # phoneme tokenizer
+
+# ── Xử lý video / ảnh ──
+opencv-python
+numpy>=2.3.5
+soundfile
+
+# ── PyAV (libav) — decode nhanh hơn OpenCV 2-3× cho H.264/H.265 ──
+# frame_decoder_backend='pyav'
+av
+
+# ── Cấu hình ──
+pydantic
+pydantic-settings
+
+# ── Fuzzy string matching ──
+# Thay thế difflib (chậm, ngưỡng boost CJK sai). RapidFuzz dùng C++ backend
+# nhanh hơn ~10×, hỗ trợ score_cutoff (early exit) cho vòng lặp Viterbi,
+# và Jaro-Winkler ưu tiên prefix match — phù hợp với câu phụ đề ngắn.
+rapidfuzz
+
+# ── Dịch phụ đề bằng AI (trang "Dịch phụ đề") ──
+# Bộ dịch đa giai đoạn dùng Google Gemini. Import lazy: nếu thiếu, trang Dịch
+# chỉ ở chế độ không khả dụng, phần còn lại của ứng dụng vẫn chạy bình thường.
+google-genai
+
+# ── Sửa JSON hỏng từ LLM (v3.23.143) ──
+# Thuần Python, zero phụ thuộc bắt buộc. Import tuỳ chọn: nếu thiếu, tự lùi về bộ
+# vá cắt cụt nội bộ nên ứng dụng vẫn chạy bình thường.
+json-repair
+charset-normalizer>=3.0  # thay chardet LGPL (an toan thuong mai)
+loguru          # logging (app dùng 22 file — BẮT BUỘC)
+scipy          # xử lý tín hiệu audio (signal/special/io — 4 file)
+librosa        # time-stretch giữ cao độ ISC (thay pedalboard GPL — 2 file)
+rjieba       # tách từ tiếng Trung cho STT (MIT)
+pydub          # chuyển MP3->WAV cho worker Edge TTS (MIT)
+pyloudnorm      # đo LUFS chuẩn hoá âm lượng (MIT, tùy chọn nhưng nên có)
+
+# Bộ component Fluent Design gốc (GPL v3). Dự án đã có bản Qt thuần tương thích API
+# (presentation/fluent_compat) nên gói này là TÙY CHỌN — bật bằng biến môi trường:
+#     set SUBEXT_USE_QFLUENTWIDGETS=1
+# Không bật thì app dùng bản Qt thuần như cũ (đang chạy ổn, đạt WCAG 2.1).
+PySide6-Fluent-Widgets
+
+# ── [v3.23.328] Các gói bị BỎ SÓT ở v3.23.312 ──────────────────────────────
+# Ghi chú: v3.23.312 ĐỊNH thêm 4 gói này nhưng điều kiện bảo vệ viết sai
+# (`if "pedalboard" not in s`) — chữ "pedalboard" đã có sẵn trong một dòng CHÚ THÍCH
+# phía trên, nên khối bị bỏ qua âm thầm và không gói nào được thêm. Log build của
+# người dùng xác nhận: không có edge-tts/pedalboard/fastembed trong danh sách cài.
+
+# Giọng đọc neural của Microsoft (GPL v3). Adapter đã viết đầy đủ, chạy cách ly
+# subprocess. Phụ thuộc bắt buộc (pip tự kéo): aiohttp, certifi, tabulate,
+# typing-extensions — trong đó `tabulate` là gói DUY NHẤT chưa có sẵn trong bản build.
+edge-tts
+
+# Kéo giãn thời gian chất lượng cao (GPL v3, nhân Rubber Band). App tự xếp hạng
+# pedalboard > librosa > WSOLA nên cài vào là tự động nâng cấp, không phải sửa code.
+pedalboard
+
+# Nhúng ngữ nghĩa cho Bộ nhớ Dịch (Apache 2.0). Trước loại vì DUNG LƯỢNG, không phải
+# license — giúp tái dùng bản dịch cũ chính xác hơn so với chỉ so khớp chuỗi.
+fastembed
+
+# Gom cụm DBSCAN cho tự động dò ROI (BSD-3). bbox_analyzer đã có cờ HAS_SKLEARN sẵn.
+scikit-learn
