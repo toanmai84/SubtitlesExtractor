@@ -1,7 +1,7 @@
-# Subtitles Extractor — v3.23
+# Subtitles Extractor — v3.23.651
 
 Ứng dụng desktop **trích xuất phụ đề hardsub/embedded → dịch bằng AI → lồng tiếng (TTS)**
-cho video, viết hoàn toàn bằng Python (PyQt6) theo kiến trúc **Clean Architecture / Hexagonal**.
+cho video, viết hoàn toàn bằng Python (PySide6) theo kiến trúc **Clean Architecture / Hexagonal**.
 
 Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên tập → Dịch → Lồng tiếng**.
 
@@ -55,6 +55,18 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
 - Validate runtime bằng `pydantic-settings`; override qua biến môi trường (`SE_HW_*`,
   `SE_OCR_*`, `SE_VIDCTX_*`, `SE_TRANS_*`...).
 - Lưu tự động qua QSettings. Giao diện tiếng Việt, theme Sáng/Tối/Tự động.
+
+### 🛡️ Ổn định, chẩn đoán & phục hồi
+- Chẩn đoán crash native: lưu `fault.log`, giữ các log crash trước đó và cảnh báo khi lần chạy
+  trước kết thúc bất thường.
+- Bảo vệ trình phát mpv: tránh các đường gọi dễ gây crash khi khởi động/nạp video; tự chuyển
+  sang trình xem dự phòng sau khi phát hiện lỗi access violation. Có thể bật lại mpv bằng
+  `SUBTITLES_EXTRACTOR_FORCE_MPV=1` hoặc tắt hẳn bằng `SUBTITLES_EXTRACTOR_NO_MPV=1`.
+- Sao lưu xoay vòng và phục hồi cơ sở dữ liệu SQLite khi phát hiện tệp hỏng; giữ lại các bản
+  dữ liệu hỏng để có thể kiểm tra, thay vì âm thầm xoá.
+- Chỉnh sửa phụ đề, waveform và bảng dịch ổn định hơn với danh sách lớn; xử lý an toàn hơn
+  khi đóng ứng dụng đang có tác vụ nền, đổi video/dự án hoặc gặp dữ liệu thời gian lỗi.
+- Nạp lại bảng dịch theo lô hiệu quả hơn, giảm thời gian chờ khi xử lý hàng nghìn dòng.
 
 ---
 
