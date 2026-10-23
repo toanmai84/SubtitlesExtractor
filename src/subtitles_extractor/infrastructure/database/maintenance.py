@@ -46,6 +46,15 @@ def reset_database(db_path: str | Path) -> list[str]:
         except sqlite3.OperationalError as exc:
             logger.warning("reset_database: VACUUM bỏ qua ({}).", exc)
         logger.info("reset_database: đã xoá dữ liệu {} bảng tại {}.", len(tables), path)
-        return tables
-    finally:
+    except BaseException:
         conn.close()
+        raise                                        # thất bại: giữ nguyên mọi bản sao lưu / bản hỏng (đường cứu duy nhất)
+    conn.close()
+    # [v3.23.649] Bản sao lưu xoay vòng / bản hỏng (db_guard) vẫn chứa dữ liệu cũ — "Dọn dẹp" thành công phải dọn cả chúng.
+    for pattern in (f"{path.name}.bak*", f"{path.name}.corrupt-*", f"{path.name}.suspect"):
+        for leftover in path.parent.glob(pattern):
+            try:
+                leftover.unlink()
+            except OSError as exc:
+                logger.warning("reset_database: không xoá được {}: {}", leftover.name, exc)
+    return tables

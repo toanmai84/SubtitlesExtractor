@@ -116,6 +116,80 @@ class _PreparedImage:
     scale: float
     border_px: int
 
+#: [v3.23.646] Thư viện khoa học mà paddle/paddlex (và các phụ thuộc của chúng) có thể kéo vào lúc import.
+_SCIENTIFIC_PREWARM_MODULES: Final[tuple[str, ...]] = ("scipy.stats", "scipy.signal", "sklearn.cluster")
+
+#: Module lõi native của paddle (đồng thời là tiền tố các module con do native tự đăng ký).
+_NATIVE_PADDLE_PREFIX: Final[str] = "paddle.base.libpaddle"
+
+
+def _prewarm_scientific_imports() -> None:
+    """[v3.23.646] Nạp scipy/sklearn TRƯỚC khi nạp paddle, lúc ``sys.modules['torch']`` không còn là ``None``.
+
+    Bộ chặn torch (``sys.modules["torch"] = None``) làm ``scipy.stats``/``scipy.signal``/``sklearn.cluster``
+    chết ngay khi nạp lần đầu: ``AttributeError: 'NoneType' object has no attribute 'Tensor'``
+    (``array_api_compat`` dò kiểu tensor bằng ``getattr(sys.modules["torch"], "Tensor")``). Trước v3.23.643
+    ``bbox_analyzer`` import sklearn ngay lúc khởi động nên các thư viện này đã nạp xong từ trước khi bộ chặn
+    bật; v3.23.643 chuyển sang nạp trễ ⇒ lần nạp đầu rơi vào giữa ``import paddle``. Lỗi gốc lại bị che bởi
+    nhánh "dọn rồi thử lại" (xoá luôn module con native ``paddle.base.libpaddle.pir`` mà chỉ thư viện native
+    mới đăng ký được) nên người dùng chỉ thấy "Thiếu lõi OCR … 'libpaddle' is not a package".
+    Chỉ nạp thư viện nào CÓ cài; lỗi nạp không chặn OCR (paddle có thể không cần chúng).
+    """
+    import importlib
+    import importlib.util
+
+    from subtitles_extractor.infrastructure.torch_import_blocker import torch_none_bypassed
+
+    with torch_none_bypassed():
+        for name in _SCIENTIFIC_PREWARM_MODULES:
+            root = name.split(".", 1)[0]
+            try:
+                if importlib.util.find_spec(root) is None:
+                    continue
+                importlib.import_module(name)
+            except Exception as exc:  # noqa: BLE001 - thư viện hỏng ABI có thể ném nhiều loại ngoại lệ
+                logger.debug("Nạp trước %s không được: %s", name, exc)
+
+
+def _native_paddle_loaded() -> bool:
+    """Lõi native ``paddle.base.libpaddle`` đã nạp (dù ``import paddle`` sau đó lỗi) chưa?"""
+    import sys
+
+    return _NATIVE_PADDLE_PREFIX in sys.modules
+
+
+def _purge_partial_paddle_modules() -> int:
+    """Xoá module Python của paddle nửa-khởi-tạo để nạp lại. CHỈ dùng khi lõi native CHƯA nạp.
+
+    Khi ``paddle.base.libpaddle`` đã nạp thì nạp lại KHÔNG cứu được: module con native
+    (``.pir``, ``.eager``…) do chính thư viện tự đăng ký nên xoá đi là mất
+    (``No module named 'paddle.base.libpaddle.pir'; … is not a package``), còn giữ lại thì chạy lại mã Python
+    của paddle đập vào đăng ký toàn cục của native (``Pass '…' is registered more than once``) hoặc của protobuf
+    (``duplicate file name``) — đã thử trên paddle 3.3.1. Trường hợp đó phải báo LỖI GỐC của lần nạp đầu.
+
+    Returns:
+        Số module đã xoá.
+    """
+    import sys
+
+    removed = 0
+    for name in list(sys.modules):
+        if name == "paddle" or name.startswith("paddle."):
+            del sys.modules[name]
+            removed += 1
+    return removed
+
+
+def _rearm_fault_handler() -> None:
+    """[v3.23.650] Paddle đè trình xử lý crash native của faulthandler khi nạp — cài lại để fault.log ghi được."""
+    try:
+        from subtitles_extractor.infrastructure.logging.crash_hooks import rearm
+
+        rearm()
+    except Exception:  # noqa: BLE001 - chẩn đoán không được làm hỏng việc nạp OCR
+        pass
+
+
 class PaddleOcrAdapter:
     def __init__(self, config: OcrEngineConfig) -> None:
         self._config: OcrEngineConfig = config
@@ -124,11 +198,14 @@ class PaddleOcrAdapter:
         # config nếu tự lùi GPU->CPU). None = chưa khởi tạo.
         self._active_device: DeviceKind | None = None
         self._init_lock: threading.RLock = threading.RLock()
+        self._release_after_init: bool = False
 
     @property
     def is_initialized(self) -> bool:
-        with self._init_lock:
-            return self._model is not None
+        # [v3.23.650] KHÔNG lấy ``_init_lock``: ``initialize()`` giữ khoá suốt lúc import paddle + nạp mô hình (7–19 s),
+        # mà thuộc tính này được gọi từ luồng giao diện (showEvent của trang Trích xuất/Chỉnh sửa, preload) →
+        # cửa sổ đơ tới khi mô hình nạp xong. Đọc một tham chiếu là nguyên tử trong CPython.
+        return self._model is not None
 
     @property
     def active_device(self) -> DeviceKind | None:
@@ -142,12 +219,44 @@ class PaddleOcrAdapter:
 
     def initialize(self) -> None:
         with self._init_lock:
-            if self._model is not None: return
-            paddle_module, paddle_ocr_cls = self._import_paddle()
-            use_gpu: bool = self._resolve_use_gpu(paddle_module)
-            self._model = self._create_model_with_device_fallback(
-                paddle_ocr_cls, use_gpu=use_gpu
+            self._release_after_init = False  # yêu cầu release() từ lần trước là cũ; chỉ giữ yêu cầu đến TRONG lúc này
+            if self._model is None:
+                paddle_module, paddle_ocr_cls = self._import_paddle()
+                use_gpu: bool = self._resolve_use_gpu(paddle_module)
+                self._model = self._create_model_with_device_fallback(
+                    paddle_ocr_cls, use_gpu=use_gpu
+                )
+                self._apply_det_batch_size(self._model)
+                _rearm_fault_handler()
+        if self._release_after_init:
+            # [v3.23.650] release() được gọi (đóng app) lúc khoá đang bận: dọn ngay khi nạp xong (kể cả đường thoát sớm).
+            self._release_after_init = False
+            self.release()
+
+    def _apply_det_batch_size(self, model: Any) -> None:
+        """[v3.23.644] Cho bộ DÒ CHỮ chạy ``det_batch_size`` ảnh mỗi lần GPU thay vì từng ảnh một.
+
+        PaddleOCR 3.x nhận cả lô ``predict(input=[...])`` nhưng ``_OCRPipeline`` và bộ dò chữ đều dựng bộ chia lô
+        với kích thước MẶC ĐỊNH 1 — ``text_recognition_batch_size`` / ``batch_size_ocr`` không ảnh hưởng tới bước dò.
+        Đo (PaddleOCR + CPU, 10 ảnh 603×119): mặc định → 10 lượt det × 1 ảnh; đặt hai bộ chia lô = 10 → 1 lượt det ×
+        10 ảnh, chữ nhận dạng GIỐNG HỆT. Trên CPU không nhanh hơn (tính toán, không phải độ trễ lần chạy); lợi ích
+        trên GPU chưa đo được — dùng ``tools/bench_ocr.py``. Chạm vào thuộc tính nội bộ nên mọi lỗi cấu trúc chỉ
+        cảnh báo và giữ mặc định.
+        """
+        size = int(getattr(self._config, "det_batch_size", 1) or 1)
+        if size <= 1 or model is None:
+            return
+        try:
+            pipeline = model.paddlex_pipeline._pipeline
+            pipeline.batch_sampler.batch_size = size
+            pipeline.text_det_model.batch_sampler.batch_size = size
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Không đặt được batch bộ dò chữ = %d (cấu trúc PaddleOCR khác dự kiến: %s) — dùng mặc định 1.",
+                size, exc,
             )
+            return
+        logger.info("Bộ dò chữ PaddleOCR chạy %d ảnh mỗi lần.", size)
 
     def _create_model_with_device_fallback(
         self, paddle_ocr_cls: Any, *, use_gpu: bool
@@ -205,21 +314,31 @@ class PaddleOcrAdapter:
         self.apply_config(new_config)
 
     def release(self) -> None:
-        with self._init_lock:
-            if self._model is None: return
-            model_ref = self._model
-            self._model = None
-            self._active_device = None
-            def _async_cleanup(model: Any) -> None:
-                try:
-                    del model
-                    gc.collect()
-                    self._empty_paddle_vram()
-                    self._empty_cupy_pool()
-                except (RuntimeError, OSError, ImportError) as exc:
-                    # Cleanup best-effort — log để chẩn đoán rò rỉ VRAM nếu có
-                    logger.debug("Dọn dẹp VRAM không hoàn tất (bỏ qua): %s", exc)
-            threading.Thread(target=_async_cleanup, args=(model_ref,), daemon=True).start()
+        # [v3.23.650] Không chặn luồng gọi (thường là giao diện lúc đóng app) khi ``initialize()`` đang giữ khoá:
+        # đánh dấu để ``initialize()`` tự dọn sau khi nạp xong.
+        if not self._init_lock.acquire(blocking=False):
+            self._release_after_init = True
+            return
+        try:
+            self._release_locked()
+        finally:
+            self._init_lock.release()
+
+    def _release_locked(self) -> None:
+        if self._model is None: return
+        model_ref = self._model
+        self._model = None
+        self._active_device = None
+        def _async_cleanup(model: Any) -> None:
+            try:
+                del model
+                gc.collect()
+                self._empty_paddle_vram()
+                self._empty_cupy_pool()
+            except (RuntimeError, OSError, ImportError) as exc:
+                # Cleanup best-effort — log để chẩn đoán rò rỉ VRAM nếu có
+                logger.debug("Dọn dẹp VRAM không hoàn tất (bỏ qua): %s", exc)
+        threading.Thread(target=_async_cleanup, args=(model_ref,), daemon=True).start()
 
     def _release_internal(self) -> None:
         if self._model is None: return
@@ -252,8 +371,9 @@ class PaddleOcrAdapter:
         try:
             raw_output = self._model.predict(
                 input=bgr_images, use_doc_orientation_classify=False, use_doc_unwarping=False,
-                use_textline_orientation=self._config.use_textline_orientation, text_det_limit_side_len=None,
-                text_det_limit_type=None, text_det_thresh=self._config.det_thresh, text_det_box_thresh=self._config.det_box_thresh,
+                use_textline_orientation=self._config.use_textline_orientation,
+                **self._det_limit_kwargs(),
+                text_det_thresh=self._config.det_thresh, text_det_box_thresh=self._config.det_box_thresh,
                 text_det_unclip_ratio=self._config.det_unclip_ratio, text_rec_score_thresh=self._config.score_threshold,
             )
         except RuntimeError as exc:
@@ -343,14 +463,25 @@ class PaddleOcrAdapter:
                 ) from exc
         raise OcrModelLoadError(f"Không khởi tạo được PaddleOCR sau {_MAX_INIT_RETRY} lần thử.")
 
+    def _det_limit_kwargs(self) -> dict[str, Any]:
+        """[v3.23.619] Giới hạn cạnh ảnh khi dò chữ theo cài đặt; 0 = PaddleOCR tự quyết.
+
+        Trước đây luôn truyền ``None`` → cài đặt "Giới hạn cạnh" ở trang Cài đặt/Biên
+        tập/Debug không có tác dụng (đổi giá trị chỉ làm nạp lại model vô ích).
+        """
+        side = int(self._config.limit_side_len or 0)
+        if side <= 0:
+            return {"text_det_limit_side_len": None, "text_det_limit_type": None}
+        kind = self._config.limit_type if self._config.limit_type in ("max", "min") else "max"
+        return {"text_det_limit_side_len": side, "text_det_limit_type": kind}
+
     def _build_init_kwargs(self, *, use_gpu: bool, use_trt: bool) -> dict[str, Any]:
         precision_str = "fp16" if (use_trt and self._config.precision == PrecisionMode.FP16) else "fp32"
         kwargs: dict[str, Any] = {
             "device": "gpu" if use_gpu else "cpu",
             "lang": self._config.language,
             "text_recognition_batch_size": self._config.batch_size,
-            "text_det_limit_side_len": None,
-            "text_det_limit_type": None,
+            **self._det_limit_kwargs(),
             "text_det_thresh": self._config.det_thresh,
             "text_det_box_thresh": self._config.det_box_thresh,
             "text_det_unclip_ratio": self._config.det_unclip_ratio,
@@ -392,6 +523,7 @@ class PaddleOcrAdapter:
             or old.det_thresh != new_config.det_thresh or old.det_box_thresh != new_config.det_box_thresh
             or old.det_unclip_ratio != new_config.det_unclip_ratio or old.use_textline_orientation != new_config.use_textline_orientation
             or old.enable_mkldnn != new_config.enable_mkldnn or old.batch_size != new_config.batch_size or old.language != new_config.language
+            or old.det_batch_size != new_config.det_batch_size
         )
 
     @staticmethod
@@ -405,17 +537,24 @@ class PaddleOcrAdapter:
             # [v3.22.6] Serialize với import torch của WhisperX (lock chung) để tránh
             # "partially initialized module 'paddle' ... circular import".
             with HEAVY_IMPORT_LOCK:
+                # [v3.23.646] Nạp TRƯỚC các thư viện khoa học mà paddle/paddlex kéo vào lúc import.
+                _prewarm_scientific_imports()
                 try:
                     import paddle
                     from paddleocr import PaddleOCR
-                except AttributeError:
+                except AttributeError as first_error:
                     # [v3.22.8] paddle nửa-khởi-tạo trong sys.modules (vd shm.dll lỗi
                     # lần trước) → xoá sạch rồi import lại một lần.
-                    import sys as _sys
-
-                    for _name in list(_sys.modules):
-                        if _name == "paddle" or _name.startswith("paddle."):
-                            del _sys.modules[_name]
+                    logger.warning(
+                        "Nạp paddle lần 1 lỗi (%s: %s).", type(first_error).__name__, first_error,
+                        exc_info=True,
+                    )
+                    if _native_paddle_loaded():
+                        # Không thể nạp lại một paddle đã khởi tạo dở: báo đúng lỗi GỐC (xem docstring).
+                        raise OcrModelLoadError(
+                            f"{_PADDLE_MISSING_MSG}\n[chi tiết: {type(first_error).__name__}: {first_error}]"
+                        ) from first_error
+                    _purge_partial_paddle_modules()
                     import paddle
                     from paddleocr import PaddleOCR
             # [v3.23.10] Paddle đã import XONG (transformers đã fallback "no torch").
@@ -428,19 +567,23 @@ class PaddleOcrAdapter:
             # sự cần torch ở top-level, không try/except), gỡ blocker & thử LẠI một
             # lần. Chấp nhận rủi ro cuDNN còn hơn không OCR được.
             if "torch" in str(exc).lower():
+                logger.warning(
+                    "Nạp paddle lần 1 lỗi liên quan torch (%s) → gỡ bộ chặn torch rồi thử lại.",
+                    exc, exc_info=True,
+                )
                 uninstall_torch_import_blocker()
+                if _native_paddle_loaded():
+                    raise OcrModelLoadError(f"{_PADDLE_MISSING_MSG}\n[chi tiết: {exc}]") from exc
                 try:
                     with HEAVY_IMPORT_LOCK:
-                        import sys as _sys
-
-                        for _name in list(_sys.modules):
-                            if _name == "paddle" or _name.startswith("paddle."):
-                                del _sys.modules[_name]
+                        _purge_partial_paddle_modules()
                         import paddle
                         from paddleocr import PaddleOCR
                     return paddle, PaddleOCR
                 except (ImportError, ModuleNotFoundError, OSError, AttributeError) as exc2:
-                    raise OcrModelLoadError(f"{_PADDLE_MISSING_MSG}\n[chi tiết: {exc2}]") from exc2
+                    raise OcrModelLoadError(
+                        f"{_PADDLE_MISSING_MSG}\n[chi tiết: {exc2}]\n[lỗi lần đầu: {exc}]"
+                    ) from exc2
             # [v3.23.296] Phân biệt lỗi NẠP DLL (thường do thiếu VC++ Redistributable
             # hoặc DLL CUDA hỏng) với thiếu package — giúp chẩn đoán trên máy người dùng.
             # LƯU Ý: paddlepaddle-gpu VẪN import được trên máy KHÔNG có GPU NVIDIA (CUDA

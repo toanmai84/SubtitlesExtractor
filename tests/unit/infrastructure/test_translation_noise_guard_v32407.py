@@ -55,10 +55,28 @@ class TestNoiseLineIndices:
         assert GeminiSubtitleTranslator._noise_line_indices(lines, _ctx("en")) == set()
 
     def test_japanese_korean_sources(self) -> None:
-        assert GeminiSubtitleTranslator._noise_line_indices(
-            [_line(1, "xyz")], _ctx("ja")) == {1}
+        """[v3.23.350] Nhánh CJK vẫn bắt dòng rác, MIỄN LÀ nó không nuốt cả lô.
+
+        Trước đây bài kiểm truyền đúng MỘT dòng Latin với nguồn 'ja' → 1/1 = 100% dòng
+        bị coi là rác. Từ v3.23.350, tỉ lệ đó kích hoạt chốt chống-tự-bắn-nhầm: nhãn
+        ngôn ngữ gần như chắc SAI nên bộ lọc bị bỏ qua (xem
+        ``test_toan_bo_dong_latin_thi_bo_qua_bo_loc``). Nay đặt dòng rác xen giữa các
+        dòng tiếng Nhật thật — đúng tình huống mà bộ lọc sinh ra để xử lý.
+        """
+        lines = [_line(1, "こんにちは"), _line(2, "xyz"), _line(3, "世界です")]
+        assert GeminiSubtitleTranslator._noise_line_indices(lines, _ctx("ja")) == {2}
         assert GeminiSubtitleTranslator._noise_line_indices(
             [_line(1, "안녕")], _ctx("ko")) == set()
+
+    def test_toan_bo_dong_latin_thi_bo_qua_bo_loc(self) -> None:
+        """[v3.23.350] Nhãn nguồn CJK mà KHÔNG dòng nào có CJK → bỏ qua bộ lọc.
+
+        Nếu vẫn áp máy móc, ``translate_stage`` lọc sạch đầu vào rồi trả nguyên bản gốc
+        trong 0.0s, không gọi API và không báo lỗi — người dùng thấy "dịch mà y hệt bản
+        gốc" mà không hiểu vì sao.
+        """
+        lines = [_line(1, "hello"), _line(2, "world"), _line(3, "xyz")]
+        assert GeminiSubtitleTranslator._noise_line_indices(lines, _ctx("ja")) == set()
 
 
 # ---------- Tích hợp: translate_stage giữ nguyên rác, căn đúng index ----------

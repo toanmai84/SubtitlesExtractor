@@ -15,7 +15,7 @@ import gc
 import logging
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC
 from pathlib import Path
@@ -42,6 +42,7 @@ from subtitles_extractor.domain.exceptions import (
 )
 from subtitles_extractor.domain.ports.frame_sampler_port import (
     FrameSamplerPort,
+    SAMPLE_TIME_TOLERANCE_SEC,
     FrameSamplingConfig,
     SampledFrame,
 )
@@ -59,6 +60,7 @@ from subtitles_extractor.domain.ports.video_metadata_reader_port import (
 
 if TYPE_CHECKING:
     from subtitles_extractor.domain.entities.video_metadata import VideoMetadata
+    from subtitles_extractor.infrastructure.serializers.ocr_checkpoint import OcrCheckpoint
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +68,30 @@ _AUTO_TUNE_TARGET_SECONDS: float = 1.5
 _AUTO_TUNE_MIN_BATCH_SIZE: int = 1
 _AUTO_TUNE_MAX_BATCH_SIZE: int = 256
 _PROGRESS_BATCH_REPORT_MULTIPLIER: int = 5
+#: [v3.23.632] Chu kỳ ghi điểm dừng OCR (giây): bị ngắt thì mất tối đa chừng này công việc.
+#: [v3.23.643] Sau chừng này khung liên tiếp thử lại từng khung vẫn rỗng thì ngừng thử phần còn lại của lô.
+_MAX_CONSECUTIVE_FRAME_RETRY_FAILURES = 3
+_CHECKPOINT_INTERVAL_SEC: float = 30.0
+
+
+#: [v3.23.644] Hàng đợi khung chờ tối đa ``batch_size`` × hệ số này (khung trùng/trống không tốn ảnh nhưng
+#: đừng để một phụ đề đứng yên hàng phút làm hàng đợi phình vô hạn trước khi trả kết quả).
+_MAX_PENDING_FACTOR = 16
+
+
+def _needs_ocr(frame: SampledFrame) -> bool:
+    """Khung có ảnh thật cần chạy OCR (không phải trùng / trống / lỗi)."""
+    return not (frame.is_duplicate or frame.is_blank or frame.is_error)
+
+
+def _align_results(frames: list[SampledFrame], results: list[OcrFrameResult]) -> list[OcrFrameResult]:
+    """Đảm bảo mỗi khung cần OCR có đúng một kết quả (engine lệch số lượng → bù rỗng / cắt bớt)."""
+    aligned = list(results[: len(frames)])
+    for frame in frames[len(aligned):]:
+        aligned.append(
+            OcrFrameResult(frame_index=frame.frame_index, timestamp_sec=frame.timestamp_sec, text_boxes=[])
+        )
+    return aligned
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +101,7 @@ class _CompressedSampledFrame:
     image_jpeg_bytes: bytes
     is_duplicate: bool
     is_error: bool
+    is_blank: bool = False
 
 
 class _ReOcrFrameCacheManager:
@@ -99,7 +126,7 @@ class _ReOcrFrameCacheManager:
         empty_image = np.empty(0, dtype=np.uint8)
 
         for comp_frame in cached_snapshot:
-            if comp_frame.is_duplicate or comp_frame.is_error or not comp_frame.image_jpeg_bytes:
+            if comp_frame.is_duplicate or comp_frame.is_error or comp_frame.is_blank or not comp_frame.image_jpeg_bytes:
                 decoded_img = empty_image
             else:
                 np_arr = np.frombuffer(comp_frame.image_jpeg_bytes, np.uint8)
@@ -112,6 +139,7 @@ class _ReOcrFrameCacheManager:
                 image_rgb=decoded_img,
                 is_duplicate=comp_frame.is_duplicate,
                 is_error=comp_frame.is_error,
+                is_blank=comp_frame.is_blank,
             ))
         return decoded_frames
 
@@ -122,7 +150,7 @@ class _ReOcrFrameCacheManager:
         compressed_list: list[_CompressedSampledFrame] = []
         for frame in frames:
             jpeg_bytes = b""
-            if not frame.is_duplicate and not frame.is_error and frame.image_rgb.size > 0:
+            if not frame.is_duplicate and not frame.is_error and not frame.is_blank and frame.image_rgb.size > 0:
                 bgr_img = cv2.cvtColor(frame.image_rgb, cv2.COLOR_RGB2BGR)
                 success, encoded = cv2.imencode(".jpg", bgr_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 if success and encoded is not None:
@@ -131,6 +159,7 @@ class _ReOcrFrameCacheManager:
             compressed_list.append(_CompressedSampledFrame(
                 frame_index=frame.frame_index, timestamp_sec=frame.timestamp_sec,
                 image_jpeg_bytes=jpeg_bytes, is_duplicate=frame.is_duplicate, is_error=frame.is_error,
+                is_blank=frame.is_blank,
             ))
 
         with self._lock:
@@ -146,6 +175,11 @@ class _ReOcrFrameCacheManager:
 
 
 _GLOBAL_FRAME_CACHE = _ReOcrFrameCacheManager()
+
+
+def clear_reocr_frame_cache() -> None:
+    """[v3.23.645] Xoá bộ đệm khung RAM của lần OCR lại (phép đo tốc độ phải giải mã khung thật mỗi kịch bản)."""
+    _GLOBAL_FRAME_CACHE.clear()
 
 
 def _sampling_signature(cfg: FrameSamplingConfig) -> str:
@@ -171,6 +205,8 @@ def _sampling_signature(cfg: FrameSamplingConfig) -> str:
             cfg.vram_border_thickness_px,
             cfg.vram_sharpen,
             cfg.vram_contrast_factor,
+            cfg.white_text_gate,
+            cfg.white_text_luma,
         )
     )
 
@@ -221,9 +257,10 @@ class ExtractSubtitlesUseCase:
             debug_frames_directory = self._resolve_debug_directory(request)
             debug_frames_directory.mkdir(parents=True, exist_ok=True)
 
+        checkpoint = self._open_checkpoint(request, video_metadata)
         try:
             ocr_frame_results = self._execute_ocr_inference_loop(
-                video_metadata, request, progress_reporter, debug_frames_directory
+                video_metadata, request, progress_reporter, debug_frames_directory, checkpoint,
             )
         finally:
             gc.collect()
@@ -241,6 +278,8 @@ class ExtractSubtitlesUseCase:
                 ocr_results=ocr_frame_results, output_file_path=request.raw_ocr_output_path,
                 request=request, metadata=video_metadata,
             )
+            if raw_ocr_file_path is not None and checkpoint is not None:
+                checkpoint.discard()   # [v3.23.632] kết quả đầy đủ đã nằm trong cache → hết cần điểm dừng
 
         built_subtitle_events = self._subtitle_builder.build(ocr_frame_results, roi=request.roi)
         final_output_path = request.output_path
@@ -272,81 +311,175 @@ class ExtractSubtitlesUseCase:
         request: ExtractSubtitlesRequest,
         reporter: ProgressReporterPort,
         debug_dir: Path | None,
+        checkpoint: OcrCheckpoint | None = None,
     ) -> list[OcrFrameResult]:
-        accumulated_results: list[OcrFrameResult] = []
-        frame_batch_queue: list[SampledFrame] = []
+        """Vòng OCR. ``checkpoint`` có thì chạy TIẾP từ phần đã OCR và ghi điểm dừng định kỳ.
+
+        [v3.23.632] Tiếp tục = nạp tiền tố kết quả của lần trước, lấy mẫu tiếp từ ngay sau frame
+        cuối của nó (``skip_intro_sec`` của bộ lấy mẫu), đánh số frame tiếp nối. ``frame_index``
+        của bộ lấy mẫu đếm từ 0 sau mỗi lần dừng → cộng ``frame_offset``.
+        """
+        resumed = checkpoint.resume() if checkpoint is not None else []
+        accumulated_results: list[OcrFrameResult] = list(resumed)
+        frame_offset = 0
+        sampling_request = request
+        if resumed:
+            last = resumed[-1]
+            frame_offset = max(frame.frame_index for frame in resumed) + 1
+            # Đúng mốc kế tiếp của lượt chạy một mạch (mốc khung vừa lấy + bước), có dung sai.
+            resume_from = (
+                last.timestamp_sec + request.sampling.sample_step_sec - SAMPLE_TIME_TOLERANCE_SEC
+            )
+            sampling_request = dataclasses.replace(
+                request,
+                sampling=dataclasses.replace(
+                    request.sampling,
+                    skip_intro_sec=max(request.sampling.skip_intro_sec, resume_from),
+                ),
+            )
+            logger.info(
+                "▶ Tiếp tục OCR từ %.1f s (đã có %d frame từ lần trước, bỏ qua phần đó).",
+                last.timestamp_sec, len(resumed),
+            )
+            reporter.report(
+                0, 100,
+                f"Tiếp tục OCR từ {last.timestamp_sec / 60:.1f} phút "
+                f"(đã có {len(resumed)} frame từ lần chạy trước)…",
+            )
+        last_checkpoint_at = time.monotonic()
+
+        def save_checkpoint(force: bool = False) -> None:
+            nonlocal last_checkpoint_at
+            if checkpoint is None or len(accumulated_results) <= checkpoint.written:
+                return
+            if not force and time.monotonic() - last_checkpoint_at < _CHECKPOINT_INTERVAL_SEC:
+                return
+            checkpoint.append(accumulated_results[checkpoint.written:])
+            last_checkpoint_at = time.monotonic()
+
+        try:
+            self._ocr_loop_body(
+                metadata, request, sampling_request, reporter, debug_dir,
+                accumulated_results, frame_offset, save_checkpoint,
+            )
+        finally:
+            save_checkpoint(force=True)   # huỷ/lỗi giữa chừng vẫn giữ phần đã xong
+        return accumulated_results
+
+    def _ocr_loop_body(
+        self,
+        metadata: VideoMetadata,
+        request: ExtractSubtitlesRequest,
+        sampling_request: ExtractSubtitlesRequest,
+        reporter: ProgressReporterPort,
+        debug_dir: Path | None,
+        accumulated_results: list[OcrFrameResult],
+        frame_offset: int,
+        save_checkpoint: Callable[[], None],
+    ) -> None:
+        """Gom khung theo THỨ TỰ, OCR theo lô, rồi trả kết quả đúng thứ tự khung.
+
+        [v3.23.644] Khung trùng / trống / lỗi KHÔNG còn cắt lô: chúng nằm trong hàng đợi cùng các khung cần OCR và
+        được giải quyết sau khi lô chạy xong (trùng = sao chép kết quả khung đứng ngay trước nó trong chuỗi; trống
+        / lỗi = rỗng). Đo thật (tập 1): các đoạn khung OCR liên tiếp giữa hai khung trùng chỉ dài trung bình 3,1
+        khung nên lô 128 chưa bao giờ đầy — GPU luôn chạy lô bé.
+        """
+        pending: list[SampledFrame] = []
+        ocr_pending = 0
+        # Kết quả cuối đã có (lượt chạy tiếp từ checkpoint / lượt đầu): khung trùng đầu tiên sao chép nó.
+        carried: OcrFrameResult | None = accumulated_results[-1] if accumulated_results else None
 
         current_batch_size = max(1, request.ocr.batch_size)
         is_auto_tune_enabled = request.auto_tune_batch
-
         processed_batch_count = 0
         progress_report_interval = max(1, current_batch_size * _PROGRESS_BATCH_REPORT_MULTIPLIER)
         last_reported_frame_count = 0
-        last_valid_ocr_result: OcrFrameResult | None = None
+        # [v3.23.645] Tính theo đoạn THỰC SỰ được quét (trừ phần bỏ đầu/cuối): thử nhanh/đo tốc độ
+        # trên cửa sổ 60 s của phim 40 phút từng báo tiến độ tối đa 2% rồi nhảy lên 95%.
+        scanned_sec = metadata.duration_sec - request.sampling.skip_intro_sec - request.sampling.skip_outro_sec
+        expected_total_frames = max(1, int(max(0.0, scanned_sec) / request.sampling.sample_step_sec))
 
-        expected_total_frames = max(1, int(metadata.duration_sec / request.sampling.sample_step_sec))
-
-        for sampled_frame in self._iterate_sampled_frames(metadata, request, reporter):
-            if reporter.is_cancelled():
-                break
-
-            if sampled_frame.is_error:
-                if frame_batch_queue:
-                    new_ocr_results, current_batch_size, progress_report_interval = self._flush_batch_and_tune_performance(
-                        batch_queue=frame_batch_queue, debug_dir=debug_dir, current_batch_size=current_batch_size,
+        def flush() -> None:
+            nonlocal pending, ocr_pending, carried, current_batch_size, progress_report_interval
+            nonlocal processed_batch_count
+            if not pending:
+                return
+            ocr_frames = [frame for frame in pending if _needs_ocr(frame)]
+            ocr_results: list[OcrFrameResult] = []
+            if ocr_frames:
+                ocr_results, current_batch_size, progress_report_interval = (
+                    self._flush_batch_and_tune_performance(
+                        batch_queue=ocr_frames, debug_dir=debug_dir, current_batch_size=current_batch_size,
                         current_interval=progress_report_interval, batch_count=processed_batch_count,
-                        auto_tune=is_auto_tune_enabled, request=request, metadata=metadata
+                        auto_tune=is_auto_tune_enabled, request=request, metadata=metadata,
                     )
-                    processed_batch_count += 1
-                    accumulated_results.extend(new_ocr_results)
-                    frame_batch_queue.clear()
-
-                accumulated_results.append(OcrFrameResult(frame_index=sampled_frame.frame_index, timestamp_sec=sampled_frame.timestamp_sec, text_boxes=[]))
-                last_valid_ocr_result = None
-                continue
-
-            if sampled_frame.is_duplicate:
-                if frame_batch_queue:
-                    new_ocr_results, current_batch_size, progress_report_interval = self._flush_batch_and_tune_performance(
-                        batch_queue=frame_batch_queue, debug_dir=debug_dir, current_batch_size=current_batch_size,
-                        current_interval=progress_report_interval, batch_count=processed_batch_count,
-                        auto_tune=is_auto_tune_enabled, request=request, metadata=metadata
-                    )
-                    processed_batch_count += 1
-                    accumulated_results.extend(new_ocr_results)
-                    if new_ocr_results:
-                        last_valid_ocr_result = new_ocr_results[-1]
-                    frame_batch_queue.clear()
-
-                if last_valid_ocr_result is not None:
-                    accumulated_results.append(OcrFrameResult(frame_index=sampled_frame.frame_index, timestamp_sec=sampled_frame.timestamp_sec, text_boxes=list(last_valid_ocr_result.text_boxes)))
-                continue
-
-            frame_batch_queue.append(sampled_frame)
-
-            if len(frame_batch_queue) >= current_batch_size:
-                new_ocr_results, current_batch_size, progress_report_interval = self._flush_batch_and_tune_performance(
-                    batch_queue=frame_batch_queue, debug_dir=debug_dir, current_batch_size=current_batch_size,
-                    current_interval=progress_report_interval, batch_count=processed_batch_count,
-                    auto_tune=is_auto_tune_enabled, request=request, metadata=metadata
                 )
                 processed_batch_count += 1
-                accumulated_results.extend(new_ocr_results)
+            produced = iter(_align_results(ocr_frames, ocr_results))
+            resolved: list[OcrFrameResult] = []
+            previous = carried
+            for frame in pending:
+                if _needs_ocr(frame):
+                    result = next(produced)
+                elif frame.is_duplicate and previous is not None:
+                    result = OcrFrameResult(
+                        frame_index=frame.frame_index, timestamp_sec=frame.timestamp_sec,
+                        text_boxes=list(previous.text_boxes),
+                    )
+                else:   # lỗi giải mã / khung trống / trùng khi chưa có kết quả trước → rỗng, KHÔNG bỏ khung
+                    result = OcrFrameResult(
+                        frame_index=frame.frame_index, timestamp_sec=frame.timestamp_sec, text_boxes=[],
+                    )
+                resolved.append(result)
+                previous = result
+            accumulated_results.extend(resolved)
+            carried = previous
+            pending = []
+            ocr_pending = 0
 
-                if new_ocr_results:
-                    last_valid_ocr_result = new_ocr_results[-1]
-                frame_batch_queue.clear()
+        for sampled_frame in self._iterate_sampled_frames(metadata, sampling_request, reporter):
+            if reporter.is_cancelled():
+                break
+            if frame_offset:
+                sampled_frame = dataclasses.replace(
+                    sampled_frame, frame_index=sampled_frame.frame_index + frame_offset,
+                )
+            save_checkpoint()
 
+            pending.append(sampled_frame)
+            if _needs_ocr(sampled_frame):
+                ocr_pending += 1
+            if ocr_pending >= current_batch_size or len(pending) >= current_batch_size * _MAX_PENDING_FACTOR:
+                flush()
                 if len(accumulated_results) - last_reported_frame_count >= progress_report_interval:
-                    reporter.report(len(accumulated_results), expected_total_frames, f"Đã quét OCR {len(accumulated_results)}/{expected_total_frames} frame…")
+                    reporter.report(
+                        len(accumulated_results), expected_total_frames,
+                        f"Đã quét OCR {len(accumulated_results)}/{expected_total_frames} frame…",
+                    )
                     last_reported_frame_count = len(accumulated_results)
 
-        if frame_batch_queue and not reporter.is_cancelled():
-            new_ocr_results = self._execute_ocr_inference_on_batch(frame_batch_queue, debug_dir, request, metadata)
-            accumulated_results.extend(new_ocr_results)
-            reporter.report(len(accumulated_results), expected_total_frames, f"Đã quét xong {len(accumulated_results)} khung hình.")
+        if pending and not reporter.is_cancelled():
+            flush()
+            reporter.report(
+                len(accumulated_results), expected_total_frames,
+                f"Đã quét xong {len(accumulated_results)} khung hình.",
+            )
 
-        return accumulated_results
+    @staticmethod
+    def _open_checkpoint(
+        request: ExtractSubtitlesRequest, metadata: VideoMetadata,
+    ) -> OcrCheckpoint | None:
+        """Điểm dừng cạnh cache OCR thô; ``None`` nếu lượt này không lưu cache thô."""
+        if request.raw_ocr_output_path is None:
+            return None
+        from subtitles_extractor.infrastructure.serializers.ocr_checkpoint import (
+            OcrCheckpoint,
+            checkpoint_path_for,
+            run_fingerprint,
+        )
+        return OcrCheckpoint(
+            checkpoint_path_for(request.raw_ocr_output_path), run_fingerprint(request, metadata),
+        )
 
     def _flush_batch_and_tune_performance(
         self, *, batch_queue: list[SampledFrame], debug_dir: Path | None, current_batch_size: int,
@@ -360,7 +493,8 @@ class ExtractSubtitlesUseCase:
         tuned_batch_size = current_batch_size
         tuned_interval = current_interval
 
-        if auto_tune and batch_count == 1 and inference_duration > 0:
+        # Chỉ đo trên lô ĐẦY: lô lẻ (hàng đợi bị cắt sớm) làm cỡ lô tối ưu bị thổi phồng → nguy cơ hết VRAM.
+        if auto_tune and batch_count == 1 and inference_duration > 0 and len(batch_queue) >= current_batch_size:
             calculated_optimal_size = int(current_batch_size * _AUTO_TUNE_TARGET_SECONDS / inference_duration)
             tuned_batch_size = max(_AUTO_TUNE_MIN_BATCH_SIZE, min(_AUTO_TUNE_MAX_BATCH_SIZE, calculated_optimal_size))
             tuned_interval = max(1, tuned_batch_size * _PROGRESS_BATCH_REPORT_MULTIPLIER)
@@ -371,7 +505,9 @@ class ExtractSubtitlesUseCase:
         self, metadata: VideoMetadata, request: ExtractSubtitlesRequest, reporter: ProgressReporterPort,
     ) -> Iterator[SampledFrame]:
 
-        is_reocr_task = request.skip_export and request.raw_ocr_output_path is None
+        is_reocr_task = (
+            request.skip_export and request.raw_ocr_output_path is None and request.use_frame_cache
+        )
         cache_key = ""
 
         if is_reocr_task:
@@ -416,11 +552,11 @@ class ExtractSubtitlesUseCase:
             self._save_debug_frames_to_disk(batch_queue, debug_dir)
 
         try:
-            raw_inference_results = self._ocr_engine_port.infer_batch(
+            raw_inference_results = _align_results(batch_queue, self._ocr_engine_port.infer_batch(
                 images_rgb=[frame.image_rgb for frame in batch_queue],
                 frame_indices=[frame.frame_index for frame in batch_queue],
                 timestamps_sec=[frame.timestamp_sec for frame in batch_queue],
-            )
+            ))
 
             if request.export_raw_images and request.raw_ocr_output_path:
                 self._save_annotated_raw_frames(batch_queue, raw_inference_results, request.raw_ocr_output_path)
@@ -429,6 +565,36 @@ class ExtractSubtitlesUseCase:
 
         except (OcrInferenceError, OcrModelLoadError) as model_error:
             logger.exception("Lỗi suy luận OCR trên lô %d frame: %s.", len(batch_queue), model_error)
+            if len(batch_queue) > 1 and isinstance(model_error, OcrInferenceError):
+                # [v3.23.643] Một khung hỏng không được kéo theo cả lô (tới 128 khung ≈ 5 giây phụ đề):
+                # thử lại TỪNG khung, chỉ khung nào hỏng thật mới rỗng.
+                results: list[OcrFrameResult] = []
+                consecutive_failures = 0
+                for frame in batch_queue:
+                    blank = OcrFrameResult(
+                        frame_index=frame.frame_index, timestamp_sec=frame.timestamp_sec, text_boxes=[],
+                    )
+                    if consecutive_failures >= _MAX_CONSECUTIVE_FRAME_RETRY_FAILURES:
+                        # Engine hỏng hẳn: đừng thử 128 lần + 128 traceback cho mỗi lô.
+                        results.append(blank)
+                        continue
+                    try:
+                        single = _align_results([frame], self._ocr_engine_port.infer_batch(
+                            images_rgb=[frame.image_rgb], frame_indices=[frame.frame_index],
+                            timestamps_sec=[frame.timestamp_sec],
+                        ))
+                        results.extend(self._reverse_vram_geometry(single, [frame], request, metadata))
+                        consecutive_failures = 0
+                    except (OcrInferenceError, OcrModelLoadError) as frame_error:
+                        consecutive_failures += 1
+                        logger.warning("Khung %d lỗi OCR riêng lẻ: %s.", frame.frame_index, frame_error)
+                        results.append(blank)
+                    except (RuntimeError, MemoryError) as system_error:
+                        logger.exception("Lỗi OOM/System khi thử lại từng khung: %s.", system_error)
+                        raise SubtitlesExtractorError(
+                            f"Hệ thống cạn kiệt bộ nhớ hoặc lỗi Trình xử lý: {system_error}"
+                        ) from system_error
+                return results
             return [OcrFrameResult(frame_index=f.frame_index, timestamp_sec=f.timestamp_sec, text_boxes=[]) for f in batch_queue]
         except (RuntimeError, MemoryError) as system_error:
             logger.exception("Lỗi OOM/System khi suy luận: %s.", system_error)

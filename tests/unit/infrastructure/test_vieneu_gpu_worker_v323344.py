@@ -115,21 +115,49 @@ def test_worker_survives_one_bad_item() -> None:
 
 
 # ── Adapter: rẽ nhánh sang worker ────────────────────────────────────────────
+def _gpu_branch_and_siblings() -> tuple[ast.If, list[ast.stmt]]:
+    """Trả nhánh ``if not self._force_cpu:`` cùng các câu lệnh ANH EM sau nó.
+
+    [v3.23.547] Trước đây bộ kiểm cắt một cửa sổ 300/400 ký tự sau chuỗi điều kiện rồi
+    dò chuỗi con. v3.23.412 chèn thêm nhánh lấy audio từ lô ``infer_batch`` vào giữa,
+    đẩy phần cần kiểm ra ngoài cửa sổ — bộ kiểm đỏ dù hành vi vẫn đúng. Nay phân tích
+    CÂY CÚ PHÁP: bất biến "gọi worker GPU bên trong nhánh, lùi về engine.infer bên
+    ngoài" được diễn đạt trực tiếp, không phụ thuộc độ dài mã xen giữa.
+    """
+    tree = ast.parse(_adapter_source())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for position, statement in enumerate(node.body):
+            if not isinstance(statement, ast.If):
+                continue
+            if ast.unparse(statement.test) == "not self._force_cpu":
+                return statement, node.body[position + 1 :]
+    raise AssertionError("Không tìm thấy nhánh rẽ GPU `if not self._force_cpu:`")
+
+
 def test_adapter_routes_to_gpu_worker_when_not_forcing_cpu() -> None:
     """Đây là mảnh ghép còn thiếu ở v3.23.343."""
-    source = _adapter_source()
-    assert "_infer_via_gpu_worker" in source
-    index = source.index("if not self._force_cpu:")
-    window = source[index : index + 300]
-    assert "_infer_via_gpu_worker" in window
+    assert "_infer_via_gpu_worker" in _adapter_source()
+
+    branch, _siblings = _gpu_branch_and_siblings()
+    calls = {
+        ast.unparse(inner.func)
+        for inner in ast.walk(branch)
+        if isinstance(inner, ast.Call)
+    }
+    assert "self._infer_via_gpu_worker" in calls
 
 
 def test_adapter_falls_back_to_in_process() -> None:
     """Worker trả ``None`` -> vẫn phải chạy được bằng ONNX/CPU."""
-    source = _adapter_source()
-    index = source.index("if not self._force_cpu:")
-    window = source[index : index + 400]
-    assert "engine.infer(**kwargs)" in window
+    _branch, siblings = _gpu_branch_and_siblings()
+    fallbacks = {
+        ast.unparse(statement.value)
+        for statement in siblings
+        if isinstance(statement, ast.Return) and statement.value is not None
+    }
+    assert "engine.infer(**kwargs)" in fallbacks
 
 
 def test_adapter_disables_gpu_after_fixed_error() -> None:

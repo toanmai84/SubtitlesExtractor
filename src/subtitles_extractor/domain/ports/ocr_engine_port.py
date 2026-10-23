@@ -42,6 +42,8 @@ class OcrEngineConfig:
 
     score_threshold: float | None = None
     batch_size: int = 16
+    #: [v3.23.644] Số ảnh bộ dò chữ xử lý mỗi lần chạy GPU (1 = hành vi cũ).
+    det_batch_size: int = 1
 
     use_textline_orientation: bool = False
     use_doc_orientation_classify: bool = False

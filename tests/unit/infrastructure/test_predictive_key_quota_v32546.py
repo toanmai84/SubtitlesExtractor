@@ -49,6 +49,10 @@ def test_has_any_daily_quota_false_when_all_exhausted() -> None:
     adapter = _adapter("KEY_A\nKEY_B\nKEY_C", quota)
     for i in range(3):
         _exhaust(quota, adapter, i)
+    # [v3.23.642] Bộ đếm đầy mà server CHƯA từ chối thì key vẫn đáng thử một lần.
+    assert adapter.has_any_daily_quota(MODEL) is True
+    for key in adapter._api_keys:
+        quota.mark_daily_exhausted(MODEL, key_id=adapter._fingerprint(key))
     assert adapter.has_any_daily_quota(MODEL) is False
 
 
@@ -79,6 +83,10 @@ def test_best_index_none_when_all_exhausted() -> None:
     adapter = _adapter("KEY_A\nKEY_B", quota)
     _exhaust(quota, adapter, 0)
     _exhaust(quota, adapter, 1)
+    # [v3.23.642] Bộ đếm đầy nhưng server chưa từ chối → vẫn trả key để thử; server từ chối cả hai → None.
+    assert adapter._best_available_key_index(MODEL) is not None
+    for key in adapter._api_keys:
+        quota.mark_daily_exhausted(MODEL, key_id=adapter._fingerprint(key))
     assert adapter._best_available_key_index(MODEL) is None
 
 

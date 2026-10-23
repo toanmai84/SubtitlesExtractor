@@ -1,7 +1,11 @@
-"""[v3.23.135] Test: khóa checkpoint phản ánh MỌI cài đặt ảnh hưởng kết quả dịch.
+"""[v3.23.135] Test: checkpoint phản ánh MỌI cài đặt ảnh hưởng kết quả dịch.
 
-Đổi phong cách / locale / thinking / context_size / visual-cues => khóa PHẢI đổi (để không
-resume nhầm bản dịch cũ). Cùng cấu hình => khóa GIỮ NGUYÊN (resume hoạt động).
+Đổi phong cách / locale / thinking / context_size / visual-cues => KHÔNG được resume nhầm
+bản dịch cũ. Cùng cấu hình => resume hoạt động.
+
+[v3.23.606] Cấu hình TỪNG GIAI ĐOẠN chuyển từ khoá file sang dấu vân tay riêng của giai
+đoạn (:func:`stage_config_signature`) — đổi model một giai đoạn không còn làm mất mọi
+giai đoạn đã xong. Khoá file chỉ còn phụ đề, cặp ngôn ngữ và Visual Cues.
 """
 
 from __future__ import annotations
@@ -9,6 +13,7 @@ from __future__ import annotations
 from subtitles_extractor.application.use_cases.translate_subtitles import (
     TranslateSubtitlesRequest,
     _compute_checkpoint_key,
+    stage_config_signature,
 )
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
 from subtitles_extractor.domain.ports.subtitle_translator_port import (
@@ -51,26 +56,38 @@ def test_same_config_same_key() -> None:
 
 
 def test_style_name_changes_key() -> None:
-    k1 = _compute_checkpoint_key(_req(_stage(style_name="Trang trọng")))
-    k2 = _compute_checkpoint_key(_req(_stage(style_name="Thân mật")))
+    k1 = stage_config_signature(_stage(style_name="Trang trọng"), attach_video=False)
+    k2 = stage_config_signature(_stage(style_name="Thân mật"), attach_video=False)
     assert k1 != k2
 
 
 def test_locale_notes_changes_key() -> None:
-    k1 = _compute_checkpoint_key(_req(_stage(locale_notes="Miền Bắc")))
-    k2 = _compute_checkpoint_key(_req(_stage(locale_notes="Miền Nam")))
+    k1 = stage_config_signature(_stage(locale_notes="Miền Bắc"), attach_video=False)
+    k2 = stage_config_signature(_stage(locale_notes="Miền Nam"), attach_video=False)
     assert k1 != k2
 
 
 def test_thinking_level_changes_key() -> None:
-    k1 = _compute_checkpoint_key(_req(_stage(thinking_level="low")))
-    k2 = _compute_checkpoint_key(_req(_stage(thinking_level="high")))
+    """[v3.23.609] Mức suy nghĩ chỉ được gửi tới model khi BẬT suy nghĩ — xét khi bật."""
+    k1 = stage_config_signature(
+        _stage(enable_thinking=True, thinking_level="low"), attach_video=False
+    )
+    k2 = stage_config_signature(
+        _stage(enable_thinking=True, thinking_level="high"), attach_video=False
+    )
     assert k1 != k2
 
 
+def test_thinking_level_ignored_while_thinking_is_off() -> None:
+    """[v3.23.609] Suy nghĩ tắt: mức suy nghĩ không được gửi → không đổi dấu vân tay."""
+    k1 = stage_config_signature(_stage(thinking_level="low"), attach_video=False)
+    k2 = stage_config_signature(_stage(thinking_level="high"), attach_video=False)
+    assert k1 == k2
+
+
 def test_context_size_changes_key() -> None:
-    k1 = _compute_checkpoint_key(_req(_stage(context_size=5)))
-    k2 = _compute_checkpoint_key(_req(_stage(context_size=20)))
+    k1 = stage_config_signature(_stage(context_size=5), attach_video=False)
+    k2 = stage_config_signature(_stage(context_size=20), attach_video=False)
     assert k1 != k2
 
 
@@ -104,6 +121,23 @@ def test_source_lang_still_distinguishes() -> None:
 
 def test_temperature_still_changes_key() -> None:
     # Hồi quy: tham số cũ vẫn còn hiệu lực.
-    assert _compute_checkpoint_key(
-        _req(_stage(temperature=0.1))
-    ) != _compute_checkpoint_key(_req(_stage(temperature=0.9)))
+    assert stage_config_signature(
+        _stage(temperature=0.1), attach_video=False
+    ) != stage_config_signature(_stage(temperature=0.9), attach_video=False)
+
+
+def test_attach_video_changes_stage_signature() -> None:
+    stage = _stage()
+    assert stage_config_signature(stage, attach_video=True) != stage_config_signature(
+        stage, attach_video=False
+    )
+
+
+def test_model_change_keeps_file_key_and_stage_signature() -> None:
+    """[v3.23.606] Model được so theo hạng khi dùng lại, không nằm trong khoá/vân tay."""
+    weak = _stage(model_name="gemini-3.5-flash-lite")
+    strong = _stage(model_name="gemini-3.8-flash")
+    assert _compute_checkpoint_key(_req(weak)) == _compute_checkpoint_key(_req(strong))
+    assert stage_config_signature(weak, attach_video=False) == stage_config_signature(
+        strong, attach_video=False
+    )

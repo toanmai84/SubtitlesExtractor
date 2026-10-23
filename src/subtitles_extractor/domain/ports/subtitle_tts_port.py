@@ -7,10 +7,34 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from subtitles_extractor.domain.value_objects.voice_profile import VoiceProfile
+
 
 class TTSCancelledError(Exception): ...
 class TTSUnavailableError(Exception): ...
 class TTSGenerationError(Exception): ...
+
+
+@dataclass(frozen=True, slots=True)
+class LineNeighbors:
+    """[v3.23.596] Mốc THẬT của hai dòng kề khi TTS lại một tập con dòng.
+
+    "TTS lại dòng chọn" gửi engine CHỈ các dòng được chọn, nên engine lấy dòng chọn kế
+    tiếp làm "câu sau" và coi như không có câu trước. Ca thật: dòng vốn nén 2,5x cho vừa
+    0,6 giây trước câu sau, TTS lại thì đọc 1,0x và đè lên câu sau 0,9 giây.
+
+    Attributes:
+        next_start_sec: Mốc bắt đầu TIẾNG của dòng kế tiếp trong cả phim (``None`` = hết
+            phim, không có biên).
+        next_fixed: ``True`` khi dòng kế tiếp KHÔNG được TTS lại — tiếng của nó đã nằm
+            trong bản trộn, không dời được, nên dòng này không được ngân trễ qua mốc đó.
+        prev_audio_end_sec: Tiếng của dòng liền trước kết thúc lúc nào; ``None`` khi dòng
+            trước cũng được TTS lại trong lượt này (engine tự theo dõi).
+    """
+
+    next_start_sec: float | None
+    next_fixed: bool
+    prev_audio_end_sec: float | None
 
 
 @dataclass(frozen=True)
@@ -66,6 +90,10 @@ class TTSRequest:
     allow_audio_overlap: bool = True  # Cho phép chồng tiếng TTS: câu sau neo đúng mốc
                                       # gốc (giữ lipsync) kể cả khi câu trước chưa dứt.
                                       # Phụ đề .srt xuất kèm LUÔN được cắt không chồng lấn.
+    # [v3.23.450] Giữ audio RIÊNG từng dòng (ghi WAV vào ``segments_dir``) để NGHE LẠI +
+    # TTS LẠI dòng chọn. Rỗng ``segments_dir`` → engine tự suy ra cạnh file output.
+    keep_line_audio: bool = False
+    segments_dir: str = ""
     min_stretch_ratio: float = 0.75   # Giãn câu tối đa: đọc chậm nhất tới base×ratio để
                                       # lấp khoảng trống tới câu sau (giữ câu sau đúng mốc).
     timing_strategy: str = "lipsync"  # Chiến lược căn thời gian:
@@ -105,6 +133,59 @@ class TTSRequest:
     # [v3.23.207] Thời lượng media gốc (giây) — file audio xuất ra sẽ dài ĐÚNG bằng
     # video để mux không lệch (trước: master = end câu cuối + đệm -> lệch vài giây).
     media_duration_s: float | None = None
+    # [v3.23.593] LỒNG TIẾNG nhiều giọng: giọng RIÊNG cho từng dòng, theo VỊ TRÍ trong
+    # ``events`` (cùng chỉ số với ``TTSSegmentResult.event_index``). Phần tử rỗng, hoặc
+    # dòng nằm ngoài độ dài tuple, đọc bằng ``speaker`` như trước. Rỗng = một giọng.
+    line_voices: tuple[str, ...] = ()
+    # [v3.23.596] TTS lại tập con dòng: mốc thật của hai dòng kề từng dòng (theo vị trí
+    # trong ``events``). Rỗng = engine tự suy từ ``events`` như một lượt đầy đủ.
+    neighbors: tuple[LineNeighbors, ...] = ()
+
+    def neighbors_at(self, position: int) -> LineNeighbors | None:
+        """Mốc dòng kề thật của dòng ở vị trí ``position`` (``None`` = tự suy).
+
+        Args:
+            position: Vị trí dòng trong ``events``.
+
+        Returns:
+            :class:`LineNeighbors` nếu yêu cầu có, ngược lại ``None``.
+        """
+        if 0 <= position < len(self.neighbors):
+            return self.neighbors[position]
+        return None
+
+    def voice_at(self, position: int, default_voice: str) -> str:
+        """Giọng đọc dòng ở vị trí ``position`` (0-based) của ``events``.
+
+        Args:
+            position: Vị trí dòng trong ``events``.
+            default_voice: Giọng engine đã giải quyết cho cả phiên (từ ``speaker``).
+
+        Returns:
+            Giọng riêng của dòng nếu có, ngược lại ``default_voice``.
+        """
+        if 0 <= position < len(self.line_voices):
+            return self.line_voices[position].strip() or default_voice
+        return default_voice
+
+    def line_voices_for(self, positions: list[int]) -> tuple[str, ...]:
+        """Giọng riêng của một TẬP CON dòng (để TTS lại vài dòng vẫn giữ đúng vai).
+
+        Args:
+            positions: Vị trí (0-based) các dòng trong ``events``, theo thứ tự tập con.
+
+        Returns:
+            Tuple giọng theo thứ tự ``positions``; rỗng khi yêu cầu chỉ dùng một giọng.
+        """
+        if not self.line_voices:
+            return ()
+        return tuple(self.voice_at(position, "") for position in positions)
+
+
+#: [v3.23.601] Phần lấn nhỏ hơn mức này là sai số làm tròn của bước nén (độ dài sau nén
+#: lệch vài mẫu so với khung), không phải hai câu chồng tiếng. Chuẩn đoán thật: tóm tắt TTS
+#: báo "Có chồng tiếng (lấn): 113" trong khi chỉ 7 dòng lấn từ 1 ms trở lên (tổng 1.16 s).
+AUDIBLE_OVERLAP_S = 0.001
 
 
 @dataclass(frozen=True)
@@ -141,6 +222,17 @@ class TTSSegmentResult:
     pause_ms: float = 0.0           # Khoảng nghỉ hội thoại chèn vào (ms)
     is_dialog: bool = False         # Câu hội thoại (mở đầu bằng gạch ngang)
     ducked_prev_s: float = 0.0      # Độ dài đã dìm (ducking) lên câu liền trước (s)
+    # [v3.23.450] Đường dẫn WAV audio RIÊNG của dòng này (rỗng nếu không giữ). Bật qua
+    # ``TTSRequest.keep_line_audio`` → cho phép NGHE LẠI từng dòng và TTS LẠI dòng chọn.
+    segment_audio_path: str = ""
+    # [v3.23.459] True nếu audio dòng này DÀI BẤT THƯỜNG so với số âm tiết (model ngân dài, mọi
+    # lần thử đều dài) → đánh dấu ở bảng TTS để người dùng lọc/nghe lại/TTS lại nhanh.
+    abnormal_length: bool = False
+
+    @property
+    def has_audible_overlap(self) -> bool:
+        """[v3.23.601] Dòng này có chồng tiếng THẬT (lấn từ :data:`AUDIBLE_OVERLAP_S`)."""
+        return self.overlap_s >= AUDIBLE_OVERLAP_S
 
 
 TTSProgressCallback = Callable[[float, str], None]
@@ -156,6 +248,19 @@ class SubtitleTTSPort(ABC):
     def list_languages(self) -> list[str]: ...
     @abstractmethod
     def list_speakers(self, language: str) -> list[str]: ...
+
+    def list_voice_catalog(self, language: str) -> list[VoiceProfile]:
+        """[v3.23.593] Giọng kèm giới tính/sắc giọng để phân vai lồng tiếng.
+
+        Mặc định chỉ có ID giọng (không rõ giới tính); engine biết thêm thì ghi đè.
+
+        Args:
+            language: Như ``list_speakers``.
+
+        Returns:
+            Danh sách :class:`VoiceProfile` theo thứ tự engine gợi ý.
+        """
+        return [VoiceProfile(voice_id=voice) for voice in self.list_speakers(language)]
     @abstractmethod
     def generate(
         self, request: TTSRequest, output_path: Path,
@@ -165,7 +270,8 @@ class SubtitleTTSPort(ABC):
 
 
 __all__ = [
-    "TTSRequest", "TTSSegmentResult", "SubtitleTTSPort",
+    "AUDIBLE_OVERLAP_S",
+    "LineNeighbors", "TTSRequest", "TTSSegmentResult", "SubtitleTTSPort",
     "TTSCancelledError", "TTSUnavailableError", "TTSGenerationError",
-    "TTSProgressCallback", "TTSCancellationCallback",
+    "TTSProgressCallback", "TTSCancellationCallback", "VoiceProfile",
 ]

@@ -10,6 +10,8 @@ import contextlib
 import json
 import logging
 import sqlite3
+
+from subtitles_extractor.infrastructure.database.db_guard import prepare_database
 import threading
 import uuid
 from pathlib import Path
@@ -20,6 +22,7 @@ from subtitles_extractor.domain.ports.subtitle_repository_port import (
     SubtitleRepositoryPort,
 )
 from subtitles_extractor.domain.value_objects.confidence import Confidence
+from subtitles_extractor.domain.exceptions import ConfigurationError
 from subtitles_extractor.domain.value_objects.time_interval import TimeInterval
 
 logger = logging.getLogger(__name__)
@@ -32,6 +35,8 @@ class SqliteSubtitleRepository(SubtitleRepositoryPort):
         self._lock: threading.RLock = threading.RLock()
 
         # Persistent Connection
+        # [v3.23.649] Kiểm tra / sao lưu / tự phục hồi tệp trước khi kết nối.
+        prepare_database(self._db_path, background=True)
         self._conn: sqlite3.Connection = sqlite3.connect(
             self._db_path,
             timeout=10.0,
@@ -140,7 +145,9 @@ class SqliteSubtitleRepository(SubtitleRepositoryPort):
                     uid=uid_str
                 ))
             return events
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError, ConfigurationError) as exc:
+            # [v3.23.650] + ConfigurationError (TimeInterval từ chối NaN/inf/end<start): dự án đã lưu mốc xấu không được
+            # làm cả lần nạp ném ngoại lệ.
             logger.warning("Lỗi phân tích JSON Subtitle từ SQLite: %s", exc)
             return []
 

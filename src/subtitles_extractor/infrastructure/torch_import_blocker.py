@@ -88,6 +88,43 @@ def torch_isolation() -> Iterator[None]:
             uninstall_torch_import_blocker()
 
 
+@contextmanager
+def torch_none_bypassed() -> Iterator[None]:
+    """Tạm gỡ các entry ``sys.modules[torch…] = None`` trong khối ``with``, rồi khôi phục.
+
+    [v3.23.628] Tiến trình chính giữ ``torch=None`` từ lúc khởi động tới khi PaddleOCR được nạp
+    (``bootstrap_for_gui``). Người dùng vào thẳng trang TTS (chưa chạy OCR) thì mọi lời gọi
+    scipy trong khâu master âm thanh (``resample_poly``/``filtfilt``…) chết với
+    ``AttributeError: 'NoneType' object has no attribute 'Tensor'`` (scipy ≥ 1.15 dò kiểu tensor
+    bằng ``getattr(sys.modules["torch"], "Tensor")``) — VieNeu tổng hợp xong cả phim mà không
+    ghi nổi file WAV. Chỉ gỡ entry đang là ``None`` (không đụng torch thật), và khôi phục đúng
+    trạng thái cũ khi ra khối nên PaddleOCR vẫn được bảo vệ ở các chỗ khác.
+    """
+    removed: list[str] = []
+    for root in _BLOCKED_ROOTS:
+        if sys.modules.get(root, "absent") is None:
+            del sys.modules[root]
+            removed.append(root)
+    try:
+        yield
+    finally:
+        for root in removed:
+            if root not in sys.modules:
+                sys.modules[root] = None  # type: ignore[assignment]
+
+
+def without_torch_block(func):
+    """Decorator: chạy ``func`` trong :func:`torch_none_bypassed` (cho khâu DSP dùng scipy)."""
+    import functools
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with torch_none_bypassed():
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
 def is_torch_dll_load_error(error: BaseException) -> bool:
     """Nhận diện lỗi tải DLL của torch/cuDNN (hàm thuần, không side-effect).
 
@@ -138,6 +175,8 @@ __all__ = [
     "uninstall_torch_import_blocker",
     "is_torch_import_blocked",
     "torch_isolation",
+    "torch_none_bypassed",
+    "without_torch_block",
     "is_torch_dll_load_error",
     "torch_dll_error_message",
 ]

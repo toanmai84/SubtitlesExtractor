@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("PyQt6")
+pytest.importorskip("PySide6")
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QSettings

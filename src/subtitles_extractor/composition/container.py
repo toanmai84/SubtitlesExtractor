@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from subtitles_extractor.application.use_cases.benchmark_ocr import BenchmarkOcrUseCase
     from subtitles_extractor.application.use_cases.reocr import ReOcrUseCase
     from subtitles_extractor.application.use_cases.extract_embedded_subtitles import (
         ExtractEmbeddedSubtitlesUseCase,
@@ -184,6 +185,21 @@ class ApplicationContainer:
         return existing
 
     @property
+    def name_readings(self):
+        """[v3.23.567] Bảng âm Hán-Việt theo chữ để soát phiên âm tên (nạp một lần)."""
+        existing = getattr(self, "_name_readings", None)
+        if existing is None:
+            from subtitles_extractor.infrastructure.translation import (
+                name_readings_loader as loader,
+            )
+
+            existing = loader.load_name_readings(
+                self._i18n_data_dir / loader.HANVIET_READINGS_FILENAME
+            )
+            self._name_readings = existing
+        return existing
+
+    @property
     def translation_memory_store(self):
         """[v3.23.55] Bộ nhớ dịch theo phim bộ (Translation Memory) — tích luỹ cặp câu đã
         dịch qua các tập để truy hồi làm tham chiếu, giữ nhất quán tên riêng/thuật ngữ."""
@@ -340,6 +356,11 @@ class ApplicationContainer:
                 self.ocr_engine,
                 self.frame_sampler,
                 analyzer_kwargs_provider=self._build_auto_roi_analyzer_kwargs,
+                # [v3.23.619] Dò vị trí phụ đề trên khung thu về cạnh dài 960 px. Đo trên
+                # phim mẫu 720x1280 (CPU): 290-300s → 174-179s / 30s video, vùng tìm được
+                # lệch ≤ 1 px so với nguyên cỡ (3 tập, gồm tập 30 fps). 736 px nhanh hơn
+                # nữa nhưng chữ phụ đề video 1920x1080 còn ~15 px → dễ sót.
+                analysis_max_side=960,
             )
         return self._auto_roi_detector
 
@@ -442,6 +463,23 @@ class ApplicationContainer:
             metadata_reader=self.metadata_reader, frame_sampler=self.frame_sampler,
             ocr_engine=self.ocr_engine, builder=builder, exporters=self.exporters,
         )
+
+    def make_benchmark_ocr_use_case(self) -> BenchmarkOcrUseCase:
+        """[v3.23.645] Use case đo A/B OCR: dùng engine + bộ lấy mẫu của ứng dụng, mỗi kịch bản một lượt trích xuất thật."""
+        from subtitles_extractor.application.use_cases.benchmark_ocr import BenchmarkOcrUseCase
+
+        engine = self.ocr_engine
+        configure = getattr(engine, "apply_config", None) or getattr(engine, "update_preprocess_config")
+        builder_config = self._build_subtitle_builder_config()
+
+        def factory(counting_engine: object) -> ExtractSubtitlesUseCase:
+            return ExtractSubtitlesUseCase(
+                metadata_reader=self.metadata_reader, frame_sampler=self.frame_sampler,
+                ocr_engine=counting_engine, builder=SubtitleBuilder(config=builder_config),  # type: ignore[arg-type]
+                exporters=self.exporters,
+            )
+
+        return BenchmarkOcrUseCase(factory, engine, configure)
 
     def make_reocr_use_case(self) -> ReOcrUseCase:
         from subtitles_extractor.application.use_cases.reocr import ReOcrUseCase
@@ -590,7 +628,47 @@ class ApplicationContainer:
             analysis_media_resolution=getattr(tr, "analysis_media_resolution", "medium"),
             analysis_thinking_level=getattr(tr, "analysis_thinking_level", "medium"),
             parallel_batches=getattr(tr, "translation_parallel_batches", 1),
+            reading_cps_budget=float(getattr(tr, "reading_cps_budget", 0.0)),
+            emotion_cues=bool(getattr(tr, "translation_emotion_cues", False)),
+            native_address=bool(getattr(tr, "native_address", False)),
+            analysis_video_fps=float(
+                getattr(self.settings_service.current.video_context, "fps", 1.0)
+            ),
+            # [v3.23.564] Tiến độ phân tích theo đoạn — chạy tiếp khi hết hạn mức ngày.
+            analysis_checkpoint_dir=self._user_data_dir / "analysis_checkpoints",
+            token_ledger=self.token_usage_ledger,
+            model_health=self.gemini_model_health,
+            clip_video_to_batch=bool(getattr(tr, "clip_video_to_batch", True)),
         )
+
+    @property
+    def token_usage_ledger(self):
+        """[v3.23.610] Sổ token Gemini DÙNG CHUNG cho mọi adapter dịch/phân tích.
+
+        Trang Dịch đánh dấu sổ lúc bắt đầu một việc và báo phần token dùng thêm khi xong.
+        """
+        existing = getattr(self, "_token_usage_ledger", None)
+        if existing is None:
+            from subtitles_extractor.application.services.token_usage import (
+                TokenUsageLedger,
+            )
+
+            existing = TokenUsageLedger()
+            self._token_usage_ledger = existing
+        return existing
+
+    @property
+    def gemini_pricing_table(self):
+        """[v3.23.610] Bảng giá Gemini (``data/gemini_pricing.json``) hoặc ``None``."""
+        if not hasattr(self, "_gemini_pricing_table"):
+            from subtitles_extractor.infrastructure.translation import (
+                pricing_loader as loader,
+            )
+
+            self._gemini_pricing_table = loader.load_pricing_table(
+                self._i18n_data_dir / loader.PRICING_FILENAME
+            )
+        return self._gemini_pricing_table
 
     @property
     def gemini_quota_manager(self):
@@ -609,6 +687,25 @@ class ApplicationContainer:
             )
             self._load_quota_limits(existing)
             self._gemini_quota_manager = existing
+        return existing
+
+    @property
+    def gemini_model_health(self):
+        """[v3.23.631] Sức khoẻ model Gemini DÙNG CHUNG (bộ ngắt mạch quá tải + model dự phòng).
+
+        Dùng chung một thể hiện cho mọi adapter: lời gọi sau biết ngay model nào vừa quá tải
+        mà không phải tự thử lại. Gieo sẵn hai model lite đã dùng làm dự phòng ở các khâu khác;
+        danh sách đầy đủ do ``list_available_models`` cập nhật.
+        """
+        existing = getattr(self, "_gemini_model_health", None)
+        if existing is None:
+            from subtitles_extractor.infrastructure.translation.model_health import (
+                ModelHealth,
+            )
+            existing = ModelHealth(
+                seed_models=("gemini-3.1-flash-lite", "gemini-3.5-flash-lite")
+            )
+            self._gemini_model_health = existing
         return existing
 
     @property
@@ -688,21 +785,50 @@ class ApplicationContainer:
             tokens_per_second=res_tokens_per_sec,
             chunk_cache_max_total_mb=getattr(vc, "chunk_cache_max_total_mb", 4096),
             chunk_cache_max_age_hours=getattr(vc, "chunk_cache_max_age_hours", 72),
+            ignore_cloud_cache=bool(getattr(vc, "ignore_cloud_cache", False)),
         )
 
-    def make_translate_subtitles_use_case(self, api_key: str, retry_count: int = 5):
+    def make_translate_subtitles_use_case(
+        self, api_key: str, retry_count: int = 5, *, use_stage_cache: bool = True
+    ):
         """Tạo use case dịch phụ đề với adapter Gemini đã cấu hình.
 
-        Checkpoint được lưu tại ``{user_data_dir}/translation_checkpoints/`` để
-        cho phép resume khi bị ngắt giữa chừng.
+        Bộ nhớ đệm từng giai đoạn lưu tại ``{user_data_dir}/translation_checkpoints/``:
+        tiếp tục lượt dịch bị ngắt, và [v3.23.608] dùng lại / sửa từng giai đoạn.
+
+        Args:
+            api_key: Khoá API (nhiều khoá cách nhau xuống dòng).
+            retry_count: Số lần thử lại khi lỗi tạm thời.
+            use_stage_cache: [v3.23.608] ``False`` cho lượt dịch lại vài dòng chọn tay —
+                bộ nhớ đệm nay được giữ sau khi xong, mỗi tập dòng con sẽ thành một file
+                riêng chiếm chỗ của bộ nhớ đệm các phim.
         """
         from subtitles_extractor.application.use_cases.translate_subtitles import (
             TranslateSubtitlesUseCase,
         )
 
         translator = self.make_subtitle_translator(api_key=api_key, retry_count=retry_count)
-        checkpoint_dir = self._user_data_dir / "translation_checkpoints"
-        return TranslateSubtitlesUseCase(translator=translator, checkpoint_dir=checkpoint_dir)
+        translation_settings = self.settings_service.current.translation
+        return TranslateSubtitlesUseCase(
+            translator=translator,
+            checkpoint_dir=self.stage_checkpoint_dir if use_stage_cache else None,
+            cache_max_files=translation_settings.stage_cache_max_files,
+            cache_max_age_days=translation_settings.stage_cache_max_age_days,
+            native_address=bool(getattr(translation_settings, "native_address", False)),
+        )
+
+    @property
+    def stage_checkpoint_dir(self) -> Path:
+        """[v3.23.608] Thư mục bộ nhớ đệm từng giai đoạn dịch."""
+        return self._user_data_dir / "translation_checkpoints"
+
+    def make_stage_cache_service(self):
+        """[v3.23.608] Dịch vụ xem/sửa/xoá bộ nhớ đệm từng giai đoạn dịch."""
+        from subtitles_extractor.application.services.stage_cache import (
+            StageCacheService,
+        )
+
+        return StageCacheService()
 
     def make_analyze_context_use_case(self, api_key: str):
         """Tạo use case phân tích ngữ cảnh toàn cục bằng Gemini."""
@@ -711,7 +837,27 @@ class ApplicationContainer:
         )
 
         translator = self.make_subtitle_translator(api_key=api_key, retry_count=3)
-        return AnalyzeSubtitleContextUseCase(translator=translator)
+        translation_settings = self.settings_service.current.translation
+        from subtitles_extractor.infrastructure.translation.audit_ledger import (
+            AuditLedgerStore,
+        )
+
+        return AnalyzeSubtitleContextUseCase(
+            translator=translator,
+            name_readings=self.name_readings,
+            native_address=bool(getattr(translation_settings, "native_address", False)),
+            # [v3.23.631] Nhớ khiếm khuyết model đã không sửa được giữa các lần tự kiểm tra.
+            audit_ledger=AuditLedgerStore(self._user_data_dir / "analysis_audit_ledger.json"),
+        )
+
+    def make_complete_speakers_use_case(self, api_key: str):
+        """[v3.23.601] Use case hỏi lại người nói cho các dòng còn thiếu (Gemini + video)."""
+        from subtitles_extractor.application.use_cases.complete_speakers import (
+            CompleteSpeakersUseCase,
+        )
+
+        translator = self.make_subtitle_translator(api_key=api_key, retry_count=3)
+        return CompleteSpeakersUseCase(translator=translator)
 
     # ── TTS ──────────────────────────────────────────────────────────────────
 
@@ -726,7 +872,9 @@ class ApplicationContainer:
         return GeminiTTSAdapter(api_key=api_key)
 
     def make_vieneu_tts_adapter(
-        self, mode: str = "standard", emotion: str = "natural", force_cpu: bool = True
+        self, mode: str = "v3turbo", emotion: str = "natural", force_cpu: bool = True,
+        batch_size: int | None = None, emotion_cues: bool = False,
+        precision: str | None = None,
     ):
         """Tạo adapter VieNeu-TTS (offline — TTS tiếng Việt chất lượng cao, voice cloning).
 
@@ -734,11 +882,19 @@ class ApplicationContainer:
             mode: Chế độ engine ("standard"/"turbo"/"v3turbo").
             emotion: Sắc thái giọng ("natural"/"storytelling").
             force_cpu: True (mặc định) ép chạy CPU/ONNX, né lỗi PyTorch/cuDNN.
+            batch_size: Kích thước lô TTS GPU (None = theo env; 0/1 = tắt; ≥2 = bật).
+            emotion_cues: Bật chèn tag cảm xúc VieNeu v3 Turbo (thử nghiệm). Mặc định False;
+                UI trang TTS truyền vào khi người dùng bật.
+            precision: [v3.23.595] ``"int8"`` cho đường CPU nhanh của v3 Turbo; ``None`` =
+                mặc định SDK.
         """
         from subtitles_extractor.infrastructure.tts.vieneu_tts_adapter import (
             VieNeuTtsAdapter,
         )
-        return VieNeuTtsAdapter(mode=mode, emotion=emotion, force_cpu=force_cpu)
+        return VieNeuTtsAdapter(
+            mode=mode, emotion=emotion, force_cpu=force_cpu, batch_size=batch_size,
+            emotion_cues=bool(emotion_cues), precision=precision or None,
+        )
 
     def make_generate_tts_use_case(self, adapter=None):
         """Tạo use case TTS. Nếu không truyền adapter, dùng Edge TTS."""
@@ -746,6 +902,13 @@ class ApplicationContainer:
         if adapter is None:
             adapter = self.make_edge_tts_adapter()
         return GenerateTTSUseCase(adapter=adapter)
+
+    def make_resynthesize_use_case(self, adapter):
+        """[v3.23.450] Tạo use case TTS lại các dòng chọn (dùng lại adapter lần TTS gần nhất)."""
+        from subtitles_extractor.application.use_cases.resynthesize_lines import (
+            ResynthesizeLinesUseCase,
+        )
+        return ResynthesizeLinesUseCase(adapter=adapter)
 
     def shutdown(self) -> None:
         """Giải phóng tất cả resource: OCR engine, SQLite, settings."""
@@ -871,6 +1034,7 @@ class ApplicationContainer:
             use_tensorrt=snapshot.hardware.use_tensorrt,
             precision=PrecisionMode(snapshot.hardware.precision.value),
             batch_size=snapshot.hardware.batch_size_ocr,
+            det_batch_size=snapshot.hardware.det_batch_size,
             parallel_workers=snapshot.hardware.workers,
             use_textline_orientation=snapshot.ocr.use_textline_orientation,
             use_doc_orientation_classify=snapshot.ocr.use_doc_orientation_classify,

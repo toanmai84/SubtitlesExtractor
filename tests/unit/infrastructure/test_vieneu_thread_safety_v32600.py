@@ -83,6 +83,7 @@ def test_engine_lock_exists_and_is_lock() -> None:
 
 def test_voice_loader_class_emits_mode_with_result() -> None:
     # Khoá thiết kế: loader phát kèm MODE để UI bỏ qua kết quả stale khi đổi chế độ.
+    import json
     import pathlib
 
     source = pathlib.Path(
@@ -91,4 +92,11 @@ def test_voice_loader_class_emits_mode_with_result() -> None:
     assert "class _VieNeuVoiceLoader(QThread)" in source
     assert "voices_loaded = Signal(str, list)" in source  # (mode, ids)
     assert "if mode != current_mode:" in source               # stale check
-    assert "(Đang nạp giọng…)" in source                       # trạng thái chờ trên UI
+    # [v3.23.547] Nhãn chờ đã chuyển sang bộ từ điển i18n; kiểm ở đúng nơi nó sống.
+    assert 'self._translator.translate("tts.voice_loading")' in source
+    strings_vi = json.loads(
+        pathlib.Path("src/subtitles_extractor/data/strings_vi.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "Đang nạp giọng" in strings_vi["tts"]["voice_loading"]

@@ -63,15 +63,21 @@ def test_gemini_25_vẫn_set_temperature() -> None:
     assert captured["temperature"] == 0.25
 
 
-def test_model_rỗng_vẫn_set_temperature() -> None:
-    # Không rõ model (rỗng) -> an toàn, giữ hành vi cũ.
+def test_model_rỗng_KHÔNG_set_temperature() -> None:
+    """[v3.23.511] Model không rõ (rỗng) → KHÔNG gửi temperature.
+
+    Đảo lại mặc định của v3.23.250. Tài liệu Gemini nêu rõ các thế hệ model SAU Gemini 3.6 sẽ trả
+    HTTP 400 nếu vẫn nhận tham số lấy mẫu, nên "không biết thì cứ gửi" là canh bạc: bỏ sót một tham
+    số vốn đã bị bỏ qua thì vô hại, còn gửi thừa thì hỏng cả tác vụ. Nay chỉ gửi cho các họ model
+    CŨ đã biết chắc còn hỗ trợ.
+    """
     adapter, captured = _adapter_with_fake_types()
     adapter._build_config(
         temperature=0.5,
         response_schema={"type": "OBJECT"},
         system_instruction="x",
     )
-    assert captured["temperature"] == 0.5
+    assert "temperature" not in captured
 
 
 def test_core_keys_giữ_nguyên_cả_hai_họ() -> None:

@@ -22,8 +22,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-# Skip nếu Qt không có (chỉ chạy được trên môi trường có PyQt6).
-PyQt6 = pytest.importorskip("PyQt6", reason="PyQt6 required for widget test")
+# Skip nếu Qt không có (chỉ chạy được trên môi trường có PySide6).
+PySide6 = pytest.importorskip("PySide6", reason="PySide6 required for widget test")
 
 # Đảm bảo có QApplication trước khi import widget.
 from PySide6.QtWidgets import QApplication

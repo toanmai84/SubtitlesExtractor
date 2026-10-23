@@ -24,6 +24,11 @@ if str(_SRC_DIR) not in sys.path:
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+# [v3.23.553] Script đo tham số PaddleOCR trên GPU chạy suy luận NGAY Ở CẤP MODULE (cần
+# GPU + ảnh mẫu, không có hàm test) — không phải test tự động. Để pytest thu thập nó thì
+# lệnh ``pytest`` ở thư mục gốc hỏng ngay bước collect. Chạy tay: ``python tests/<file>``.
+collect_ignore = ["test_all_parameter_Paddle_with_gpu.py"]
+
 
 # -------------------------------------------------------------------------
 # [v2.31] Stub qfluentwidgets — package custom không có trên PyPI nên không
@@ -161,3 +166,48 @@ def tmp_config_file(tmp_path: Path) -> Iterator[Path]:
     yield config_path
     if config_path.exists():
         config_path.unlink()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_torch_import_blocker() -> Iterator[None]:
+    """[v3.23.602] Test nào cài bộ chặn import torch thì tự gỡ khi xong.
+
+    ``bootstrap_for_gui`` cài bộ chặn cho CẢ tiến trình (đúng cho ứng dụng thật). Trong bộ
+    test, nó rò sang các test chạy sau: scipy đọc ``sys.modules["torch"] = None`` rồi báo
+    ``'NoneType' object has no attribute 'Tensor'`` — hai test âm thanh hỏng tuỳ thứ tự
+    chạy (đo được khi một test ở ``tests/unit/application`` gọi ``bootstrap_for_gui``).
+    """
+    from subtitles_extractor.infrastructure.torch_import_blocker import (
+        is_torch_import_blocked,
+        uninstall_torch_import_blocker,
+    )
+
+    blocked_before = is_torch_import_blocked()
+    yield
+    if not blocked_before and is_torch_import_blocked():
+        uninstall_torch_import_blocker()
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """[v3.23.619] Huỷ tường minh các cửa sổ cấp cao còn sống trước khi tiến trình thoát.
+
+    Nhiều widget được tạo không cha rồi gắn vào layout: Qt đặt cha nhưng PySide vẫn coi
+    chúng thuộc Python. Khi thoát, ``PySide::destroyQCoreApplication`` huỷ mọi đối tượng
+    thuộc Python theo thứ tự tuỳ ý → có lần huỷ trùng → SIGSEGV trong ``QObject::~QObject``
+    (đo được: chạy riêng ``test_ui_bug_sweep_v323613.py`` crash ~50% số lần, mọi test vẫn
+    qua). Huỷ cửa sổ cấp cao trước để Qt tự huỷ con theo đúng cây cha–con. Ứng dụng thật
+    không bị: ``MainWindow`` thoát sạch 10/10 lần.
+    """
+    try:
+        import shiboken6
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        return
+    app = QApplication.instance()
+    if app is None:
+        return
+    for widget in list(QApplication.topLevelWidgets()):
+        if shiboken6.isValid(widget):
+            widget.close()
+            shiboken6.delete(widget)
+    app.processEvents()

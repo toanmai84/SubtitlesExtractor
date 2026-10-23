@@ -7,6 +7,8 @@ CẢI TIẾN ĐỘT PHÁ (V3.15 - The Control Center Polish):
 
 from __future__ import annotations
 
+import sqlite3
+
 import logging
 import tempfile
 from pathlib import Path
@@ -151,7 +153,8 @@ class SettingsPageViewModel(QObject):
             cleared = self._container.reset_database()
             total_tables = sum(len(tables) for tables in cleared.values())
             logger.info("Dọn database hoàn tất: xoá dữ liệu %d bảng.", total_tables)
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
+            # [v3.23.650] + sqlite3.Error: DB bị khoá/hỏng không được làm mất tín hiệu `database_reset` (UI kẹt "đang dọn").
             logger.error("Lỗi khi dọn database: %s", exc)
             total_tables = 0
         self.database_reset.emit(total_tables)

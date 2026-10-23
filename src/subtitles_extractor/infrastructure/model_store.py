@@ -80,8 +80,10 @@ def _frozen_runtime_root() -> Path | None:
     """
     if not getattr(sys, "frozen", False):
         return None
+    from subtitles_extractor.infrastructure.app_paths import application_root_dir
+
     try:
-        exe_dir = Path(sys.executable).resolve().parent
+        exe_dir = application_root_dir(frozen=True)
     except (OSError, ValueError):
         return None
     return exe_dir / _MODELS_DIRNAME

@@ -15,6 +15,19 @@ from subtitles_extractor.infrastructure.translation.gemini_translation_adapter i
 )
 
 
+def _bare_translator() -> "GeminiSubtitleTranslator":
+    """[v3.23.536] Thực thể TRỐNG để gọi các hàm thuần cần ``self``.
+
+    ``_length_hint``, ``_line_to_payload`` và ``_line_to_dual_payload`` là phương thức thực thể
+    (không phải staticmethod); phần thân chỉ dùng vài thuộc tính tuỳ chọn nên dựng bằng ``__new__``
+    là đủ, không cần API key.
+    """
+    instance = GeminiSubtitleTranslator.__new__(GeminiSubtitleTranslator)
+    instance._reading_cps_budget = 0.0
+    instance._emotion_cues = False
+    return instance
+
+
 def _line(index: int, text: str) -> TranslationLine:
     return TranslationLine(
         index=index, start_ms=index * 1000, end_ms=index * 1000 + 2000, text=text,
@@ -58,8 +71,8 @@ def test_scene_survives_into_next_stage_payload() -> None:
     merged = GeminiSubtitleTranslator._merge_ai_items(
         batch, [{"line_no": 1, "text": "bản dịch"}], is_preprocess=False
     )
-    dual = GeminiSubtitleTranslator._line_to_dual_payload(merged[0])
-    single = GeminiSubtitleTranslator._line_to_payload(merged[0])
+    dual = _bare_translator()._line_to_dual_payload(merged[0])
+    single = _bare_translator()._line_to_payload(merged[0])
     assert dual.get("cue") == "tức giận, trong đại điện"
     assert single.get("cue") == "tức giận, trong đại điện"
     assert dual.get("addressee") == "Nữ tỳ"

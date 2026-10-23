@@ -120,42 +120,63 @@ class TestExportToFileReturnsFalseWhenBusy:
 # ── EXPORT-FIX-3: _on_export_clicked guard sau dialog ──────────────────────
 
 class TestExportClickedBusyGuardAfterDialog:
-    """_on_export_clicked phải kiểm tra _is_busy SAU KHI dialog đóng."""
+    """Luồng xuất tệp phải kiểm tra _is_busy SAU KHI dialog đóng.
+
+    [v3.23.547] v3.23.374 TÁCH ``_on_export_clicked`` làm hai: phần ngoài chỉ ghi log và
+    bọc try/except (chặn PySide6 nuốt lỗi trong slot), toàn bộ luồng xuất thật chuyển
+    sang ``_do_export_clicked``. Bộ kiểm cắt đúng một hàm nên soi nhầm phần vỏ — vừa bỏ
+    sót bất biến thật, vừa "xanh nhầm" nhờ những chuỗi tình cờ có trong phần vỏ
+    (``_is_busy`` trong dòng log, ``setEnabled(bool(`` trong nhánh except). Nay soi hàm
+    chứa luồng thật.
+    """
+
+    @staticmethod
+    def _export_flow() -> str:
+        src = _PAGE_SRC.read_text(encoding="utf-8")
+        return _snip(src, "_do_export_clicked")
+
+    def test_wrapper_delegates_to_export_flow(self) -> None:
+        """Phần vỏ phải gọi đúng hàm luồng — nếu không, các kiểm dưới soi nhầm chỗ."""
+        wrapper = _snip(_PAGE_SRC.read_text(encoding="utf-8"), "_on_export_clicked")
+        assert "self._do_export_clicked()" in wrapper
 
     def test_is_busy_check_after_dialog_call(self) -> None:
-        src = _PAGE_SRC.read_text(encoding="utf-8")
-        snippet = _snip(src, "_on_export_clicked")
+        snippet = self._export_flow()
 
         dialog_pos   = snippet.find("getSaveFileName(")
         is_busy_pos  = snippet.find("_is_busy")
 
         assert is_busy_pos != -1, (
-            "EXPORT-FIX-3: _on_export_clicked phải kiểm tra _is_busy "
+            "EXPORT-FIX-3: luồng xuất phải kiểm tra _is_busy "
             "SAU KHI dialog đóng để phát hiện trường hợp hệ thống busy "
             "trong lúc dialog mở."
         )
+        assert dialog_pos != -1, "Luồng xuất phải mở hộp thoại chọn tệp."
         assert dialog_pos < is_busy_pos, (
             "_is_busy check phải xuất hiện SAU getSaveFileName() call."
         )
 
     def test_export_started_check_handles_false(self) -> None:
-        """_on_export_clicked phải xử lý khi export_to_file trả False."""
-        src = _PAGE_SRC.read_text(encoding="utf-8")
-        snippet = _snip(src, "_on_export_clicked")
+        """Luồng xuất phải xử lý khi export_to_file trả False."""
+        snippet = self._export_flow()
 
-        # Phải có logic kiểm tra return value của export_to_file
-        assert "started" in snippet or "not started" in snippet or "= self._view_model.export_to_file" in snippet, (
-            "EXPORT-FIX-3: _on_export_clicked phải bắt return value của "
-            "export_to_file() và phục hồi UI khi nó trả False."
+        assert "started = self._view_model.export_to_file(" in snippet, (
+            "EXPORT-FIX-3: phải BẮT giá trị trả về của export_to_file()."
+        )
+        assert "if not started:" in snippet, (
+            "EXPORT-FIX-3: phải phục hồi UI khi export_to_file() trả False."
         )
 
     def test_button_restored_when_export_rejected(self) -> None:
-        """Khi export bị reject, nút phải được restore."""
-        src = _PAGE_SRC.read_text(encoding="utf-8")
-        snippet = _snip(src, "_on_export_clicked")
+        """Khi export bị reject, nút phải được restore NGAY trong nhánh đó."""
+        snippet = self._export_flow()
+        rejected_branch = snippet[snippet.find("if not started:") :]
 
-        # Phải có logic restore nút
-        assert "setEnabled(bool(" in snippet or "setEnabled(True" in snippet, (
+        restored = (
+            "setEnabled(bool(" in rejected_branch
+            or "setEnabled(True" in rejected_branch
+        )
+        assert restored, (
             "Khi export bị reject (is_busy), phải restore nút về trạng thái có thể click."
         )
 

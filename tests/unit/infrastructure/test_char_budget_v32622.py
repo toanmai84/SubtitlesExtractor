@@ -32,6 +32,19 @@ from subtitles_extractor.infrastructure.tts.timing_math import (
 )
 
 
+def _bare_translator() -> "GeminiSubtitleTranslator":
+    """[v3.23.536] Thực thể TRỐNG để gọi các hàm thuần cần ``self``.
+
+    ``_length_hint``, ``_line_to_payload`` và ``_line_to_dual_payload`` là phương thức thực thể
+    (không phải staticmethod); phần thân chỉ dùng vài thuộc tính tuỳ chọn nên dựng bằng ``__new__``
+    là đủ, không cần API key.
+    """
+    instance = GeminiSubtitleTranslator.__new__(GeminiSubtitleTranslator)
+    instance._reading_cps_budget = 0.0
+    instance._emotion_cues = False
+    return instance
+
+
 def _line(start_ms: int, end_ms: int, text: str = "x") -> TranslationLine:
     return TranslationLine(index=1, start_ms=start_ms, end_ms=end_ms, text=text)
 
@@ -70,8 +83,8 @@ def test_sua_duoc_sai_lech_cua_cong_thuc_cu() -> None:
 def test_hint_dung_gap_toi_cau_sau() -> None:
     # Ca thật #91: khung gốc 0.96s nhưng có gap -> khung hiệu dụng 1.34s.
     line = _line(147_960, 148_920)
-    hint_khong_gap = GeminiSubtitleTranslator._length_hint(line)
-    hint_co_gap = GeminiSubtitleTranslator._length_hint(line, next_start_ms=149_400)
+    hint_khong_gap = _bare_translator()._length_hint(line)
+    hint_co_gap = _bare_translator()._length_hint(line, next_start_ms=149_400)
     assert hint_co_gap > hint_khong_gap  # gap rộng -> được dịch dài hơn, không cắt oan
 
 
@@ -83,7 +96,7 @@ def test_hint_khong_phong_khi_khong_biet_dong_ke_tiep() -> None:
     lần khung.
     """
     line = _line(123_960, 124_600)  # ca thật #72: khung 0.64s
-    hint_khong_biet = GeminiSubtitleTranslator._length_hint(line)
+    hint_khong_biet = _bare_translator()._length_hint(line)
     # KHÔNG được phồng như câu cuối phim (bug: 46 ký tự cho khung 0.64s).
     # [v3.23.238] Ngân sách nay theo ÂM TIẾT rồi quy sang ký tự — mô hình theo KÝ TỰ đã bị
     # bác bỏ bằng dữ liệu (R²=0.07 so với 0.89). Điều test này bảo vệ vẫn nguyên: không
@@ -101,18 +114,18 @@ def test_hint_ca_that_72_chat_nhung_khong_bop_nghet() -> None:
     bóp tới mức 6 ký tự như v222 — con số đó buộc model dịch thành "Chú?", mất sạch nghĩa.
     """
     line = _line(123_960, 124_600)
-    hint = GeminiSubtitleTranslator._length_hint(line, next_start_ms=124_680)
+    hint = _bare_translator()._length_hint(line, next_start_ms=124_680)
     assert hint < 27  # vẫn báo cho model biết dòng này chật
     assert hint > MIN_CHAR_BUDGET  # nhưng đủ chỗ giữ nghĩa (v222 chỉ cho 6 -> hỏng)
 
 
 def test_hint_bang_0_khi_moc_thoi_gian_hong() -> None:
-    assert GeminiSubtitleTranslator._length_hint(_line(1000, 1000)) == 0
-    assert GeminiSubtitleTranslator._length_hint(_line(2000, 1000)) == 0
+    assert _bare_translator()._length_hint(_line(1000, 1000)) == 0
+    assert _bare_translator()._length_hint(_line(2000, 1000)) == 0
 
 
 def test_payload_kem_max_chars() -> None:
-    payload = GeminiSubtitleTranslator._line_to_payload(
+    payload = _bare_translator()._line_to_payload(
         _line(10_000, 12_000, "xin chào"), next_start_ms=12_500
     )
     assert payload["max_chars"] > MIN_CHAR_BUDGET

@@ -1,10 +1,10 @@
 # Thông báo License Thư viện Bên thứ ba (Third-Party Licenses)
 
-> ## ⚠️ THAY ĐỔI ĐỊNH HƯỚNG (v3.23.312)
+> ## ⚠️ ĐỊNH HƯỚNG CẤP PHÉP (v3.23.312, xác nhận lại 2026-09-18)
 >
-> Dự án **KHÔNG còn hướng tới phân phối thương mại mã đóng**. Ràng buộc "chỉ dùng
-> LGPL/Apache/MIT/ISC" đã được gỡ bỏ; các thành phần **GPL** nay được chấp nhận để
-> đổi lấy chất lượng tốt hơn.
+> Dự án là **MÃ NGUỒN MỞ HOÀN TOÀN, không thương mại**. Ràng buộc "chỉ dùng
+> LGPL/Apache/MIT/ISC" đã được gỡ bỏ; các thành phần **GPL** được dùng tự do — kể cả
+> đóng gói kèm và import trong tiến trình chính — để đổi lấy chất lượng tốt hơn.
 >
 > **Hệ quả pháp lý cần biết:** khi phân phối ứng dụng có kèm thành phần GPL
 > (libmpv, pedalboard, edge-tts), toàn bộ tác phẩm phải được phát hành theo **GPL** —
@@ -18,9 +18,8 @@
 Ứng dụng **SubtitlesExtractor** sử dụng các thư viện mã nguồn mở bên thứ ba dưới đây. Bản
 phân phối này giữ nguyên các thông báo bản quyền và license theo yêu cầu của từng thư viện.
 
-> Tài liệu này liệt kê license để tuân thủ yêu cầu phân phối. Không phải tư vấn pháp lý —
-> hãy nhờ luật sư rà soát trước khi phát hành thương mại. Toàn văn license của mỗi thư viện
-> có trong thư mục cài đặt tương ứng và tại trang chủ dự án.
+> Tài liệu này liệt kê license để tuân thủ yêu cầu phân phối. Toàn văn license của mỗi
+> thư viện có trong thư mục cài đặt tương ứng và tại trang chủ dự án.
 
 ---
 
@@ -156,19 +155,44 @@ phân phối này giữ nguyên các thông báo bản quyền và license theo 
 - **Trang chủ:** https://github.com/pnnbao97/sea-g2p
 - **Ghi chú:** phụ thuộc của VieNeu (chuyển tự vị → âm vị).
 
+### Dữ liệu âm Hán-Việt (`data/hanviet_readings.json`, từ v3.23.567)
+Bảng dựng sẵn bằng `tools/build_hanviet_readings.py` từ ba nguồn dữ liệu:
+- **hanviet-pinyin-words** — MIT — © 2024 Phong Phan —
+  https://github.com/ph0ngp/hanviet-pinyin-words (âm Hán-Việt theo chữ).
+- **OpenCC** `STCharacters.txt` — Apache License 2.0 — © Carbo Kuo và cộng sự —
+  https://github.com/BYVoid/OpenCC (ánh xạ giản thể → phồn thể).
+- **Unicode Unihan** trường `kVietnamese` — Unicode License v3 — © Unicode, Inc. —
+  https://www.unicode.org/charts/unihan.html (âm bổ sung).
+
+### Bảng giá Gemini (`data/gemini_pricing.json`, từ v3.23.610)
+- **gemini-srt-translator** — MIT — © 2024 Matheus Castro —
+  https://github.com/MaKTaiL/gemini-srt-translator. Bảng giá lấy từ `pricing.json` của
+  dự án này (cập nhật 27/08/2026), bổ sung giá gemini-3.8-flash và tỉ lệ giá token cache.
+  Các cải tiến của v3.23.610 (mức suy nghĩ khi tắt, thống kê token, đồng bộ âm thanh, chữ
+  phải-sang-trái, quyền tệp khi ghi nguyên tử) học ý tưởng từ mã nguồn dự án này và được
+  viết lại.
+
 ---
 
-## 6. Thành phần chạy NGOÀI tiến trình chính (không liên kết vào app)
+## 6. Thành phần chạy NGOÀI tiến trình chính
 
-Các thành phần dưới đây KHÔNG được liên kết tĩnh/đóng gói vào ứng dụng. Chúng chạy như
-CÔNG CỤ ĐỘC LẬP qua ranh giới tiến trình (subprocess) hoặc tải runtime, nên license của
-chúng không áp lên mã nguồn ứng dụng.
+Các thành phần dưới đây chạy qua ranh giới tiến trình (subprocess) hoặc được tải runtime.
+Lý do là **KỸ THUẬT**, không phải cấp phép: chống treo ứng dụng khi thành phần ngoài lỗi,
+tránh xung đột phiên bản thư viện (WhisperX kéo torch làm hạ cấp huggingface-hub → hỏng
+VieNeu/PaddleOCR), và giữ bản đóng gói nhỏ. Dự án là mã nguồn mở nên không có ràng buộc
+cấp phép nào buộc phải giữ các ranh giới này — nhưng **đừng gỡ chúng**, vì lý do kỹ thuật
+vẫn nguyên giá trị.
 
 ### edge-tts (tùy chọn — cách ly subprocess)
 - **License:** GPL v3
 - **Trang chủ:** https://github.com/rany2/edge-tts
-- **Cách dùng:** chạy trong tiến trình RIÊNG (``edge_tts_subprocess.py``) bằng Python cài
-  ngoài. KHÔNG đóng gói kèm ứng dụng. Người dùng tự cài nếu muốn dùng engine Edge TTS.
+- **Cách dùng:** đường MẶC ĐỊNH chạy trong tiến trình RIÊNG (``edge_tts_subprocess.py``)
+  bằng Python cài ngoài. Từ v3.23.328, tệp spec cũng gom ``edge_tts`` vào bundle và
+  adapter có đường dự phòng chạy edge-tts ngay trong tiến trình chính khi máy không có
+  Python ngoài — hợp lệ vì dự án là mã nguồn mở hoàn toàn.
+- **Vì sao vẫn giữ subprocess làm đường mặc định:** lý do KỸ THUẬT, không phải cấp phép —
+  lỗi/treo của edge-tts (mạng chậm, dịch vụ Microsoft từ chối) không được kéo theo cả
+  ứng dụng.
 
 ### WhisperX (tùy chọn — cách ly subprocess)
 - **License:** BSD-4-Clause
@@ -207,7 +231,10 @@ Chỉ cài khi người dùng có phần cứng phù hợp; KHÔNG đóng gói k
 2. **Apache 2.0 (paddle, opencv, google-genai, VieNeu):** kèm file LICENSE + NOTICE nếu có;
    ghi nhận thay đổi nếu có sửa đổi mã nguồn thư viện (ứng dụng không sửa).
 3. **BSD/MIT/ISC:** giữ thông báo bản quyền + văn bản license (tài liệu này thực hiện điều đó).
-4. **GPL (edge-tts, whisperx):** KHÔNG đóng gói kèm; chạy như công cụ ngoài qua subprocess.
+4. **GPL (libmpv, pedalboard, edge-tts, whisperx):** dự án là mã nguồn mở nên được đóng
+   gói kèm tự do. Nghĩa vụ duy nhất khi phân phối: **kèm mã nguồn** và giữ nguyên thông
+   báo bản quyền trong tài liệu này. Một số vẫn chạy qua subprocess vì lý do kỹ thuật
+   (chống treo, tránh xung đột phiên bản thư viện) — không phải vì cấp phép.
 5. **Kèm tài liệu này** trong bản phân phối (thư mục cài đặt hoặc menu "Giới thiệu → License").
 
 ---

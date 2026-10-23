@@ -9,6 +9,7 @@ from subtitles_extractor.infrastructure.translation.gemini_translation_adapter i
     GeminiSubtitleTranslator,
 )
 from subtitles_extractor.domain.ports.subtitle_translator_port import TranslationLine
+from tests.unit.infrastructure.gemini_call_harness import bare_analysis_adapter
 
 
 class _Ref:
@@ -21,9 +22,7 @@ class _Ref:
 
 
 def _make_adapter() -> GeminiSubtitleTranslator:
-    adapter = GeminiSubtitleTranslator.__new__(GeminiSubtitleTranslator)
-    adapter._types_module = MagicMock()
-    return adapter
+    return bare_analysis_adapter()
 
 
 class TestContextMapReduce:
@@ -35,7 +34,7 @@ class TestContextMapReduce:
         prompts: list[str] = []
 
         def fake_call(model, prompt, config, validator, cancel_cb=None,
-                      video_files=None, est_tokens=0, video_refs=None):
+                      video_files=None, est_tokens=0, video_refs=None, **_extra):
             video_counts.append(len(video_files) if video_files else 0)
             prompts.append(prompt)
             return {"source_lang": "zh", "characters": "林昆 (Lâm Côn)",
@@ -59,7 +58,9 @@ class TestContextMapReduce:
         assert "TÍCH LUỸ" in prompts[1]
         assert "TÍCH LUỸ" in prompts[2]
         # Kết quả cuối = phân tích đoạn cuối (đã hợp nhất).
-        assert result.overview == "đoạn 3"
+        # [v3.23.539] Từ v3.23.489, tóm tắt được TÍCH LUỸ theo thứ tự thời gian (nối tiếp),
+        # không còn ghi đè bằng đoạn mới nhất — nếu ghi đè thì mất hết diễn biến đầu phim.
+        assert result.overview.splitlines() == ["đoạn 1", "", "đoạn 2", "", "đoạn 3"]
 
     def test_single_video_no_mapreduce(self) -> None:
         adapter = _make_adapter()
@@ -67,7 +68,7 @@ class TestContextMapReduce:
         video_counts: list[int] = []
 
         def fake_call(model, prompt, config, validator, cancel_cb=None,
-                      video_files=None, est_tokens=0, video_refs=None):
+                      video_files=None, est_tokens=0, video_refs=None, **_extra):
             video_counts.append(len(video_files) if video_files else 0)
             return {"source_lang": "en", "characters": "x", "overview": "y"}
 
@@ -92,11 +93,14 @@ class TestContextMapReduce:
             source_lang="zh", characters="林昆", overview="đoạn 1", glossary="内功 => nội công")
         # Đoạn mới bỏ trống glossary → phải giữ glossary cũ.
         current = SubtitleContextAnalysis(
-            source_lang="zh", characters="林昆, 王语嫣", overview="đoạn 1+2", glossary="")
+            source_lang="zh", characters="林昆\n王语嫣", overview="đoạn 1+2", glossary="")
         merged = adapter._merge_sequential_analysis(prev, current)
-        assert merged.characters == "林昆, 王语嫣"   # bản mới
+        # [v3.23.539] Từ v3.23.489, roster được HỢP NHẤT theo tên và trả về MỖI MỤC MỘT DÒNG
+        # (quy cách cố định), không còn nối bằng dấu phẩy.
+        assert merged.characters.splitlines() == ["林昆", "王语嫣"]
         assert merged.overview == "đoạn 1+2"        # bản mới
-        assert merged.glossary == "内功 => nội công"  # giữ cũ vì mới rỗng
+        # [v3.23.539] Từ v3.23.488, thuật ngữ được chuẩn hoá về quy cách "gốc = dịch".
+        assert merged.glossary == "内功 = nội công"  # giữ cũ vì mới rỗng
 
     def test_merge_sequential_none_prev(self) -> None:
         from subtitles_extractor.domain.ports.subtitle_translator_port import (

@@ -37,6 +37,7 @@ from subtitles_extractor.presentation.qt_compat import is_deleted, is_valid
 from PySide6.QtCore import QEvent, QLine, QPoint, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
+    QImage,
     QEnterEvent,
     QFont,
     QHideEvent,
@@ -270,6 +271,8 @@ class _RoiOverlay(QWidget):
         self._ocr_overlay_rects: list[QRect] = []
         self._ocr_overlay_visible: bool = False
         self._qt_paint_fallback_active: bool = False
+        #: [v3.23.619] Khung hình vẽ bằng Qt khi MPV không khởi tạo được (xem set_frame).
+        self._background_frame: QImage | None = None
 
         self.get_video_roi_callback: Callable[[QRect], Roi | None] | None = None
         self.get_video_size_callback: Callable[[], tuple[int, int] | None] | None = None
@@ -305,6 +308,11 @@ class _RoiOverlay(QWidget):
         self._tooltip_font.setPointSize(9)
         self._tooltip_bg_color = QColor(20, 20, 25, 220)
         self._tooltip_text_pen = QPen(QColor(255, 255, 255), 1)
+
+    def set_background_frame(self, image: QImage | None) -> None:
+        """[v3.23.619] Khung hình nền vẽ bằng Qt khi không có MPV render."""
+        self._background_frame = None if image is None or image.isNull() else image
+        self.update()
 
     def set_fallback_qt_paint(self, active: bool) -> None:
         if self._qt_paint_fallback_active != active:
@@ -549,6 +557,8 @@ class _RoiOverlay(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
         if self._qt_paint_fallback_active:
+            if self._background_frame is not None:
+                painter.drawImage(self._get_video_display_rect(), self._background_frame)
             if self._ocr_overlay_visible and self._ocr_overlay_rects:
                 painter.setPen(self._ocr_pen)
                 painter.setBrush(self._ocr_fill)
@@ -649,6 +659,27 @@ class _RoiOverlay(QWidget):
                     painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, size_text)
 
 
+# [v3.23.650] Mọi MpvVideoWidget còn sống: ``destroyed.connect(self._cleanup_on_destroy)`` KHÔNG BAO GIỜ chạy trong
+# PySide6 (slot là phương thức của chính đối tượng đang bị huỷ), và widget con không nhận ``closeEvent`` khi cửa sổ
+# chính đóng → lõi mpv (vo=gpu-next/d3d11, hwdec) vẫn chạy khi HWND đã bị Qt huỷ. MainWindow gọi
+# :func:`release_all_mpv_players` trước khi đóng để giải phóng tường minh từ luồng giao diện.
+_LIVE_MPV_WIDGETS: weakref.WeakSet[MpvVideoWidget] = weakref.WeakSet()
+
+
+def release_all_mpv_players() -> int:
+    """Giải phóng lõi mpv của mọi MpvVideoWidget còn sống. Trả về số lõi đã giải phóng."""
+    released = 0
+    for widget in list(_LIVE_MPV_WIDGETS):
+        try:
+            if is_deleted(widget) or widget._player is None:  # noqa: SLF001
+                continue
+            widget.release_player()
+            released += 1
+        except (RuntimeError, AttributeError) as exc:
+            logger.debug("Không giải phóng được mpv của một widget: {}.", exc)
+    return released
+
+
 class MpvVideoWidget(QWidget):
     """Widget MPV player Native Hardware Decode + OSD Overlay."""
 
@@ -678,7 +709,9 @@ class MpvVideoWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(320, 180)
 
-        self.destroyed.connect(self._cleanup_on_destroy)
+        _LIVE_MPV_WIDGETS.add(self)
+        self._player_wid: int = 0
+        self._loaded_path: Path | None = None
 
         # ── Setup Playback Controller ──
         self._playback_timer = QTimer(self)
@@ -857,6 +890,15 @@ class MpvVideoWidget(QWidget):
         if player is None: return False
         return player.send_command(*args)
 
+    def peek_player(self) -> MpvPlayerAdapter | None:
+        """Lõi mpv HIỆN CÓ (hoặc None) — KHÔNG khởi tạo lõi mới.
+
+        [v3.23.650] ``player()`` vừa là getter vừa tạo lõi mpv + ép tạo cửa sổ native; mã chỉ cần hỏi/điều khiển
+        phải dùng hàm này, kẻo mỗi lần làm mới phụ đề xem trước lại dựng một lõi gpu-next/d3d11 cho container đang ẩn.
+        """
+        if is_deleted(self): return None
+        return self._player
+
     def player(self) -> MpvPlayerAdapter | None:
         if is_deleted(self): return None
         if self._player is None:
@@ -866,6 +908,7 @@ class MpvVideoWidget(QWidget):
                     MpvPlayerAdapter,
                 )
                 self._player = MpvPlayerAdapter(wid=int(win_id), mpv_options=self._mpv_options)
+                self._player_wid = int(win_id)
                 self._osd_renderer = MpvOsdRenderer(self._player)
 
                 self._osd_renderer.update_canvas_size(self._video_container.width(), self._video_container.height())
@@ -874,11 +917,30 @@ class MpvVideoWidget(QWidget):
                 logger.warning("Thư viện Mpv Binding không có sẵn: {}", exc)
                 self._player = None
                 self._overlay.set_fallback_qt_paint(True)
-            except RuntimeError as exc:
+            except (RuntimeError, OSError) as exc:
+                # [v3.23.619] + OSError: python-mpv có nhưng thiếu/hỏng libmpv (DLL/SO).
                 logger.exception("Khởi tạo Mpv C-Core thất bại: {}.", exc)
                 self._player = None
                 self._overlay.set_fallback_qt_paint(True)
         return self._player
+
+    def set_frame(self, image: QImage, video_w: int, video_h: int) -> None:
+        """[v3.23.619] Hiện một khung hình do SeekWorker giải mã.
+
+        MPV chạy bình thường thì tự render qua cửa sổ gốc → không làm gì. MPV khởi tạo
+        lỗi (``player()`` là None) thì vẽ khung bằng Qt trên overlay. Trước đây lớp này
+        không có ``set_frame`` → trang Trích xuất ném AttributeError mỗi lần tua video.
+        """
+        if is_deleted(self) or self._player is not None or image.isNull():
+            return
+        self._main_layout.setCurrentIndex(1)
+        self._overlay.set_fallback_qt_paint(True)
+        self._overlay.set_background_frame(image)
+        self.set_video_size(video_w, video_h)
+
+    def schedule_overlay_refresh(self) -> None:
+        """[v3.23.619] API chung với VideoCanvas: vẽ lại lớp phủ (ROI, OCR, phụ đề)."""
+        self._schedule_geometry_update()
 
     def release_player(self) -> None:
         if is_deleted(self): return
@@ -892,11 +954,49 @@ class MpvVideoWidget(QWidget):
             self._player = None
         self._main_layout.setCurrentIndex(0)
 
+    def rebind_if_window_changed(self) -> bool:
+        """Sau khi đổi cha (tách/gắn lại cửa sổ video): nạp lại video nếu HWND của container đã đổi.
+
+        [v3.23.650] mpv vẽ vào ``wid`` cố định lúc khởi tạo; reparent widget native có thể làm Qt tạo lại HWND, khi đó
+        mpv vẽ vào cửa sổ đã bị huỷ (lỗi VO/crash driver). Trả về True nếu đã nạp lại.
+        """
+        if is_deleted(self) or self._player is None or self._loaded_path is None:
+            return False
+        if not is_valid(self._video_container):
+            return False
+        if int(self._video_container.winId()) == self._player_wid:
+            return False
+        path = self._loaded_path
+        position = 0.0
+        was_playing = False
+        with contextlib.suppress(AttributeError, RuntimeError, ValueError):
+            position = float(self._player.position_sec)
+            was_playing = bool(self._player.is_playing)
+        logger.info("HWND của video đổi sau khi đổi cha — nạp lại mpv tại {:.1f}s.", position)
+        self.release_player()
+        self.load(path)
+        if self._player is not None:
+            with contextlib.suppress(AttributeError, RuntimeError, ValueError):
+                self.seek(position)  # qua widget: phát position_changed để thanh trượt/sóng âm không về 0:00
+                if was_playing:
+                    self._player.play()
+                    self._is_playing = True
+                    self.state_changed.emit(True)
+        return True
+
     def load(self, video_path: Path) -> None:
         if is_deleted(self): return
         p = self.player()
         if p is None: return
-        p.load(video_path)
+        try:
+            p.load(video_path)
+        except (FileNotFoundError, RuntimeError, OSError) as exc:
+            # [v3.23.650] Tệp mất/hỏng không được làm ngoại lệ trào ra khỏi slot gọi load().
+            logger.warning("Mpv không mở được video {}: {}.", video_path, exc)
+            self._loaded_path = None
+            self._main_layout.setCurrentIndex(0)
+            return
+        self._loaded_path = video_path
         p.pause()
         self._is_playing = False
 

@@ -35,6 +35,9 @@ _DEFAULT_CRF: Final[int] = 20
 _DEFAULT_PRESET: Final[str] = "medium"
 # NVENC dùng thang -cq thay cho -crf.
 _NVENC_PRESET: Final[str] = "p5"
+#: [v3.23.618] Giá trị ``video_encoder`` nghĩa là "GPU nếu có, không thì CPU" — được
+#: ``render_video`` dò thành bộ mã hoá cụ thể trước khi dựng lệnh.
+AUTO_VIDEO_ENCODER: Final[str] = "auto"
 
 # ── [v3.23.315] Tham số trộn thuyết minh (ducking) ──────────────────────────
 # Các NGƯỠNG dưới đây được DO THỰC NGHIỆM bằng ffmpeg (nền 200Hz + thuyết minh 1kHz,
@@ -157,6 +160,11 @@ class RenderRequest:
         subtitle_mode: [v3.23.326] Cách xử lý phụ đề. ``None`` = suy từ ``mode`` (giữ
             tương thích với mã cũ).
         audio_mode: [v3.23.326] Cách xử lý âm thanh. ``None`` = suy từ ``mode``.
+        clip_start_sec: [v3.23.630] Xuất thử: mốc bắt đầu đoạn (giây) trong video gốc.
+        clip_duration_sec: [v3.23.630] Xuất thử: độ dài đoạn (giây); ``0`` = xuất cả phim.
+            Log thật: mỗi lần xuất cả phim 86 tập mất ~3 phút dù chỉ cần nghe thử vài câu.
+            Đoạn thử luôn MÃ HOÁ LẠI hình (nhanh, preset ``veryfast``): cắt sao chép luồng
+            chỉ chính xác ở khung hình khoá nên giọng đọc sẽ lệch hình tới vài giây.
     """
 
     video_path: Path
@@ -174,6 +182,13 @@ class RenderRequest:
     downmix_multichannel: bool = True
     subtitle_mode: SubtitleMode | None = None
     audio_mode: AudioMode | None = None
+    clip_start_sec: float = 0.0
+    clip_duration_sec: float = 0.0
+
+    @property
+    def is_clip(self) -> bool:
+        """[v3.23.630] Xuất THỬ một đoạn (``clip_duration_sec`` > 0) thay vì cả phim."""
+        return self.clip_duration_sec > 0.0
 
 
 def escape_filter_path(path: Path) -> str:
@@ -275,14 +290,27 @@ def subtitle_styling_warning(
     )
 
 
-def _quality_args(encoder: str, quality: int) -> list[str]:
+def _quality_args(encoder: str, quality: int, fast: bool = False) -> list[str]:
     """Tham số chất lượng theo bộ mã hoá.
 
     NVENC dùng ``-cq`` và ``-preset pN``; các bộ mã hoá CPU dùng ``-crf`` và preset chữ.
+    ``fast`` (xuất thử đoạn): bộ mã hoá CPU dùng preset ``veryfast``.
     """
     if "nvenc" in encoder:
         return ["-preset", _NVENC_PRESET, "-cq", str(quality)]
-    return ["-preset", _DEFAULT_PRESET, "-crf", str(quality)]
+    if encoder.endswith(("_qsv", "_amf", "_videotoolbox")):
+        # [v3.23.618] QSV/AMF/VideoToolbox không nhận -crf: quy đổi sang thang riêng.
+        from subtitles_extractor.infrastructure.video.video_encoder_selector import (
+            encoder_quality_args,
+        )
+
+        return encoder_quality_args(encoder, quality)
+    return ["-preset", "veryfast" if fast else _DEFAULT_PRESET, "-crf", str(quality)]
+
+
+def resolve_video_encoder(encoder: str) -> str:
+    """[v3.23.618] ``"auto"`` chưa được dò (vd gọi thẳng không qua ``render_video``) → CPU."""
+    return "libx264" if encoder == AUTO_VIDEO_ENCODER else encoder
 
 
 #: Ánh xạ chế độ CŨ sang cặp (phụ đề, âm thanh) — giữ tương thích ngược.
@@ -380,6 +408,9 @@ def _validate(request: RenderRequest) -> None:
         if not request.audio_path.is_file():
             raise VideoRenderError(f"Không tìm thấy âm thanh: {request.audio_path}")
 
+    if request.clip_start_sec < 0 or request.clip_duration_sec < 0:
+        raise VideoRenderError("Đoạn xuất thử không hợp lệ (mốc hoặc độ dài âm).")
+
     try:
         same = request.output_path.resolve() == request.video_path.resolve()
     except OSError:
@@ -430,10 +461,19 @@ def build_render_command(ffmpeg_binary: str, request: RenderRequest) -> list[str
     subtitle_mode, audio_mode = resolve_modes(request)
     _validate_modes(request, subtitle_mode, audio_mode)
 
+    clip = request.is_clip
+    # [v3.23.630] Xuất thử: nhảy tới đoạn TRƯỚC mỗi -i (nhanh, không đọc cả phim). Phụ đề
+    # đã được cắt/dời về mốc 0 ở ``render_video`` nên không cần -ss.
+    seek = ["-ss", f"{request.clip_start_sec:.3f}"] if clip else []
     command: list[str] = [
         ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-stats", "-y",
-        "-i", str(request.video_path),
+        *seek, "-i", str(request.video_path),
     ]
+    video_copy = (
+        ["-c:v", resolve_video_encoder(request.video_encoder),
+         *_quality_args(resolve_video_encoder(request.video_encoder), request.quality, True)]
+        if clip else ["-c:v", "copy"]
+    )
 
     # Thứ tự input quyết định chỉ số dùng trong -map: 0=video, rồi lần lượt.
     audio_input_index: int | None = None
@@ -441,7 +481,7 @@ def build_render_command(ffmpeg_binary: str, request: RenderRequest) -> list[str
     next_index = 1
 
     if audio_mode is not AudioMode.ORIGINAL:
-        command += ["-i", str(request.audio_path)]
+        command += [*seek, "-i", str(request.audio_path)]
         audio_input_index = next_index
         next_index += 1
 
@@ -463,15 +503,15 @@ def build_render_command(ffmpeg_binary: str, request: RenderRequest) -> list[str
             "-filter_complex",
             f"[0:v]subtitles='{escaped}'[vout];{audio_filter}",
             "-map", "[vout]", "-map", "[aout]",
-            "-c:v", request.video_encoder,
-            *_quality_args(request.video_encoder, request.quality),
+            "-c:v", resolve_video_encoder(request.video_encoder),
+            *_quality_args(resolve_video_encoder(request.video_encoder), request.quality, clip),
             "-c:a", "aac", "-b:a", "192k",
         ]
     elif needs_audio_filter:
         command += [
             "-filter_complex", build_voice_over_filter(request, audio_input_index or 1),
             "-map", "0:v", "-map", "[aout]",
-            "-c:v", "copy",          # hình không đụng tới -> rất nhanh
+            *video_copy,             # hình không đụng tới -> rất nhanh (đoạn thử: mã hoá lại)
             "-c:a", "aac", "-b:a", "192k",
         ]
     elif needs_video_filter:
@@ -479,12 +519,12 @@ def build_render_command(ffmpeg_binary: str, request: RenderRequest) -> list[str
         command += [
             "-vf", f"subtitles='{escaped}'",
             "-map", "0:v",
-            "-c:v", request.video_encoder,
-            *_quality_args(request.video_encoder, request.quality),
+            "-c:v", resolve_video_encoder(request.video_encoder),
+            *_quality_args(resolve_video_encoder(request.video_encoder), request.quality, clip),
         ]
         command += _plain_audio_args(request, audio_mode, audio_input_index)
     else:
-        command += ["-map", "0:v", "-c:v", "copy"]
+        command += ["-map", "0:v", *video_copy]
         command += _plain_audio_args(request, audio_mode, audio_input_index)
 
     # Ghép track phụ đề (chỉ với kiểu mềm).
@@ -496,6 +536,8 @@ def build_render_command(ffmpeg_binary: str, request: RenderRequest) -> list[str
             "-disposition:s:0", "default",
         ]
 
+    if clip:
+        command += ["-t", f"{request.clip_duration_sec:.3f}"]
     command.append(str(request.output_path))
     return command
 

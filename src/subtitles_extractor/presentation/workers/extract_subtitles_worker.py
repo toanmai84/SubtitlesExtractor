@@ -80,7 +80,7 @@ class _MultiRoiProgressProxy:
         self._total_rois = total_rois
 
     def report(self, current: int, total: int, message: str) -> None:
-        if total > 0:
+        if total > 0 and self._total_rois > 0:
             base_percent = (self._current_roi - 1) / self._total_rois
             roi_percent = (current / total) / self._total_rois
             overall_progress = base_percent + roi_percent

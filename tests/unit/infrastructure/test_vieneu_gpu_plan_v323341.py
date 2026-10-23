@@ -143,3 +143,19 @@ def test_summary_is_short_when_ready(isolated_env: Path) -> None:
     summary = summarise_plan(build_gpu_tts_plan(installed=_ALL_READY))
     assert "dùng được ngay" in summary
     assert "pip install" not in summary
+
+
+def test_transformers_repair_command_forces_downgrade() -> None:
+    """[v3.23.401] Lệnh tự sửa phải force-reinstall + no-deps + đúng pin transformers."""
+    from subtitles_extractor.infrastructure.tts.vieneu_gpu_plan import (
+        VIENEU_TRANSFORMERS_SPEC,
+        build_transformers_repair_command,
+    )
+
+    cmd = build_transformers_repair_command("py.exe")
+    assert cmd[0] == "py.exe"
+    assert "--force-reinstall" in cmd
+    assert "--no-deps" in cmd  # KHÔNG đụng torch
+    assert VIENEU_TRANSFORMERS_SPEC in cmd
+    # Không kéo vieneu/sea-g2p (chỉ sửa transformers).
+    assert not any("vieneu" in part for part in cmd)

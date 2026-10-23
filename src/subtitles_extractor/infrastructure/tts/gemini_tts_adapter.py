@@ -18,6 +18,8 @@ Cài đặt: pip install google-genai soundfile
 
 from __future__ import annotations
 
+import importlib.util
+
 import asyncio
 import logging
 import time
@@ -26,6 +28,7 @@ from typing import Any
 
 import numpy as np
 
+from subtitles_extractor.infrastructure.torch_import_blocker import without_torch_block
 from subtitles_extractor.domain.ports.subtitle_tts_port import (
     SubtitleTTSPort,
     TTSCancellationCallback,
@@ -35,15 +38,32 @@ from subtitles_extractor.domain.ports.subtitle_tts_port import (
     TTSSegmentResult,
     TTSUnavailableError,
 )
+from subtitles_extractor.domain.value_objects.voice_profile import (
+    VOICE_FEMALE,
+    VOICE_MALE,
+    VoiceProfile,
+)
 from subtitles_extractor.infrastructure.tts.audio_utils import (
     cap_nhat_ban_tot_nhat,
     is_effectively_silent,
     shorter_take,
+    speech_seconds,
     trim_edge_silence,
 )
 from subtitles_extractor.infrastructure.tts.edge_tts_adapter import (
     _preprocess_tts_text,
     _skip_from_request,
+    completed_task_results,
+)
+from subtitles_extractor.infrastructure.tts.gemini_tts_schema import (
+    decode_tts_audio,
+    sampling_params_deprecated,
+    uses_verbatim_tts_schema,
+)
+from subtitles_extractor.infrastructure.tts.line_placement import (
+    comfort_speed,
+    line_context,
+    place_line,
 )
 from subtitles_extractor.infrastructure.tts.text_prep import (
     dem_am_tiet,
@@ -53,14 +73,12 @@ from subtitles_extractor.infrastructure.tts.text_prep import (
 from subtitles_extractor.infrastructure.tts.timing_math import (
     GEMINI_MIN_BASE_S,
     GEMINI_MIN_PER_SYLLABLE_S,
-    QUALITY_STRETCH_CAP,
+    audible_overlap_seconds,
     effective_available_seconds,
     exceeds_window_even_compressed,
     fit_limit_samples,
     is_abnormally_long_vs_floor,
-    lead_in_seconds,
     master_length_samples,
-    total_speed_ratio,
     window_below_engine_floor,
 )
 
@@ -70,8 +88,15 @@ logger = logging.getLogger(__name__)
 
 # Standard TTS: dùng generate_content API
 _STANDARD_TTS_MODELS = [
-    "gemini-2.5-flash-preview-tts",    # nhanh, rẻ — khuyến nghị cho subtitle dài
-    "gemini-2.5-pro-preview-tts",      # chất lượng cao nhất
+    # [v3.23.595] GA 22/9/2026. Flash-Lite thay cho 3.1 preview, hợp đọc phụ đề số lượng
+    # lớn (nhanh, rẻ, 100+ ngôn ngữ có tiếng Việt); Flash cho chất lượng diễn xuất cao nhất
+    # (130 ngôn ngữ). Lược đồ mới — xem ``gemini_tts_schema``.
+    "gemini-3.8-flash-lite-tts",       # ★ khuyến nghị cho phụ đề — GA, nhanh, rẻ
+    "gemini-3.8-flash-tts",            # GA — giọng biểu cảm nhất
+    # [v3.23.409] 200+ audio tag, 70+ ngôn ngữ. Preview, được 3.8 Flash-Lite thay thế.
+    "gemini-3.1-flash-tts-preview",
+    "gemini-2.5-flash-preview-tts",    # đời cũ — nhanh, rẻ
+    "gemini-2.5-pro-preview-tts",      # đời cũ — chất lượng cao
 ]
 
 # Native Audio Dialog: dùng Live API (WebSocket) — giọng tự nhiên, cảm xúc
@@ -105,6 +130,13 @@ GEMINI_TTS_VOICES = [
     "Sulafat", "Umbriel", "Vindemiatrix", "Zephyr", "Zubenelgenubi",
 ]
 
+#: [v3.23.593] Giới tính 30 giọng theo bảng giọng Chirp 3 HD của Google (cùng bộ giọng với
+#: Gemini TTS) — để phân vai lồng tiếng tự động không giao giọng nữ cho nhân vật nam.
+_GEMINI_FEMALE_VOICES = frozenset({
+    "Achernar", "Aoede", "Autonoe", "Callirrhoe", "Despina", "Erinome", "Gacrux",
+    "Kore", "Laomedeia", "Leda", "Pulcherrima", "Sulafat", "Vindemiatrix", "Zephyr",
+})
+
 _SAMPLE_RATE = 24_000
 # [v3.23.251] Ngôn ngữ đầu ra TTS. Tài liệu Live API khuyến nghị đặt language_code rõ ràng
 # để giữ nhất quán — "without this definition, Gemini might alter the conversation language
@@ -134,10 +166,11 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         API key được kiểm tra riêng khi generate — màn hình chọn engine chỉ
         cần biết thư viện google-genai đã cài hay chưa.
         """
+        # [v3.23.643] ``find_spec`` thay cho ``import``: import google.genai tốn 0,7-1,0 s trên LUỒNG
+        # GIAO DIỆN mỗi lần mở trang TTS (``check_engines``), chỉ để biết gói có cài hay không.
         try:
-            from google import genai  # noqa: F401
-            return True
-        except ImportError:
+            return importlib.util.find_spec("google.genai") is not None
+        except (ImportError, ValueError):
             return False
 
     def get_engine_name(self) -> str:
@@ -148,6 +181,17 @@ class GeminiTTSAdapter(SubtitleTTSPort):
 
     def list_speakers(self, language: str) -> list[str]:
         return GEMINI_TTS_VOICES
+
+    def list_voice_catalog(self, language: str) -> list[VoiceProfile]:
+        """[v3.23.593] 30 giọng kèm giới tính (nhãn "Charon (nam)") để phân vai."""
+        return [
+            VoiceProfile(
+                voice_id=voice,
+                label=f"{voice} ({'nữ' if voice in _GEMINI_FEMALE_VOICES else 'nam'})",
+                gender=VOICE_FEMALE if voice in _GEMINI_FEMALE_VOICES else VOICE_MALE,
+            )
+            for voice in GEMINI_TTS_VOICES
+        ]
 
     # ── Client factory ────────────────────────────────────────────────────────
 
@@ -176,6 +220,7 @@ class GeminiTTSAdapter(SubtitleTTSPort):
 
     # ── Public generate ───────────────────────────────────────────────────────
 
+    @without_torch_block
     def generate(
         self,
         request: TTSRequest,
@@ -295,16 +340,16 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                 progress_cb(ratio, f"Dòng {idx + 1}/{n}: {event.text[:30]}…")
             # [v3.23.199] Gap-aware (đồng bộ VieNeu v194): tận dụng khoảng lặng tới
             # câu sau -> giảm tỉ lệ nén -> giọng ít gấp/méo (đo thực: nén mạnh -55%).
-            next_start = (
-                request.events[idx + 1].start_sec
-                if idx + 1 < len(request.events)
-                else getattr(request, "media_duration_s", None)
-            )
+            # [v3.23.596] Biên chung với VieNeu (``line_context``): ngân trễ elastic, và
+            # mốc dòng kề THẬT khi TTS lại tập con.
+            context = line_context(request, idx, prev_audio_end)
             result = self._process_standard(
-                event=event, idx=idx, master=master, next_start_sec=next_start,
-                client=client, model=model, voice=voice,
+                event=event, idx=idx, master=master,
+                next_start_sec=context.next_start_sec,
+                client=client, model=model, voice=request.voice_at(idx, voice),
                 sr=sr, request=request, cancel_cb=cancel_cb,
-                prev_audio_end_sec=prev_audio_end,
+                prev_audio_end_sec=context.prev_audio_end_sec,
+                late_s=context.late_s, defer_s=context.defer_s,
             )
             results.append(result)
             if not result.was_skipped and result.audio_duration_s > 0.0:
@@ -340,6 +385,8 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         self, *, event, idx, master, client, model, voice, sr, request, cancel_cb,
         next_start_sec: float | None = None,
         prev_audio_end_sec: float = 0.0,
+        late_s: float = 0.0,
+        defer_s: float = 0.0,
     ) -> TTSSegmentResult:
         from google.genai import types
         # [v3.23.154] Chuẩn "văn bản âm thanh thật" (như Edge Pass 1): áp SKIP
@@ -370,28 +417,26 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                 ),
                 adjusted_start_sec=start_sec, adjusted_end_sec=end_sec,
             )
-        # [v3.23.251] language_code giữ nhất quán ngôn ngữ (xem hằng số). Bọc an toàn
-        # cho SDK cũ không nhận field.
+        std_speech_config = self._standard_speech_config(types, model, voice)
+        config_kwargs: dict[str, Any] = {
+            "response_modalities": ["AUDIO"],
+            "speech_config": std_speech_config,
+        }
+        # [v3.23.246] Nhiệt độ tuỳ chỉnh (None -> mặc định model). Hạ thấp giảm
+        # hallucination "ngân dài ngẫu nhiên". [v3.23.595] Không gửi cho model đã bỏ tham
+        # số lấy mẫu (3.6+, Flash-Lite 3.5+, TTS 3.8): bị bỏ qua, có thể bị từ chối.
+        temperature = getattr(request, "gemini_temperature", None)
+        if temperature is not None and not sampling_params_deprecated(model):
+            config_kwargs["temperature"] = temperature
+        # [v3.23.419] Tắt AFC (Automatic Function Calling) — TTS không dùng function calling,
+        # AFC bật mặc định chỉ gây cảnh báo + overhead. Guard cho SDK cũ.
         try:
-            std_speech_config = types.SpeechConfig(
-                language_code=_TTS_LANGUAGE_CODE,
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
-                ),
+            config_kwargs["automatic_function_calling"] = (
+                types.AutomaticFunctionCallingConfig(disable=True)
             )
-        except (TypeError, ValueError):
-            std_speech_config = types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
-                )
-            )
-        config = types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=std_speech_config,
-            # [v3.23.246] Nhiệt độ tuỳ chỉnh (None -> mặc định model). Hạ thấp giảm
-            # hallucination "ngân dài ngẫu nhiên".
-            temperature=getattr(request, "gemini_temperature", None),
-        )
+        except (AttributeError, TypeError):
+            pass
+        config = types.GenerateContentConfig(**config_kwargs)
         audio = self._standard_with_retry(
             client, model, text, config, request, cancel_cb,
             # [v3.23.234] Khung THẬT của câu -> vòng retry phân biệt được "audio bất
@@ -422,34 +467,31 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         was_truncated = False
 
         # Time-stretch nếu audio dài hơn window (Gemini không có speed param)
-        # [v3.23.199] Khung HIỆU DỤNG = khung gốc + gap tới câu sau (đồng bộ VieNeu
-        # v194) -> giảm mạnh tỉ lệ nén cần thiết -> giọng tự nhiên hơn.
-        base_available = effective_available_seconds(
-            start_sec, end_sec, next_start_sec
-        )
-        # [v3.23.228] ĂN GIAN ĐẦU (lead-in) — đồng bộ VieNeu v219. Chỉ dời sớm những câu
-        # THẬT SỰ cần khung rộng hơn (``needed_lead_s``); câu vốn đã vừa khung giữ NGUYÊN
-        # mốc phụ đề, tránh đúng bug v218 (dời sớm cả loạt -> tiếng lệch trước khẩu hình).
-        needed_window = voice_dur / max(1.0, float(request.base_speed)) + pause_s
-        lead_s = lead_in_seconds(
-            start_sec,
-            prev_audio_end_sec,
+        # [v3.23.199] Khung HIỆU DỤNG = khung gốc + gap tới câu sau; [v3.23.228] ăn gian
+        # đầu đúng mức cần; [v3.23.215] tốc độ tổng tối thiểu base_speed — nay gom trong
+        # ``place_line`` (dùng chung VieNeu), kèm ngân trễ elastic [v3.23.596].
+        placement = place_line(
+            start_sec=start_sec,
+            end_sec=end_sec,
+            next_start_sec=next_start_sec,
+            prev_audio_end_sec=prev_audio_end_sec,
+            voice_duration_s=voice_dur,
+            pause_s=pause_s,
+            base_speed=float(request.base_speed),
+            max_speed=float(request.max_speed),
             max_lead_s=float(getattr(request, "lead_in_s", 0.0)),
-            needed_lead_s=max(0.0, needed_window - base_available),
+            late_s=late_s,
+            comfort_speed=comfort_speed(request),
+            defer_s=defer_s,
         )
-        play_start_sec = start_sec - lead_s
-        effective_available = base_available + lead_s
-        # [v3.23.215] Tốc độ TỔNG đúng ngữ nghĩa (đồng bộ VieNeu): audio luôn đọc TỐI
-        # THIỂU ở base_speed (trước đây base chỉ là nhãn), nén thêm nếu chưa vừa khung;
-        # chặn bởi max_speed + trần chất lượng 2.0.
-        available_for_voice = max(0.05, effective_available - pause_s)
-        capped_ratio = total_speed_ratio(
-            voice_dur, available_for_voice, request.base_speed, request.max_speed
-        )
+        play_start_sec = placement.play_start_sec
+        effective_available = placement.effective_available_s
+        capped_ratio = placement.speed
         if capped_ratio > 1.0:
             logger.debug(
                 "Gemini TTS time-stretch dòng %d: %.2fx (%.2fs → %.2fs)",
-                idx, capped_ratio, voice_dur, available_for_voice,
+                idx, capped_ratio, voice_dur,
+                max(0.05, effective_available - pause_s),
             )
             stretched = self._time_stretch(audio, sr, capped_ratio)
             if len(stretched) > 0:
@@ -485,12 +527,47 @@ class GeminiTTSAdapter(SubtitleTTSPort):
             text=text, audio_duration_s=len(audio) / sr,
             speed_used=speed_used, was_truncated=was_truncated,
             # [v3.23.203] Chồng thật (đồng bộ Edge/VieNeu) -> UI đếm đúng.
-            overlap_s=max(0.0, (len(audio) / sr) - effective_available),
+            overlap_s=audible_overlap_seconds(len(audio) / sr, effective_available),
             # [v3.23.228] adjusted = mốc PHÁT THẬT (đã trừ lead-in) — đồng bộ VieNeu:
             # SRT xuất ra khớp tiếng, và UI đếm "Dời mốc" đúng. Trước đây Gemini luôn ghi
             # mốc gốc vì không có lead-in.
-            adjusted_start_sec=play_start_sec, adjusted_end_sec=end_sec,
+            adjusted_start_sec=play_start_sec,
+            # [v3.23.596] Như VieNeu: phụ đề hiện tới khi TIẾNG dứt (câu có thể bị đọc
+            # lùi).
+            adjusted_end_sec=max(end_sec, play_start_sec + len(audio) / sr),
         )
+
+    @staticmethod
+    def _standard_speech_config(types: Any, model: str, voice: str) -> Any:
+        """``SpeechConfig`` theo thế hệ model TTS.
+
+        * Model ≥ 3.8: ``voice_config.voice`` (đúng mẫu tài liệu); không có
+          ``language_code`` — model tự nhận diện ngôn ngữ. SDK cũ chưa có trường ``voice``
+          thì dùng ``prebuilt_voice_config`` (mẫu hội thoại nhiều giọng của 3.8 vẫn dùng).
+        * Model cũ: như trước — ``prebuilt_voice_config`` + ``language_code`` cố định
+          (v3.23.251), bọc an toàn cho SDK cũ không nhận trường này.
+
+        Args:
+            types: Module ``google.genai.types``.
+            model: Tên model TTS.
+            voice: Tên giọng.
+
+        Returns:
+            Instance ``SpeechConfig``.
+        """
+        prebuilt = types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+        )
+        if uses_verbatim_tts_schema(model):
+            if "voice" in getattr(types.VoiceConfig, "model_fields", {}):
+                return types.SpeechConfig(voice_config=types.VoiceConfig(voice=voice))
+            return types.SpeechConfig(voice_config=prebuilt)
+        try:
+            return types.SpeechConfig(
+                language_code=_TTS_LANGUAGE_CODE, voice_config=prebuilt
+            )
+        except (TypeError, ValueError):
+            return types.SpeechConfig(voice_config=prebuilt)
 
     def _standard_with_retry(
         self, client, model, text, config, request, cancel_cb, available_s: float = 0.0
@@ -514,9 +591,14 @@ class GeminiTTSAdapter(SubtitleTTSPort):
             if cancel_cb and cancel_cb():
                 raise TTSCancelledError("Huỷ trong retry Standard TTS.")
             try:
+                # [v3.23.595] Model ≥ 3.8 đọc NGUYÊN VĂN ``text``: lời dẫn bọc quanh câu
+                # (dành cho model cũ, v3.23.245) sẽ bị đọc thành tiếng.
                 response = client.models.generate_content(
                     model=model,
-                    contents=wrap_transcript_for_tts(text),
+                    contents=(
+                        text.strip() if uses_verbatim_tts_schema(model)
+                        else wrap_transcript_for_tts(text)
+                    ),
                     config=config,
                 )
                 # [v3.23.258] SDK google-genai 2.x TỰ decode base64 -> ``inline_data.data``
@@ -525,19 +607,22 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                 # trực tiếp, đồng bộ với đường native audio (dòng ``chunks.append(idata.data)``).
                 # Nội soi SDK 2.12.1: Blob.data là Optional[bytes], parser tự b64decode.
                 raw = response.candidates[0].content.parts[0].inline_data.data
-                audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                # [v3.23.595] Model ≥ 3.8 trả WAV có header; model cũ trả PCM thô.
+                audio = decode_tts_audio(raw, _SAMPLE_RATE)
                 # [v3.23.210] Audio TOÀN IM LẶNG (có độ dài nhưng không tiếng) coi như
                 # thất bại -> retry (đồng bộ VieNeu v205: lưới len>0 để lọt dạng lỗi
                 # này -> mất thoại mà vẫn báo OK).
                 if len(audio) > 0 and not is_effectively_silent(audio):
-                    duration_s = len(audio) / _SAMPLE_RATE
+                    # [v3.23.601] Đo PHẦN TIẾNG (sau cắt lặng biên) — đồng bộ VieNeu:
+                    # khâu đặt câu cắt lặng ngay sau bước này, im lặng không tới tai.
+                    duration_s = speech_seconds(audio, _SAMPLE_RATE)
                     ly_do = self._ly_do_lay_mau_lai(
                         duration_s, char_count, available_s, request,
                         syllable_count=dem_am_tiet(text),
                     )
                     if ly_do is None:
                         return audio
-                    overlong_best = shorter_take(overlong_best, audio)
+                    overlong_best = shorter_take(overlong_best, audio, sr=_SAMPLE_RATE)
                     quality_retry = True
                     best_duration_s, no_improve_streak, nen_dung = cap_nhat_ban_tot_nhat(
                         best_duration_s, duration_s, no_improve_streak
@@ -690,31 +775,27 @@ class GeminiTTSAdapter(SubtitleTTSPort):
             speed_used = request.base_speed
             was_truncated = False
 
-            # [v3.23.199] Gap-aware (đồng bộ VieNeu v194): khung hiệu dụng gồm gap tới
-            # câu sau -> giảm tỉ lệ nén -> giọng tự nhiên hơn.
-            next_start = (
-                request.events[idx + 1].start_sec
-                if idx + 1 < len(request.events)
-                else getattr(request, "media_duration_s", None)
-            )
-            base_available = effective_available_seconds(
-                start_sec, end_sec, next_start
-            )
-            # [v3.23.228] Chỉ dời sớm câu THẬT SỰ cần khung rộng hơn (bug v218: dời cả
-            # loạt -> tiếng lệch trước khẩu hình).
-            needed_window = voice_dur / max(1.0, float(request.base_speed)) + pause_s
-            lead_s = lead_in_seconds(
-                start_sec,
-                prev_audio_end,
+            # [v3.23.199] Gap-aware; [v3.23.228] ăn gian đầu đúng mức cần — nay gom trong
+            # ``place_line`` dùng chung, kèm ngân trễ elastic và mốc dòng kề thật khi TTS
+            # lại tập con [v3.23.596].
+            context = line_context(request, idx, prev_audio_end)
+            placement = place_line(
+                start_sec=start_sec,
+                end_sec=end_sec,
+                next_start_sec=context.next_start_sec,
+                prev_audio_end_sec=context.prev_audio_end_sec,
+                voice_duration_s=voice_dur,
+                pause_s=pause_s,
+                base_speed=float(request.base_speed),
+                max_speed=float(request.max_speed),
                 max_lead_s=float(getattr(request, "lead_in_s", 0.0)),
-                needed_lead_s=max(0.0, needed_window - base_available),
+                late_s=context.late_s,
+                comfort_speed=comfort_speed(request),
+                defer_s=context.defer_s,
             )
-            play_start_sec = start_sec - lead_s
-            effective_available = base_available + lead_s
-            available_for_voice = max(0.05, effective_available - pause_s)
-            ratio = total_speed_ratio(
-                voice_dur, available_for_voice, request.base_speed, request.max_speed
-            )
+            play_start_sec = placement.play_start_sec
+            effective_available = placement.effective_available_s
+            ratio = placement.speed
             if ratio > 1.0:
                 stretched = self._time_stretch(audio, sr, ratio)
                 if len(stretched) > 0:
@@ -749,9 +830,10 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                 event_index=idx, start_sec=start_sec, end_sec=end_sec,
                 text=text_clean, audio_duration_s=len(audio) / sr,
                 speed_used=speed_used, was_truncated=was_truncated,
-                overlap_s=max(0.0, (len(audio) / sr) - effective_available),
+                overlap_s=audible_overlap_seconds(len(audio) / sr, effective_available),
                 # [v3.23.228] Mốc PHÁT THẬT (đã trừ lead-in) -> SRT khớp tiếng.
-                adjusted_start_sec=play_start_sec, adjusted_end_sec=end_sec,
+                adjusted_start_sec=play_start_sec,
+                adjusted_end_sec=max(end_sec, play_start_sec + len(audio) / sr),
             )
             prev_audio_end = play_start_sec + len(audio) / sr
 
@@ -796,7 +878,7 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                     else None
                 )
                 audio = await self._async_native_single_with_retry(
-                    model=model, voice=voice, text=text_clean,
+                    model=model, voice=request.voice_at(idx, voice), text=text_clean,
                     request=request, use_affective=use_affective,
                     available_s=effective_available_seconds(
                         event.start_sec, event.end_sec, nxt
@@ -814,7 +896,12 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                         f"(x{min(_NATIVE_CONCURRENCY, n_valid)} song song)…"
                     )
 
-        await asyncio.gather(*[process_one(idx) for idx in valid_indices], return_exceptions=True)
+        outcomes = await asyncio.gather(
+            *[process_one(idx) for idx in valid_indices], return_exceptions=True
+        )
+        # [v3.23.613] Trước đây kết quả gather bị bỏ đi: dòng lỗi chỉ hiện "Không xử lý
+        # được." mà log không có một chữ nào về nguyên nhân.
+        completed_task_results(outcomes, "Gemini TTS")
         return audio_map
 
     @staticmethod
@@ -861,7 +948,9 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         )
         if hallucination:
             return "audio DÀI BẤT THƯỜNG so với nhịp đọc Gemini"
-        max_ratio = min(float(getattr(request, "max_speed", 2.0)), QUALITY_STRETCH_CAP)
+        # [v3.23.464] Đồng bộ với tốc độ ÁP DỤNG (total_speed_ratio nay honor max_speed) →
+        # detection cũng dùng ĐÚNG max_speed người dùng đặt, không chặn cứng ở 2.0.
+        max_ratio = float(getattr(request, "max_speed", 2.0))
         # [v3.23.237] Khung DƯỚI SÀN VẬT LÝ của engine -> không bản nào vừa được, kể cả
         # bản đọc một âm tiết. Lấy mẫu lại là vô nghĩa HOÀN TOÀN (không phải "khó").
         #
@@ -905,14 +994,14 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                     request=request, use_affective=current_affective,
                 )
                 if audio is not None and len(audio) > 0:
-                    duration_s = len(audio) / _SAMPLE_RATE
+                    duration_s = speech_seconds(audio, _SAMPLE_RATE)  # [v3.23.601]
                     ly_do = self._ly_do_lay_mau_lai(
                         duration_s, char_count, available_s, request,
                         syllable_count=dem_am_tiet(text),
                     )
                     if ly_do is None:
                         return audio
-                    overlong_best = shorter_take(overlong_best, audio)
+                    overlong_best = shorter_take(overlong_best, audio, sr=_SAMPLE_RATE)
                     quality_retry = True
                     best_duration_s, no_improve_streak, nen_dung = cap_nhat_ban_tot_nhat(
                         best_duration_s, duration_s, no_improve_streak

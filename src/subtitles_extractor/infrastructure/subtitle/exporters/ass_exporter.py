@@ -18,6 +18,9 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
+from subtitles_extractor.application.services.bidi_marks import mark_rtl_lines
+from subtitles_extractor.application.services.subtitle_line_wrapper import wrap_subtitle_line
+from subtitles_extractor.infrastructure.tts.emotion_cues import strip_emotion_cues
 from subtitles_extractor.domain.exceptions import SubtitleExportError
 from subtitles_extractor.infrastructure.subtitle.atomic_save import (
     atomic_write_text,
@@ -67,7 +70,8 @@ class AssExporter:
     def _format_event_line(event: SubtitleEvent) -> str:
         start = _format_ass_timestamp(event.interval.start_sec)
         end = _format_ass_timestamp(event.interval.end_sec)
-        text = _escape_ass_text(event.text)
+        # [v3.23.610] Bọc dấu định hướng cho dòng chữ phải-sang-trái (từng dòng).
+        text = _escape_ass_text(mark_rtl_lines(wrap_subtitle_line(event.text)))
         return f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n"
 
 
@@ -90,6 +94,8 @@ def _escape_ass_text(text: str) -> str:
     sanitized = sanitized.replace("<i>", r"{\i1}").replace("</i>", r"{\i0}")
     sanitized = sanitized.replace("<u>", r"{\u1}").replace("</u>", r"{\u0}")
     sanitized = re.sub(r"<[^>]+>", "", sanitized)
+    # [v3.23.447] Bỏ tag cảm xúc VieNeu khỏi phụ đề ASS (chỉ dành cho giọng đọc TTS).
+    sanitized = strip_emotion_cues(sanitized)
     return sanitized.replace("\n", r"\N")
 
 

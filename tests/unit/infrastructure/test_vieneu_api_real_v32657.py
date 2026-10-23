@@ -46,6 +46,12 @@ def _adapter(emotion: str = "natural") -> VieNeuTtsAdapter:
     a._mode = "v3turbo"
     a._emotion = emotion
     a._precision = None
+    # [v3.23.543] Thực thể dựng bằng ``__new__`` không chạy ``__init__`` nên phải gán tay các
+    # thuộc tính mà luồng tổng hợp có đụng tới; thiếu chúng thì test vỡ vì AttributeError chứ
+    # không phải vì hành vi sai.
+    a._gpu_worker_disabled = False
+    a._gpu_server = None
+    a._force_cpu = False
     return a
 
 

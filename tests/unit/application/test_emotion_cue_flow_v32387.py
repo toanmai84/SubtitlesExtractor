@@ -20,6 +20,18 @@ from subtitles_extractor.infrastructure.translation.gemini_translation_adapter i
 )
 
 
+def _bare_translator():
+    """[v3.23.539] Thực thể TRỐNG để gọi các hàm dựng payload (là phương thức thực thể).
+
+    Phần thân chỉ đọc vài thuộc tính tuỳ chọn nên ``__new__`` là đủ, không cần API key.
+    """
+    instance = G.__new__(G)
+    instance._reading_cps_budget = 0.0
+    instance._emotion_cues = False
+    instance._video_handle_cache = {}
+    return instance
+
+
 def test_apply_cue_injects_scene_into_line() -> None:
     lines = [TranslationLine(index=1, start_ms=0, end_ms=1000, text="滚")]
     cues = [VisualCue(line_no=1, speaker="Tần Chính", addressee="Sở Nhan",
@@ -35,7 +47,7 @@ def test_dual_payload_includes_cue() -> None:
         index=1, start_ms=0, end_ms=1000, text="Cút!",
         original_text="滚", scene="giận dữ", speaker="Tần Chính",
     )
-    payload = G._line_to_dual_payload(line)
+    payload = _bare_translator()._line_to_dual_payload(line)
     assert payload["cue"] == "giận dữ"
     assert payload["original"] == "滚"
 
@@ -43,7 +55,7 @@ def test_dual_payload_includes_cue() -> None:
 def test_dual_payload_omits_cue_when_absent() -> None:
     line = TranslationLine(index=1, start_ms=0, end_ms=1000, text="Cút!",
                            original_text="滚")
-    payload = G._line_to_dual_payload(line)
+    payload = _bare_translator()._line_to_dual_payload(line)
     assert "cue" not in payload
 
 
@@ -72,7 +84,7 @@ def test_literal_payload_includes_addressee_and_cue() -> None:
         index=1, start_ms=0, end_ms=1000, text="滚",
         speaker="Tần Chính", addressee="Sở Nhan", scene="giận dữ",
     )
-    payload = G._line_to_payload(line)
+    payload = _bare_translator()._line_to_payload(line)
     assert payload["addressee"] == "Sở Nhan"
     assert payload["cue"] == "giận dữ"
     assert payload["speaker"] == "Tần Chính"

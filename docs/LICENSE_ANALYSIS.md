@@ -1,11 +1,30 @@
-# Phân tích License & Giải pháp cho Build Thương mại
+# Phân tích License
 
-**Ngày rà soát:** 2026-07-18
+**Ngày rà soát:** 2026-07-18 — **cập nhật 2026-09-18 (v3.23.548).**
 **Phạm vi:** toàn bộ dependencies runtime của SubtitlesExtractor.
 
-> ⚠️ **MIỄN TRỪ:** Tài liệu này là phân tích kỹ thuật để tham khảo, KHÔNG phải tư vấn
-> pháp lý. Trước khi phát hành thương mại, hãy nhờ luật sư sở hữu trí tuệ rà soát lại.
-> Người viết là kỹ sư, không phải luật sư.
+---
+
+## 0. ⭐ QUYẾT ĐỊNH CẤP PHÉP (2026-09-18) — ĐỌC TRƯỚC KHI ĐỌC PHẦN CÒN LẠI
+
+**SubtitlesExtractor KHÔNG còn là dự án thương mại. Dự án là MÃ NGUỒN MỞ HOÀN TOÀN.**
+
+Hệ quả trực tiếp:
+
+* **Thư viện GPL được dùng tự do** — kể cả đóng gói kèm và import thẳng trong tiến trình
+  chính. Không còn ràng buộc "không phân phối kèm" hay "phải cách ly qua subprocess"
+  **vì lý do cấp phép**. edge-tts, WhisperX, pedalboard, qfluentwidgets đều dùng thoải mái.
+* **Không cần mua license thương mại nào.** Mục "Bắt buộc trước khi bán" ở dưới không còn
+  hiệu lực.
+* **Cách ly subprocess vẫn giữ — nhưng vì lý do KỸ THUẬT, không phải pháp lý:** tránh treo
+  ứng dụng, tránh xung đột phiên bản thư viện (WhisperX kéo theo torch làm hạ cấp
+  huggingface-hub → hỏng VieNeu/PaddleOCR), giữ bản đóng gói nhỏ. Đừng gỡ các ranh giới
+  tiến trình đó chỉ vì cấp phép không còn đòi hỏi.
+
+**Toàn bộ phân tích từ mục 1 trở xuống được GIỮ LẠI làm tư liệu lịch sử** — nó ghi lại vì
+sao kiến trúc hiện tại có hình dạng như vậy (PySide6 thay PyQt6, librosa thay pedalboard,
+worker subprocess cho edge-tts/WhisperX). Đọc nó để HIỂU mã nguồn, đừng đọc nó như ràng
+buộc còn hiệu lực.
 
 ---
 
@@ -161,19 +180,33 @@ libmpv, FFmpeg đã xử lý. Kèm toàn văn LGPL trong bản phân phối (THI
 
 ## 5. Engine TTS — kiểm riêng
 
-- **edge-tts:** license GPL v3 (⚠️). ✅ **ĐÃ XỬ LÝ (v3.23.268):** cách ly vào subprocess
-  riêng (``edge_tts_subprocess.py``). Tiến trình chính KHÔNG import edge_tts (dùng
-  ``find_spec`` để kiểm tồn tại). edge-tts KHÔNG đóng gói kèm exe (excludes trong spec) —
-  chạy bằng Python NGOÀI như công cụ độc lập. Nhờ ranh giới tiến trình + không phân phối
-  kèm, edge-tts là "công cụ ngoài" không lan GPL vào app.
+- **edge-tts:** license GPL v3 (⚠️). **ĐÃ XỬ LÝ (v3.23.268):** cách ly vào subprocess
+  riêng (``edge_tts_subprocess.py``). Tiến trình chính không import edge_tts (dùng
+  ``find_spec`` để kiểm tồn tại) — chạy bằng Python NGOÀI như công cụ độc lập. Nhờ ranh
+  giới tiến trình + không phân phối kèm, edge-tts là "công cụ ngoài" không lan GPL vào app.
+
+  ✅ **ĐÃ GIẢI QUYẾT (2026-09-18) — không còn là vấn đề cấp phép.** Dự án là mã nguồn mở
+  hoàn toàn (mục 0), nên việc v3.23.328 gom ``edge_tts`` vào bundle và thêm đường dự phòng
+  ``_run_edge_in_process`` (chạy trong tiến trình chính khi máy không có Python ngoài)
+  là **hợp lệ, không cần xử lý gì thêm**.
+
+  Cách ly subprocess vẫn là đường MẶC ĐỊNH, nhưng nay vì lý do kỹ thuật: lỗi/treo của
+  edge-tts (mạng chậm, dịch vụ Microsoft từ chối) không được phép kéo theo cả ứng dụng.
+  Bộ kiểm ``test_edge_tts_cach_ly_gpl_subprocess`` khoá đúng bất biến kỹ thuật đó:
+  ``edge_tts`` chỉ import LƯỜI bên trong hàm dự phòng, không bao giờ ở cấp module — nhờ
+  vậy phiên dùng subprocess không nạp thư viện vào tiến trình chính một cách vô ích.
 - **VieNeu:** Apache 2.0 ✅ — an toàn, giữ làm engine TTS chính offline.
 - **Gemini TTS:** google-genai Apache 2.0 ✅ — an toàn (client API).
 
 ---
 
-## 6. Kế hoạch hành động đề xuất (theo thứ tự ưu tiên)
+## 6. Kế hoạch hành động (TƯ LIỆU LỊCH SỬ — đã hoàn tất, không còn ràng buộc)
 
-### Bắt buộc trước khi bán:
+> Mục này ghi lại kế hoạch đã thực hiện khi dự án còn hướng tới phát hành thương mại.
+> Từ 2026-09-18 dự án là mã nguồn mở hoàn toàn (mục 0) nên các yêu cầu dưới đây KHÔNG
+> còn hiệu lực. Giữ lại để hiểu vì sao kiến trúc hiện tại chọn PySide6/librosa/subprocess.
+
+### Đã làm (khi còn nhắm tới bản thương mại):
 1. **pedalboard → librosa** (dễ nhất, làm ngay): bỏ pedalboard khỏi build, app tự fallback
    librosa (ISC). ✅ Không tốn tiền, công sức thấp.
 2. **PyQt6 → PySide6** (LGPL) HOẶC mua license PyQt6 thương mại. Đây là quyết định lớn nhất.

@@ -126,3 +126,36 @@ def test_edge_khong_ap_luoi_dai_bat_thuong() -> None:
         ).read_text(encoding="utf-8")
         assert "is_abnormally_long" in src, engine
         assert "shorter_take" in src, engine
+
+
+# [v3.23.458] Ngưỡng tuyệt đối chống false-positive câu cực ngắn (app_log: ~300 dòng 1-âm-tiết
+# <1.8s bị flag oan → retry 10 lần vô ích). Vẫn bắt ngân THẬT (≥1.8s / ≥floor×2.5).
+from subtitles_extractor.infrastructure.tts.timing_math import (
+    is_abnormally_long_vs_floor,
+    VIENEU_MIN_BASE_S,
+    VIENEU_MIN_PER_SYLLABLE_S,
+)
+
+
+def _ab(dur, syl):
+    return is_abnormally_long_vs_floor(
+        dur, syl, min_base_s=VIENEU_MIN_BASE_S, min_per_syllable_s=VIENEU_MIN_PER_SYLLABLE_S
+    )
+
+
+def test_short_line_normal_duration_not_flagged():
+    # "Hừ." 1.12s (1 âm tiết) — bình thường, KHÔNG được flag (bug cũ: ngưỡng 1.1s → flag oan)
+    for d in [1.12, 1.20, 1.60, 1.79]:
+        assert _ab(d, 1) is False, f"{d}s 1 âm tiết bị flag oan"
+
+
+def test_short_line_genuine_drone_flagged():
+    # Ngân thật vẫn phải bắt
+    for d in [1.81, 2.24, 4.56, 8.72, 15.36]:
+        assert _ab(d, 1) is True, f"{d}s 1 âm tiết ngân thật mà bỏ sót"
+
+
+def test_longer_line_sensitivity_preserved():
+    assert _ab(2.1, 3) is True      # 3 âm tiết, ngưỡng 2.08s
+    assert _ab(3.1, 5) is True      # 5 âm tiết, ngưỡng 3.06s
+    assert _ab(1.5, 2) is False     # 2 âm tiết ngắn bình thường

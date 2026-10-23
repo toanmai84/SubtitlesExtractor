@@ -157,3 +157,241 @@ class TestInMemRefsCache:
             provider.prepare_and_upload(src)
 
         assert mat_calls["n"] == 2  # refs hết hạn → phải làm lại
+
+
+@pytest.mark.skipif(not _FFMPEG, reason="cần ffmpeg")
+class TestYoutubeChromaFormats:
+    """[v3.23.466] Video YouTube (VP9/AV1) hay 4:4:4/10-bit — libx264 'main' từ chối → phải ép
+    -pix_fmt yuv420p mới cắt được."""
+
+    def _has_vp9(self) -> bool:
+        out = subprocess.run([_FFMPEG, "-hide_banner", "-encoders"], capture_output=True, text=True)
+        return "libvpx-vp9" in out.stdout
+
+    def test_cuts_vp9_444_youtube_style(self, tmp_path: Path) -> None:
+        if not self._has_vp9():
+            pytest.skip("ffmpeg thiếu libvpx-vp9")
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import (
+            GeminiVideoContextProvider, VideoChunk,
+        )
+        src = tmp_path / "yt.webm"
+        subprocess.run(
+            [_FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "testsrc=duration=6:size=1280x720:rate=30",
+             "-f", "lavfi", "-i", "sine=duration=6",
+             "-c:v", "libvpx-vp9", "-b:v", "300k", "-c:a", "libopus", str(src)],
+            check=True, capture_output=True, timeout=120,
+        )
+        prov = GeminiVideoContextProvider(work_dir=tmp_path)
+        prov._nvenc_available = False  # bỏ GPU (sandbox không có)
+        chunk = VideoChunk(0, tmp_path / "out.ctxpart00.mp4", 0.0, 6.0)
+        prov._encode_low_res_chunk(_FFMPEG, src, chunk)
+        # Phải ra file 360p yuv420p hợp lệ (không "main doesn't support 4:4:4")
+        out = subprocess.run(
+            [shutil.which("ffprobe"), "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=height,pix_fmt", "-of", "csv=p=0", str(chunk.path)],
+            capture_output=True, text=True,
+        )
+        assert "360" in out.stdout and "yuv420p" in out.stdout, out.stdout
+
+
+class TestNvdecHybridTier:
+    """[v3.23.467] Tier NVDEC-giải-mã + CPU-encode: né NVENC hỏng, giải mã VP9/AV1 nhanh."""
+
+    def _prov(self, tmp_path):
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import (
+            GeminiVideoContextProvider,
+        )
+        return GeminiVideoContextProvider(work_dir=tmp_path)
+
+    def test_hybrid_tier_present_and_uses_libx264_not_nvenc(self, tmp_path: Path) -> None:
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import VideoChunk
+        prov = self._prov(tmp_path)
+        prov._nvenc_available = False  # NVENC hỏng → chỉ còn nvdec-hybrid + cpu
+        chunk = VideoChunk(0, tmp_path / "o.mp4", 0.0, 10.0)
+        cmds = prov._build_encode_commands("ffmpeg", tmp_path / "in.webm", chunk, tmp_path / "t.mp4")
+        nvdec = [c for g, c in cmds if (not g) and ("-hwaccel" in c)]
+        assert len(nvdec) == 1, "phải có đúng 1 tier NVDEC-hybrid"
+        assert "libx264" in nvdec[0] and "h264_nvenc" not in nvdec[0]  # né NVENC
+        assert "yuv420p" in nvdec[0]  # ép 4:2:0 (chroma YouTube)
+
+    def test_hybrid_tier_excluded_when_marked_broken(self, tmp_path: Path) -> None:
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import VideoChunk
+        prov = self._prov(tmp_path)
+        prov._nvenc_available = False
+        # [v3.23.471] Đánh dấu MỌI hwaccel ứng viên hỏng → không còn tier hwdec nào.
+        prov._hwdec_broken = {"d3d11va", "cuda"}
+        chunk = VideoChunk(0, tmp_path / "o.mp4", 0.0, 10.0)
+        cmds = prov._build_encode_commands("ffmpeg", tmp_path / "in.webm", chunk, tmp_path / "t.mp4")
+        assert not any((not g) and ("-hwaccel" in c) for g, c in cmds)
+
+
+class TestYoutubeMovFlags:
+    """[v3.23.469] Cờ chống treo cho MP4 YouTube/Google: ignore_editlist (chỉ mov/mp4) +
+    max_interleave_delta 0 (chống treo muxing khi hạ fps mạnh)."""
+
+    def _cmds(self, tmp_path, suffix):
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import (
+            GeminiVideoContextProvider, VideoChunk,
+        )
+        prov = GeminiVideoContextProvider(work_dir=tmp_path)
+        prov._nvenc_available = False
+        ch = VideoChunk(0, tmp_path / "o.mp4", 0.0, 10.0)
+        return prov._build_encode_commands("ffmpeg", tmp_path / f"in{suffix}", ch, tmp_path / "t.mp4")
+
+    def test_mp4_gets_ignore_editlist(self, tmp_path: Path) -> None:
+        for _g, c in self._cmds(tmp_path, ".mp4"):
+            assert "-ignore_editlist" in c
+
+    def test_webm_no_ignore_editlist(self, tmp_path: Path) -> None:
+        # -ignore_editlist là option demuxer mov → thêm cho webm sẽ LỖI "Option not found".
+        for _g, c in self._cmds(tmp_path, ".webm"):
+            assert "-ignore_editlist" not in c
+
+    def test_mkv_no_ignore_editlist(self, tmp_path: Path) -> None:
+        for _g, c in self._cmds(tmp_path, ".mkv"):
+            assert "-ignore_editlist" not in c
+
+    def test_default_has_audio_not_an(self, tmp_path: Path) -> None:
+        # [v3.23.473] Mặc định KÈM audio (bỏ -an); chỉ rơi video-only khi file kẹt (auto-fallback).
+        for _g, c in self._cmds(tmp_path, ".mp4"):
+            assert "-an" not in c and "0:a:0?" in c
+
+
+class TestChunkFailureTolerance:
+    """[v3.23.472] Một đoạn nén lỗi (file hỏng ở đầu) KHÔNG làm hỏng cả ngữ cảnh — bỏ đoạn lỗi,
+    dùng các đoạn còn lại. Chỉ thất bại hẳn nếu MỌI đoạn lỗi."""
+
+    def _plan(self, tmp_path, n):
+        from subtitles_extractor.domain.ports.video_context_port import (
+            VideoContextPlan, VideoChunk,
+        )
+        chunks = [VideoChunk(i, tmp_path / f"c{i}.mp4", i * 10.0, i * 10.0 + 10) for i in range(n)]
+        return VideoContextPlan(source_path=tmp_path / "in.mp4", chunks=chunks,
+                                duration_sec=float(n * 10), estimated_tokens=1000)
+
+    def test_skips_failed_chunk_keeps_rest(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import (
+            GeminiVideoContextProvider, VideoContextError,
+        )
+        prov = GeminiVideoContextProvider(work_dir=tmp_path)
+        plan = self._plan(tmp_path, 4)
+
+        def enc(ffmpeg, src, chunk):
+            if chunk.index == 0:
+                raise VideoContextError("đoạn 0 hỏng")
+            chunk.path.write_bytes(b"x" * 2000)
+
+        with patch.object(prov, "_encode_low_res_chunk", side_effect=enc), \
+             patch("subtitles_extractor.infrastructure.translation.gemini_video_context."
+                   "find_ffmpeg", return_value="ffmpeg"):
+            prov.materialize_chunks(plan)
+        assert [c.index for c in plan.chunks] == [1, 2, 3]
+
+    def test_all_failed_raises(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import (
+            GeminiVideoContextProvider, VideoContextError,
+        )
+        prov = GeminiVideoContextProvider(work_dir=tmp_path)
+        plan = self._plan(tmp_path, 3)
+
+        def enc(ffmpeg, src, chunk):
+            raise VideoContextError("hỏng")
+
+        with patch.object(prov, "_encode_low_res_chunk", side_effect=enc), \
+             patch("subtitles_extractor.infrastructure.translation.gemini_video_context."
+                   "find_ffmpeg", return_value="ffmpeg"), \
+             pytest.raises(VideoContextError):
+            prov.materialize_chunks(plan)
+
+
+class TestAudioFallback:
+    """[v3.23.473] Mặc định KÈM audio; nếu file kẹt xen kẽ (audio fail) → tự rơi video-only."""
+
+    def test_default_includes_audio(self, tmp_path: Path) -> None:
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import (
+            GeminiVideoContextProvider, VideoChunk,
+        )
+        prov = GeminiVideoContextProvider(work_dir=tmp_path)
+        prov._nvenc_available = False
+        ch = VideoChunk(0, tmp_path / "o.mp4", 0.0, 10.0)
+        cmds = prov._build_encode_commands("ffmpeg", tmp_path / "in.mp4", ch, tmp_path / "t.mp4")
+        for _g, c in cmds:
+            assert "0:a:0?" in c and "-an" not in c  # có audio, không -an
+
+    def test_drop_audio_switches_to_video_only(self, tmp_path: Path) -> None:
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import (
+            GeminiVideoContextProvider, VideoChunk,
+        )
+        prov = GeminiVideoContextProvider(work_dir=tmp_path)
+        prov._nvenc_available = False
+        prov._drop_audio = True
+        ch = VideoChunk(0, tmp_path / "o.mp4", 0.0, 10.0)
+        cmds = prov._build_encode_commands("ffmpeg", tmp_path / "in.mp4", ch, tmp_path / "t.mp4")
+        for _g, c in cmds:
+            assert "-an" in c and "0:a:0?" not in c  # video-only
+
+
+@pytest.mark.skipif(not _FFMPEG, reason="cần ffmpeg")
+class TestAttachAudioSeparately:
+    """[v3.23.474] File kẹt xen kẽ a/v (drop_audio) VẪN có audio nhờ trích RIÊNG audio + ghép."""
+
+    def test_drop_audio_chunk_still_gets_audio(self, tmp_path: Path) -> None:
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import (
+            GeminiVideoContextProvider, VideoChunk,
+        )
+        src = tmp_path / "in.mp4"
+        subprocess.run(
+            [_FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "testsrc=duration=6:size=640x360:rate=30",
+             "-f", "lavfi", "-i", "sine=duration=6",
+             "-c:v", "libx264", "-c:a", "aac", str(src)],
+            check=True, capture_output=True, timeout=60,
+        )
+        prov = GeminiVideoContextProvider(work_dir=tmp_path)
+        prov._nvenc_available = False
+        prov._drop_audio = True  # mô phỏng file kẹt → đi đường video-only + ghép audio riêng
+        ch = VideoChunk(0, tmp_path / "out.ctxpart00.mp4", 0.0, 6.0)
+        prov._encode_low_res_chunk(_FFMPEG, src, ch)
+        out = subprocess.run(
+            [shutil.which("ffprobe"), "-v", "error", "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", str(ch.path)],
+            capture_output=True, text=True,
+        )
+        assert "video" in out.stdout and "audio" in out.stdout
+
+
+class TestIgnoreCloudCache:
+    """[v3.23.479] Tùy chọn 'bỏ cache cloud' → BỎ mọi tái dùng, buộc cắt+tải lại (khi đã xoá cloud)."""
+
+    def test_flag_stored(self, tmp_path: Path) -> None:
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import (
+            GeminiVideoContextProvider,
+        )
+        assert GeminiVideoContextProvider(work_dir=tmp_path, ignore_cloud_cache=True)._ignore_cloud_cache is True
+        assert GeminiVideoContextProvider(work_dir=tmp_path)._ignore_cloud_cache is False
+
+    def test_skip_cache_bypasses_all_lookups(self, tmp_path: Path) -> None:
+        from unittest.mock import patch, MagicMock
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import (
+            GeminiVideoContextProvider,
+        )
+        prov = GeminiVideoContextProvider(work_dir=tmp_path, ignore_cloud_cache=True)
+        prov._inmem_refs = {}
+        calls = {"plan": 0, "source": 0}
+        with patch.object(prov, "_video_signature", return_value="sig"), \
+             patch.object(prov, "plan_chunks",
+                          return_value=MagicMock(chunks=[1, 2], needs_split=True, estimated_tokens=1)), \
+             patch.object(prov, "_plan_cache_lookup",
+                          side_effect=lambda *a: calls.__setitem__("plan", calls["plan"] + 1)), \
+             patch.object(prov, "_resolve_chunks_from_source_cache",
+                          side_effect=lambda *a: calls.__setitem__("source", calls["source"] + 1)), \
+             patch.object(prov, "materialize_chunks"), \
+             patch.object(prov, "_ensure_client"):
+            try:
+                prov.prepare_and_upload(tmp_path / "v.mp4")
+            except Exception:
+                pass
+        assert calls["plan"] == 0 and calls["source"] == 0

@@ -21,15 +21,15 @@ from subtitles_extractor.domain.exceptions import VideoDecodeError, VideoNotFoun
 from subtitles_extractor.domain.ports.frame_sampler_port import (
     FrameSamplingConfig,
     SampledFrame,
+    is_sample_due,
 )
 from subtitles_extractor.domain.value_objects.roi import Roi
-from subtitles_extractor.infrastructure.video.perceptual_hash import (
-    compute_phash,
-    hamming_distance,
-    pixel_diff_ratio,
-)
+from subtitles_extractor.infrastructure.video.frame_dedupe import FrameDeduper, FrameVerdict
 
 logger = logging.getLogger(__name__)
+
+#: [v3.23.632] Lùi bao nhiêu giây trước mốc bắt đầu khi seek (phần lùi được giải mã rồi bỏ qua).
+_SEEK_MARGIN_SEC = 5.0
 
 
 def _get_av_errors() -> tuple[type[Exception], ...]:
@@ -92,6 +92,10 @@ class PyAvFrameSampler:
             raise VideoDecodeError(f"{metadata.path.name} không có luồng video nào hợp lệ.")
 
         stream = video_streams[0]
+        # [v3.23.643] Giải mã đa luồng theo khung (AUTO) thay cho mặc định SLICE: đo trên 4 nhân,
+        # 720x1280 HEVC, 190-221 → 415-437 khung/giây. Chỉ ảnh hưởng hiệu năng.
+        with contextlib.suppress(AttributeError, ValueError, TypeError):
+            stream.thread_type = "AUTO"
 
         step_sec = max(0.001, config.sample_step_sec)
         total_sec = metadata.duration_sec
@@ -102,8 +106,8 @@ class PyAvFrameSampler:
         end_sec = total_sec - skip_outro_sec if skip_outro_sec > 0 else total_sec
         next_target_sec = start_sec
 
-        last_phash_val: int | None = None
-        last_image_arr: np.ndarray | None = None
+        # [v3.23.644] Quyết định OCR / trùng / trống dùng chung với bộ NVDEC (xem ``frame_dedupe``).
+        deduper = FrameDeduper(config)
         frame_counter_idx: int = 0
 
         if start_sec > 0:
@@ -114,7 +118,11 @@ class PyAvFrameSampler:
                 # =30000 nhưng pts/sec thực tế = 30000/1001 ≈ 29.97, không phải 30000.
                 # seek_worker.py đã dùng đúng công thức này — đồng nhất ở đây.
                 tb_float = float(stream.time_base) if stream.time_base else 1.0 / 90000.0
-                seek_pts = int(start_sec / tb_float)
+                # [v3.23.632] Lùi 5 s như bộ NVDEC: seek tới ĐÚNG mốc rơi vào khung khoá có
+                # dts <= mốc nhưng pts > mốc (video có B-frame) → mất các khung từ mốc tới khung
+                # khoá kế (đo: skip_intro=5.85 s cho khung đầu 6.00 s thay vì 5.88 s). Phần lùi
+                # được bỏ qua bằng phép so ``< start_sec`` bên dưới.
+                seek_pts = int(max(0.0, start_sec - _SEEK_MARGIN_SEC) / tb_float)
                 container.seek(seek_pts, backward=True, stream=stream)
             except _get_av_errors() as exc:
                 logger.warning("Lỗi khi seek bằng PyAV: %s", exc)
@@ -144,7 +152,7 @@ class PyAvFrameSampler:
                     continue
                 if frame_timestamp_sec > end_sec:
                     return
-                if frame_timestamp_sec < next_target_sec:
+                if not is_sample_due(frame_timestamp_sec, next_target_sec):
                     continue
 
                 try:
@@ -162,19 +170,19 @@ class PyAvFrameSampler:
                     next_target_sec = frame_timestamp_sec + step_sec
                     continue
 
-                if not self._should_keep_with_hash(cropped_rgb_arr, last_phash_val, last_image_arr, config):
+                verdict = deduper.verdict(cropped_rgb_arr, frame_timestamp_sec)
+                if verdict is not FrameVerdict.OCR:
                     yield SampledFrame(
                         frame_index=frame_counter_idx,
                         timestamp_sec=frame_timestamp_sec,
                         image_rgb=np.empty(0),
-                        is_duplicate=True
+                        is_duplicate=verdict is FrameVerdict.DUPLICATE,
+                        is_blank=verdict is FrameVerdict.BLANK,
                     )
                     frame_counter_idx += 1
                     next_target_sec = frame_timestamp_sec + step_sec
                     del cropped_rgb_arr
                     continue
-
-                current_phash_val = compute_phash(cropped_rgb_arr)
 
                 yield SampledFrame(
                     frame_index=frame_counter_idx,
@@ -183,8 +191,7 @@ class PyAvFrameSampler:
                     is_duplicate=False
                 )
 
-                last_phash_val = current_phash_val
-                last_image_arr = cropped_rgb_arr
+                deduper.accept(cropped_rgb_arr, frame_timestamp_sec)
                 frame_counter_idx += 1
                 next_target_sec = frame_timestamp_sec + step_sec
 
@@ -201,22 +208,5 @@ class PyAvFrameSampler:
             clipped_roi.x : clipped_roi.x2
         ].copy()
         return cropped_arr if cropped_arr.size > 0 else None
-
-    @staticmethod
-    def _should_keep_with_hash(
-        image_rgb: np.ndarray,
-        last_hash: int | None,
-        last_image: np.ndarray | None,
-        config: FrameSamplingConfig
-    ) -> bool:
-        """Quyết định giữ lại frame hay không dựa vào độ khác biệt hình ảnh."""
-        if last_hash is None or last_image is None:
-            return True
-
-        current_hash = compute_phash(image_rgb)
-        if hamming_distance(current_hash, last_hash) > config.phash_distance_threshold:
-            return True
-
-        return pixel_diff_ratio(image_rgb, last_image) > config.pixel_diff_threshold
 
 __all__ = ["PyAvFrameSampler"]

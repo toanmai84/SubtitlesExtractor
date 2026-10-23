@@ -226,7 +226,16 @@ class InteractiveImagePreviewLabel(QWidget):
         return self._image_width, self._image_height
 
     def paintEvent(self, event: QPaintEvent) -> None:
+        # [v3.23.650] Ngoại lệ trong lúc vẽ để QPainter còn active → "QBackingStore::endPaint() called with active
+        # painter" rồi SEGFAULT khi huỷ widget. Luôn end() trong finally.
         painter = QPainter(self)
+        try:
+            self._paint_contents(painter)
+        finally:
+            if painter.isActive():
+                painter.end()
+
+    def _paint_contents(self, painter: QPainter) -> None:
         painter.fillRect(self.rect(), QColor("#1a1a1a"))
 
         pm = self._direct_qimage
@@ -237,7 +246,7 @@ class InteractiveImagePreviewLabel(QWidget):
             painter.setPen(QColor("#888888")); painter.setFont(QFont("Segoe UI", 11))
             text = self._fallback_text if (self._current_path or self._direct_qimage) else self._translator.translate("debug.dbg_no_frame")
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, text)
-            painter.end(); return
+            return
 
         w_factor = self.width() / max(1, pm.width())
         h_factor = self.height() / max(1, pm.height())
@@ -270,8 +279,6 @@ class InteractiveImagePreviewLabel(QWidget):
             painter.drawRoundedRect(rect, 4.0, 4.0)
             painter.setPen(QColor("#00FF00"))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
-
-        painter.end()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         delta = event.angleDelta().y() or event.angleDelta().x()
@@ -336,8 +343,10 @@ class InteractiveImagePreviewLabel(QWidget):
             self.reset_view()
 
 class InteractiveOutputImagePreviewLabel(InteractiveImagePreviewLabel):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
+    def __init__(self, translator, parent: QWidget | None = None) -> None:
+        # [v3.23.650] Trước đây `(parent=None)` → `super().__init__(parent)` đẩy parent vào chỗ `translator`: nhãn có
+        # `_translator = None`, paintEvent ném AttributeError khi chưa có ảnh và để QPainter active → segfault.
+        super().__init__(translator, parent)
         self._frame_result: OcrFrameResult | None = None
         self._meta_roi_xywh: list[int] | None = None
 
@@ -508,7 +517,7 @@ class DebugPage(QWidget):
 
         self._tabs_img = QTabWidget()
         self._lbl_img_in = InteractiveImagePreviewLabel(self._translator)
-        self._lbl_img_out = InteractiveOutputImagePreviewLabel()
+        self._lbl_img_out = InteractiveOutputImagePreviewLabel(self._translator)
 
         self._tabs_img.addTab(self._lbl_img_in, self._translator.translate("debug.tab_input"))
         self._tabs_img.addTab(self._lbl_img_out, self._translator.translate("debug.tab_output"))
@@ -539,9 +548,23 @@ class DebugPage(QWidget):
 
         # [V3.30] Bổ sung ComboBox lựa chọn Mô hình (AI Model)
         self._cb_model = ComboBox()
+        # [v3.23.595] Thêm PP-OCRv6 (mặc định của ứng dụng từ PaddleOCR 3.7). Trước
+        # đây combo chỉ có v5/v4: ``findData("PP-OCRv6_medium")`` trả -1 nên trang Gỡ lỗi
+        # hiện "PP-OCRv5 Mobile" trong khi chạy thử bằng PP-OCRv6 của Cài đặt.
+        for key, version in (
+            ("editor.ed_m_medium", "PP-OCRv6_medium"),
+            ("editor.ed_m_small", "PP-OCRv6_small"),
+            ("editor.ed_m_tiny", "PP-OCRv6_tiny"),
+        ):
+            self._cb_model.addItem(self._translator.translate(key), userData=version)
         self._cb_model.addItem("PP-OCRv5 (Mobile) - Nhanh", userData="PP-OCRv5_mobile")
         self._cb_model.addItem(self._translator.translate("debug.dbg_m_server"), userData="PP-OCRv5_server")
         self._cb_model.addItem(self._translator.translate("debug.dbg_m_v4"), userData="PP-OCRv4")
+        # [v3.23.595] Chạy thử luôn dùng model ở trang Cài đặt (view model không đọc
+        # ``model_override``): ô chọn chỉ HIỂN THỊ model đó — để chọn được mà không có tác
+        # dụng là hứa điều không làm.
+        self._cb_model.setEnabled(False)
+        self._cb_model.setToolTip(self._translator.translate("debug.dbg_model_from_settings"))
         form_tuning.addRow(self._translator.translate("debug.dbg_ai_model"), self._cb_model)
 
         self._chk_use_custom_roi = CheckBox(self._translator.translate("debug.dbg_chk_roi"))

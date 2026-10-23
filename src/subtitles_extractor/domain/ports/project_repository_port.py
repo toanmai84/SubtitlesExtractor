@@ -26,6 +26,14 @@ class ProjectRepositoryPort(ABC):
     def list_all(self) -> list[ProjectRecord]:
         """Liệt kê tất cả dự án, mới cập nhật xếp trước."""
 
+    def list_summaries(self) -> list[ProjectRecord]:
+        """[v3.23.643] Như :meth:`list_all` nhưng KHÔNG nạp các cột lớn (phụ đề, dữ liệu OCR, cài đặt).
+
+        Dành cho danh sách trên giao diện; muốn dữ liệu đầy đủ của một dự án thì dùng :meth:`get`.
+        Mặc định rơi về :meth:`list_all` để các hiện thực cũ vẫn chạy đúng.
+        """
+        return self.list_all()
+
     @abstractmethod
     def delete(self, video_hash: str) -> None:
         """Xoá dự án theo hash (không lỗi nếu không tồn tại)."""

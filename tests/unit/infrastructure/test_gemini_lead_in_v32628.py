@@ -41,7 +41,11 @@ _GEMINI_SRC = pathlib.Path(
 
 # ── Gemini nay CÓ lead-in, ở CẢ HAI nhánh ───────────────────────────────────
 def test_gemini_dung_lead_in_dung_chung() -> None:
-    assert "lead_in_seconds" in _GEMINI_SRC
+    # [v3.23.596] Ăn gian đầu nằm trong hàm đặt câu dùng chung với VieNeu.
+    assert _GEMINI_SRC.count("place_line(") >= 2
+    assert "lead_in_seconds(" in pathlib.Path(
+        "src/subtitles_extractor/infrastructure/tts/line_placement.py"
+    ).read_text(encoding="utf-8")
     # Cả hai nhánh (Standard TTS và Native Audio) đều phải áp — bỏ sót một nhánh nghĩa là
     # người dùng vẫn gặp bug tuỳ model họ chọn.
     assert _GEMINI_SRC.count("play_start_sec") >= 4

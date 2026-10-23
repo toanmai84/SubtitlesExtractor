@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "subtitles-extractor"
-version = "3.23.399"
+version = "3.23.651"
 description = "Subtitle Studio — trích xuất, dịch, lồng tiếng và xuất bản phụ đề video (Clean Architecture)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,25 +21,42 @@ classifiers = [
     "Topic :: Text Processing",
 ]
 dependencies = [
+    # [v3.23.619] Đồng bộ với requirements.txt — trước đây thiếu 10 gói ứng dụng import
+    # (av, rapidfuzz, google-genai, scipy, librosa…) nên `pip install .` ra bản thiếu chức
+    # năng. Gói GPL (edge-tts, pedalboard, whisperx…) CỐ Ý không có ở đây — xem
+    # docs/LICENSE_ANALYSIS.md và requirements-gpu.txt.
     # GUI
     "PySide6>=6.6",  # LGPL v3 — an toàn thương mại (thay PyQt6 GPL)
     # OCR
-    "paddlepaddle>=2.6",
-    "paddleocr>=2.9",
-    # Video / Image
+    "paddlepaddle>=3.0",
+    # [v3.23.595] PP-OCRv6 (model mặc định) chỉ có từ PaddleOCR 3.7.0.
+    "paddleocr>=3.7.0",
+    # Video / ảnh / âm thanh
+    "python-mpv>=1.0",
     "opencv-python>=4.9",
     "numpy>=1.24",
     "soundfile>=0.12",
+    "Pillow>=10.0",  # giải mã phụ đề ảnh PGS/VobSub
+    "av>=12.0",
+    "scipy>=1.11",
+    "librosa>=0.10",  # time-stretch giữ cao độ (ISC, thay pedalboard GPL)
+    "pydub>=0.25",
+    "pyloudnorm>=0.1",
     # Settings
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
     # Logging (v2.29) — Plug & Play, thread-safe, auto color
     "loguru>=0.7.0",
-    # Tách từ tiếng Trung cho STT (v3.23) — rjieba (bản Rust, nhanh, có fallback)
-    "rjieba>=0.1.11",
-    # Sửa JSON hỏng từ LLM (v3.23.143) — thuần Python, zero phụ thuộc bắt buộc; xử lý
-    # thiếu phẩy/ngoặc/nháy, cắt cụt, prose thừa... mạnh hơn bộ vá nội bộ.
+    # Văn bản
+    "rapidfuzz>=3.0",
+    "charset-normalizer>=3.0",  # thay chardet LGPL
+    "rjieba>=0.1.11",  # tách từ tiếng Trung cho STT
+    # Dịch / TTS Gemini
+    "google-genai>=2.29,<3",
+    # Sửa JSON hỏng từ LLM (v3.23.143)
     "json-repair>=0.39",
+    # [v3.23.607] Dữ liệu múi giờ cho zoneinfo trên Windows (mốc đổi ngày hạn mức Gemini).
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
@@ -68,7 +85,7 @@ subtitles-extractor-gui = "main:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"subtitles_extractor" = ["data/*.json"]
+"subtitles_extractor" = ["data/*.json", "data/*.txt"]
 
 # ── Code quality ──────────────────────────────────────────────────────────
 

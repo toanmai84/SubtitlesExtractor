@@ -26,6 +26,11 @@ from pathlib import Path
 
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
 from subtitles_extractor.domain.exceptions import SubtitleExportError
+from subtitles_extractor.infrastructure.tts.emotion_cues import strip_emotion_cues
+from subtitles_extractor.application.services.bidi_marks import mark_rtl_lines
+from subtitles_extractor.application.services.subtitle_line_wrapper import (
+    wrap_subtitle_line,
+)
 from subtitles_extractor.infrastructure.subtitle.atomic_save import (
     atomic_write_text,
 )
@@ -54,17 +59,26 @@ class SrtExporter:
         return output_path.resolve()
 
     @staticmethod
-    def _build_content(events: Sequence[SubtitleEvent]) -> str:
+    def _build_content(
+        events: Sequence[SubtitleEvent], max_chars_per_line: int = 42
+    ) -> str:
         """Tạo nội dung SRT.
 
         Dùng ``event.index`` thay vì counter vòng lặp để đảm bảo số thứ tự
         khớp với những gì user thấy trong editor sau khi xoá/chèn câu.
+
+        [v3.23.441] Ngắt dòng dài (>``max_chars_per_line``) thành 2 dòng CÂN ĐỐI tại điểm
+        tự nhiên (0 = tắt) — tránh player tự wrap tùy tiện giữa cụm từ.
         """
         blocks: list[str] = []
         for event in events:
             start = _format_srt_timestamp(event.interval.start_ms())
             end = _format_srt_timestamp(event.interval.end_ms())
             text = _normalize_text(event.text)
+            if max_chars_per_line > 0:
+                text = wrap_subtitle_line(text, max_chars_per_line)
+            # [v3.23.610] Dòng chữ phải-sang-trái: bọc dấu định hướng để dấu câu đúng chỗ.
+            text = mark_rtl_lines(text)
             blocks.append(f"{event.index}\n{start} --> {end}\n{text}\n")
         return "\n".join(blocks)
 
@@ -102,6 +116,9 @@ def _normalize_text(text: str) -> str:
     cleaned = cleaned.replace(_BRACE_OPEN_PH, "{").replace(_BRACE_CLOSE_PH, "}")
     # Bước 4: Strip HTML tags
     cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    # [v3.23.447] Bỏ tag cảm xúc VieNeu ([cười]/[thở dài]/[hắng giọng]) khỏi PHỤ ĐỀ — chúng chỉ
+    # dành cho giọng đọc TTS, người xem không nên thấy. (TTS giữ tag qua đường prep riêng.)
+    cleaned = strip_emotion_cues(cleaned)
     # Bước 5: ASS / soft newline → real newline
     cleaned = cleaned.replace(r"\N", "\n").replace(r"\n", "\n")
     return cleaned.strip()

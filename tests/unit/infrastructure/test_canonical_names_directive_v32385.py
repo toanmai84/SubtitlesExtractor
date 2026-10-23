@@ -22,14 +22,21 @@ def test_empty_roster_returns_empty() -> None:
 
 
 def test_lists_canonical_vietnamese_names() -> None:
+    """[v3.23.546] Chỉ thị nay là BẢNG QUY ĐỔI, có CẢ HAI vế tên.
+
+    Thiết kế đổi ở v3.23.491 và có lý do cụ thể: nhãn ``speaker``/``addressee`` kèm mỗi dòng phụ đề
+    được ghi bằng TÊN GỐC, nên nếu chỉ đưa danh sách tên tiếng đích thì model không tra ngược được
+    ai là ai. Bảng quy đổi ``tên gốc → tên đích`` giải quyết đúng chỗ đó, nên việc tên gốc xuất
+    hiện trong chỉ thị là CỐ Ý, không phải lỗi.
+    """
     out = G._canonical_names_directive(_ROSTER)
-    assert "DANH SÁCH TÊN CHUẨN:" in out
     assert "Hứa Phượng Niên" in out
     assert "Hoàng đế" in out
     assert "Thái hậu" in out
-    # KHÔNG được chèn nguyên ký tự CJK alias vào danh sách tên chuẩn.
-    assert "许凤年" not in out
-    assert "皇帝" not in out
+    # Tên GỐC phải có mặt để tra ngược từ nhãn người nói.
+    assert "许凤年" in out
+    # Và phải nêu rõ yêu cầu dùng nhất quán tên tiếng đích.
+    assert "BẮT BUỘC NHẤT QUÁN" in out
 
 
 def test_directive_has_consistency_instruction() -> None:
@@ -38,10 +45,10 @@ def test_directive_has_consistency_instruction() -> None:
 
 
 def test_legacy_cjk_first_format_extracts_vietnamese() -> None:
-    # Định dạng "CJK (Việt)" vẫn lấy đúng phần Việt làm tên chuẩn.
+    """Định dạng "CJK (Việt)" vẫn lấy đúng phần Việt, và giữ tên gốc để tra ngược."""
     out = G._canonical_names_directive("林昆 (Lâm Côn): vai phụ")
     assert "Lâm Côn" in out
-    assert "林昆" not in out
+    assert "林昆" in out  # [v3.23.546] vế trái của bảng quy đổi
 
 
 def test_names_deduplicated() -> None:

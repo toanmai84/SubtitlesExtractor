@@ -19,6 +19,7 @@ from subtitles_extractor.domain.exceptions import (
     VideoNotFoundError,
 )
 from subtitles_extractor.domain.ports.frame_sampler_port import (
+    SAMPLE_TIME_TOLERANCE_SEC,
     FrameSamplingConfig,
     SampledFrame,
 )
@@ -30,6 +31,9 @@ from subtitles_extractor.infrastructure.video.perceptual_hash import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Dung sai so mốc ``CAP_PROP_POS_MSEC`` (ms) — xem ``is_sample_due``.
+_POS_TOLERANCE_MS = SAMPLE_TIME_TOLERANCE_SEC * 1000.0
 
 # Ngưỡng (ms) để quyết định dùng grab() (nhanh) thay vì set() (chậm do phải tìm Keyframe)
 _SMART_GRAB_THRESHOLD_MS: float = 1200.0
@@ -86,8 +90,12 @@ class OpenCvFrameSampler:
 
             # Thuật toán Smart Seek-or-Grab
             if current_pos_ms >= 0 and 0 < timestamp_ms - current_pos_ms <= _SMART_GRAB_THRESHOLD_MS:
-                # Nếu khoảng cách gần, grab() cày lướt bỏ qua frame cho đến khi đạt mục tiêu
-                while current_pos_ms < timestamp_ms:
+                # Nếu khoảng cách gần, grab() cày lướt bỏ qua frame cho tới mục tiêu.
+                # [v3.23.615] So có dung sai: POS_MSEC của khung đúng mốc có thể hụt
+                # mục tiêu một phần tỉ ms (32.11999 < 32.12) → grab thêm một khung, bỏ
+                # mất khung đó rồi lần sau lấy lại khung kế (trùng mốc). Video thật
+                # 14/10: 22 lần.
+                while current_pos_ms + _POS_TOLERANCE_MS < timestamp_ms:
                     if not capture.grab():
                         break
                     current_pos_ms = capture.get(cv2.CAP_PROP_POS_MSEC)

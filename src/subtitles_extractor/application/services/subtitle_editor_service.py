@@ -10,6 +10,7 @@ BẢN CẬP NHẬT v3.42 (THE "QUANTUM" POLISH):
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections import deque
 from collections.abc import Sequence
@@ -223,6 +224,10 @@ class SubtitleEditorService:
 
             if index + 1 < len(self._events):
                 next_event = self._events[index + 1]
+                # [v3.23.650] Khe giữa hai câu < 0.05s: start mặc định (kết thúc câu trước + 0.05) vượt start câu
+                # sau làm danh sách mất thứ tự theo thời gian → bisect/duyệt-cặp-kề cho kết quả sai. Kẹp lại.
+                start_sec = min(start_sec, next_event.start_sec)
+                end_sec = start_sec + desired_duration
                 # [No-Domino Shift] TUYỆT ĐỐI không đẩy lùi các câu phía sau (phá
                 # lipsync toàn phim). Kẹp câu mới lọt thỏm trong khe hở: tối đa là
                 # mép câu kế (trừ 0.01s), tối thiểu 0.15s để vẫn hợp lệ.
@@ -394,6 +399,8 @@ class SubtitleEditorService:
         return self.snapshot_state()
 
     def shift_all(self, offset_sec: float) -> EditorState:
+        if not math.isfinite(offset_sec):
+            raise ConfigurationError(f"Offset phải là số hữu hạn, nhận được {offset_sec}.")
         if not self._events:
             return self.snapshot_state()
         for event in self._events:

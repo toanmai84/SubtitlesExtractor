@@ -1,9 +1,5 @@
-# Binary native lớn trong vendor/ — không đưa vào git (chép thủ công khi build).
-# Giữ lại README + cấu trúc thư mục.
-vendor/**/*.dll
-vendor/**/*.exe
-vendor/**/*.so
-vendor/**/*.dylib
+# Bundled runtime and third-party dependencies — copy manually when building.
+vendor/
 
 # Model tải về trong models/ — không đưa vào git (chạy tools/prefetch_*.py để tải lại).
 # Giữ lại README + cấu trúc thư mục.
@@ -16,6 +12,7 @@ models/**
 build_cache/
 build/
 dist/
+build_env/
 *.spec.bak
 
 # Python / virtual environments
@@ -47,8 +44,3 @@ Thumbs.db
 # Logs
 *.log
 logs/
-
-# Local packaging / installers
-*.zip
-*.tar.gz
-*.7z

@@ -62,4 +62,83 @@ def popen_hidden(command: list[str], **kwargs: Any) -> subprocess.Popen[Any]:
     return subprocess.Popen(command, **no_window_kwargs(), **kwargs)
 
 
-__all__ = ["no_window_kwargs", "popen_hidden", "run_hidden"]
+def _kill_process_tree(proc: "subprocess.Popen[Any]") -> None:
+    """[v3.23.461] Kết liễu CHẮC CHẮN tiến trình con (và con cháu). Trên Windows, ffmpeg treo
+    trong lời gọi driver GPU có thể KHÔNG chết bằng ``TerminateProcess`` đơn lẻ → dùng
+    ``taskkill /F /T`` (force + cây tiến trình). Nền khác: ``kill()``."""
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                creationflags=_CREATE_NO_WINDOW,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def run_ffmpeg_hardened(
+    command: list[str], timeout: float, check: bool = True
+) -> subprocess.CompletedProcess[Any]:
+    """[v3.23.461] Chạy ffmpeg CHỐNG TREO tối đa cho app GUI.
+
+    Ba lớp chống treo:
+    1. ``stdin=DEVNULL`` — ffmpeg nhận EOF ngay, KHÔNG kẹt chờ nhập (kết hợp cờ ``-nostdin``).
+    2. ``communicate(timeout)`` — rút CẢ stdout/stderr song song (không deadlock buffer) + có
+       hạn giờ.
+    3. Khi timeout → ``taskkill /F /T`` kết liễu CHẮC CHẮN (kể cả ffmpeg kẹt trong driver GPU),
+       KHÔNG để app chờ vô hạn / bắt người dùng tự kill ffmpeg.
+
+    Args:
+        command: Lệnh ffmpeg (nên có sẵn ``-nostdin``).
+        timeout: Hạn giờ (giây) — quá thì kill cứng.
+        check: True → ném ``CalledProcessError`` khi mã thoát ≠ 0 (như ``subprocess.run``).
+
+    Returns:
+        ``CompletedProcess`` (stdout/stderr là bytes).
+
+    Raises:
+        subprocess.TimeoutExpired: Nếu quá hạn (đã kill tiến trình).
+        subprocess.CalledProcessError: Nếu ``check`` và mã thoát ≠ 0.
+    """
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **no_window_kwargs(),
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        # Rút nốt output còn lại sau khi kill (có hạn giờ để chính bước dọn KHÔNG treo).
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            stdout, stderr = b"", b""
+        raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
+    if check and proc.returncode:
+        raise subprocess.CalledProcessError(
+            proc.returncode, command, output=stdout, stderr=stderr
+        )
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+
+
+__all__ = [
+    "no_window_kwargs",
+    "popen_hidden",
+    "run_hidden",
+    "run_ffmpeg_hardened",
+]

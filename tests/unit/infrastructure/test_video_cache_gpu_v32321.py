@@ -8,6 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from subtitles_extractor.domain.ports.video_context_port import VideoChunk
+from subtitles_extractor.infrastructure.translation import (
+    gemini_video_context as gvc,
+)
 from subtitles_extractor.infrastructure.translation.gemini_video_context import (
     GeminiVideoContextProvider,
     RemoteVideoRef,
@@ -87,9 +90,14 @@ class TestNvencEncoding:
         provider._nvenc_available = True
         chunk = VideoChunk(0, tmp_path / "o.mp4", 0.0, 100.0, False)
         cmds = provider._build_encode_commands("ffmpeg", Path("s.mkv"), chunk, tmp_path / "t.mp4")
-        # [v3.23.159] 5 cấp: GPU hoàn toàn → GPU qua upload → GPU giải mã+scale CPU
-        # → NVENC-only → CPU.
-        assert len(cmds) == 5
+        # [v3.23.538] Cập nhật theo thiết kế HIỆN TẠI. Từ v3.23.471 có thêm các cấp GIẢI MÃ phần
+        # cứng cho nhánh mã hoá CPU, nên chuỗi dự phòng dài hơn bản 5 cấp của v3.23.159:
+        #   0-1: GPU hoàn toàn (hwaccel cuda + scale_cuda + nvenc)
+        #   2:   GPU giải mã + scale CPU + nvenc
+        #   3:   NVENC-only (không hwaccel)
+        #   4:   giải mã phần cứng + mã hoá CPU (libx264)
+        #   5-6: CPU hoàn toàn
+        assert len(cmds) == 7
         # Cấp 1: GPU hoàn toàn (hwaccel cuda + scale_cuda + nvenc).
         assert cmds[0][0] is True
         assert "-hwaccel" in cmds[0][1] and "cuda" in cmds[0][1]
@@ -105,15 +113,24 @@ class TestNvencEncoding:
         # Cấp 2: NVENC-only (không hwaccel).
         assert cmds[3][0] is True and "h264_nvenc" in cmds[3][1]
         assert "-hwaccel" not in cmds[3][1]
-        # Cấp 3: CPU.
+        # Cấp 3: giải mã phần cứng nhưng mã hoá CPU — cứu các video mà NVENC hỏng.
         assert cmds[4][0] is False and "libx264" in cmds[4][1]
+        assert "-hwaccel" in cmds[4][1]
+        # Cấp cuối: CPU hoàn toàn, không phụ thuộc phần cứng.
+        assert cmds[-1][0] is False and "libx264" in cmds[-1][1]
+        assert "-hwaccel" not in cmds[-1][1]
 
     def test_build_commands_cpu_only(self, provider, tmp_path) -> None:
         provider._nvenc_available = False
         chunk = VideoChunk(0, tmp_path / "o.mp4", 0.0, 100.0, False)
         cmds = provider._build_encode_commands("ffmpeg", Path("s.mkv"), chunk, tmp_path / "t.mp4")
-        assert len(cmds) == 1
-        assert cmds[0][0] is False
+        # [v3.23.538] Không có NVENC thì mọi cấp đều mã hoá CPU, nhưng vẫn thử GIẢI MÃ phần cứng
+        # trước (nhanh hơn nhiều với H264/HEVC) rồi mới hạ dần về CPU hoàn toàn.
+        assert len(cmds) == 3
+        assert all(is_gpu is False for is_gpu, _ in cmds)
+        assert all("libx264" in command for _, command in cmds)
+        assert "-hwaccel" in cmds[0][1]
+        assert "-hwaccel" not in cmds[-1][1]
 
 
 class TestEncodeModeLabel:
@@ -149,7 +166,7 @@ class TestGpuHangFix:
 
         calls = {"n": 0}
 
-        def fake_run(cmd, **kwargs):
+        def fake_run(cmd, **kwargs):  # chữ ký của run_ffmpeg_hardened
             calls["n"] += 1
             is_gpu = "h264_nvenc" in cmd
             if is_gpu:
@@ -159,7 +176,12 @@ class TestGpuHangFix:
             out.write_bytes(b"x" * 2048)
             return sp.CompletedProcess(cmd, 0)
 
-        monkeypatch.setattr(sp, "run", fake_run)
+        # [v3.23.543] Giả lập nốt bước xác nhận KHUNG HÌNH bằng ffprobe — tệp giả không qua được.
+        monkeypatch.setattr(
+            gvc.GeminiVideoContextProvider, "_output_has_video_frames",
+            lambda self, ffmpeg, path: True,
+        )
+        monkeypatch.setattr(gvc, "run_ffmpeg_hardened", fake_run)
         # Không raise = thành công fallback.
         provider._encode_low_res_chunk("ffmpeg", Path("s.mkv"), chunk)
         # GPU bị tắt sau khi mọi lệnh GPU treo.
@@ -193,7 +215,7 @@ class TestGpuPartialFallback:
         provider._nvenc_available = True
         chunk = VideoChunk(0, tmp_path / "o.mp4", 0.0, 816.0, False)
 
-        def fake_run(cmd, **kwargs):
+        def fake_run(cmd, **kwargs):  # chữ ký của run_ffmpeg_hardened
             is_scale_cuda = any("scale_cuda" in str(x) for x in cmd)
             if is_scale_cuda:
                 raise sp.CalledProcessError(-40, cmd)  # cấp 1 crash
@@ -201,7 +223,16 @@ class TestGpuPartialFallback:
             Path(cmd[-1]).write_bytes(b"x" * 2048)
             return sp.CompletedProcess(cmd, 0)
 
-        monkeypatch.setattr(sp, "run", fake_run)
+        # [v3.23.538] Giả lập ĐÚNG điểm nối: module gọi ``run_ffmpeg_hardened`` (dùng Popen +
+        # communicate), nên vá ``subprocess.run`` không chặn được và ffmpeg THẬT sẽ chạy.
+        # [v3.23.543] Sau khi ffmpeg chạy, code còn xác nhận tệp có KHUNG HÌNH thật bằng ffprobe.
+        # Tệp giả 2048 byte không qua được bước đó nên mọi cấp đều bị coi là thất bại — phải giả
+        # lập nốt, nếu không test đo nhầm cơ chế dự phòng.
+        monkeypatch.setattr(
+            gvc.GeminiVideoContextProvider, "_output_has_video_frames",
+            lambda self, ffmpeg, path: True,
+        )
+        monkeypatch.setattr(gvc, "run_ffmpeg_hardened", fake_run)
         provider._encode_low_res_chunk("ffmpeg", Path("s.mkv"), chunk)
         # NVENC vẫn dùng được (cấp 2) → KHÔNG bị tắt.
         assert provider._nvenc_available is True
@@ -212,13 +243,22 @@ class TestGpuPartialFallback:
         provider._nvenc_available = True
         chunk = VideoChunk(0, tmp_path / "o.mp4", 0.0, 816.0, False)
 
-        def fake_run(cmd, **kwargs):
+        def fake_run(cmd, **kwargs):  # chữ ký của run_ffmpeg_hardened
             is_nvenc = "h264_nvenc" in cmd
             if is_nvenc:
                 raise sp.CalledProcessError(-40, cmd)  # mọi GPU lỗi
             Path(cmd[-1]).write_bytes(b"x" * 2048)  # CPU OK
             return sp.CompletedProcess(cmd, 0)
 
-        monkeypatch.setattr(sp, "run", fake_run)
+        # [v3.23.538] Giả lập ĐÚNG điểm nối: module gọi ``run_ffmpeg_hardened`` (dùng Popen +
+        # communicate), nên vá ``subprocess.run`` không chặn được và ffmpeg THẬT sẽ chạy.
+        # [v3.23.543] Sau khi ffmpeg chạy, code còn xác nhận tệp có KHUNG HÌNH thật bằng ffprobe.
+        # Tệp giả 2048 byte không qua được bước đó nên mọi cấp đều bị coi là thất bại — phải giả
+        # lập nốt, nếu không test đo nhầm cơ chế dự phòng.
+        monkeypatch.setattr(
+            gvc.GeminiVideoContextProvider, "_output_has_video_frames",
+            lambda self, ffmpeg, path: True,
+        )
+        monkeypatch.setattr(gvc, "run_ffmpeg_hardened", fake_run)
         provider._encode_low_res_chunk("ffmpeg", Path("s.mkv"), chunk)
         assert provider._nvenc_available is False

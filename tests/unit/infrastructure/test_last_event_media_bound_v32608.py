@@ -96,4 +96,8 @@ def test_gemini_sources_use_media_as_last_boundary() -> None:
     source = pathlib.Path(
         "src/subtitles_extractor/infrastructure/tts/gemini_tts_adapter.py"
     ).read_text(encoding="utf-8")
-    assert source.count('else getattr(request, "media_duration_s", None)') >= 2
+    # [v3.23.596] Biên câu cuối nằm trong ``line_context`` dùng chung, cả hai đường gọi.
+    assert source.count("line_context(request, idx, prev_audio_end)") >= 2
+    assert 'getattr(request, "media_duration_s", None)' in pathlib.Path(
+        "src/subtitles_extractor/infrastructure/tts/line_placement.py"
+    ).read_text(encoding="utf-8")

@@ -15,7 +15,6 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from loguru import logger
 from PySide6.QtCore import Qt, QThread, QTimer, Signal, QObject, QEvent
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QImage, QKeyEvent
 from PySide6.QtWidgets import (
@@ -45,6 +44,7 @@ from subtitles_extractor.presentation.fluent_compat import (
     ToolButton,
     themeColor,
 )
+from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
 
 from subtitles_extractor.application.dtos.extract_subtitles_dto import (
     ExtractSubtitlesResponse,
@@ -103,6 +103,7 @@ class ExtractPage(QWidget):
     def __init__(self, container: ApplicationContainer, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("extractPage")
+        self._thread_keeper = WorkerThreadKeeper(self)
         self.setAcceptDrops(True)
 
         self._container = container
@@ -343,6 +344,10 @@ class ExtractPage(QWidget):
             self._translator.translate("extract.ex_tt_probe")
         )
         self._probe_button.clicked.connect(self._on_probe_clicked)
+        # [v3.23.645] Đo A/B tốc độ OCR ngay trong ứng dụng (thay cho script cmd của v3.23.644).
+        self._bench_button = PushButton(self._translator.translate("extract.ex_btn_bench"))
+        self._bench_button.setToolTip(self._translator.translate("extract.ex_tt_bench"))
+        self._bench_button.clicked.connect(self._on_bench_clicked)
         self._start_button = PrimaryPushButton(self._translator.translate("extract.btn_start"))
         self._start_button.setEnabled(False)
         self._start_button.setToolTip(
@@ -353,6 +358,7 @@ class ExtractPage(QWidget):
         inner.addWidget(self._rebuild_button)
         inner.addWidget(self._cb_probe_position)
         inner.addWidget(self._probe_button)
+        inner.addWidget(self._bench_button)
         inner.addWidget(self._start_button)
         inner.addStretch(1)
         return tab
@@ -887,8 +893,12 @@ class ExtractPage(QWidget):
         from subtitles_extractor.presentation.workers.install_whisperx_worker import (
             InstallWhisperXWorker,
         )
+        from subtitles_extractor.infrastructure.stt.whisperx_installer import (
+            whisperx_env_root,
+        )
 
-        project_root = Path(__file__).resolve().parents[4]
+        # [v3.23.403] Cài whisperx_env CẠNH exe (bền, portable) — không vào %TEMP% nữa.
+        project_root = whisperx_env_root()
         self._btn_install_stt.setEnabled(False)
         self._stt_install_progress.setValue(0)
         self._stt_install_progress.setVisible(True)
@@ -915,7 +925,9 @@ class ExtractPage(QWidget):
 
     def _on_install_progress(self, percent: int, label: str) -> None:
         self._stt_install_progress.setValue(percent)
-        self._lbl_stt_hint.setText(self._translator.translate("extract.st_installing").replace("{{label}}", str(label)))
+        self._lbl_stt_hint.setText(
+            self._translator.translate("extract.st_installing", label=label)
+        )
 
     def _on_install_finished(self, env_python: str) -> None:
         """Cài xong: làm mới trạng thái để dùng được NGAY, không cần mở lại app."""
@@ -927,14 +939,19 @@ class ExtractPage(QWidget):
         self._refresh_stt_state()
         QMessageBox.information(
             self, self._translator.translate("extract.dlg_wxdone_title"),
-            self._translator.translate("extract.dlg_wxdone_body").replace("{env}", str(env_python)),
+            self._translator.translate("extract.dlg_wxdone_body", env=env_python),
         )
 
     def _on_install_failed(self, message: str) -> None:
         from PySide6.QtWidgets import QMessageBox
 
-        self._lbl_stt_hint.setText(self._translator.translate("extract.st_install_failed").replace("{{msg}}", str(message.splitlines()[0])))
-        QMessageBox.warning(self, self._translator.translate("extract.dlg_wxfailed_title"), message)
+        first_line = next(iter(message.splitlines()), "")
+        self._lbl_stt_hint.setText(
+            self._translator.translate("extract.st_install_failed", msg=first_line)
+        )
+        QMessageBox.warning(
+            self, self._translator.translate("extract.dlg_wxfailed_title"), message
+        )
 
     def _cleanup_install_thread(self) -> None:
         """Dừng và xoá luồng cài (kể cả khi lỗi)."""
@@ -957,12 +974,18 @@ class ExtractPage(QWidget):
             return
         if available:
             self._lbl_stt_hint.setText(
-                "Phiên âm toàn bộ giọng nói trong video thành phụ đề."
+                self._translator.translate("extract.st_transcribe_hint")
             )
         else:
             self._lbl_stt_hint.setText(self._view_model.get_stt_diagnosis_hint())
         self._btn_install_stt.setVisible(not available)
-        self._update_action_states()
+        # [v3.23.613] Trước đây gọi _update_action_states() (không tồn tại) → cài WhisperX
+        # xong nút Phiên âm vẫn tắt và hộp thoại "đã sẵn sàng" không hiện.
+        self._btn_transcribe.setEnabled(
+            available
+            and self._view_model.video is not None
+            and not self._view_model.is_busy
+        )
 
     def _on_probe_clicked(self) -> None:
         """Chạy thử nhanh: bó OCR vào một đoạn ngắn rồi hiện kết quả để đối chiếu."""
@@ -975,6 +998,26 @@ class ExtractPage(QWidget):
         self._view_model.start_probe_extraction(
             center_ratio=float(ratio) if ratio is not None else 0.5
         )
+
+    def _on_bench_clicked(self) -> None:
+        """[v3.23.645] Mở hộp thoại đo A/B tốc độ OCR (cần video đã mở; ROI/cài đặt lấy từ trang)."""
+        if self._view_model.video is None:
+            from PySide6.QtWidgets import QMessageBox
+
+            QMessageBox.information(
+                self, self._translator.translate("bench.title"), self._translator.translate("bench.cannot_start"),
+            )
+            return
+        if not self._run_preflight():
+            return
+        from subtitles_extractor.presentation.widgets.ocr_benchmark_dialog import OcrBenchmarkDialog
+
+        self._canvas.pause()
+        dialog = OcrBenchmarkDialog(self._view_model, self._translator, self)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()      # nếu không, mỗi lần mở để lại một hộp thoại ẩn còn nối 3 tín hiệu của VM
 
     def _show_probe_result(self, response: ExtractSubtitlesResponse) -> None:
         """Hiện tóm tắt kết quả thử nhanh (không chuyển tab, không lưu tệp)."""
@@ -1063,9 +1106,8 @@ class ExtractPage(QWidget):
         worker = ConcatVideoWorker(videos, output_path, 0.0, reencode=reencode)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progress.connect(
-            lambda p: self._set_status(self._translator.translate("extract.ss_concat_prog").replace("{p}", str(p)))
-        )
+        # [v3.23.650] Slot của trang (luồng GUI) thay cho lambda (chạy ở luồng worker, đụng QLabel sai luồng).
+        worker.progress.connect(self._on_concat_progress)
         worker.finished.connect(self._on_concat_finished)
         worker.failed.connect(self._on_concat_failed)
         worker.done.connect(
@@ -1074,6 +1116,9 @@ class ExtractPage(QWidget):
         self._concat_thread = thread
         self._concat_worker = worker
         thread.start()
+
+    def _on_concat_progress(self, p: int) -> None:
+        self._set_status(self._translator.translate("extract.ss_concat_prog").replace("{p}", str(p)))
 
     def _on_concat_finished(self, output: object) -> None:
         out_path = Path(str(output))
@@ -1201,6 +1246,11 @@ class ExtractPage(QWidget):
         item = getattr(self, "_pending_batch_item", None)
         if item is None:
             return
+        if self._view_model.is_busy:
+            # [v3.23.613] Luồng tập trước chưa báo thoát: start_extraction sẽ thoát im
+            # lặng trong khi tập đã bị gỡ khỏi hàng chờ → hàng đợi đứng yên. Thử lại sau.
+            QTimer.singleShot(250, self._start_batch_item_extraction)
+            return
         self._pending_batch_item = None
         if item.roi is not None:
             self._view_model.set_roi(item.roi)
@@ -1230,8 +1280,11 @@ class ExtractPage(QWidget):
         total = len(self._batch_queue)
         failures = list(self._batch_failures)
         cancelled = getattr(self, "_batch_cancelled", False)
-        processed = self._batch_index + (0 if cancelled else 0)
-        skipped = max(0, total - processed - (0 if cancelled else 0)) if cancelled else 0
+        # [v3.23.434] Bỏ biểu thức chết '(0 if cancelled else 0)' (LUÔN = 0, gây khó hiểu, bị
+        # ruff RUF034 gắn cờ). processed = số mục đã xong; khi huỷ giữa chừng, mục đang dở +
+        # các mục sau = skipped.
+        processed = self._batch_index
+        skipped = max(0, total - processed) if cancelled else 0
         self._batch_queue = []
         self._batch_index = 0
         self._batch_failures = []
@@ -1271,10 +1324,17 @@ class ExtractPage(QWidget):
             self._load_video(Path(path_str))
 
     def _load_video(self, path: Path) -> None:
+        # [v3.23.650] Đang trích xuất mà nạp video khác: `vm._video` bị thay giữa chừng → phụ đề của video A lưu vào
+        # DB/dự án của video B và Editor nhận video B kèm chữ của A. Không cho nạp khi đang bận.
+        if self._view_model.is_busy:
+            self._set_status(self._translator.translate("extract.ss_busy_cannot_load"))
+            return
         self._pending_video_path = path
         self._view_model.load_video(path)
 
     def _on_start_clicked(self) -> None:
+        if self._view_model.is_busy:
+            return  # [v3.23.650] nút có thể bật lại bởi _on_video_loaded; bấm lúc bận từng xoá hàng đợi/cờ của lượt đang chạy
         if self._view_model.video is None or not self._run_preflight():
             return
 
@@ -1301,8 +1361,8 @@ class ExtractPage(QWidget):
         self._is_cancelled_by_user = False
         # [v3.23.319] Hàng đợi trích xuất hàng loạt.
         self._is_probing: bool = False
-        self._stt_install_thread = None
-        self._stt_install_worker = None
+        # [v3.23.650] KHÔNG đặt lại _stt_install_thread/_worker ở đây: cài WhisperX không đặt trạng thái bận nên Start còn
+        # bấm được; bỏ tham chiếu làm luồng cài thành mồ côi và cho phép cài lần hai song song (2 pip cùng môi trường).
         self._batch_queue: list = []
         self._batch_cancelled: bool = False
         self._batch_index: int = 0
@@ -1495,14 +1555,21 @@ class ExtractPage(QWidget):
         if self._pending_video_path is None:
             return
         thread = QThread(self)
-        worker = SeekWorker(self._pending_video_path, timestamp_sec, reader=self._video_reader, sequential=False)
+        worker = SeekWorker(
+            self._pending_video_path, timestamp_sec,
+            reader=self._video_reader, sequential=False,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.frame_ready.connect(self._on_seek_frame_ready)
-        worker.failed.connect(lambda msg: logger.debug("Seek thất bại: {}.", msg))
+        worker.failed.connect(lambda msg: logger.debug("Seek thất bại: %s.", msg))
         worker.frame_ready.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
+        # [v3.23.613] Một chủ sở hữu duy nhất cho worker (xem thread_keeper): KHÔNG gắn
+        # worker.deleteLater vào thread.finished — Qt xoá trong luồng nền song song với
+        # Python xoá ở luồng giao diện làm xoá hai lần, sập ứng dụng.
+        # Đo: tua liên tục 400 lần sập 4/5 lần chạy trước khi sửa.
+        self._thread_keeper.keep(thread, worker)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_seek_thread_finished)
 
@@ -1525,8 +1592,11 @@ class ExtractPage(QWidget):
         self._canvas.set_video_size(w, h)
         if self._canvas.player() is None:
             self._canvas.set_frame(img, w, h)
-        if self.current_roi:
-            self._canvas.set_committed_roi(self.current_roi)
+        # [v3.23.613] Vùng ROI đã chốt nằm ở view model (thuộc tính current_roi không
+        # tồn tại → tua video xong khung ROI không được vẽ lại).
+        committed_roi = self._view_model.roi
+        if committed_roi is not None:
+            self._canvas.set_committed_roi(committed_roi)
 
     def _on_video_loaded(self, metadata: VideoMetadata) -> None:
         # [v3.23.319] Đang chạy hàng loạt: nạp xong là chạy ngay tập này.
@@ -1544,9 +1614,10 @@ class ExtractPage(QWidget):
             )
             self._video_label.setStyleSheet(f"color: {_c.on_surface()};")
 
-        if hasattr(self, '_start_button'): self._start_button.setEnabled(True)
-        if hasattr(self, '_detect_hardsub_button'): self._detect_hardsub_button.setEnabled(True)
-        if hasattr(self, '_detect_roi_button'): self._detect_roi_button.setEnabled(True)
+        busy = self._view_model.is_busy  # [v3.23.650] đang bận thì KHÔNG bật lại các nút bắt đầu
+        if hasattr(self, '_start_button'): self._start_button.setEnabled(not busy)
+        if hasattr(self, '_detect_hardsub_button'): self._detect_hardsub_button.setEnabled(not busy)
+        if hasattr(self, '_detect_roi_button'): self._detect_roi_button.setEnabled(not busy)
         if hasattr(self, '_btn_export_raw'): self._btn_export_raw.setVisible(True)
         # [v3.21] Cho phép quét phụ đề nhúng; reset combo của video cũ.
         if hasattr(self, '_btn_scan_embedded'):
@@ -1671,6 +1742,7 @@ class ExtractPage(QWidget):
         if hasattr(self, '_select_button'): self._select_button.setEnabled(not busy)
         if hasattr(self, '_batch_button'): self._batch_button.setEnabled(not busy)
         if hasattr(self, '_probe_button'): self._probe_button.setEnabled(not busy)
+        if hasattr(self, '_bench_button'): self._bench_button.setEnabled(not busy)
         if hasattr(self, '_cb_main_ocr_language'): self._cb_main_ocr_language.setEnabled(not busy)
         if hasattr(self, '_cb_probe_position'): self._cb_probe_position.setEnabled(not busy)
         if hasattr(self, '_rebuild_button'): self._rebuild_button.setEnabled((not busy) and self._view_model.has_cached_ocr())
@@ -1878,7 +1950,7 @@ class ExtractPage(QWidget):
         kind = "OCR ảnh phụ đề" if getattr(track, "is_bitmap", False) else "trích phụ đề văn bản"
         if hasattr(self, '_status_label'):
             self._status_label.setStyleSheet(f"color: {_c.info()};")
-            self._status_label.setText(self._translator.translate("extract.st_extracting_embedded").replace("{{kind}}", str(kind)))
+            self._status_label.setText(self._translator.translate("extract.st_extracting_embedded", kind=kind))
         ocr_language = ""
         if hasattr(self, "_ocr_language_codes"):
             lang_index = self._cb_ocr_language.currentIndex()
@@ -1899,7 +1971,7 @@ class ExtractPage(QWidget):
             return
         if hasattr(self, '_status_label'):
             self._status_label.setStyleSheet(f"color: {_c.success()};")
-            self._status_label.setText(self._translator.translate("extract.st_embedded_done").replace("{{n}}", str(len(events))))
+            self._status_label.setText(self._translator.translate("extract.st_embedded_done", n=len(events)))
         InfoBar.success(
             "Trích phụ đề nhúng xong",
             f"Đã lấy {len(events)} câu. Đang chuyển sang trang Chỉnh sửa…",
@@ -2039,7 +2111,7 @@ class ExtractPage(QWidget):
             return
         if hasattr(self, '_status_label'):
             self._status_label.setStyleSheet(f"color: {_c.success()};")
-            self._status_label.setText(self._translator.translate("extract.st_speech_done").replace("{{n}}", str(len(events))))
+            self._status_label.setText(self._translator.translate("extract.st_speech_done", n=len(events)))
         InfoBar.success(
             "Phiên âm xong",
             f"Đã nhận dạng {len(events)} câu. Đang chuyển sang trang Chỉnh sửa…",
@@ -2219,6 +2291,22 @@ class ExtractPage(QWidget):
     def cancel_extraction(self) -> None:
         if hasattr(self, "_view_model"): self._view_model.cancel_extraction()
 
+    def begin_shutdown(self) -> None:
+        """[v3.23.650] Gọi đầu tiên khi đóng ứng dụng: ngắt hàng đợi hàng loạt và các tín hiệu kết thúc để việc dọn
+        luồng (có bơm sự kiện) không kích hoạt tập kế tiếp / hộp thoại / nạp Editor giữa lúc đang tắt."""
+        self._batch_cancelled = True
+        self._batch_queue = []
+        self._pending_batch_item = None
+        vm = getattr(self, "_view_model", None)
+        if vm is None:
+            return
+        for name in ("extraction_finished", "extraction_failed", "extraction_completed"):
+            signal = getattr(vm, name, None)
+            if signal is not None:
+                with contextlib.suppress(RuntimeError, TypeError):
+                    signal.disconnect()
+        vm.cancel_extraction()
+
     def closeEvent(self, event: QCloseEvent) -> None:
         with contextlib.suppress(RuntimeError): self._seek_debounce_timer.stop()
 
@@ -2255,6 +2343,13 @@ class ExtractPage(QWidget):
                     logger.warning("Extract thread timeout — buộc terminate để tránh crash.")
                     extract_thread.terminate()
                     extract_thread.wait(2000)
+
+            # [v3.23.645] Luồng đo tốc độ OCR dùng chung bộ OCR với trích xuất: phải dừng trước khi giải phóng.
+            bench_thread = getattr(self._view_model, 'active_benchmark_thread', None)
+            if bench_thread and bench_thread.isRunning():
+                if not bench_thread.wait(_WAIT_MS):
+                    bench_thread.terminate()
+                    bench_thread.wait(2000)
 
             detect_thread = getattr(self._view_model, 'active_detect_thread', None)
             if detect_thread and detect_thread.isRunning():

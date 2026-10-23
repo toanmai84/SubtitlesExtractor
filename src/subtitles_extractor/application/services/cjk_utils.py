@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 
+from subtitles_extractor.domain.value_objects.cjk_char import is_cjk_char
+
 # Phụ đề CJK trung bình ~3-4 ký tự/giây. Dùng để ước tính min_duration
 CJK_READING_SPEED_CHARS_PER_SEC: float = 3.5
 
@@ -23,22 +25,6 @@ MIN_DURATION_FLOOR_SEC: float = 0.3
 _CJK_RE = re.compile(
     r'[\u4E00-\u9FFF\u3400-\u4DBF\uAC00-\uD7AF\u3040-\u309F\u30A0-\u30FF\uF900-\uFAFF]'
 )
-
-
-def is_cjk_char(char: str) -> bool:
-    """``True`` nếu ký tự thuộc CJK / Hangul / Kana."""
-    if len(char) != 1:
-        return False
-    # Giữ nguyên check ord() cho hàm này để tối ưu tốc độ khi chỉ check 1 ký tự duy nhất
-    code = ord(char)
-    return (
-        0x4E00 <= code <= 0x9FFF
-        or 0x3400 <= code <= 0x4DBF
-        or 0xAC00 <= code <= 0xD7AF
-        or 0x3040 <= code <= 0x309F
-        or 0x30A0 <= code <= 0x30FF
-        or 0xF900 <= code <= 0xFAFF
-    )
 
 
 def contains_cjk(text: str) -> bool:

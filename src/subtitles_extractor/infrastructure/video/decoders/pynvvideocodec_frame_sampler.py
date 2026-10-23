@@ -26,13 +26,10 @@ from subtitles_extractor.domain.exceptions import VideoDecodeError, VideoNotFoun
 from subtitles_extractor.domain.ports.frame_sampler_port import (
     FrameSamplingConfig,
     SampledFrame,
+    is_sample_due,
 )
 from subtitles_extractor.domain.value_objects.roi import Roi
-from subtitles_extractor.infrastructure.video.perceptual_hash import (
-    compute_phash,
-    hamming_distance,
-    pixel_diff_ratio,
-)
+from subtitles_extractor.infrastructure.video.frame_dedupe import FrameDeduper, FrameVerdict
 
 # [V3.28] Import Pipeline GPU mới tạo
 from subtitles_extractor.infrastructure.ocr.preprocessing.gpu_image_filters import apply_gpu_preprocessing_pipeline
@@ -498,7 +495,7 @@ class PyNvVideoCodecFrameSampler:
                     continue
                 if ts > end_sec:
                     break
-                if ts + 1e-6 < next_target_sec:
+                if not is_sample_due(ts, next_target_sec):
                     continue
                 next_target_sec += step_sec
 
@@ -594,8 +591,8 @@ class PyNvVideoCodecFrameSampler:
         start_sec = max(0.0, config.skip_intro_sec)
         end_sec = metadata.duration_sec - config.skip_outro_sec if config.skip_outro_sec > 0 else metadata.duration_sec
 
-        last_hash_val: int | None = None
-        last_image_arr: np.ndarray | None = None
+        # [v3.23.644] Quyết định OCR / trùng / trống dùng chung với bộ PyAV (xem ``frame_dedupe``).
+        deduper = FrameDeduper(config)
         next_target_sec = start_sec
         frame_counter_idx = 0
 
@@ -659,7 +656,8 @@ class PyNvVideoCodecFrameSampler:
                         history_ring_buffer[insert_idx] = cropped_gpu
                         history_count += 1
 
-                        if frame_timestamp_sec < next_target_sec or history_count < num_blend_frames:
+                        due = is_sample_due(frame_timestamp_sec, next_target_sec)
+                        if not due or history_count < num_blend_frames:
                             continue
 
                         target_idx = (history_count - num_blend_frames // 2 - 1) % num_blend_frames
@@ -687,27 +685,29 @@ class PyNvVideoCodecFrameSampler:
                         final_rgb_numpy = cp.asnumpy(blended_gpu)
 
                     else:
-                        if frame_timestamp_sec < next_target_sec: continue
+                        if not is_sample_due(frame_timestamp_sec, next_target_sec):
+                            continue
                         cropped_gpu = self._apply_vram_preprocessing(cropped_gpu, config, vram_buffers)
                         final_rgb_numpy = cp.asnumpy(cropped_gpu)
                 else:
-                    if frame_timestamp_sec < next_target_sec: continue
+                    if not is_sample_due(frame_timestamp_sec, next_target_sec):
+                        continue
                     final_rgb_numpy = self._convert_and_crop_cpu_fallback(device_frame, video_height, video_width, is_16bit, is_hdr, roi)
                     if final_rgb_numpy is None: continue
 
-                current_hash_val = compute_phash(final_rgb_numpy)
-                is_dup = not self._should_keep_frame(final_rgb_numpy, current_hash_val, last_hash_val, last_image_arr, config)
+                verdict = deduper.verdict(final_rgb_numpy, frame_timestamp_sec)
+                needs_ocr = verdict is FrameVerdict.OCR
 
                 yield SampledFrame(
                     frame_index=frame_counter_idx,
                     timestamp_sec=frame_timestamp_sec,
-                    image_rgb=EMPTY_ARRAY if is_dup else final_rgb_numpy,
-                    is_duplicate=is_dup
+                    image_rgb=final_rgb_numpy if needs_ocr else EMPTY_ARRAY,
+                    is_duplicate=verdict is FrameVerdict.DUPLICATE,
+                    is_blank=verdict is FrameVerdict.BLANK,
                 )
 
-                if not is_dup:
-                    last_hash_val = current_hash_val
-                    last_image_arr = final_rgb_numpy
+                if needs_ocr:
+                    deduper.accept(final_rgb_numpy, frame_timestamp_sec)
 
                 frame_counter_idx += 1
                 next_target_sec = frame_timestamp_sec + step_sec
@@ -723,7 +723,8 @@ class PyNvVideoCodecFrameSampler:
                 pts_val = device_frame.getPTS()
                 frame_timestamp_sec = float(pts_val) * time_base if pts_val else end_sec
                 if frame_timestamp_sec > end_sec: break
-                if frame_timestamp_sec < next_target_sec: continue
+                if not is_sample_due(frame_timestamp_sec, next_target_sec):
+                    continue
 
                 if HAS_CUPY:
                     cropped_gpu = self._convert_and_crop_cupy(device_frame, video_height, video_width, is_16bit, is_hdr, roi, rgb_gpu_buffer)
@@ -734,18 +735,17 @@ class PyNvVideoCodecFrameSampler:
                     final_rgb_numpy = self._convert_and_crop_cpu_fallback(device_frame, video_height, video_width, is_16bit, is_hdr, roi)
                     if final_rgb_numpy is None: continue
 
-                current_hash_val = compute_phash(final_rgb_numpy)
-                is_dup = not self._should_keep_frame(final_rgb_numpy, current_hash_val, last_hash_val, last_image_arr, config)
-
+                verdict = deduper.verdict(final_rgb_numpy, frame_timestamp_sec)
+                needs_ocr = verdict is FrameVerdict.OCR
                 yield SampledFrame(
                     frame_index=frame_counter_idx,
                     timestamp_sec=frame_timestamp_sec,
-                    image_rgb=EMPTY_ARRAY if is_dup else final_rgb_numpy,
-                    is_duplicate=is_dup
+                    image_rgb=final_rgb_numpy if needs_ocr else EMPTY_ARRAY,
+                    is_duplicate=verdict is FrameVerdict.DUPLICATE,
+                    is_blank=verdict is FrameVerdict.BLANK,
                 )
-                if not is_dup:
-                    last_hash_val = current_hash_val
-                    last_image_arr = final_rgb_numpy
+                if needs_ocr:
+                    deduper.accept(final_rgb_numpy, frame_timestamp_sec)
                 frame_counter_idx += 1
                 next_target_sec = frame_timestamp_sec + step_sec
         except RuntimeError: pass
@@ -893,14 +893,5 @@ class PyNvVideoCodecFrameSampler:
         except (RuntimeError, ValueError, AttributeError, MemoryError, IndexError) as exc:
             logger.debug("CPU Fallback lỗi: %s.", exc)
             return None
-
-    @staticmethod
-    def _should_keep_frame(
-        image_rgb: np.ndarray, current_hash: int, last_hash: int | None, last_image: np.ndarray | None, config: FrameSamplingConfig
-    ) -> bool:
-        if last_hash is None or last_image is None: return True
-        if hamming_distance(current_hash, last_hash) > config.phash_distance_threshold: return True
-        if pixel_diff_ratio(image_rgb, last_image) > config.pixel_diff_threshold: return True
-        return False
 
 __all__ = ["PyNvVideoCodecFrameSampler"]

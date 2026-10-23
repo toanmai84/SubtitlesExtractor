@@ -7,6 +7,7 @@ Tách biệt khái niệm "khoảng thời gian" khỏi nội dung phụ đề g
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from subtitles_extractor.domain.exceptions import ConfigurationError
@@ -28,6 +29,11 @@ class TimeInterval:
     end_sec: float
 
     def __post_init__(self) -> None:
+        # [v3.23.650] NaN/inf lọt qua mọi phép so sánh (NaN < 0 là False) và làm hỏng bảng/hiển thị về sau.
+        if not (math.isfinite(self.start_sec) and math.isfinite(self.end_sec)):
+            raise ConfigurationError(
+                f"Mốc thời gian phải là số hữu hạn, nhận được {self.start_sec}–{self.end_sec}."
+            )
         if self.start_sec < 0:
             raise ConfigurationError(
                 f"Mốc bắt đầu phải không âm, nhận được {self.start_sec:.3f}s."

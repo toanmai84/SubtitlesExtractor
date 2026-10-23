@@ -19,7 +19,7 @@ def _batch_same_as_origin(n: int) -> list[TranslationLine]:
 def _make_translator(call_counter: list[int]) -> GeminiSubtitleTranslator:
     t = GeminiSubtitleTranslator(api_key="dummy")
 
-    def fake_call(model_name, prompt, config, validator, cancel_cb=None, video_files=None, est_tokens=0):
+    def fake_call(model_name, prompt, config, validator, cancel_cb=None, video_files=None, est_tokens=0, **_extra):
         call_counter[0] += 1
         # AI trả 100% giống BẢN GỐC (mô phỏng "không dịch / giữ nguyên").
         return {"subtitles": [{"line_no": i + 1, "text": "原文"} for i in range(3)]}

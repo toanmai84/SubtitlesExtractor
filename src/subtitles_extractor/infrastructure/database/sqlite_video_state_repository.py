@@ -6,6 +6,8 @@ import contextlib
 import json
 import logging
 import sqlite3
+
+from subtitles_extractor.infrastructure.database.db_guard import prepare_database
 import threading
 from pathlib import Path
 
@@ -27,6 +29,10 @@ class SqliteVideoStateRepository(VideoStateRepositoryPort):
         self._db_path = db_path
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+
+        # [v3.23.649] Kiểm tra / sao lưu / tự phục hồi tệp trước khi kết nối.
+
+        prepare_database(self._db_path, background=True)
 
         self._conn = sqlite3.connect(
             self._db_path,

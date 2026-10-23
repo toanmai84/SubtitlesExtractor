@@ -23,10 +23,11 @@ import numpy as np
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Signal, QThread
+from PySide6.QtCore import QObject, Qt, Signal, QThread
 from PySide6.QtGui import QImage, QPainter, QPen, QColor, QFont
 
 from subtitles_extractor.application.dtos.extract_subtitles_dto import SubtitleBuilderConfig
+from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
 from subtitles_extractor.application.services.subtitle_builder import SubtitleBuilder
 from subtitles_extractor.composition.container import ApplicationContainer
 from subtitles_extractor.domain.entities.ocr_frame_result import OcrFrameResult, OcrTextBox
@@ -58,7 +59,7 @@ def _ndarray_to_qimage(arr: np.ndarray) -> QImage:
         contiguous_arr = np.ascontiguousarray(arr, dtype=np.uint8)
         return QImage(contiguous_arr.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
     except (ValueError, TypeError) as exc:
-        logger.debug("Không dựng được QImage từ mảng: {}", exc)
+        logger.debug("Không dựng được QImage từ mảng: %s", exc)
         return QImage()
 
 
@@ -150,7 +151,7 @@ class _SingleFrameReocrWorker(QObject):
                                 used_vram_preprocessing = True
 
                     except Exception as e:
-                        logger.debug("Lỗi đọc Frame bằng Backend: {}", e)
+                        logger.debug("Lỗi đọc Frame bằng Backend: %s", e)
 
             # 2. Fallback: Đọc ảnh JPG Input nếu không tìm thấy/giải mã được Video gốc
             if (full_frame_rgb is None or full_frame_rgb.size == 0) and self.base_img_dir:
@@ -377,6 +378,7 @@ class DebugPageViewModel(QObject):
 
     def __init__(self, container: ApplicationContainer, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        self._thread_keeper = WorkerThreadKeeper(self)
         self._container = container
         self._frames: list[OcrFrameResult] = []
         self._meta: RawOcrMeta | None = None
@@ -514,9 +516,12 @@ class DebugPageViewModel(QObject):
         self._worker.success_result.connect(self._on_worker_success)
         self._worker.failed.connect(self._on_worker_failed)
 
-        self._worker.success_result.connect(self._async_thread.quit)
-        self._worker.failed.connect(self._async_thread.quit)
-        self._async_thread.finished.connect(self._worker.deleteLater)
+        self._worker.success_result.connect(self._async_thread.quit, Qt.ConnectionType.DirectConnection)
+        self._worker.failed.connect(self._async_thread.quit, Qt.ConnectionType.DirectConnection)
+        # [v3.23.613] Một chủ sở hữu duy nhất cho worker (xem thread_keeper): KHÔNG gắn
+        # worker.deleteLater vào thread.finished — Qt xoá trong luồng nền song song với
+        # Python xoá ở luồng giao diện làm xoá hai lần, sập ứng dụng.
+        self._thread_keeper.keep(self._async_thread, self._worker)
         self._async_thread.finished.connect(self._on_thread_finished_cleanup)
         self._async_thread.finished.connect(self._async_thread.deleteLater)
 

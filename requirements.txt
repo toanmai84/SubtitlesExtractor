@@ -2,8 +2,8 @@
 PySide6>=6.6  # LGPL v3 — an toàn thương mại (thay PyQt6 GPL)
 
 # ── OCR Engine ──
-paddlepaddle>=2.6
-paddleocr>=2.9
+paddlepaddle>=3.0
+paddleocr>=3.7.0  # [v3.23.595] PP-OCRv6 (model mặc định) cần 3.7.0+
 
 # ── Video player & decoder phần cứng ──
 # python-mpv: embed mpv vào widget Qt, hỗ trợ NVDEC/VAAPI/VideoToolbox/D3D11VA/Vulkan
@@ -21,6 +21,9 @@ python-mpv>=1.0
 opencv-python>=4.9
 numpy>=1.24
 soundfile>=0.12
+# [v3.23.619] Giải mã phụ đề ảnh PGS/VobSub (pgs_decoder import ngay khi nạp). Trước chỉ
+# có nhờ paddleocr kéo theo gián tiếp; giấy phép HPND/MIT-CMU — an toàn thương mại.
+Pillow>=10.0
 
 # ── PyAV (libav) — decode nhanh hơn OpenCV 2-3× cho H.264/H.265 ──
 # frame_decoder_backend='pyav'
@@ -39,7 +42,7 @@ rapidfuzz>=3.0
 # ── Dịch phụ đề bằng AI (trang "Dịch phụ đề") ──
 # Bộ dịch đa giai đoạn dùng Google Gemini. Import lazy: nếu thiếu, trang Dịch
 # chỉ ở chế độ không khả dụng, phần còn lại của ứng dụng vẫn chạy bình thường.
-google-genai>=0.3
+google-genai>=2.29,<3  # [v3.23.595] VoiceConfig.voice cho Gemini TTS 3.8
 
 # ── Sửa JSON hỏng từ LLM (v3.23.143) ──
 # Thuần Python, zero phụ thuộc bắt buộc. Import tuỳ chọn: nếu thiếu, tự lùi về bộ
@@ -52,3 +55,4 @@ librosa>=0.10        # time-stretch giữ cao độ ISC (thay pedalboard GPL —
 rjieba>=0.1.11       # tách từ tiếng Trung cho STT (MIT)
 pydub>=0.25          # chuyển MP3->WAV cho worker Edge TTS (MIT)
 pyloudnorm>=0.1      # đo LUFS chuẩn hoá âm lượng (MIT, tùy chọn nhưng nên có)
+tzdata>=2024.1       # [v3.23.607] dữ liệu múi giờ cho zoneinfo trên Windows (mốc hạn mức Gemini 00:00 giờ Thái Bình Dương; thiếu vẫn chạy nhờ quy tắc dự phòng)

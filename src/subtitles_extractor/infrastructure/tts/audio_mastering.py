@@ -25,8 +25,9 @@ Mọi hàm xử lý theo chunk khi cần để an toàn RAM với audio dài hà
 from __future__ import annotations
 
 import logging
-import shutil
+import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from subtitles_extractor.infrastructure.process.hidden_process import no_window_kwargs
 from pathlib import Path
 
@@ -68,12 +69,85 @@ _BLOCK_S = 60.0
 _BLOCK_PAD_S = 1.0
 
 
+#: [v3.23.643] Cỡ khối (mẫu) cho các bước xử lý theo khối của chuỗi master (≈ 30 s ở 48 kHz).
+_MASTER_BLOCK_SAMPLES = 1_440_000
+
+
+def _peak_abs_chunked(audio: np.ndarray) -> float:
+    """Đỉnh tuyệt đối không tạo mảng ``abs`` cỡ toàn bộ."""
+    peak = 0.0
+    for start in range(0, audio.shape[0] if audio.ndim else 0, _MASTER_BLOCK_SAMPLES):
+        peak = max(peak, float(np.max(np.abs(audio[start:start + _MASTER_BLOCK_SAMPLES]))))
+    return peak
+
+
+#: [v3.23.647] Số luồng tối đa cho các bước master độc lập theo đoạn (scipy nhả GIL trong ``sosfilt``/``upfirdn``).
+_MAX_MASTER_WORKERS = 6
+#: Khối nhỏ hơn khi chạy song song: RAM đỉnh = số luồng × RAM một khối, nên giảm khối để tổng không phình.
+_PARALLEL_BLOCK_S = 30.0
+#: Độ phân giải khi dò đoạn có tiếng (giây) và khoảng lặng tối thiểu để cắt một "đảo" tiếng (giây).
+_ACTIVITY_FRAME_S = 0.25
+_ISLAND_GAP_S = 2.5
+
+
+def master_worker_count() -> int:
+    """Số luồng dùng cho xử lý song song theo đoạn: số lõi CPU, trong khoảng 1–``_MAX_MASTER_WORKERS``."""
+    return max(1, min(_MAX_MASTER_WORKERS, os.cpu_count() or 1))
+
+
+def find_active_islands(audio: np.ndarray, sr: int, gap_s: float = _ISLAND_GAP_S) -> list[tuple[int, int]]:
+    """[v3.23.647] Các đoạn ``[bắt đầu, kết thúc)`` (mẫu) chứa tiếng, cách nhau bởi khoảng im LẶNG TUYỆT ĐỐI ≥ ``gap_s``.
+
+    Master lồng tiếng là mảng ``zeros`` cộng từng câu nên giữa các câu là số 0 đúng nghĩa; mọi bộ lọc tuyến tính cho
+    đầu ra 0 với đầu vào 0, nên không phải lọc các đoạn đó (phim thật: 30–40% thời lượng).
+
+    Args:
+        audio: Tín hiệu mono.
+        sr: Tần số lấy mẫu.
+        gap_s: Khoảng 0 tối thiểu để tách hai đảo.
+
+    Returns:
+        Danh sách đảo theo thứ tự; rỗng nếu toàn số 0.
+    """
+    n = audio.shape[0]
+    frame = max(1, int(sr * _ACTIVITY_FRAME_S))
+    frames = (n + frame - 1) // frame
+    active = np.zeros(frames, dtype=bool)
+    chunk_frames = max(1, _MASTER_BLOCK_SAMPLES // frame)
+    for first in range(0, frames, chunk_frames):
+        last = min(frames, first + chunk_frames)
+        segment = audio[first * frame : min(n, last * frame)]
+        pad = (-segment.size) % frame
+        if pad:
+            segment = np.concatenate([segment, np.zeros(pad, dtype=segment.dtype)])
+        active[first:last] = np.any(segment.reshape(-1, frame) != 0, axis=1)
+    on = np.flatnonzero(active)
+    if on.size == 0:
+        return []
+    gap_frames = max(1, int(round(gap_s / _ACTIVITY_FRAME_S)))
+    # Mỗi đảo nới thêm MỘT khung (0,25 s) về hai phía: bộ lọc zero-phase có tiền-vọng/đuôi ~20–50 ms ngoài câu, cắt thẳng ở
+    # biên khung gây click (đo: bước nhảy gấp ~63× ở biên đảo). Khoảng cách giữa hai đảo ≥ ``gap_frames`` khung nên
+    # sau khi nới vẫn không chồng nhau.
+    islands: list[tuple[int, int]] = []
+    begin = previous = int(on[0])
+    for position in on[1:]:
+        position = int(position)
+        if position - previous > gap_frames:
+            islands.append((max(0, (begin - 1) * frame), min(n, (previous + 2) * frame)))
+            begin = position
+        previous = position
+    islands.append((max(0, (begin - 1) * frame), min(n, (previous + 2) * frame)))
+    return islands
+
+
 def process_in_blocks(
     audio: np.ndarray,
     sr: int,
     transform: "Callable[[np.ndarray, int], np.ndarray]",
     block_s: float = _BLOCK_S,
     pad_s: float = _BLOCK_PAD_S,
+    skip_silence: bool = False,
+    workers: int = 1,
 ) -> np.ndarray:
     """[v3.23.212] Áp ``transform`` theo KHỐI có đệm warm-up (hàm thuần, tiết kiệm RAM).
 
@@ -82,12 +156,18 @@ def process_in_blocks(
     gần như đồng nhất với xử lý toàn cục. RAM đỉnh chỉ còn tỉ lệ với KHỐI, không với
     toàn bộ phim.
 
+    [v3.23.647] ``skip_silence``: chỉ lọc các "đảo" có tiếng (xem :func:`find_active_islands`), phần im lặng tuyệt đối
+    giữ nguyên bằng 0 — CHỈ dùng cho ``transform`` tuyến tính/không nhớ (0 vào → 0 ra). ``workers`` > 1: lọc các khối song
+    song (mỗi khối ghi vào đoạn riêng của mảng đầu ra). Đuôi nhiễu dư của bộ lọc rơi vào vùng im lặng bị bỏ đi.
+
     Args:
         audio: Tín hiệu mono float32.
         sr: Tần số lấy mẫu.
         transform: Hàm lọc thuần ``(audio, sr) -> audio`` giữ nguyên độ dài.
         block_s: Độ dài mỗi khối (giây).
         pad_s: Đệm warm-up mỗi biên (giây).
+        skip_silence: Bỏ qua đoạn im lặng tuyệt đối (xem trên).
+        workers: Số luồng lọc song song.
 
     Returns:
         Tín hiệu đã xử lý (float32), CÙNG độ dài với đầu vào.
@@ -97,13 +177,29 @@ def process_in_blocks(
     pad = max(1, int(pad_s * sr))
     if n <= block + 2 * pad:
         return transform(audio, sr)
-    out = np.empty(n, dtype=np.float32)
-    for start in range(0, n, block):
-        end = min(start + block, n)
+    spans = find_active_islands(audio, sr) if skip_silence else [(0, n)]
+    if not spans:
+        return np.zeros(n, dtype=np.float32)
+    out = np.zeros(n, dtype=np.float32) if skip_silence else np.empty(n, dtype=np.float32)
+    jobs: list[tuple[int, int]] = []
+    for span_start, span_end in spans:
+        jobs.extend(
+            (start, min(start + block, span_end)) for start in range(span_start, span_end, block)
+        )
+
+    def run(job: tuple[int, int]) -> None:
+        start, end = job
         lo = max(0, start - pad)
         hi = min(n, end + pad)
         chunk = transform(audio[lo:hi], sr)
         out[start:end] = chunk[start - lo : start - lo + (end - start)]
+
+    if workers > 1 and len(jobs) > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+            list(pool.map(run, jobs))             # list(): ném lại ngoại lệ của luồng con
+    else:
+        for job in jobs:
+            run(job)
     return out
 
 
@@ -127,6 +223,43 @@ def clip_for_output(audio: np.ndarray, ceiling: float = 1.0) -> np.ndarray:
 
 
 # ── Đo lường ─────────────────────────────────────────────────────────────────
+def _k_weight_window(window: np.ndarray) -> np.ndarray:
+    """K-weighting (ITU-R BS.1770) một đoạn, khởi tạo trạng thái ở mẫu đầu; float64 nội bộ, trả float32."""
+    from scipy.signal import lfilter, lfilter_zi
+
+    block = window.astype(np.float64)
+    stage1 = lfilter(_KW_B1, _KW_A1, block, zi=lfilter_zi(_KW_B1, _KW_A1) * float(block[0]))[0]
+    stage2 = lfilter(_KW_B2, _KW_A2, stage1, zi=lfilter_zi(_KW_B2, _KW_A2) * float(stage1[0]))[0]
+    return stage2.astype(np.float32)
+
+
+def _kweighted_by_islands(audio: np.ndarray, sr: int) -> np.ndarray:
+    """K-weighted của ``audio`` tính theo từng khối của các đảo có tiếng (song song); phần im lặng = 0."""
+    n = audio.shape[0]
+    kweighted = np.zeros(n, dtype=np.float32)
+    block = int(_BLOCK_S * sr)
+    pad = int(_BLOCK_PAD_S * sr)
+    jobs = [
+        (start, min(start + block, end))
+        for begin, end in find_active_islands(audio, sr)
+        for start in range(begin, end, block)
+    ]
+
+    def run(job: tuple[int, int]) -> None:
+        start, end = job
+        lo, hi = max(0, start - pad), min(n, end + pad)
+        kweighted[start:end] = _k_weight_window(audio[lo:hi])[start - lo : start - lo + (end - start)]
+
+    workers = min(master_worker_count(), max(1, len(jobs)))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(run, jobs))
+    else:
+        for job in jobs:
+            run(job)
+    return kweighted
+
+
 def measure_lufs(audio: np.ndarray, sr: int) -> float:
     """Đo độ to tích hợp (LUFS) theo EBU R128 CÓ gating (bỏ im lặng).
 
@@ -145,6 +278,11 @@ def measure_lufs(audio: np.ndarray, sr: int) -> float:
     if n == 0:
         return float("-inf")
     from scipy.signal import lfilter, lfilter_zi
+
+    # [v3.23.647] Audio DÀI: K-weighting chỉ trên các "đảo" có tiếng, song song. Bộ lọc K-weighting suy giảm trong vài
+    # ms nên đệm 1 s là đủ để khớp lọc một mạch (đo: lệch < 0,001 LU); đoạn im lặng tuyệt đối cho K-weighted = 0.
+    if audio.ndim == 1 and n > _LONG_AUDIO_S * sr:
+        return _gated_loudness_from_kweighted(_kweighted_by_islands(audio, sr), sr)
 
     zi1 = lfilter_zi(_KW_B1, _KW_A1) * float(audio[0])
     zi2 = None
@@ -235,7 +373,12 @@ def voice_clarity(audio: np.ndarray, sr: int) -> np.ndarray:
     # thước audio xuống mức tỉ lệ với KHỐI (phim 2h: ~10.9GB -> vài trăm MB, hết treo
     # máy). Video ngắn đi đường cũ -> zero regression.
     if audio.size > _LONG_AUDIO_S * sr:
-        return process_in_blocks(audio, sr, _voice_clarity_core)
+        # [v3.23.647] Bỏ qua đoạn im lặng tuyệt đối + lọc song song các khối (chuỗi này tuyến tính/không nhớ giữa các khối).
+        workers = master_worker_count()
+        return process_in_blocks(
+            audio, sr, _voice_clarity_core, skip_silence=True, workers=workers,
+            block_s=_PARALLEL_BLOCK_S if workers > 1 else _BLOCK_S,
+        )
     return _voice_clarity_core(audio, sr)
 
 
@@ -287,29 +430,46 @@ def normalize_to_lufs(
     # loudness rất thấp (phim thoại thưa/nhỏ).
     gain = _loudness_gain_linear(current, target_lufs)
     out = (audio if audio.dtype == np.float32 else audio.astype(np.float32)) * np.float32(gain)
-    peak = float(np.max(np.abs(out)))
+    peak = _peak_abs_chunked(out)
     if peak > max_peak:
         out *= np.float32(max_peak / peak)
     return out
 
 
 def soft_limit(audio: np.ndarray, threshold: float = 0.85, ceiling: float = 0.92) -> np.ndarray:
-    """Nén mềm (tanh knee) mọi mẫu vượt ``threshold`` về sát ``ceiling``."""
-    abs_a = np.abs(audio)
-    over = abs_a > threshold
-    if not np.any(over):
-        return audio
-    result = audio.copy()
+    """Nén mềm (tanh knee) mọi mẫu vượt ``threshold`` về sát ``ceiling``.
+
+    [v3.23.643] Xử lý theo khối 30 s: bản cũ tạo ``abs`` + mặt nạ + bản sao toàn bộ (phim 2h19 ở 48 kHz ≈
+    3 × 1,6 GB). Kết quả đồng nhất từng mẫu (phép biến đổi theo từng mẫu, không có trạng thái).
+    """
+    n = audio.size
+    block = _MASTER_BLOCK_SAMPLES
+    result: np.ndarray | None = None
     room = max(ceiling - threshold, 1e-6)
-    limited = threshold + room * np.tanh((abs_a[over] - threshold) / room)
-    result[over] = np.sign(audio[over]) * limited
-    return result.astype(np.float32)
+    for start in range(0, n, block):
+        segment = audio[start:start + block]
+        abs_a = np.abs(segment)
+        over = abs_a > threshold
+        if not over.any():
+            continue
+        if result is None:
+            result = audio.copy()
+        limited = threshold + room * np.tanh((abs_a[over] - threshold) / room)
+        target = result[start:start + block]
+        target[over] = np.sign(segment[over]) * limited
+    if result is None:
+        return audio
+    return result.astype(np.float32, copy=False)
 
 
 def true_peak_limit(
     audio: np.ndarray, sr: int, ceiling: float = 0.95, lookahead_ms: float = 1.5
 ) -> np.ndarray:
-    """Ghìm CỤC BỘ chỉ các đỉnh liên-mẫu vượt ``ceiling`` (giữ độ to phần còn lại)."""
+    """Ghìm CỤC BỘ chỉ các đỉnh liên-mẫu vượt ``ceiling`` (giữ độ to phần còn lại).
+
+    [v3.23.647] Các đoạn 30 s độc lập nhau nên xử lý song song (``resample_poly``/``maximum_filter1d`` nhả GIL), và đoạn
+    toàn số 0 được bỏ qua — kết quả từng mẫu giống hệt bản tuần tự.
+    """
     n = len(audio)
     if n < 8:
         return audio
@@ -320,23 +480,33 @@ def true_peak_limit(
     look = max(1, int(sr * lookahead_ms / 1000.0))
     smooth_win = max(1, int(sr * 0.003))
     chunk = sr * 30
-    for start in range(0, n, chunk):
+
+    def limit_chunk(start: int) -> None:
         end = min(n, start + chunk)
         seg = np.asarray(audio[start:end], dtype=np.float32)
-        if seg.size < 8:
-            continue
+        if seg.size < 8 or not np.any(seg):
+            return
         up = resample_poly(seg, os_factor, 1)
         env_up = maximum_filter1d(np.abs(up), size=os_factor * look * 2 + 1)
         env = env_up[::os_factor][: seg.size]
         if env.size < seg.size:
             env = np.pad(env, (0, seg.size - env.size), mode="edge")
         if not np.any(env > ceiling):
-            continue
+            return
         gain = np.ones(seg.size, dtype=np.float32)
         over = env > ceiling
         gain[over] = (ceiling / env[over]).astype(np.float32)
         gain = uniform_filter1d(gain, size=smooth_win)
         audio[start:end] = seg * gain
+
+    starts = list(range(0, n, chunk))
+    workers = master_worker_count() if len(starts) > 2 else 1
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(limit_chunk, starts))
+    else:
+        for start in starts:
+            limit_chunk(start)
     return audio
 
 
@@ -364,7 +534,18 @@ def dc_block(audio: np.ndarray, sr: int, cutoff_hz: float = 20.0) -> np.ndarray:
     from scipy.signal import butter, sosfilt
 
     sos = butter(2, cutoff_hz / (sr * 0.5), btype="highpass", output="sos")
-    return sosfilt(sos, audio).astype(np.float32)
+    if audio.ndim > 1:                     # đa kênh: giữ đường cũ (chỉ master đơn kênh đi đường theo khối)
+        return sosfilt(sos, audio).astype(np.float32)
+    # [v3.23.643] Lọc theo KHỐI có mang trạng thái (``zi``): về toán học y hệt lọc một lượt (đo: sai khác
+    # 0.0) nhưng RAM đỉnh chỉ ~1x audio thay vì ~3.2x (sosfilt đổi cả mảng sang float64 + đầu ra float64
+    # + bản float32: phim 2h19 ở 48 kHz ≈ 5 GB).
+    out = np.empty(n, dtype=np.float32)
+    zi = np.zeros((sos.shape[0], 2))
+    block = _MASTER_BLOCK_SAMPLES
+    for start in range(0, n, block):
+        filtered, zi = sosfilt(sos, audio[start:start + block], zi=zi)
+        out[start:start + len(filtered)] = filtered
+    return out
 
 
 def master_finalize(
@@ -471,6 +652,21 @@ def _encode_with_ffmpeg(
             pass
 
 
+def _write_clipped_streaming(target: Path, audio: np.ndarray, sr: int, subtype: str) -> None:
+    """[v3.23.643] Ghi WAV/FLAC theo khối đã chặn biên (không tạo hai bản sao cỡ toàn bộ như ``np.clip`` +
+    ``astype``). Kết quả giống hệt ``sf.write(clip_for_output(audio))``."""
+    import soundfile as sf
+
+    data = np.asarray(audio)
+    channels = 1 if data.ndim == 1 else data.shape[1]
+    with sf.SoundFile(
+        str(target), mode="w", samplerate=sr, channels=channels, subtype=subtype,
+        format=target.suffix.lstrip(".").upper() or "WAV",
+    ) as handle:
+        for start in range(0, data.shape[0], _MASTER_BLOCK_SAMPLES):
+            handle.write(clip_for_output(data[start:start + _MASTER_BLOCK_SAMPLES]))
+
+
 def write_audio(
     audio: np.ndarray, sr: int, output_path: Path,
     fmt: str = "wav", subtype: str = "PCM_16", bitrate_kbps: int = 320,
@@ -493,7 +689,7 @@ def write_audio(
             subtype = "PCM_24"
         # [v3.23.183] Chặn biên trước khi ghi: nhất quán với path ffmpeg, tránh mẫu
         # vượt ±1.0 gây méo (đặc biệt subtype FLOAT không tự clip như PCM).
-        sf.write(str(target), clip_for_output(audio), sr, subtype=subtype)
+        _write_clipped_streaming(target, audio, sr, subtype)
         return target
 
     if _encode_with_ffmpeg(audio, sr, target, fmt, bitrate_kbps):

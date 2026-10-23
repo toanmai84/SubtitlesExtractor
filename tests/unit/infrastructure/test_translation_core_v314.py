@@ -17,6 +17,11 @@ from subtitles_extractor.infrastructure.translation.gemini_translation_adapter i
 )
 
 
+def _adapter() -> GeminiSubtitleTranslator:
+    """Instance tối thiểu (init không gọi mạng) để test payload."""
+    return GeminiSubtitleTranslator(api_key="test-key")
+
+
 def _line(**kwargs) -> TranslationLine:
     base = dict(index=1, start_ms=0, end_ms=1000, text="bản nháp")
     base.update(kwargs)
@@ -26,7 +31,7 @@ def _line(**kwargs) -> TranslationLine:
 class TestDualPayload:
     def test_dual_payload_includes_original(self) -> None:
         line = _line(text="Ta đi đây", original_text="我走了", addressee="Nam đệ tử")
-        payload = GeminiSubtitleTranslator._line_to_dual_payload(line)
+        payload = _adapter()._line_to_dual_payload(line)
         assert payload["original"] == "我走了"
         assert payload["text"] == "Ta đi đây"
         assert payload["addressee"] == "Nam đệ tử"
@@ -34,12 +39,12 @@ class TestDualPayload:
 
     def test_dual_payload_omits_original_when_same(self) -> None:
         line = _line(text="同", original_text="同")
-        payload = GeminiSubtitleTranslator._line_to_dual_payload(line)
+        payload = _adapter()._line_to_dual_payload(line)
         assert "original" not in payload
 
     def test_plain_payload_has_no_original(self) -> None:
         line = _line(text="x", original_text="y")
-        assert "original" not in GeminiSubtitleTranslator._line_to_payload(line)
+        assert "original" not in _adapter()._line_to_payload(line)
 
 
 class TestFieldPreservation:

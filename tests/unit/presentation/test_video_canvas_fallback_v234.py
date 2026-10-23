@@ -184,10 +184,13 @@ class TestFactoryFunction:
 class TestFactoryRuntime:
     """v2.34: ``create_video_widget`` runtime behavior."""
 
+    # [v3.23.601] classmethod: pytest ≥9 cảnh báo fixture phạm vi class viết dạng phương
+    # thức thể hiện (PytestRemovedIn10Warning) — sẽ thành lỗi ở pytest 10.
     @pytest.fixture(scope="class")
-    def qapp(self):
+    @classmethod
+    def qapp(cls):
         """QApplication fixture — share giữa các tests trong class."""
-        pytest.importorskip("PyQt6", reason="PyQt6 required for runtime widget tests")
+        pytest.importorskip("PySide6", reason="PySide6 required for runtime widget tests")
         from PySide6.QtWidgets import QApplication
         import sys
         app = QApplication.instance()

@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import sqlite3
+
+from subtitles_extractor.infrastructure.database.db_guard import prepare_database
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +58,8 @@ class SqliteProjectRepository(ProjectRepositoryPort):
         self._db_path = db_path
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        # [v3.23.649] Kiểm tra / sao lưu / tự phục hồi tệp trước khi kết nối.
+        prepare_database(self._db_path, background=True)
         self._conn = sqlite3.connect(
             self._db_path, timeout=10.0, check_same_thread=False
         )
@@ -211,6 +215,40 @@ class SqliteProjectRepository(ProjectRepositoryPort):
                 return [self._row_to_record(r) for r in cur.fetchall()]
             finally:
                 cur.close()
+
+    #: Cột nhẹ cho danh sách (không có phụ đề / OCR thô / cài đặt JSON — đo: 86 dự án × 2 SRT 293 KB
+    #: = 58 MB, ``list_all`` 1,44 s trên luồng giao diện sau mỗi lần trích xuất / TTS / xuất bản).
+    _SUMMARY_COLUMNS = (
+        "video_hash, video_path, video_name, stage, subtitle_format, target_lang, "
+        "tts_audio_path, published_video_path, created_at, updated_at"
+    )
+
+    def list_summaries(self) -> list[ProjectRecord]:
+        with self._lock:
+            self._conn.row_factory = sqlite3.Row
+            cur = self._conn.cursor()
+            try:
+                cur.execute(
+                    f"SELECT {self._SUMMARY_COLUMNS} FROM projects ORDER BY updated_at DESC"
+                )
+                return [self._summary_row_to_record(r) for r in cur.fetchall()]
+            finally:
+                cur.close()
+
+    @staticmethod
+    def _summary_row_to_record(row: sqlite3.Row) -> ProjectRecord:
+        return ProjectRecord(
+            video_hash=row["video_hash"],
+            video_path=row["video_path"] or "",
+            video_name=row["video_name"] or "",
+            stage=WorkflowStage(row["stage"] or 0),
+            subtitle_format=row["subtitle_format"] or "srt",
+            target_lang=row["target_lang"] or "",
+            tts_audio_path=row["tts_audio_path"] or "",
+            published_video_path=_optional_column(row, "published_video_path"),
+            created_at=row["created_at"] or "",
+            updated_at=row["updated_at"] or "",
+        )
 
     def delete(self, video_hash: str) -> None:
         with self._lock, self._conn:

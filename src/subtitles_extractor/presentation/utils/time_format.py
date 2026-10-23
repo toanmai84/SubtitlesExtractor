@@ -8,6 +8,8 @@ Hỗ trợ:
 
 from __future__ import annotations
 
+import math
+
 
 def seconds_to_srt(seconds: float) -> str:
     """Convert giây → format SRT ``HH:MM:SS,mmm``."""
@@ -19,8 +21,14 @@ def seconds_to_srt(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _finite_non_negative(seconds: float) -> float:
+    """[v3.23.650] NaN/inf/âm → 0: hàm hiển thị gọi trong ``data()`` của model, ném ngoại lệ là hỏng cả bảng."""
+    return seconds if math.isfinite(seconds) and seconds > 0 else 0.0
+
+
 def seconds_to_ass(seconds: float) -> str:
     """Convert giây → format ASS ``H:MM:SS.cc``."""
+    seconds = _finite_non_negative(seconds)
     t = max(0, int(seconds))
     cs = int((max(0.0, seconds) - t) * 100)
     return f"{t // 3600}:{(t % 3600) // 60:02d}:{t % 60:02d}.{cs:02d}"
@@ -28,6 +36,7 @@ def seconds_to_ass(seconds: float) -> str:
 
 def seconds_to_display(seconds: float) -> str:
     """Convert giây → format hiển thị UI ``HH:MM:SS.mmm``."""
+    seconds = _finite_non_negative(seconds)
     t = max(0, int(seconds))
     ms = int((max(0.0, seconds) - t) * 1000)
     return f"{t // 3600:02d}:{(t % 3600) // 60:02d}:{t % 60:02d}.{ms:03d}"

@@ -104,14 +104,28 @@ class TestPartialBatchPatch:
             assert exc.missing_line_nos == [4, 5]
 
     def test_large_overflow_raises_validation(self) -> None:
-        # Model trả DƯ nhiều (95 cho batch 25) → ValidationError (halving).
+        """[v3.23.512] Trả DƯ nhiều chỉ còn là lỗi khi lọc xong vẫn THIẾU dòng của lô.
+
+        Nếu phần dư chỉ là dòng ngữ cảnh mà lô vẫn đủ, adapter lọc và đi tiếp (xem
+        ``test_large_overflow_covered_is_filtered``). Ca dưới đây là dư THẬT: không dòng
+        nào thuộc khoảng 1..25 nên buộc phải chia nhỏ.
+        """
         from subtitles_extractor.infrastructure.translation.gemini_translation_adapter import (
             _BatchValidationError,
         )
 
-        payload = {"subtitles": [{"line_no": i, "text": f"t{i}"} for i in range(1, 96)]}
+        payload = {
+            "subtitles": [{"line_no": i, "text": f"t{i}"} for i in range(200, 295)]
+        }
         try:
             self._adapter()._validate_batch(payload, 25, 0)
             raise AssertionError("không raise")
         except _BatchValidationError:
             pass
+
+    def test_large_overflow_covered_is_filtered(self) -> None:
+        """Dư 95 dòng nhưng chứa đủ 25 dòng của lô → lọc phần thừa, không dịch lại."""
+        payload = {"subtitles": [{"line_no": i, "text": f"t{i}"} for i in range(1, 96)]}
+        self._adapter()._validate_batch(payload, 25, 0)  # không được ném
+
+        assert len(payload["subtitles"]) == 25

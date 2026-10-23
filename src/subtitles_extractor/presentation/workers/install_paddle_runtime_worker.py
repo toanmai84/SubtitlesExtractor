@@ -79,6 +79,12 @@ class InstallPaddleRuntimeWorker(QObject):
                 return
             if result.returncode != 0:
                 tail = (result.stderr or result.stdout or "").strip()
+                # [v3.23.547] Xem chú thích cùng đợt ở install_cuda_runtime_worker.py.
+                logger.error(
+                    "Tải paddle runtime thất bại (mã thoát %s). Đuôi log:\n%s",
+                    result.returncode,
+                    tail[-4000:],
+                )
                 self.failed.emit(
                     "Tải paddle runtime thất bại:\n"
                     + "\n".join(tail.splitlines()[-4:])
@@ -87,6 +93,7 @@ class InstallPaddleRuntimeWorker(QObject):
             self.progress.emit(100, "Hoàn tất.")
             self.finished.emit(self._paddle_dir)
         except subprocess.TimeoutExpired:
+            logger.error("Tải paddle runtime quá thời gian cho phép (giới hạn 3600s).")
             self.failed.emit("Tải paddle runtime quá thời gian cho phép (mạng chậm?).")
         except (OSError, ValueError) as exc:
             logger.exception("Lỗi hệ thống khi tải paddle runtime.")

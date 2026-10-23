@@ -2,19 +2,124 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+import uuid
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QObject, Signal
 
-from subtitles_extractor.domain.ports.subtitle_tts_port import TTSRequest, TTSSegmentResult
+from subtitles_extractor.application.services.dubbing_cast import (
+    CastMember,
+    DubbingSource,
+    align_to_source,
+    auto_cast,
+    build_cast,
+    conversation_weights,
+    line_speakers,
+    voices_for_lines,
+)
+from subtitles_extractor.application.services.dubbing_line_edits import (
+    LineEdits,
+    LineSnapshot,
+    TextEdit,
+    apply_speaker_overrides,
+    restorable_text_edits,
+    subtitle_fingerprint,
+)
+from subtitles_extractor.application.services.tts_line_cache import PlanMode
+from subtitles_extractor.application.services.dubbing_line_structure import (
+    build_snapshot,
+    default_line_timing,
+    delete_mapping,
+    insert_mapping,
+    insertion_position,
+    remap_keys,
+    remap_set,
+    snapshot_is_structural,
+    valid_snapshot,
+)
+from subtitles_extractor.application.services import tts_incremental_run as incremental_run
+from subtitles_extractor.application.services.speaker_review_flow import (
+    ReviewItem,
+    ReviewLine,
+    review_queue,
+)
+from subtitles_extractor.application.services.speaker_review import (
+    SpeakerIssue,
+    review_speakers,
+)
+from subtitles_extractor.domain.ports.subtitle_tts_port import (
+    TTSRequest,
+    TTSSegmentResult,
+)
+from subtitles_extractor.domain.value_objects.confidence import Confidence
+from subtitles_extractor.domain.value_objects.time_interval import TimeInterval
+from subtitles_extractor.domain.value_objects.voice_profile import VoiceProfile
+from subtitles_extractor.infrastructure.tts.segment_store import renumber_results
+from subtitles_extractor.infrastructure.tts.tts_fit import (
+    LineFit,
+    measured_misfits,
+    predict_misfits,
+)
 
 if TYPE_CHECKING:
     from subtitles_extractor.composition.container import ApplicationContainer
     from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
 
 logger = logging.getLogger(__name__)
+
+#: [v3.23.627] Số bước hoàn tác tối đa giữ lại.
+MAX_UNDO_STEPS = 100
+
+
+def _addressee_map(visual_cues: str) -> dict[int, str]:
+    """``{số câu gốc (1-based): người được nói tới}`` từ JSON Visual Cues (rỗng nếu hỏng)."""
+    if not visual_cues.strip():
+        return {}
+    try:
+        import json
+
+        result: dict[int, str] = {}
+        for cue in json.loads(visual_cues):
+            target = str(cue.get("to") or "").strip()
+            if target:
+                result[int(cue.get("id", -1))] = target
+        return result
+    except (ValueError, TypeError, AttributeError):
+        return {}
+
+
+@dataclass(frozen=True, slots=True)
+class _EditState:
+    """Ảnh chụp mọi chỉnh sửa tay trên danh sách dòng (để hoàn tác / làm lại)."""
+
+    events: tuple
+    origins: tuple[int, ...]
+    speakers: tuple[tuple[int, str], ...]
+    texts: tuple[tuple[int, TextEdit], ...]
+    edited: frozenset[int]
+
+
+def _undoable(method):
+    """Ghi MỘT bước hoàn tác cho cả thao tác (thao tác lồng nhau chỉ tính bước ngoài cùng)."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        outermost = self._tx_depth == 0
+        before = self._capture_state() if outermost else None
+        self._tx_depth += 1
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._tx_depth -= 1
+            if outermost and before is not None:
+                self._record_history(before)
+
+    return wrapper
 
 
 class TTSPageViewModel(QObject):
@@ -28,6 +133,10 @@ class TTSPageViewModel(QObject):
     status_message = Signal(str)
     tts_cancelled = Signal()
     engine_available = Signal(str, bool)
+    #: [v3.23.598] Người nói / lời thoại sửa tay, hoặc tập "dòng đã sửa chưa TTS lại" đổi.
+    line_edits_changed = Signal()
+    #: [v3.23.625] Danh sách dòng vừa đổi (thêm/xoá dòng) — trang vẽ lại bảng dòng.
+    structure_changed = Signal()
 
     def __init__(self, container: "ApplicationContainer") -> None:
         super().__init__()
@@ -39,6 +148,45 @@ class TTSPageViewModel(QObject):
         self._last_engine_name: str = ""
         self._worker = None
         self._is_busy = False
+        self._last_adapter = None  # [v3.23.450] adapter lần TTS gần nhất (để TTS lại dòng chọn)
+        #: [v3.23.630] Lượt TTS đang chạy dùng cache từng dòng (ghi lại cache khi xong).
+        self._run: incremental_run.PreparedRun | None = None
+        #: [v3.23.630] ``(dùng lại, tổng, tổng hợp lại)`` của lượt tăng dần vừa xong; ``None``
+        #: khi lượt gần nhất chạy cả phim.
+        self._reuse_summary: tuple[int, int, int] | None = None
+        #: [v3.23.630] TTS lại dòng chọn đang chạy: (yêu cầu, vị trí dòng) để cập nhật cache.
+        self._manual_run: tuple[TTSRequest, frozenset[int]] | None = None
+        # [v3.23.593] Lồng tiếng: ngữ cảnh phân vai (từ trang Dịch) + vai đã tìm thấy.
+        self._dubbing_source: DubbingSource | None = None
+        self._dubbing_cast: list[CastMember] = []
+        self._dubbing_weights: dict[frozenset[str], int] = {}
+        #: [v3.23.594] Visual Cues có ghép được vào phụ đề TTS đang nạp không (cùng phim).
+        self._dubbing_cues_matched: bool = False
+        # [v3.23.598] Sửa tay từng dòng (theo VỊ TRÍ dòng nguồn) — xem dubbing_line_edits.
+        self._dubbing_prepared = False
+        self._auto_speakers: list[str] = []
+        self._speaker_overrides: dict[int, str] = {}
+        self._text_edits: dict[int, TextEdit] = {}
+        #: Dòng sửa tay SAU lần tổng hợp gần nhất của dòng đó (cần TTS lại).
+        self._edited_since_synthesis: set[int] = set()
+        #: Dòng sửa tay mà lượt TTS đang chạy đã đọc bản mới — xong thì hết "cần TTS lại".
+        self._synthesizing: set[int] = set()
+        self._fingerprint = ""
+        #: [v3.23.625] Phụ đề lúc nạp + vị trí gốc của từng dòng hiện tại (-1 = dòng thêm).
+        self._original_events: list["SubtitleEvent"] = []
+        self._origins: list[int] = []
+        #: [v3.23.627] Hoàn tác / làm lại chỉnh sửa dòng — CHỈ khi chưa có kết quả TTS (audio
+        #: từng dòng không khôi phục được nguyên vẹn sau khi tổng hợp lại).
+        self._undo_stack: list[_EditState] = []
+        self._redo_stack: list[_EditState] = []
+        self._tx_depth = 0
+        # [v3.23.599] Soát người nói: vị trí câu gốc từng dòng + kết quả soát gần nhất.
+        self._source_positions: list[int | None] = []
+        self._issues_cache: (
+            tuple[tuple[object, ...], dict[int, SpeakerIssue]] | None
+        ) = None
+        #: [v3.23.630] ``{số câu gốc (1-based): người được nói tới}`` của Visual Cues.
+        self._addressees: dict[int, str] = {}
 
     @property
     def source_events(self) -> list["SubtitleEvent"]:
@@ -72,9 +220,882 @@ class TTSPageViewModel(QObject):
     def last_engine_name(self) -> str:
         return self._last_engine_name
 
+    @property
+    def dubbing_cast(self) -> list[CastMember]:
+        """Vai tìm thấy ở lần nạp vai gần nhất."""
+        return self._dubbing_cast
+
+    @property
+    def dubbing_cues_matched(self) -> bool:
+        """[v3.23.594] Lần nạp vai gần nhất có dùng được Visual Cues của trang Dịch không.
+
+        ``False`` khi trang Dịch không có cues, hoặc phụ đề TTS không cùng phim với phụ đề
+        trang Dịch (khi đó chỉ tag ``[Tên:]`` đầu dòng được dùng).
+        """
+        return self._dubbing_cues_matched
+
+    @property
+    def dubbing_prepared(self) -> bool:
+        """[v3.23.598] Đã tìm người nói cho phụ đề ĐANG nạp chưa (nạp vai sau khi nạp)."""
+        return self._dubbing_prepared
+
+    @property
+    def speaker_overrides(self) -> dict[int, str]:
+        """[v3.23.598] Người nói chọn tay ``{vị trí dòng: vai}`` (rỗng: giọng chung)."""
+        return dict(self._speaker_overrides)
+
+    @property
+    def edited_positions(self) -> frozenset[int]:
+        """[v3.23.598] Dòng sửa tay (người nói/lời) sau lần tổng hợp gần nhất của dòng."""
+        return frozenset(self._edited_since_synthesis)
+
+    @property
+    def subtitle_fingerprint(self) -> str:
+        """[v3.23.598] Dấu của phụ đề đang nạp (để nhớ chỉnh sửa tay theo phụ đề)."""
+        return self._fingerprint
+
+    @property
+    def can_resynthesize(self) -> bool:
+        """[v3.23.598] Lần TTS gần nhất có giữ audio từng dòng (TTS lại được dòng chọn).
+
+        Chỉ VieNeu ghi audio từng dòng. Bản trước vẫn cho bấm "TTS lại dòng chọn" sau khi
+        chạy Edge/Gemini: tổng hợp xong các dòng chọn rồi mới báo lỗi "Không có segment
+        nào để ghép lại master".
+        """
+        return self._last_adapter is not None and any(
+            getattr(result, "segment_audio_path", "") for result in self._last_results
+        )
+
+    def line_edits(self) -> LineEdits:
+        """[v3.23.598] Chỉnh sửa tay hiện có (để lưu theo phụ đề)."""
+        return LineEdits(
+            speakers=dict(self._speaker_overrides), texts=dict(self._text_edits),
+            lines=self._line_snapshot(),
+        )
+
+    def _line_snapshot(self) -> tuple[LineSnapshot, ...] | None:
+        """[v3.23.625] Ảnh chụp danh sách dòng khi đã thêm/xoá dòng; ``None`` nếu chưa."""
+        if not (
+            snapshot_is_structural(self._origins, len(self._original_events))
+            or self._timing_changed()
+        ):
+            return None
+        events = self._source_events
+        return build_snapshot(
+            self._origins,
+            [float(e.start_sec) for e in events],
+            [float(e.end_sec) for e in events],
+            [str(getattr(e, "text", "") or "") for e in events],
+        )
+
+    def _timing_changed(self) -> bool:
+        """[v3.23.626] Có dòng nào đã đổi mốc thời gian so với lúc nạp không."""
+        for event, origin in zip(self._source_events, self._origins, strict=False):
+            if 0 <= origin < len(self._original_events):
+                base = self._original_events[origin]
+                if (event.start_sec, event.end_sec) != (base.start_sec, base.end_sec):
+                    return True
+        return False
+
+    @property
+    def reuse_summary(self) -> tuple[int, int, int] | None:
+        """[v3.23.630] ``(dòng dùng lại, tổng, dòng tổng hợp lại)`` của lượt tăng dần gần nhất."""
+        return self._reuse_summary
+
+    @property
+    def line_structure_changed(self) -> bool:
+        """[v3.23.625] Danh sách dòng đã khác lúc nạp (có thêm/xoá dòng)."""
+        return self._line_snapshot() is not None
+
+    def has_line_edits(self, positions: Iterable[int] | None = None) -> bool:
+        """[v3.23.598] Có chỉnh sửa tay nào (trong ``positions`` nếu có) không."""
+        edited = set(self._speaker_overrides) | set(self._text_edits)
+        if positions is None:
+            return bool(edited)
+        return any(position in edited for position in positions)
+
+    def auto_line_speakers(self) -> list[str]:
+        """[v3.23.598] Người nói ứng dụng tự tìm cho từng dòng nguồn (chưa áp sửa tay).
+
+        Returns:
+            Theo vị trí dòng; toàn rỗng khi chưa nạp vai cho phụ đề này.
+        """
+        count = len(self._source_events)
+        if not self._dubbing_prepared or self._dubbing_source is None:
+            return [""] * count
+        if len(self._auto_speakers) != count:
+            self._auto_speakers = line_speakers(self._source_events, self._dubbing_source)
+        return list(self._auto_speakers)
+
+    def effective_line_speakers(self) -> list[str]:
+        """[v3.23.598] Người nói từng dòng sau khi áp lựa chọn tay của người dùng."""
+        return apply_speaker_overrides(self.auto_line_speakers(), self._speaker_overrides)
+
+    def speaker_issues(self) -> dict[int, SpeakerIssue]:
+        """[v3.23.599] Dòng cần soát người nói (xem ``speaker_review``).
+
+        Dòng người dùng đã chọn tay người nói coi như đã soát. Chưa nạp vai cho phụ đề
+        này thì rỗng.
+
+        Returns:
+            ``{vị trí dòng: vấn đề}``.
+        """
+        source = self._dubbing_source
+        if not self._dubbing_prepared or source is None:
+            return {}
+        speakers = self.effective_line_speakers()
+        signature = (tuple(speakers), tuple(sorted(self._speaker_overrides)))
+        if self._issues_cache is not None and self._issues_cache[0] == signature:
+            return dict(self._issues_cache[1])
+        texts = [
+            source.source_texts[position]
+            if position is not None and position < len(source.source_texts) else ""
+            for position in self._source_positions
+        ]
+        if len(texts) != len(speakers):
+            texts = [""] * len(speakers)
+        issues = review_speakers(
+            speakers, texts, source.characters,
+            {member.name: member.gender for member in self._dubbing_cast},
+            frozenset(self._speaker_overrides),
+        )
+        self._issues_cache = (signature, issues)
+        return dict(issues)
+
+    @_undoable
+    def set_speaker_override(
+        self, positions: Iterable[int], speaker: str | None
+    ) -> int:
+        """[v3.23.598] Chọn tay người nói cho các dòng (sửa phân vai sai của khâu dịch).
+
+        Args:
+            positions: Vị trí dòng (0-based).
+            speaker: Tên vai; :data:`SHARED_VOICE_SPEAKER` = giọng chung; ``None`` = bỏ
+                lựa chọn tay, dùng lại người nói tự tìm.
+
+        Returns:
+            Số dòng thay đổi.
+        """
+        changed: list[int] = []
+        for position in self._valid_positions(positions):
+            if speaker is None:
+                if self._speaker_overrides.pop(position, None) is not None:
+                    changed.append(position)
+            elif self._speaker_overrides.get(position) != speaker:
+                self._speaker_overrides[position] = speaker
+                changed.append(position)
+        if changed:
+            self._mark_edited(changed)
+            self.line_edits_changed.emit()
+        return len(changed)
+
+    @_undoable
+    def revert_line_edits(self, positions: Iterable[int]) -> list[int]:
+        """[v3.23.598] Bỏ mọi sửa tay của các dòng: lời về chữ lúc nạp, người nói tự tìm.
+
+        Args:
+            positions: Vị trí dòng.
+
+        Returns:
+            Vị trí các dòng vừa được trả lại lời gốc (để trang cập nhật ô nội dung).
+        """
+        reverted_texts: list[int] = []
+        changed: list[int] = []
+        for position in self._valid_positions(positions):
+            if self._speaker_overrides.pop(position, None) is not None:
+                changed.append(position)
+            edit = self._text_edits.pop(position, None)
+            if edit is not None:
+                self._replace_event_text(position, edit.original)
+                reverted_texts.append(position)
+                changed.append(position)
+        if changed:
+            if reverted_texts:
+                self._refresh_auto_speakers()
+            self._mark_edited(changed)
+            self.line_edits_changed.emit()
+        return reverted_texts
+
+    def restore_line_edits(self, edits: LineEdits) -> tuple[int, int]:
+        """[v3.23.598] Áp lại chỉnh sửa tay đã lưu cho phụ đề vừa nạp.
+
+        Người nói áp theo vị trí (cùng dấu phụ đề = cùng các dòng). Lời sửa chỉ áp khi
+        dòng còn đúng chữ lúc sửa (:func:`restorable_text_edits`).
+
+        Args:
+            edits: Chỉnh sửa đã lưu của phụ đề này.
+
+        Returns:
+            ``(số dòng áp người nói, số dòng áp lời sửa)``.
+        """
+        structural = self._restore_structure(edits.lines)
+        count = len(self._source_events)
+        speakers = {
+            position: speaker
+            for position, speaker in edits.speakers.items()
+            if 0 <= position < count
+        }
+        if structural:
+            # Lời trong ảnh chụp đã là lời sau khi sửa; chỉ nhớ lại chữ gốc để "Bỏ sửa tay".
+            texts = {
+                position: edit for position, edit in edits.texts.items()
+                if 0 <= position < count
+                and edit.edited != edit.original
+                and str(getattr(self._source_events[position], "text", "") or "") == edit.edited
+            }
+        else:
+            texts = restorable_text_edits(self._source_events, edits.texts)
+        if not speakers and not texts:
+            if structural:
+                self.line_edits_changed.emit()
+            return 0, 0
+        self._speaker_overrides.update(speakers)
+        for position, edit in texts.items():
+            if not structural:
+                self._replace_event_text(position, edit.edited)
+            self._text_edits[position] = edit
+        if texts:
+            self._refresh_auto_speakers()
+        self.line_edits_changed.emit()
+        return len(speakers), len(texts)
+
+    def prepare_dubbing(self, source: DubbingSource) -> list[str]:
+        """[v3.23.593] Tìm người nói từng dòng TTS và lập danh sách vai.
+
+        [v3.23.598] Áp người nói chọn tay trước khi lập danh sách vai: vai người dùng gán
+        cho một dòng (kể cả nhân vật Visual Cues bỏ sót) có mặt trong bảng phân vai và
+        nhận giọng như mọi vai khác.
+
+        Args:
+            source: Bảng nhân vật + Visual Cues + mốc câu gốc từ trang Dịch.
+
+        Returns:
+            Người nói của từng dòng nguồn TTS (rỗng = không rõ / giọng chung).
+        """
+        self._dubbing_source = source
+        self._dubbing_prepared = True
+        self._issues_cache = None
+        self._addressees = _addressee_map(source.visual_cues)
+        self._auto_speakers = line_speakers(self._source_events, source)
+        speakers = self.effective_line_speakers()
+        self._source_positions = align_to_source(self._source_events, source.source_spans)
+        self._dubbing_cues_matched = bool(source.visual_cues.strip()) and any(
+            position is not None for position in self._source_positions
+        )
+        self._dubbing_cast = build_cast(speakers, source.characters)
+        self._dubbing_weights = conversation_weights(speakers)
+        return speakers
+
+    def voice_catalog(self, engine: str, language: str) -> list[VoiceProfile]:
+        """Bộ giọng phân vai của Edge/Gemini (tức thì, không nạp model).
+
+        VieNeu phải nạp model mới biết giọng nên trang lấy qua luồng nền riêng.
+
+        Args:
+            engine: ``"edge"`` hoặc ``"gemini"``.
+            language: Locale (Edge) hoặc tên model (Gemini).
+
+        Returns:
+            Danh sách giọng; rỗng với engine khác.
+        """
+        if engine == "edge":
+            return self._container.make_edge_tts_adapter().list_voice_catalog(language)
+        if engine == "gemini":
+            return self._container.make_gemini_tts_adapter().list_voice_catalog(language)
+        return []
+
+    def auto_cast(self, catalog: list[VoiceProfile]) -> dict[str, str]:
+        """Giao giọng tự động cho các vai đã nạp (xem ``dubbing_cast.auto_cast``)."""
+        return auto_cast(self._dubbing_cast, catalog, self._dubbing_weights)
+
+    def dubbing_line_voices(self, casting: dict[str, str]) -> tuple[str, ...]:
+        """Giọng từng dòng nguồn HIỆN TẠI theo bảng phân vai.
+
+        Tính lại người nói trên phụ đề đang nạp (người dùng có thể đã nạp lại phụ đề sau
+        khi nạp vai), nên giọng luôn khớp đúng dòng. [v3.23.598] Có áp người nói chọn tay.
+
+        Args:
+            casting: ``{tên vai: voice_id}``.
+
+        Returns:
+            Giọng theo vị trí dòng; rỗng khi chưa nạp vai hoặc không dòng nào có giọng
+            riêng.
+        """
+        if self._dubbing_source is None:
+            return ()
+        speakers = apply_speaker_overrides(
+            line_speakers(self._source_events, self._dubbing_source),
+            self._speaker_overrides,
+        )
+        return voices_for_lines(speakers, casting)
+
     def set_source_events(self, events: list["SubtitleEvent"]) -> None:
         self._source_events = list(events)
+        self._original_events = list(events)
+        self._origins = list(range(len(events)))
+        self._undo_stack, self._redo_stack = [], []
+        # [v3.23.598] Sửa tay gắn với phụ đề CŨ; trang khôi phục sửa tay đã lưu của
+        # phụ đề mới (theo dấu phụ đề) khi nhận source_changed.
+        self._fingerprint = subtitle_fingerprint(self._source_events)
+        self._speaker_overrides = {}
+        self._text_edits = {}
+        self._edited_since_synthesis = set()
+        self._synthesizing = set()
+        self._auto_speakers = []
+        self._dubbing_prepared = False
+        self._source_positions = []
+        self._issues_cache = None
+        # [v3.23.598] Kết quả TTS cũ là của phụ đề CŨ. Bảng dòng nay hiện ngay các dòng
+        # vừa nạp và cho chọn dòng: "TTS lại dòng chọn" trên kết quả cũ sẽ ghép lời phụ đề
+        # mới vào audio phụ đề cũ.
+        self._last_results = []
+        self._last_request = None
+        self._last_adapter = None
         self.source_changed.emit(len(self._source_events))
+
+    @_undoable
+    def update_event_text(self, position: int, new_text: str) -> None:
+        """[v3.23.451] Cập nhật nội dung dòng nguồn theo VỊ TRÍ (0-based, = ``event_index`` của
+        kết quả) — KHÔNG dùng ``event.index`` (1-based) để tránh lệch n→n-1.
+
+        [v3.23.598] Ghi nhận lời sửa tay (nhớ chữ gốc để "Bỏ sửa tay" và để lưu theo phụ
+        đề) và đánh dấu dòng cần TTS lại. Sửa chỉ khác khoảng trắng không tính là sửa.
+
+        Args:
+            position: Vị trí enumerate của dòng (bằng ``TTSSegmentResult.event_index``).
+            new_text: Nội dung mới (đã sửa trên bảng).
+        """
+        if not (0 <= position < len(self._source_events)):
+            return
+        current = str(getattr(self._source_events[position], "text", "") or "")
+        if new_text.strip() == current.strip():
+            return
+        edit = self._text_edits.get(position)
+        original = edit.original if edit is not None else current
+        self._replace_event_text(position, new_text)
+        if new_text.strip() == original.strip():
+            self._text_edits.pop(position, None)
+        else:
+            self._text_edits[position] = TextEdit(original=original, edited=new_text)
+        # Lời mới có thể vừa thêm/bỏ tag [Tên:] đầu dòng — tag quyết định người nói.
+        self._refresh_auto_speakers()
+        self._mark_edited([position])
+        self.line_edits_changed.emit()
+
+    def _replace_event_text(self, position: int, text: str) -> None:
+        event = self._source_events[position]
+        try:
+            self._source_events[position] = replace(event, text=text)
+        except (TypeError, ValueError):
+            event.text = text  # type: ignore[attr-defined]
+
+    def _refresh_auto_speakers(self) -> None:
+        if self._dubbing_prepared and self._dubbing_source is not None:
+            self._auto_speakers = line_speakers(self._source_events, self._dubbing_source)
+
+    def _mark_edited(self, positions: Iterable[int]) -> None:
+        for position in positions:
+            self._edited_since_synthesis.add(position)
+            # Sửa trong lúc lượt TTS đang chạy: lượt đó đọc bản CŨ → vẫn cần TTS lại.
+            self._synthesizing.discard(position)
+
+    def _valid_positions(self, positions: Iterable[int]) -> list[int]:
+        count = len(self._source_events)
+        return sorted({
+            int(position) for position in positions if 0 <= int(position) < count
+        })
+
+    def resynthesize_lines(
+        self,
+        selected_indices: set[int],
+        line_voices: tuple[str, ...] | None = None,
+        remerge_only: bool = False,
+    ) -> bool:
+        """[v3.23.450] TTS lại các dòng được chọn (kể cả nội dung vừa sửa) rồi ghép lại master.
+
+        Args:
+            selected_indices: Vị trí (0-based) các dòng cần TTS lại.
+            line_voices: [v3.23.594] Giọng từng dòng theo bảng phân vai HIỆN TẠI
+                (người dùng vừa đổi giọng một vai rồi TTS lại các dòng của vai đó).
+                ``None`` = giữ giọng của lần TTS trước.
+
+            remerge_only: [v3.23.625] Chỉ ghép lại master (không tổng hợp dòng nào).
+
+        Returns:
+            True nếu đã khởi chạy; False nếu tiền điều kiện không thoả (chưa TTS, thiếu file,
+            engine không hỗ trợ giữ audio per-line, hoặc đang bận).
+        """
+        if self._is_busy or self._worker is not None and self._worker.isRunning():
+            return False
+        if (
+            (not selected_indices and not remerge_only)
+            or self._last_adapter is None
+            or self._last_request is None
+            or self._last_output_path is None
+            or not self._last_results
+        ):
+            return False
+        if not self._last_output_path.exists() or not self.can_resynthesize:
+            return False
+
+        # Đọc sample_rate + độ dài master từ file WAV output hiện có (giữ nguyên tổng thời lượng).
+        try:
+            import soundfile as sf
+
+            info = sf.info(str(self._last_output_path))
+            sample_rate = int(info.samplerate)
+            total_length_samples = int(info.frames)
+        except (OSError, RuntimeError) as exc:
+            self.error_occurred.emit(f"Không đọc được file audio để ghép lại: {exc}")
+            return False
+
+        # Yêu cầu ghép nội dung MỚI (source_events đã cập nhật qua update_event_text).
+        # [v3.23.598] Bản SAO danh sách dòng: luồng nền không được thấy sửa tay giữa chừng.
+        full_request = replace(
+            self._last_request, events=list(self._source_events), keep_line_audio=True
+        )
+        if line_voices is not None:
+            full_request = replace(full_request, line_voices=tuple(line_voices))
+
+        use_case = self._container.make_resynthesize_use_case(self._last_adapter)
+        from subtitles_extractor.presentation.workers.resynthesize_worker import (
+            ResynthesizeWorker,
+        )
+        self._worker = ResynthesizeWorker(
+            use_case,
+            full_request=full_request,
+            selected_indices=set(int(i) for i in selected_indices),
+            prior_results=self._last_results,
+            output_path=self._last_output_path,
+            sample_rate=sample_rate,
+            total_length_samples=total_length_samples,
+            remerge_only=remerge_only,
+        )
+        self._worker.progress_changed.connect(self.progress_changed.emit)
+        self._worker.finished_ok.connect(self._on_worker_finished)
+        self._worker.failed.connect(self._on_worker_failed)
+        self._worker.cancelled.connect(self._on_worker_cancelled)
+        self._worker.finished.connect(self._on_thread_finished)
+        self._set_busy(True)
+        self._synthesizing = self._edited_since_synthesis & {
+            int(i) for i in selected_indices
+        }
+        self._run = None
+        self._reuse_summary = None
+        self._manual_run = (
+            None if remerge_only
+            else (full_request, frozenset(int(i) for i in selected_indices))
+        )
+        self._worker.start()
+        self.status_message.emit(
+            "Đang ghép lại audio sau khi đổi danh sách dòng..." if remerge_only
+            else f"Đang TTS lại {len(selected_indices)} dòng rồi ghép lại audio..."
+        )
+        return True
+
+    # ── [v3.23.625] Thêm / xoá dòng ───────────────────────────────────────────
+
+    def _restore_structure(self, lines: tuple[LineSnapshot, ...] | None) -> bool:
+        """Dựng lại danh sách dòng đã thêm/xoá từ ảnh chụp đã lưu. ``True`` nếu đã áp."""
+        original = self._original_events
+        if lines is None or not original or not valid_snapshot(lines, len(original)):
+            return False
+        rebuilt: list["SubtitleEvent"] = []
+        for line in lines:
+            base = original[line.origin] if line.origin >= 0 else None
+            rebuilt.append(self._make_event(
+                base or original[0], len(rebuilt) + 1, line.start_sec, line.end_sec,
+                line.text, keep_identity=base is not None,
+            ))
+        self._source_events = rebuilt
+        self._origins = [line.origin for line in lines]
+        return True
+
+    @staticmethod
+    def _make_event(
+        template: "SubtitleEvent", index: int, start_sec: float, end_sec: float, text: str,
+        *, keep_identity: bool = False,
+    ) -> "SubtitleEvent":
+        """Bản sao ``template`` với số thứ tự, mốc và lời mới (dòng mới: danh tính mới)."""
+        changes: dict[str, object] = {
+            "index": index, "text": text, "interval": TimeInterval(start_sec, end_sec),
+        }
+        if not keep_identity:
+            changes.update(
+                uid=str(uuid.uuid4()), confidence=Confidence.zero(), frame_count=0,
+                position=None, bounding_box=None,
+            )
+        return replace(template, **changes)  # type: ignore[type-var]
+
+    def _renumber_events(self) -> None:
+        """Số thứ tự ``index`` của dòng theo vị trí hiện tại (1-based)."""
+        for position, event in enumerate(self._source_events):
+            if getattr(event, "index", position + 1) != position + 1:
+                self._source_events[position] = replace(event, index=position + 1)
+
+    def _after_structure_change(self, mapping: dict[int, int]) -> None:
+        """Đưa mọi trạng thái đánh theo vị trí sang vị trí mới rồi báo trang."""
+        self._speaker_overrides = remap_keys(self._speaker_overrides, mapping)
+        self._text_edits = remap_keys(self._text_edits, mapping)
+        self._edited_since_synthesis = remap_set(self._edited_since_synthesis, mapping)
+        self._synthesizing = set()
+        self._renumber_events()
+        self._rederive_speakers()
+        self.structure_changed.emit()
+        self.line_edits_changed.emit()
+
+    def _rederive_speakers(self) -> None:
+        """Tính lại người nói tự tìm và vị trí câu gốc theo danh sách dòng hiện tại."""
+        self._auto_speakers = []
+        self._source_positions = []
+        self._issues_cache = None
+        if self._dubbing_prepared and self._dubbing_source is not None:
+            self._auto_speakers = line_speakers(self._source_events, self._dubbing_source)
+            self._source_positions = align_to_source(
+                self._source_events, self._dubbing_source.source_spans
+            )
+
+    # ── [v3.23.627] Hoàn tác / làm lại ────────────────────────────────────────
+
+    def _capture_state(self) -> _EditState:
+        return _EditState(
+            events=tuple(self._source_events),
+            origins=tuple(self._origins),
+            speakers=tuple(sorted(self._speaker_overrides.items())),
+            texts=tuple(sorted(self._text_edits.items())),
+            edited=frozenset(self._edited_since_synthesis),
+        )
+
+    def _record_history(self, before: _EditState) -> None:
+        """Đẩy trạng thái trước thao tác vào ngăn hoàn tác nếu thao tác có đổi gì."""
+        if self._last_results or self._capture_state() == before:
+            return
+        self._undo_stack.append(before)
+        del self._undo_stack[:-MAX_UNDO_STEPS]
+        self._redo_stack.clear()
+
+    def _apply_state(self, state: _EditState) -> None:
+        self._source_events = list(state.events)
+        self._origins = list(state.origins)
+        self._speaker_overrides = dict(state.speakers)
+        self._text_edits = dict(state.texts)
+        self._edited_since_synthesis = set(state.edited)
+        self._synthesizing = set()
+        self._rederive_speakers()
+        self.structure_changed.emit()
+        self.line_edits_changed.emit()
+
+    @property
+    def can_undo(self) -> bool:
+        """Có bước để hoàn tác (chưa có kết quả TTS, không bận)."""
+        return bool(self._undo_stack) and not self._last_results and not self._is_busy
+
+    @property
+    def can_redo(self) -> bool:
+        """Có bước để làm lại."""
+        return bool(self._redo_stack) and not self._last_results and not self._is_busy
+
+    def undo(self) -> bool:
+        """Hoàn tác thao tác chỉnh dòng gần nhất (lời, người nói, thêm/xoá/gộp/tách, mốc)."""
+        if not self.can_undo:
+            return False
+        self._redo_stack.append(self._capture_state())
+        self._apply_state(self._undo_stack.pop())
+        return True
+
+    def redo(self) -> bool:
+        """Làm lại thao tác vừa hoàn tác."""
+        if not self.can_redo:
+            return False
+        self._undo_stack.append(self._capture_state())
+        self._apply_state(self._redo_stack.pop())
+        return True
+
+    @_undoable
+    def delete_lines(self, positions: Iterable[int]) -> int:
+        """[v3.23.625] Xoá các dòng khỏi danh sách lồng tiếng.
+
+        Người nói chọn tay, lời sửa tay, dòng cần TTS lại, kết quả tổng hợp và tệp audio từng
+        dòng đều được đánh số lại theo vị trí mới; audio của dòng bị xoá bị dọn. Master chưa bị
+        đổi — trang gọi :meth:`remerge_master` để ghép lại.
+
+        Args:
+            positions: Vị trí (0-based) các dòng cần xoá.
+
+        Returns:
+            Số dòng đã xoá (0 nếu đang bận, hoặc sẽ xoá hết mọi dòng).
+        """
+        if self._is_busy:
+            return 0
+        removed = self._valid_positions(positions)
+        count = len(self._source_events)
+        if not removed or len(removed) >= count:
+            return 0
+        mapping = delete_mapping(count, removed)
+        self._source_events = [
+            event for position, event in enumerate(self._source_events)
+            if position in mapping
+        ]
+        self._origins = [o for position, o in enumerate(self._origins) if position in mapping]
+        self._remap_results(mapping, removed=len(removed))
+        self._after_structure_change(mapping)
+        return len(removed)
+
+    @_undoable
+    def insert_line(
+        self, start_sec: float, end_sec: float, text: str
+    ) -> int | None:
+        """[v3.23.625] Thêm một dòng mới (đúng thứ tự thời gian) vào danh sách lồng tiếng.
+
+        Args:
+            start_sec: Mốc bắt đầu (giây).
+            end_sec: Mốc kết thúc (giây), lớn hơn mốc bắt đầu.
+            text: Lời thoại (không rỗng).
+
+        Returns:
+            Vị trí của dòng mới; ``None`` nếu đang bận hoặc dữ liệu không hợp lệ.
+        """
+        text = (text or "").strip()
+        if self._is_busy or not self._source_events or not text:
+            return None
+        if start_sec < 0 or end_sec <= start_sec:
+            return None
+        starts = [float(e.start_sec) for e in self._source_events]
+        position = insertion_position(starts, start_sec)
+        count = len(self._source_events)
+        mapping = insert_mapping(count, position)
+        template = self._source_events[max(0, position - 1)]
+        event = self._make_event(template, position + 1, start_sec, end_sec, text)
+        self._source_events.insert(position, event)
+        self._origins.insert(position, -1)
+        self._remap_results(mapping, inserted=(position, start_sec, end_sec, text))
+        self._after_structure_change(mapping)
+        self._mark_edited([position])
+        return position
+
+    def suggested_line_timing(self, after_position: int | None) -> tuple[float, float]:
+        """[v3.23.625] Mốc gợi ý cho dòng mới đặt ngay sau dòng ``after_position``."""
+        duration = getattr(self._last_request, "media_duration_s", None)
+        return default_line_timing(
+            [float(e.start_sec) for e in self._source_events],
+            [float(e.end_sec) for e in self._source_events],
+            after_position, duration,
+        )
+
+    def _remap_results(
+        self, mapping: dict[int, int], removed: int = 0,
+        inserted: tuple[int, float, float, str] | None = None,
+    ) -> None:
+        """Đánh số lại kết quả TTS (và giọng từng dòng của lần chạy gần nhất)."""
+        if not self._last_results:
+            return
+        old_voices = (
+            self._last_request.line_voices if self._last_request is not None else ()
+        )
+        self._last_results = renumber_results(self._last_results, mapping)
+        if (
+            self._last_adapter is not None and self._last_request is not None
+            and self._last_output_path is not None
+        ):
+            # [v3.23.630] Cache theo đĩa phải đi theo audio vừa đổi tên.
+            incremental_run.remap_saved_cache(
+                self._last_request, self._last_adapter, self._last_output_path, mapping
+            )
+        if inserted is not None:
+            position, start, end, text = inserted
+            self._last_results.append(TTSSegmentResult(
+                event_index=position, start_sec=start, end_sec=end, text=text,
+                subtitle_text=text, was_skipped=True,
+            ))
+            self._last_results.sort(key=lambda r: r.event_index)
+        if self._last_request is not None and old_voices:
+            voices = [""] * len(self._source_events)
+            for old, voice in enumerate(old_voices):
+                if old in mapping and mapping[old] < len(voices):
+                    voices[mapping[old]] = voice
+            self._last_request = replace(self._last_request, line_voices=tuple(voices))
+
+    @_undoable
+    def set_line_timing(self, position: int, start_sec: float, end_sec: float) -> bool:
+        """[v3.23.626] Đổi mốc thời gian của MỘT dòng (giữ nguyên thứ tự các dòng).
+
+        Args:
+            position: Vị trí dòng (0-based).
+            start_sec: Mốc bắt đầu mới.
+            end_sec: Mốc kết thúc mới, sau mốc bắt đầu.
+
+        Returns:
+            ``True`` nếu đã đổi; ``False`` nếu đang bận, mốc không hợp lệ, hoặc làm dòng đứng
+            trước dòng kề (đổi thứ tự dòng: hãy xoá rồi thêm lại).
+        """
+        events = self._source_events
+        if self._is_busy or not (0 <= position < len(events)):
+            return False
+        if start_sec < 0 or end_sec <= start_sec:
+            return False
+        if position > 0 and start_sec < events[position - 1].start_sec:
+            return False
+        if position + 1 < len(events) and start_sec > events[position + 1].start_sec:
+            return False
+        event = events[position]
+        if (event.start_sec, event.end_sec) == (start_sec, end_sec):
+            return True
+        self._set_interval(position, start_sec, end_sec)
+        self._mark_edited([position])
+        self.structure_changed.emit()
+        self.line_edits_changed.emit()
+        return True
+
+    def _set_interval(self, position: int, start_sec: float, end_sec: float) -> None:
+        """Ghi mốc mới vào dòng nguồn và kết quả TTS cùng dòng (mốc đã xếp lại bị xoá)."""
+        self._source_events[position] = replace(
+            self._source_events[position], interval=TimeInterval(start_sec, end_sec)
+        )
+        for index, result in enumerate(self._last_results):
+            if int(result.event_index) == position:
+                self._last_results[index] = replace(
+                    result, start_sec=start_sec, end_sec=end_sec,
+                    adjusted_start_sec=-1.0, adjusted_end_sec=-1.0,
+                )
+
+    @_undoable
+    def merge_lines(self, positions: Iterable[int]) -> int | None:
+        """[v3.23.626] Gộp các dòng LIỀN NHAU thành một (lời nối bằng dấu cách, mốc phủ cả hai).
+
+        Dòng đầu giữ người nói đã chọn; các dòng sau bị xoá. Dòng gộp cần TTS lại.
+
+        Returns:
+            Vị trí dòng gộp; ``None`` nếu ít hơn hai dòng, không liền nhau, hoặc đang bận.
+        """
+        chosen = self._valid_positions(positions)
+        if self._is_busy or len(chosen) < 2:
+            return None
+        if chosen[-1] - chosen[0] != len(chosen) - 1:
+            return None
+        events = self._source_events
+        first = chosen[0]
+        merged_text = " ".join(
+            str(getattr(events[p], "text", "") or "").strip() for p in chosen
+        ).strip()
+        start = float(events[first].start_sec)
+        end = max(float(events[p].end_sec) for p in chosen)
+        if not merged_text or end <= start:
+            return None
+        self.update_event_text(first, merged_text)
+        self._set_interval(first, start, end)
+        for index, result in enumerate(self._last_results):
+            if int(result.event_index) == first:
+                self._last_results[index] = replace(
+                    result, text=merged_text, subtitle_text=merged_text
+                )
+        self.delete_lines(chosen[1:])
+        self._mark_edited([first])
+        return first
+
+    @_undoable
+    def split_line(
+        self, position: int, text_a: str, text_b: str, split_sec: float
+    ) -> int | None:
+        """[v3.23.626] Tách một dòng thành hai tại ``split_sec``; dòng sau giữ người nói.
+
+        Returns:
+            Vị trí dòng mới (dòng sau); ``None`` nếu dữ liệu không hợp lệ hoặc đang bận.
+        """
+        events = self._source_events
+        text_a, text_b = (text_a or "").strip(), (text_b or "").strip()
+        if self._is_busy or not (0 <= position < len(events)) or not text_a or not text_b:
+            return None
+        start, end = float(events[position].start_sec), float(events[position].end_sec)
+        if not (start < split_sec < end):
+            return None
+        speaker = self._speaker_overrides.get(position)
+        self.update_event_text(position, text_a)
+        self._set_interval(position, start, split_sec)
+        for index, result in enumerate(self._last_results):
+            if int(result.event_index) == position:
+                self._last_results[index] = replace(
+                    result, text=text_a, subtitle_text=text_a
+                )
+        new_position = self.insert_line(split_sec, end, text_b)
+        if new_position is not None and speaker is not None:
+            self._speaker_overrides[new_position] = speaker
+            self.line_edits_changed.emit()
+        self._mark_edited([position])
+        return new_position
+
+    # ── [v3.23.629] Dịch ↔ TTS: dòng không vừa khung ─────────────────────────
+
+    def speech_misfits(self) -> list[LineFit]:
+        """Dòng bản dịch KHÔNG vừa khung giọng đọc.
+
+        Đã tổng hợp thì dùng số đo THẬT (nén ≥ 1,5×, bị cắt, chồng tiếng); chưa tổng hợp thì dự đoán
+        theo mô hình thời lượng VieNeu (ngưỡng cao — bộ lập lịch còn dời câu / mượn khoảng lặng).
+        """
+        if self._last_results:
+            return measured_misfits(self._source_events, self._last_results)
+        return predict_misfits(self._source_events)
+
+    def line_context(self, position: int) -> tuple[str, str, str]:
+        """``(câu gốc, người nói, người nghe)`` của một dòng — ngữ cảnh cho bước rút gọn bằng AI.
+
+        Rỗng ở phần không biết (chưa nạp ngữ cảnh phân vai của trang Dịch).
+        """
+        source = self._dubbing_source
+        if not self._dubbing_prepared or source is None:
+            return "", "", ""
+        speakers = self.effective_line_speakers()
+        speaker = speakers[position] if 0 <= position < len(speakers) else ""
+        source_pos = (
+            self._source_positions[position]
+            if 0 <= position < len(self._source_positions) else None
+        )
+        text = (
+            source.source_texts[source_pos]
+            if source_pos is not None and 0 <= source_pos < len(source.source_texts) else ""
+        )
+        addressee = self._addressees.get(source_pos + 1, "") if source_pos is not None else ""
+        return text, speaker, addressee
+
+    def speaker_review_lines(self) -> list[ReviewLine]:
+        """[v3.23.630] Mọi dòng kèm ngữ cảnh người nói (cho hộp thoại duyệt nhanh).
+
+        Chưa nạp vai cho phụ đề này thì người nói/câu gốc/người nghe để rỗng.
+        """
+        speakers = self.effective_line_speakers()
+        source = self._dubbing_source if self._dubbing_prepared else None
+        lines: list[ReviewLine] = []
+        for position, event in enumerate(self._source_events):
+            source_pos = (
+                self._source_positions[position]
+                if position < len(self._source_positions) else None
+            )
+            origin = (
+                source.source_texts[source_pos]
+                if source is not None and source_pos is not None
+                and 0 <= source_pos < len(source.source_texts) else ""
+            )
+            lines.append(ReviewLine(
+                position=position, start_sec=float(event.start_sec),
+                end_sec=float(event.end_sec), text=str(getattr(event, "text", "") or ""),
+                source=origin, speaker=speakers[position] if position < len(speakers) else "",
+                addressee=(
+                    self._addressees.get(source_pos + 1, "") if source_pos is not None else ""
+                ),
+            ))
+        return lines
+
+    def speaker_review_queue(self) -> list[ReviewItem]:
+        """[v3.23.630] Dòng cần soát người nói, bằng chứng chắc nhất trước."""
+        return review_queue(self.speaker_issues())
+
+    def remerge_master(self) -> bool:
+        """[v3.23.625] Ghép lại master từ các segment còn lại (sau khi xoá dòng), không TTS.
+
+        Returns:
+            ``True`` nếu đã khởi chạy; ``False`` khi chưa có kết quả, đang bận, hoặc lần TTS
+            gần nhất không giữ audio từng dòng (Edge/Gemini: phải TTS lại cả phim).
+        """
+        return self.resynthesize_lines(set(), remerge_only=True)
 
     def load_source_from_file(self, source_path: Path) -> None:
         try:
@@ -143,11 +1164,22 @@ class TTSPageViewModel(QObject):
         affective_dialog: bool = True,
         gemini_temperature: float | None = None,
         # VieNeu
-        vieneu_mode: str = "standard",
+        vieneu_mode: str = "v3turbo",
         vieneu_emotion: str = "natural",
         vieneu_force_cpu: bool = True,
+        vieneu_batch_size: int = 0,
+        vieneu_emotion_cues: bool = False,
+        vieneu_precision: str = "",
         media_duration_s: float | None = None,
+        line_voices: tuple[str, ...] = (),
+        incremental: bool = True,
     ) -> bool:
+        """Chạy TTS cả bộ phụ đề (hoặc chỉ các dòng đã đổi khi ``incremental``).
+
+        [v3.23.630] ``incremental``: engine ghi được audio từng dòng (VieNeu) và đã có kết quả
+        cũ cạnh file output → chỉ tổng hợp lại dòng có lời/mốc/giọng/cài đặt khác lần trước
+        rồi ghép lại master. ``False`` luôn chạy lại cả phim.
+        """
         if self._is_busy:
             self.status_message.emit("Đang bận, vui lòng chờ.")
             return False
@@ -163,7 +1195,10 @@ class TTSPageViewModel(QObject):
             output_path = output_path.with_suffix(f".{fmt}")
 
         request = TTSRequest(
-            events=self._source_events,
+            # [v3.23.598] Bản SAO: người dùng sửa lời/người nói trong lúc đang chạy thì luồng
+            # nền vẫn đọc trọn bộ dòng lúc bấm Tổng hợp (dòng sửa giữa chừng được đánh dấu
+            # cần TTS lại).
+            events=list(self._source_events),
             language=language, speaker=speaker,
             base_speed=base_speed, max_speed=max_speed,
             device=device, normalize=normalize,
@@ -189,13 +1224,33 @@ class TTSPageViewModel(QObject):
             style_prompt=style_prompt, affective_dialog=affective_dialog,
             gemini_temperature=gemini_temperature,
             media_duration_s=media_duration_s,
+            line_voices=tuple(line_voices),
+            # [v3.23.450] Luôn giữ audio từng dòng ở trang TTS → cho phép nghe lại + TTS lại
+            # dòng chọn. Chi phí: mỗi dòng một WAV nhỏ trong thư mục _segments cạnh output.
+            keep_line_audio=True,
         )
 
         if engine == "gemini":
             adapter = self._container.make_gemini_tts_adapter(api_key=api_key)
         elif engine == "vieneu":
+            # [v3.23.416/422] Giải quyết batch size (số CÂU gom mỗi lần gọi GPU):
+            #   0 = tắt · -1 = Tự động (theo VRAM) · -2 = MỘT LÔ cho TẤT CẢ câu · ≥2 = cố định.
+            resolved_batch = vieneu_batch_size
+            if vieneu_batch_size == -2:
+                # Số lớn hơn mọi phụ đề thực tế → look-ahead gom HẾT câu vào một lần gọi.
+                resolved_batch = 10_000_000
+                logger.info("VieNeu batch: MỘT LÔ cho toàn bộ câu (gom hết một lần).")
+            elif vieneu_batch_size < 0:
+                from subtitles_extractor.infrastructure.tts.vieneu_batch_tuning import (
+                    suggest_auto_batch_size,
+                )
+
+                resolved_batch = suggest_auto_batch_size()
+                logger.info("VieNeu batch: Tự động → %d câu/lô (theo VRAM).", resolved_batch)
             adapter = self._container.make_vieneu_tts_adapter(
-                mode=vieneu_mode, emotion=vieneu_emotion, force_cpu=vieneu_force_cpu
+                mode=vieneu_mode, emotion=vieneu_emotion, force_cpu=vieneu_force_cpu,
+                batch_size=resolved_batch, emotion_cues=vieneu_emotion_cues,
+                precision=vieneu_precision or None,
             )
         else:
             adapter = self._container.make_edge_tts_adapter()
@@ -212,11 +1267,26 @@ class TTSPageViewModel(QObject):
             )
             return False
 
+        prepared = incremental_run.prepare_run(request, adapter, output_path, incremental)
+        if prepared is not None and prepared.plan.mode is not PlanMode.FULL:
+            return self._start_incremental(prepared, adapter, output_path)
+        self._run = prepared
+        self._reuse_summary = None
+        if prepared is not None:
+            logger.info(
+                "TTS cả phim (%s): %d dòng.", prepared.plan.reason, prepared.plan.total
+            )
+            # [v3.23.647] Điểm kiểm tra giữa lượt: huỷ/sập/mất điện sau 15 phút thì lần sau chạy tiếp từ dòng đã xong.
+            setter = getattr(adapter, "set_checkpoint_callback", None)
+            if setter is not None:
+                setter(lambda results, rate, run=prepared: incremental_run.record_checkpoint(run, results, rate))
+
         use_case = self._container.make_generate_tts_use_case(adapter)
         from subtitles_extractor.presentation.workers.tts_worker import TTSWorker
         self._worker = TTSWorker(use_case, request, output_path)
         self._last_request = request  # snapshot cấu hình để xuất debug
         self._last_engine_name = adapter.get_engine_name()
+        self._last_adapter = adapter  # [v3.23.450] để TTS lại dòng chọn không phải tạo lại
         self._worker.progress_changed.connect(self.progress_changed.emit)
         self._worker.finished_ok.connect(self._on_worker_finished)
         self._worker.failed.connect(self._on_worker_failed)
@@ -224,8 +1294,77 @@ class TTSPageViewModel(QObject):
         self._worker.finished.connect(self._on_thread_finished)
         self._set_busy(True)
         self._last_output_path = output_path
+        self._synthesizing = set(self._edited_since_synthesis)
         self._worker.start()
-        self.status_message.emit(f"Đang TTS {len(self._source_events)} dòng bằng {adapter.get_engine_name()}...")
+        dubbing_note = (
+            f" — lồng tiếng {len({v for v in request.line_voices if v})} giọng"
+            if request.line_voices else ""
+        )
+        self.status_message.emit(
+            f"Đang TTS {len(self._source_events)} dòng bằng "
+            f"{adapter.get_engine_name()}{dubbing_note}..."
+        )
+        return True
+
+    def _start_incremental(
+        self, run: incremental_run.PreparedRun, adapter: object, output_path: Path
+    ) -> bool:
+        """[v3.23.630] Chỉ tổng hợp lại dòng đã đổi (hoặc chỉ ghép lại master) rồi trả kết quả.
+
+        Dòng không đổi dùng lại audio đã có (``prepare_run`` đã dời đúng tên); lượt chạy đi
+        qua đúng đường "TTS lại dòng chọn" nên ghép master/phụ đề y như các lượt đó.
+        """
+        from subtitles_extractor.presentation.workers.resynthesize_worker import (
+            ResynthesizeWorker,
+        )
+
+        plan = run.plan
+        unchanged = plan.mode is PlanMode.UNCHANGED
+        setter = getattr(adapter, "set_checkpoint_callback", None)
+        if setter is not None:
+            setter(None)
+        use_case = self._container.make_resynthesize_use_case(adapter)
+        self._worker = ResynthesizeWorker(
+            use_case,
+            full_request=run.request,
+            selected_indices=set(plan.stale),
+            prior_results=list(run.prior_results),
+            output_path=output_path,
+            sample_rate=run.sample_rate,
+            total_length_samples=run.total_length_samples,
+            remerge_only=unchanged,
+            # [v3.23.647] Lượt tiếp tục sau khi bị ngắt có thể còn hàng nghìn dòng: cũng ghi điểm kiểm tra.
+            checkpoint_cb=None if unchanged else (
+                lambda results, rate, prepared_run=run: incremental_run.record_checkpoint(
+                    prepared_run, results, rate
+                )
+            ),
+        )
+        self._run = run
+        self._reuse_summary = (plan.reused_count, plan.total, len(plan.stale))
+        self._last_request = run.request
+        self._last_engine_name = adapter.get_engine_name()  # type: ignore[attr-defined]
+        self._last_adapter = adapter
+        self._last_output_path = output_path
+        self._worker.progress_changed.connect(self.progress_changed.emit)
+        self._worker.finished_ok.connect(self._on_worker_finished)
+        self._worker.failed.connect(self._on_worker_failed)
+        self._worker.cancelled.connect(self._on_worker_cancelled)
+        self._worker.finished.connect(self._on_thread_finished)
+        self._set_busy(True)
+        # Dòng đã sửa mà chữ ký khớp cache = audio đã đúng bản sửa → cũng hết "cần TTS lại".
+        self._synthesizing = set(self._edited_since_synthesis)
+        self._worker.start()
+        reused = plan.reused_count
+        logger.info(
+            "TTS tăng dần: dùng lại %d/%d dòng, tổng hợp lại %d dòng.",
+            reused, plan.total, len(plan.stale),
+        )
+        self.status_message.emit(
+            f"Không dòng nào đổi ({plan.total} dòng) — chỉ ghép lại audio..." if unchanged
+            else f"Dùng lại audio {reused}/{plan.total} dòng, tổng hợp lại "
+                 f"{len(plan.stale)} dòng đã đổi..."
+        )
         return True
 
     def cancel_tts(self) -> None:
@@ -233,14 +1372,50 @@ class TTSPageViewModel(QObject):
             self._worker.request_cancel()
             self.status_message.emit("Đang huỷ TTS...")
 
+    def _clear_checkpoint_callback(self) -> None:
+        """[v3.23.647] Gỡ hàm điểm kiểm tra khỏi adapter (nó chỉ có nghĩa cho đúng một lượt cả phim)."""
+        setter = getattr(getattr(self, "_last_adapter", None), "set_checkpoint_callback", None)
+        if setter is not None:
+            setter(None)
+
+    def _record_line_cache(self, results: list[TTSSegmentResult]) -> None:
+        """[v3.23.630] Ghi cache từng dòng sau lượt chạy (lỗi ghi cache không chặn kết quả)."""
+        run, self._run = self._run, None
+        manual, self._manual_run = self._manual_run, None
+        self._clear_checkpoint_callback()
+        try:
+            if run is not None:
+                incremental_run.record_run(run, results)
+            elif manual is not None and self._last_adapter is not None and (
+                self._last_output_path is not None
+            ):
+                incremental_run.record_selected(
+                    manual[0], self._last_adapter, self._last_output_path,
+                    results, set(manual[1]),
+                )
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Không cập nhật được cache TTS từng dòng: %s", exc)
+
     def _on_worker_finished(self, results: object) -> None:
         self._last_results = list(results)  # type: ignore[arg-type]
+        self._record_line_cache(self._last_results)
+        self._undo_stack, self._redo_stack = [], []
+        # [v3.23.598] Dòng sửa tay mà lượt này đã đọc bản mới thì hết "cần TTS lại".
+        finished_edits = self._synthesizing & self._edited_since_synthesis
+        self._edited_since_synthesis -= self._synthesizing
+        self._synthesizing = set()
         self.result_ready.emit(self._last_results)
+        if finished_edits:
+            self.line_edits_changed.emit()
 
     def _on_worker_failed(self, message: str) -> None:
+        self._run, self._manual_run = None, None
+        self._clear_checkpoint_callback()
         self.error_occurred.emit(message)
 
     def _on_worker_cancelled(self) -> None:
+        self._run, self._manual_run = None, None
+        self._clear_checkpoint_callback()
         self.tts_cancelled.emit()
 
     def _on_thread_finished(self) -> None:

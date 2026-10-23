@@ -90,20 +90,27 @@ class InterceptHandler(logging.Handler):
             except ValueError:
                 level = record.levelno
 
-            frame, depth = sys._getframe(6), 6
-            while frame and frame.f_code.co_filename == logging.__file__:
-                frame = frame.f_back
-                depth += 1
-
             # Bỏ traceback cho DEBUG nội bộ của thư viện ồn ào (chỉ giữ message).
             exc_info = record.exc_info
             if exc_info is not None and record.levelno <= logging.DEBUG:
                 if record.name.split(".")[0] in self._NOISY_DEBUG_PREFIXES:
                     exc_info = None
 
-            logger.opt(depth=depth, exception=exc_info).log(
-                level, record.getMessage()
+            # [v3.23.456] Đặt THẲNG tên module/hàm/dòng từ record stdlib qua ``logger.patch``,
+            # KHÔNG dựa vào suy luận frame. Cách cũ (v443/v449) đi ngược stack so khớp
+            # ``co_filename`` với ``logging.__file__``/``_THIS_FILE`` — KHÔNG đáng tin trong bản
+            # ĐÓNG GÓI PyInstaller (co_filename của frame ≠ __file__ frozen) → mọi log stdlib bị
+            # gán module "logging" (thấy rõ trong app_log 718/868 dòng). Patch giá trị có sẵn
+            # trong record là chính xác và bền vững ở mọi môi trường.
+            std_name = record.name
+            std_func = record.funcName
+            std_line = record.lineno
+            patched = logger.patch(
+                lambda log_record: log_record.update(
+                    name=std_name, function=std_func, line=std_line
+                )
             )
+            patched.opt(depth=0, exception=exc_info).log(level, record.getMessage())
         except Exception:
             pass
 
@@ -200,6 +207,10 @@ def setup_loguru(
         # [v3.23.20] KHÔNG hạ cả "google"/"google_genai" — chúng có thể chứa cảnh báo
         # hữu ích (AFC, quota). Chỉ chặn đúng 2 logger trace gây deadlock.
         "httpcore", "httpx",
+        # [v3.23.603] filelock (huggingface_hub dùng khi nạp model VieNeu) ghi 4 dòng
+        # DEBUG cho MỖI file model: 60/553 dòng nhật ký của lượt chạy 11/10 chỉ là
+        # "Attempting to acquire lock …" — che mất các dòng chẩn đoán thật.
+        "filelock",
     ):
         logging.getLogger(noisy_logger_name).setLevel(logging.WARNING)
 

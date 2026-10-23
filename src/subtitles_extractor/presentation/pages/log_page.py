@@ -7,12 +7,12 @@ xoá và xuất ra file để dễ debug/kiểm tra.
 from __future__ import annotations
 
 import logging
+from html import escape
 from pathlib import Path
 
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox,
-    QFileDialog,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from subtitles_extractor.domain.ports.translator_port import TranslatorPort
 from subtitles_extractor.infrastructure.logging.qt_log_handler import (
     LogEntry,
     QtLogBridge,
@@ -31,7 +32,9 @@ from subtitles_extractor.presentation.theme import metrics as _m
 
 logger = logging.getLogger(__name__)
 
-_LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "SUCCESS": 25, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+_LEVEL_ORDER = {
+    "DEBUG": 10, "INFO": 20, "SUCCESS": 25, "WARNING": 30, "ERROR": 40, "CRITICAL": 50,
+}
 _LEVEL_COLOR = {
     "DEBUG": "#888888", "INFO": "#e0e0e0", "SUCCESS": "#4caf50",
     "WARNING": "#ffb300", "ERROR": "#ff5252", "CRITICAL": "#ff1744",
@@ -41,7 +44,12 @@ _LEVEL_COLOR = {
 class LogPage(QWidget):
     """Trang hiển thị log thời gian thực với lọc cấp độ và xuất file."""
 
-    def __init__(self, log_bridge: QtLogBridge, translator, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        log_bridge: QtLogBridge,
+        translator: TranslatorPort,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("LogPage")
         self._translator = translator
@@ -109,18 +117,39 @@ class LogPage(QWidget):
         self._view.clear()
 
     def _on_export(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, self._translator.translate("log.export_dlg"), "app_log.txt", "Text (*.txt)"
+        # [v3.23.582] Cùng cách xử lý với hai nút xuất chuẩn đoán: hộp thoại Qt mở ở thư
+        # mục gốc của ứng dụng (trước đây là hộp thoại hệ điều hành, nhớ thư mục lần
+        # trước), tên có timestamp để không ghi đè lần xuất trước.
+        from subtitles_extractor.application.services.diagnostic_naming import (
+            build_app_log_filename,
+        )
+        from subtitles_extractor.presentation.utils.export_location import (
+            export_dialog_path,
+        )
+        from subtitles_extractor.presentation.utils.safe_dialogs import save_file
+
+        path = save_file(
+            self,
+            self._translator.translate("log.export_dlg"),
+            export_dialog_path(build_app_log_filename()),
+            "Text (*.txt)",
         )
         if not path:
             return
         try:
             Path(path).write_text(self._view.toPlainText(), encoding="utf-8")
             logger.info("Đã xuất nhật ký ra %s", path)
-            _feedback.show_success(self, self._translator.translate("log.exported"), self._translator.translate("log.saved_to").replace("{path}", str(path)))
+            translate = self._translator.translate
+            _feedback.show_success(
+                self,
+                translate("log.exported"),
+                translate("log.saved_to").replace("{path}", str(path)),
+            )
         except OSError as exc:
             logger.error("Không thể xuất nhật ký: %s", exc)
-            _feedback.show_error(self, self._translator.translate("log.export_err"), str(exc))
+            _feedback.show_error(
+                self, self._translator.translate("log.export_err"), str(exc)
+            )
 
     def _on_record(self, entry: LogEntry) -> None:
         self._append_entry(entry, refresh=True)
@@ -135,11 +164,15 @@ class LogPage(QWidget):
             return
         color = _LEVEL_COLOR.get(entry.level, "#e0e0e0")
         short_name = entry.name.split(".")[-1] if entry.name else ""
+        # [v3.23.614] Thoát ký tự HTML và giữ xuống dòng/khoảng trắng: trước đây mọi thứ
+        # sau "<" bị coi là thẻ và biến mất ("khung OCR chớp nhoáng < 0.3 s" mất nửa sau,
+        # traceback mất từ "in <module>") và traceback dồn thành một dòng trong app_log.
         line = (
-            f'<span style="color:#666">{entry.time_str}</span> '
-            f'<span style="color:{color};font-weight:600">{entry.level:<7}</span> '
-            f'<span style="color:#569cd6">{short_name}</span>: '
-            f'<span style="color:{color}">{entry.message}</span>'
+            f'<span style="color:#666">{escape(entry.time_str)}</span> '
+            f'<span style="color:{color};font-weight:600">{escape(entry.level)}</span> '
+            f'<span style="color:#569cd6">{escape(short_name)}</span>: '
+            f'<span style="color:{color};white-space:pre-wrap">'
+            f"{escape(entry.message)}</span>"
         )
         self._view.appendHtml(line)
         if refresh and self._autoscroll:

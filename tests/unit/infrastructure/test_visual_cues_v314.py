@@ -75,7 +75,10 @@ class TestMicroBatching:
 
         def fake_sleep(seconds, cancel_cb):
             call_log["sleeps"] += 1
-            return True
+            # [v3.23.560] Đúng hợp đồng của _interruptible_sleep: False = ngủ hết, KHÔNG bị
+            # huỷ. Bản giả cũ trả True (nghĩa là "bị huỷ") khớp với điều kiện ĐẢO trong bộ
+            # quét, nên che mất lỗi làm mọi lần quét nhiều lô dừng sau lô đầu.
+            return False
 
         monkeypatch.setattr(translator, "_call_gemini", fake_call)
         monkeypatch.setattr(translator, "_interruptible_sleep", fake_sleep)

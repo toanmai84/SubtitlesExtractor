@@ -17,18 +17,37 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from itertools import compress
 import numpy as np
+import importlib.util
 from loguru import logger
 from typing import Optional, Set
 import cv2
 
 from subtitles_extractor.domain.value_objects.roi import TextAlignment, TextOrientation
 
-try:
-    from sklearn.cluster import DBSCAN as SklearnDBSCAN
-    HAS_SKLEARN = True
-except ImportError:
-    HAS_SKLEARN = False
-    SklearnDBSCAN = None
+# [v3.23.643] KHÔNG import sklearn lúc nạp module: ``sklearn.cluster`` kéo theo scipy.stats + pandas
+# (đo: 1,55 s trong ~2 s của ``import composition.bootstrap``) mà chỉ dùng khi phân cụm DBSCAN.
+# ``HAS_SKLEARN`` chỉ dò sự hiện diện; lớp được nạp trễ trong ``_analyze_with_dbscan``.
+HAS_SKLEARN = importlib.util.find_spec("sklearn") is not None
+SklearnDBSCAN = None
+
+
+def load_dbscan_class() -> type | None:
+    """Nạp ``sklearn.cluster.DBSCAN`` (nạp trễ); ``None`` nếu sklearn thiếu/hỏng.
+
+    [v3.23.646] Nạp TRONG ``torch_none_bypassed``: tiến trình chính giữ ``sys.modules["torch"] = None`` từ lúc
+    khởi động đến khi PaddleOCR nạp xong, và khi đó ``sklearn.cluster`` (kéo scipy.stats) chết với
+    ``AttributeError: 'NoneType' object has no attribute 'Tensor'`` — lỗi bị nuốt ở nhánh ``except`` nên dò vùng
+    phụ đề âm thầm rơi về Heatmap kém chính xác hơn. Hồi quy của v3.23.643 (nạp trễ sklearn).
+    """
+    from subtitles_extractor.infrastructure.torch_import_blocker import torch_none_bypassed
+
+    try:
+        with torch_none_bypassed():
+            from sklearn.cluster import DBSCAN
+    except Exception as exc:  # noqa: BLE001 - sklearn hỏng ABI có thể ném ValueError/AttributeError
+        logger.warning("sklearn nạp lỗi ({}), fallback về Heatmap.", exc)
+        return None
+    return DBSCAN
 
 
 # ============================================================================
@@ -754,7 +773,10 @@ class BBoxAnalyzer:
         dynamic_min_samples = max(1, min(dynamic_min_samples, len(valid_boxes)))
 
         # [MEMORY FIX] Ép dùng thuật toán KD-Tree thay vì 'auto' để chống tràn O(N^2) RAM Matrix.
-        db = SklearnDBSCAN(eps=1.0, min_samples=dynamic_min_samples, algorithm='kd_tree')
+        dbscan_class = SklearnDBSCAN or load_dbscan_class()
+        if dbscan_class is None:
+            return self._analyze_with_heatmap(valid_boxes)
+        db = dbscan_class(eps=1.0, min_samples=dynamic_min_samples, algorithm='kd_tree')
         labels = db.fit_predict(X)
         
         cl = defaultdict(list)

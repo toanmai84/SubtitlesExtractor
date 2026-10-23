@@ -46,7 +46,9 @@ class _SpeakerDescTranslator:
 
     def translate_stage(self, *, stage, context, source_lines, input_lines,
                         has_prior_translation, progress_cb=None, cancel_cb=None,
-                        video_refs=None, attach_video=False):
+                        video_refs=None, attach_video=False,
+        **_extra,
+    ):
         return [
             TranslationLine(
                 index=ln.index, start_ms=ln.start_ms, end_ms=ln.end_ms,

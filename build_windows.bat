@@ -96,6 +96,15 @@ if errorlevel 1 (
 REM Goi truc tiep python trong build_env (chac chan hon activate + PATH)
 set "PYEXE=build_env\Scripts\python.exe"
 
+REM [v3.23.417] Tuy chon TAI MOI HOAN TOAN (bo qua pip cache). Mac dinh DUNG cache (nhanh,
+REM van lay dung phien ban moi nhat - cache chi tranh tai lai file da co). Neu nghi cache
+REM hong hoac muon tai lai tu dau: chay "set SUBEXT_NO_PIP_CACHE=1" truoc khi chay bat nay.
+set "PIP_CACHE_FLAG="
+if defined SUBEXT_NO_PIP_CACHE (
+    set "PIP_CACHE_FLAG=--no-cache-dir"
+    echo [INFO] SUBEXT_NO_PIP_CACHE=1 -^> TAI MOI hoan toan, khong dung pip cache.
+)
+
 REM --- Buoc 2: Cai dependencies runtime (KHONG cai dev/test/whisperx) ---
 echo [INFO] Nang cap pip...
 "%PYEXE%" -m pip install --upgrade pip >nul
@@ -115,7 +124,7 @@ REM   Neu de --extra-index-url trong requirements, pip se hoi CA HAI index cho M
 REM   goi -> may chu Paddle (Trung Quoc) cham/timeout tu VN -> retry 15s x nhieu goi.
 REM   Giai phap: cai phan lon tu PyPI (khong extra-index), rieng paddlepaddle-gpu moi
 REM   dung index Paddle. Nhanh hon nhieu va het WARNING.
-"%PYEXE%" -m pip install -r "%REQFILE%" --index-url https://pypi.org/simple --retries 3 --timeout 60
+"%PYEXE%" -m pip install -r "%REQFILE%" --index-url https://pypi.org/simple %PIP_CACHE_FLAG% --retries 3 --timeout 60
 if errorlevel 1 (
     echo [LOI] Cai requirements that bai.
     exit /b 1
@@ -124,7 +133,7 @@ if errorlevel 1 (
 REM Rieng paddlepaddle-gpu: chi goi nay moi can index Paddle (cu129).
 if "%REQFILE%"=="requirements-gpu.txt" (
     echo [INFO] Cai paddlepaddle-gpu tu kho Paddle cu129 - goi lon ~810MB, kien nhan...
-    "%PYEXE%" -m pip install "paddlepaddle-gpu==3.3.1" --index-url https://www.paddlepaddle.org.cn/packages/stable/cu129/ --extra-index-url https://pypi.org/simple --retries 5 --timeout 120
+    "%PYEXE%" -m pip install "paddlepaddle-gpu==3.3.1" --index-url https://www.paddlepaddle.org.cn/packages/stable/cu129/ --extra-index-url https://pypi.org/simple %PIP_CACHE_FLAG% --retries 5 --timeout 120
     if errorlevel 1 (
         echo [LOI] Cai paddlepaddle-gpu that bai. Kiem tra mang / thu lai.
         exit /b 1

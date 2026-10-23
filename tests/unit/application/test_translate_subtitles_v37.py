@@ -37,6 +37,19 @@ from subtitles_extractor.infrastructure.tts.timing_math import (
 )
 
 
+def _bare_translator() -> "GeminiSubtitleTranslator":
+    """[v3.23.536] Thực thể TRỐNG để gọi các hàm thuần cần ``self``.
+
+    ``_line_to_payload`` và ``_context_window`` là phương thức thực thể (không phải staticmethod),
+    nhưng phần thân không dùng trạng thái nào ngoài vài thuộc tính tuỳ chọn — nên dựng bằng
+    ``__new__`` là đủ và không cần API key.
+    """
+    instance = GeminiSubtitleTranslator.__new__(GeminiSubtitleTranslator)
+    instance._reading_cps_budget = 0.0
+    instance._emotion_cues = False
+    return instance
+
+
 def _ngan_sach(khung_s: float) -> int:
     """[v3.23.238] Ngân sách dịch: âm tiết -> ký tự (xem test_syllable_budget_v32638)."""
     return max(
@@ -66,6 +79,7 @@ class _FakeTranslator:
         self, *, stage, context, source_lines, input_lines,
         has_prior_translation, progress_cb=None, cancel_cb=None,
         video_refs=None, attach_video=False,
+        **_extra,
     ) -> list[TranslationLine]:
         self.calls.append(stage.kind)
         out: list[TranslationLine] = []
@@ -203,7 +217,7 @@ class TestAdapterPureFunctions:
 
     def test_line_to_payload_includes_optional_fields(self) -> None:
         line = TranslationLine(1, 0, 1000, "hi", speaker="Bob", description="laughs")
-        payload = GeminiSubtitleTranslator._line_to_payload(line)
+        payload = _bare_translator()._line_to_payload(line)
         # [v3.23.238] payload kèm max_chars theo ngân sách ÂM TIẾT (quy sang ký tự) —
         # mô hình theo KÝ TỰ cũ đã bị bác bỏ bằng dữ liệu (R²=0.07 vs 0.89).
         assert payload == {
@@ -213,17 +227,17 @@ class TestAdapterPureFunctions:
 
     def test_line_to_payload_omits_empty_optional(self) -> None:
         line = TranslationLine(2, 0, 1000, "hi")
-        payload = GeminiSubtitleTranslator._line_to_payload(line)
+        payload = _bare_translator()._line_to_payload(line)
         assert payload == {"line_no": 2, "text": "hi", "max_chars": _ngan_sach(1.0)}
 
     def test_context_window_zero_size(self) -> None:
         lines = [TranslationLine(i, 0, 1, str(i)) for i in range(1, 6)]
-        before, after = GeminiSubtitleTranslator._context_window(lines, start_idx=2, batch_len=1, ctx_size=0)
+        before, after = _bare_translator()._context_window(lines, start_idx=2, batch_len=1, ctx_size=0)
         assert before == [] and after == []
 
     def test_context_window_clamps_bounds(self) -> None:
         lines = [TranslationLine(i, 0, 1, str(i)) for i in range(1, 6)]
-        before, after = GeminiSubtitleTranslator._context_window(lines, start_idx=0, batch_len=2, ctx_size=10)
+        before, after = _bare_translator()._context_window(lines, start_idx=0, batch_len=2, ctx_size=10)
         assert before == []  # không có gì trước index 0
         assert len(after) == 3  # phần tử 2,3,4 (sau batch [0:2])
 

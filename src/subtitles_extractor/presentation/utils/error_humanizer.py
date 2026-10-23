@@ -34,10 +34,13 @@ _ERROR_HINTS: list[tuple[tuple[str, ...], str]] = [
         "câu nhạy cảm rồi dịch lại.",
     ),
     (
-        ("503", "unavailable", "overloaded", "500", "internal error",
-         "internal server"),
-        "Máy chủ Gemini đang quá tải hoặc tạm gián đoạn (lỗi tạm thời). Thử lại sau ít "
-        "phút; nếu đang dịch, tiến trình có thể tự tiếp tục từ checkpoint đã lưu.",
+        # [v3.23.616] Bỏ "500" trần (khớp nhầm mọi chuỗi có số 500, vd "1500 dòng").
+        ("503", "unavailable", "overloaded", "quá tải", "500 internal",
+         "internal error", "internal server"),
+        "Máy chủ Gemini đang quá tải hoặc tạm gián đoạn (lỗi tạm thời phía Google, không "
+        "phải do cấu hình). Thử lại sau ít phút, hoặc chọn model khác — model nhẹ hơn "
+        "(bản 'flash-lite') thường ít bị quá tải hơn. Phần đã dịch xong được giữ "
+        "(checkpoint): chạy lại, kể cả bằng model khác, chỉ dịch phần còn thiếu.",
     ),
     (
         ("deadline", "timeout", "timed out", "deadline_exceeded"),

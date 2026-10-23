@@ -15,6 +15,7 @@ Pipeline post-processing 6 stage:
 from __future__ import annotations
 
 import bisect
+from itertools import pairwise
 
 import rapidfuzz.fuzz as fuzz
 from loguru import logger
@@ -29,6 +30,7 @@ from subtitles_extractor.application.services.cjk_utils import (
     is_predominantly_cjk,
 )
 from subtitles_extractor.application.services.flicker_absorber import absorb_flickers
+from subtitles_extractor.application.services.han_variants import fold_han_variants
 from subtitles_extractor.application.services.subtitle_pipeline.box_filters import (
     is_latin_gibberish,
 )
@@ -62,8 +64,12 @@ _VARIANT_NOISE_RUN_FRAMES: int = 2
 
 
 def _normalize_for_variant(text: str) -> str:
-    """Chuẩn hoá text để so khối: bỏ whitespace (OCR dao động space vô nghĩa)."""
-    return "".join(text.split())
+    """Chuẩn hoá text để so khối: bỏ whitespace (OCR dao động space vô nghĩa).
+
+    [v3.23.616] Gộp cả chữ phồn/giản: khung đọc "瑤瑤" và khung đọc "瑶瑶" là cùng một
+    câu, không phải hai khối ổn định của hai câu thật.
+    """
+    return fold_han_variants("".join(text.split()))
 
 
 def _is_cjk_char(ch: str) -> bool:
@@ -583,6 +589,32 @@ def _is_cjk_edge_fragment(
     return False
 
 
+#: [v3.23.616] Câu 2 chữ Hán ĐỨNG YÊN ít nhất chừng này giây và chừng này khung...
+_STABLE_TWO_CJK_MIN_DURATION_SEC: float = 0.40
+_STABLE_TWO_CJK_MIN_FRAMES: int = 5
+#: ...thì chỉ cần conf trung bình chừng này (câu ngắn hơn vẫn cần 0.65 như cũ).
+_STABLE_TWO_CJK_MIN_CONFIDENCE: float = 0.55
+_TWO_CJK_MIN_CONFIDENCE: float = 0.65
+
+
+def _two_cjk_min_confidence(event: SubtitleEvent) -> float:
+    """[v3.23.616] Ngưỡng conf của câu đúng 2 chữ Hán, theo độ ổn định (hàm thuần).
+
+    Đo trên OCR thật 14/10 (phim "天骄女友退婚" tập 1, cả 3 lần trích): câu gọi tên
+    "瑶瑶" hiện rõ 0.44s (12 khung, cùng một vị trí, đọc giống nhau) trên nền áo sáng,
+    PaddleOCR chấm 0.56-0.73/khung, trung bình 0.62-0.63 → bị ngưỡng cứng 0.65 loại; cả
+    hai lần người dùng phải tự thêm lại câu này bằng tay. Rác OCR 2 chữ là mảnh chớp
+    1-4 khung; câu đứng yên đủ lâu là bằng chứng mạnh hơn điểm từng khung — cùng tinh
+    thần ngưỡng theo số khung của câu 1 chữ ở trên.
+    """
+    if (
+        event.frame_count >= _STABLE_TWO_CJK_MIN_FRAMES
+        and event.duration_sec >= _STABLE_TWO_CJK_MIN_DURATION_SEC
+    ):
+        return _STABLE_TWO_CJK_MIN_CONFIDENCE
+    return _TWO_CJK_MIN_CONFIDENCE
+
+
 def filter_short_text_events(
     subtitles_events_list: list[SubtitleEvent],
     config: SubtitleBuilderConfig,
@@ -695,7 +727,7 @@ def filter_short_text_events(
             elif cjk_only_char_count == 2 and non_cjk_residue_count == 0:
                 if recorded_frame_count <= 1:
                     continue
-                if recorded_confidence < 0.65:
+                if recorded_confidence < _two_cjk_min_confidence(current_event):
                     continue
 
             # ── v2.9+: Flash-noise guard — CJK 3-24 chars, fc≤2, conf<0.78 ──
@@ -1195,6 +1227,65 @@ def filter_echo_trail_events(
     return kept_events
 
 
+#: [v3.23.615] Khoảng lấy mẫu tối đa (giây) vẫn coi là lấy TỪNG KHUNG (≥ 20fps): khi đó
+#: một khung giữ trên màn hình đúng một khoảng lấy mẫu.
+FRAME_LEVEL_MAX_INTERVAL_SEC = 0.05
+
+
+def frame_display_hold(timestamps: list[float]) -> float:
+    """[v3.23.615] Thời gian một khung lấy mẫu CÒN ĐỨNG trên màn hình sau mốc của nó.
+
+    Hàm thuần.
+
+    Khung ở mốc ``t`` hiển thị trong ``[t, t + khoảng khung)``. Câu phụ đề biến mất lúc
+    khung KẾ TIẾP (không còn chữ) hiện ra, không phải lúc khung cuối cùng có chữ bắt đầu.
+    Lấy mẫu từng khung thì độ giữ đúng bằng khoảng lấy mẫu; lấy thưa hơn thì lúc chữ biến
+    mất nằm đâu đó trong khoảng, lấy nửa khoảng cho sai số trung bình bằng 0.
+
+    Args:
+        timestamps: Mốc các khung đã lấy mẫu (kể cả khung trùng).
+
+    Returns:
+        Số giây cộng vào mốc kết thúc mỗi câu; 0 nếu không đủ khung để biết.
+    """
+    ordered = sorted(set(timestamps))
+    intervals = [b - a for a, b in pairwise(ordered) if b - a > 1e-6]
+    if not intervals:
+        return 0.0
+    intervals.sort()
+    interval = intervals[len(intervals) // 2]
+    return interval if interval <= FRAME_LEVEL_MAX_INTERVAL_SEC else interval / 2.0
+
+
+def extend_ends_by_display_hold(
+    events: list[SubtitleEvent], hold_sec: float, min_gap_sec: float = 0.001
+) -> list[SubtitleEvent]:
+    """[v3.23.615] Mốc kết thúc = lúc chữ BIẾN MẤT, không phải mốc khung cuối có chữ.
+
+    Đo bằng điểm ảnh vùng phụ đề trên video thật 14/10 (25fps, lấy mẫu mọi khung): 84/94
+    câu kết thúc sớm đúng 40ms (một khung) so với lúc chữ biến mất, và giữa hai câu liền
+    nhau luôn có một khe 40ms không có thật. Lồng tiếng mất 40ms khung đọc mỗi câu. Sau
+    khi cộng độ giữ khung: 83/94 câu kết thúc đúng mốc (sai số dưới 1ms).
+
+    Args:
+        events: Câu phụ đề đã sắp theo thời gian (bị sửa tại chỗ).
+        hold_sec: Độ giữ khung (:func:`frame_display_hold`).
+        min_gap_sec: Khe tối thiểu với câu kế tiếp (không bao giờ chồng câu sau).
+
+    Returns:
+        Chính danh sách ``events``.
+    """
+    if hold_sec <= 0:
+        return events
+    for position, event in enumerate(events):
+        end = event.end_sec + hold_sec
+        if position + 1 < len(events):
+            end = min(end, events[position + 1].start_sec - min_gap_sec)
+        if end > event.end_sec:
+            event.interval = TimeInterval(start_sec=event.start_sec, end_sec=end)
+    return events
+
+
 def reindex_events(unindexed_events_list: list[SubtitleEvent]) -> list[SubtitleEvent]:
     """Cập nhật trường ``index`` của events thành thứ tự 1-based.
 
@@ -1458,10 +1549,45 @@ def strip_persistent_watermark_lines(
     return result_events
 
 
+BoundingBox = tuple[int, int, int, int]
+
+
+def _boxes_overlap(left: BoundingBox, right: BoundingBox) -> bool:
+    """Hai bbox ``(xmin, ymin, xmax, ymax)`` có phần giao dương không (hàm thuần)."""
+    return (
+        min(left[2], right[2]) > max(left[0], right[0])
+        and min(left[3], right[3]) > max(left[1], right[1])
+    )
+
+
+def _drop_belongs_to_group(
+    group: FrameGroup,
+    drop_timestamp: float,
+    soft_dropped_boxes: dict[float, list[BoundingBox]] | None,
+) -> bool:
+    """[v3.23.616] Khung soft-drop có phải khung của CHÍNH câu này không (hàm thuần).
+
+    Đo trên OCR thật 14/10 (phim "天骄女友退婚" tập 1): cả 2/2 lần nới biên bằng khung
+    soft-drop mà chữ của khung đó nằm ở chỗ KHÁC câu (``山`` ở góc phải trên, ``公`` ở
+    mép trái) đều sai so với điểm ảnh: câu "就是" bắt đầu sớm 40ms, câu "瑶瑶" kết
+    thúc trễ 40ms. Khung mờ dần/hiện dần của chính câu (lý do có bước nới biên) luôn
+    nằm cùng chỗ.
+
+    Không biết vị trí (thiếu bbox) thì giữ cách cũ: chấp nhận.
+    """
+    if soft_dropped_boxes is None or group.aggregated_bounding_box is None:
+        return True
+    boxes = soft_dropped_boxes.get(drop_timestamp)
+    if not boxes:
+        return True
+    return any(_boxes_overlap(group.aggregated_bounding_box, box) for box in boxes)
+
+
 def extend_group_timing_from_soft_drops(
     groups: list[FrameGroup],
     soft_dropped_sorted: list[float],
     sample_step_sec: float,
+    soft_dropped_boxes: dict[float, list[BoundingBox]] | None = None,
 ) -> list[FrameGroup]:
     """Phục hồi timing biên của group bằng timestamp frame bị lọc sát biên.
 
@@ -1485,6 +1611,9 @@ def extend_group_timing_from_soft_drops(
         groups:              FrameGroup đã merge (sort theo timestamp).
         soft_dropped_sorted: Timestamp sort tăng dần của frame bị lọc có nội dung.
         sample_step_sec:     Bước lấy mẫu (config.sample_step_sec).
+        soft_dropped_boxes:  [v3.23.616] ``timestamp → bbox`` chữ của từng khung
+                             soft-drop; có thì chỉ nới biên bằng khung có chữ chồng
+                             lên vùng của group (xem :func:`_drop_belongs_to_group`).
 
     Returns:
         Danh sách group đã mở rộng timing (mutate in-place và return).
@@ -1507,7 +1636,9 @@ def extend_group_timing_from_soft_drops(
         lo = bisect.bisect_left(soft_dropped_sorted, target_start - _WINDOW_HIGH)
         hi = bisect.bisect_left(soft_dropped_sorted, target_start - _WINDOW_LOW)
         candidates_start = [
-            t for t in soft_dropped_sorted[lo:hi] if t > min_allowed
+            t for t in soft_dropped_sorted[lo:hi]
+            if t > min_allowed
+            and _drop_belongs_to_group(group, t, soft_dropped_boxes)
         ]
         if candidates_start:
             new_start = candidates_start[0]  # frame bị lọc SỚM NHẤT liền kề
@@ -1520,7 +1651,9 @@ def extend_group_timing_from_soft_drops(
         lo2 = bisect.bisect_right(soft_dropped_sorted, target_end + _WINDOW_LOW)
         hi2 = bisect.bisect_right(soft_dropped_sorted, target_end + _WINDOW_HIGH)
         candidates_end = [
-            t for t in soft_dropped_sorted[lo2:hi2] if t < max_allowed
+            t for t in soft_dropped_sorted[lo2:hi2]
+            if t < max_allowed
+            and _drop_belongs_to_group(group, t, soft_dropped_boxes)
         ]
         if candidates_end:
             new_end = candidates_end[-1]  # frame bị lọc MUỘN NHẤT liền kề

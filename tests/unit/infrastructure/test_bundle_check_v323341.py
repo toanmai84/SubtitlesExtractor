@@ -29,15 +29,25 @@ def _load_tool():
     return module
 
 
+def _materialise(root: Path, relative: str) -> None:
+    """Tạo tệp (nếu có phần mở rộng) hoặc thư mục tại ``root / relative``."""
+    target = root / relative
+    if target.suffix:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x", encoding="utf-8")
+    else:
+        target.mkdir(parents=True, exist_ok=True)
+
+
 def _make_complete_bundle(root: Path, tool) -> None:
-    """Tạo bundle có đủ mọi thành phần bắt buộc."""
-    for relative, _reason in tool.REQUIRED_ENTRIES:
-        target = root / relative
-        if target.suffix:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("x", encoding="utf-8")
-        else:
-            target.mkdir(parents=True, exist_ok=True)
+    """Tạo bundle có đủ mọi thành phần BẮT BUỘC **và** TUỲ CHỌN.
+
+    [v3.23.547] Công cụ đã tách thêm ``OPTIONAL_ENTRIES`` (vd mô hình OCR nhúng sẵn).
+    Bundle "đủ" trong bộ kiểm phải bao gồm cả hai nhóm, nếu không ``check_bundle`` vẫn
+    trả về các mục tuỳ chọn còn thiếu và bộ kiểm "không báo động giả" sẽ đỏ oan.
+    """
+    for relative, _reason in tool.REQUIRED_ENTRIES + tool.OPTIONAL_ENTRIES:
+        _materialise(root, relative)
 
 
 def test_detects_missing_whisperx_worker(tmp_path: Path) -> None:
@@ -74,7 +84,23 @@ def test_detects_torch_leaking_into_bundle(tmp_path: Path) -> None:
 def test_empty_bundle_reports_everything(tmp_path: Path) -> None:
     tool = _load_tool()
     issues = tool.check_bundle(tmp_path)
-    assert len(issues) == len(tool.REQUIRED_ENTRIES)
+    assert len(issues) == len(tool.REQUIRED_ENTRIES) + len(tool.OPTIONAL_ENTRIES)
+
+
+def test_optional_entries_are_flagged_optional(tmp_path: Path) -> None:
+    """[v3.23.547] Thiếu thành phần TUỲ CHỌN không được coi ngang hàng lỗi bắt buộc.
+
+    Nếu cờ ``optional`` sai, kịch bản build sẽ dừng vì mô hình OCR không nhúng sẵn —
+    đúng cấu hình mặc định (``SUBEXT_PREFETCH_MODELS`` không bật).
+    """
+    tool = _load_tool()
+    for relative, _reason in tool.REQUIRED_ENTRIES:
+        _materialise(tmp_path, relative)
+
+    issues = tool.check_bundle(tmp_path)
+    assert issues, "Phải liệt kê các mục tuỳ chọn còn thiếu để người build biết"
+    assert all(issue.optional for issue in issues)
+    assert not [i for i in issues if i.missing and not i.optional]
 
 
 @pytest.mark.parametrize(

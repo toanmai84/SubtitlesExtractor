@@ -13,16 +13,17 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Signal, QRunnable, QThreadPool, QTimer
+from PySide6.QtCore import QObject, Qt, Signal, QRunnable, QThreadPool, QTimer
 
 from subtitles_extractor.application.dtos.extract_subtitles_dto import (
     SubtitleBuilderConfig,
 )
+from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
 from subtitles_extractor.application.services.subtitle_editor_service import (
     SubtitleEditorService,
 )
 from subtitles_extractor.composition.container import ApplicationContainer
-from subtitles_extractor.domain.exceptions import ConfigurationError
+from subtitles_extractor.domain.exceptions import ConfigurationError, SubtitlesExtractorError
 from subtitles_extractor.domain.ports.frame_sampler_port import FrameSamplingConfig
 from subtitles_extractor.domain.ports.ocr_engine_port import OcrEngineConfig
 from subtitles_extractor.domain.value_objects.device_kind import (
@@ -150,6 +151,7 @@ class EditorPageViewModel(QObject):
 
     def __init__(self, container: ApplicationContainer, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        self._thread_keeper = WorkerThreadKeeper(self)
         self._container = container
         self._service: SubtitleEditorService = container.make_subtitle_editor_service()
         self._is_busy = False
@@ -189,14 +191,16 @@ class EditorPageViewModel(QObject):
             # KeyError.__str__() → "'message'" (có dấu nháy) — lấy args[0] cho sạch
             self.error_occurred.emit(exc.args[0] if exc.args else str(exc))
             return
-        except (FileNotFoundError, ValueError) as exc:
-            self.error_occurred.emit(str(exc))
-            return
         except UnicodeDecodeError as exc:
+            # [v3.23.435] PHẢI đặt TRƯỚC ValueError vì UnicodeDecodeError là con của
+            # ValueError — nếu để sau sẽ bị ValueError bắt mất, thông báo UTF-8 không hiện.
             self.error_occurred.emit(
                 f"File không phải UTF-8. Vui lòng chuyển encoding sang UTF-8 trước.\n"
                 f"Chi tiết: {exc}"
             )
+            return
+        except (FileNotFoundError, ValueError) as exc:
+            self.error_occurred.emit(str(exc))
             return
         except OSError as exc:
             self.error_occurred.emit(
@@ -226,6 +230,9 @@ class EditorPageViewModel(QObject):
             self._reocr_reporter.request_cancel()
         thread = getattr(self, "_reocr_thread", None)
         if thread is not None and thread.isRunning():
+            # [v3.23.650] Worker có thể xong nốt đoạn cuối trước khi thấy cờ huỷ (was_cancelled=False): đánh dấu
+            # kết quả là "cũ" để _on_reocr_finished bỏ đi, không chèn phụ đề của video cũ vào dữ liệu mới.
+            self._reocr_result_stale = True
             logger.info("Nạp dữ liệu mới → ngắt luồng Re-OCR cũ chống nhiễm chéo.")
             with contextlib.suppress(RuntimeError, TypeError):
                 thread.requestInterruption()
@@ -304,7 +311,7 @@ class EditorPageViewModel(QObject):
         worker = _AutoSaveRunnable(self._container.subtitle_repository, path_str, events_snapshot)
         self._thread_pool.start(worker)
 
-    def export_to_file(self, output_path: Path, output_format: SubtitleFormat) -> None:
+    def export_to_file(self, output_path: Path, output_format: SubtitleFormat) -> bool:
         """Ghi file phụ đề trên background thread — không block UI.
 
         [v3.6 bugfix] Lưu strong Python reference đến worker để ngăn PyQt6
@@ -442,7 +449,9 @@ class EditorPageViewModel(QObject):
         # nếu video lỗi/không đọc được, ROI đã bị persist sai vào DB.
         try:
             metadata = self._container.metadata_reader.read(video_path)
-        except (OSError, ValueError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError, SubtitlesExtractorError) as exc:
+            # [v3.23.650] VideoNotFoundError/VideoDecodeError là SubtitlesExtractorError (không phải OSError) —
+            # video bị xoá/đổi tên từng làm ngoại lệ trào ra khỏi slot nút Re-OCR, người dùng không thấy phản hồi.
             self.error_occurred.emit(f"Lỗi đọc Video Metadata: {exc}")
             return
 
@@ -528,6 +537,7 @@ class EditorPageViewModel(QObject):
         sampling_cfg = FrameSamplingConfig(
             sample_step_sec=snapshot.frame.sample_step_sec, phash_distance_threshold=snapshot.frame.phash_distance,
             pixel_diff_threshold=snapshot.frame.pixel_diff_ratio, skip_intro_sec=snapshot.frame.skip_intro_sec, skip_outro_sec=snapshot.frame.skip_outro_sec,
+            white_text_gate=snapshot.frame.white_text_gate, white_text_luma=snapshot.frame.white_text_luma,
             apply_median_blend=bool(tweaks.get("median_blend", snapshot.preprocess.apply_median_blend)),
             median_blend_frames=snapshot.preprocess.median_blend_frames,
             vram_upscale_small_text=vram_upscale, vram_upscale_target_height_px=int(tweaks.get("upscale_h", snapshot.preprocess.upscale_target_height_px)),
@@ -566,6 +576,7 @@ class EditorPageViewModel(QObject):
             use_tensorrt=snapshot.hardware.use_tensorrt,
             precision=PrecisionMode(snapshot.hardware.precision.value),
             batch_size=snapshot.hardware.batch_size_ocr,
+            det_batch_size=snapshot.hardware.det_batch_size,
             parallel_workers=snapshot.hardware.workers,
             preprocess=pre_cfg,
         )
@@ -605,21 +616,28 @@ class EditorPageViewModel(QObject):
         worker.finished.connect(self._on_reocr_finished)
         worker.failed.connect(self._on_reocr_failed)
 
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
 
-        thread.finished.connect(worker.deleteLater)
+        # [v3.23.613] Một chủ sở hữu duy nhất cho worker (xem thread_keeper): KHÔNG gắn
+        # worker.deleteLater vào thread.finished — Qt xoá trong luồng nền song song với
+        # Python xoá ở luồng giao diện làm xoá hai lần, sập ứng dụng.
+        self._thread_keeper.keep(thread, worker)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_reocr_thread_finished)
 
         self._reocr_thread = thread
         self._reocr_worker = worker
         self._reocr_reporter = reporter
+        self._reocr_result_stale = False
         thread.start()
 
     def _on_reocr_finished(self, response) -> None:
         # [Cross-Thread Contamination] Bỏ qua kết quả đến muộn từ worker Re-OCR cũ.
         if self.sender() is not self._reocr_worker:
+            return
+        if getattr(self, "_reocr_result_stale", False):
+            self.progress_changed.emit(100, 100, "Đã bỏ kết quả Re-OCR cũ (đã nạp dữ liệu mới).")
             return
         # [v3.7 bugfix REOCR-CANCEL]: Nếu người dùng huỷ giữa chừng, KHÔNG áp dụng
         # thay thế. Lý do: replaced_uids chứa TẤT CẢ uid được chọn, nhưng new_events

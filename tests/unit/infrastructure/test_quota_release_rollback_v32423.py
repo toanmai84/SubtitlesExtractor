@@ -47,6 +47,9 @@ def test_committed_requests_still_count() -> None:
     mgr = _mgr(rpd=2)
     mgr.acquire("m", 100, key_id="k")
     mgr.acquire("m", 100, key_id="k")
+    # [v3.23.526] Bộ đếm nội bộ chạm trần KHÔNG còn chặn cứng — phải có xác nhận từ
+    # server, vì bộ đếm là ước lượng và từng làm ứng dụng tự khoá dù còn quota.
+    mgr.mark_daily_exhausted("m", key_id="k")
     with pytest.raises(QuotaExhaustedError):
         mgr.acquire("m", 100, key_id="k")
 

@@ -18,11 +18,14 @@ Bốn quy tắc cốt lõi (đã nghiệm thu trên dữ liệu thật):
 
 from __future__ import annotations
 
+from subtitles_extractor.domain.ports.subtitle_tts_port import AUDIBLE_OVERLAP_S
+
 __all__ = [
     "ABNORMAL_LENGTH_MIN_EXCESS_S",
     "ABNORMAL_LENGTH_RATIO",
     "ABNORMAL_SHORT_EXCESS_FACTOR",
     "ABNORMAL_VS_FLOOR_RATIO",
+    "ABNORMAL_MIN_ABSOLUTE_S",
     "CHARS_PER_SYLLABLE",
     "EDGE_MIN_BASE_S",
     "EDGE_MIN_PER_SYLLABLE_S",
@@ -44,6 +47,7 @@ __all__ = [
     "TRANSLATION_REF_SPEED",
     "VIENEU_MIN_BASE_S",
     "VIENEU_MIN_PER_SYLLABLE_S",
+    "audible_overlap_seconds",
     "compute_fit_stretch_ratio",
     "effective_available_seconds",
     "expected_speech_seconds",
@@ -58,14 +62,15 @@ __all__ = [
     "readable_syllable_budget",
     "stretch_ratio_cap",
     "syllable_budget_to_chars",
+    "reading_char_budget",
     "total_speed_ratio",
     "window_below_engine_floor",
 ]
 
 # [v3.23.196] Trần nén CHẤT LƯỢNG cho time-stretch giọng nói. Nén quá 2x bằng
-# phase-vocoder/WSOLA làm tan năng lượng formant -> giọng thành tiếng gió thều thào
-# "như không có tiếng" (người dùng xác nhận trên câu nén 2.4-3.0x). Thà đọc RÕ ở 2x và
-# cắt tối thiểu phần dư còn hơn "đọc đủ" mà không nghe được gì.
+# [v3.23.464] KHUYẾN NGHỊ (không còn chặn cứng): phase-vocoder/WSOLA nén quá ~2× làm tan năng
+# lượng formant -> giọng dễ thành "tiếng gió thều thào". Đây là mức khuyến nghị hiển thị ở tooltip;
+# ``total_speed_ratio`` nay TÔN TRỌNG ``max_speed`` người dùng đặt (không âm thầm ghi đè về 2.0).
 QUALITY_STRETCH_CAP = 2.0
 
 # [v3.23.218] Trần "ăn gian đầu": đọc sớm tối đa 0.25s khi câu trước đã đọc xong (tận
@@ -197,6 +202,13 @@ ABNORMAL_LENGTH_MIN_EXCESS_S = 1.0
 # trung bình theo ký tự). Đo trên 95 câu Gemini thật: x2.5 bắt 12/12 câu hallucination gây
 # lấn (89% tổng lấn) mà không đụng câu đọc bình thường (audio ≈ 1-2x biên dưới).
 ABNORMAL_VS_FLOOR_RATIO = 2.5
+
+# [v3.23.458] Sàn TUYỆT ĐỐI để coi là "dài bất thường". Với câu CỰC NGẮN (1-2 âm tiết), ngưỡng
+# floor×2.5 quá nhỏ (1 âm tiết → chỉ 1.1s) nên audio bình thường (vd "Hừ." 1.12s, có đuôi ngân
+# tự nhiên) bị GẮN CỜ OAN → retry tới 10 lần vô ích (app_log: ~300 dòng 1-âm-tiết <1.8s bị flag).
+# Chỉ coi là bất thường khi vượt CẢ floor×2.5 LẪN sàn này → bỏ false-positive, GIỮ bắt ngân thật
+# (≥1.8s cho câu ngắn vẫn được retry để tìm bản gọn hơn).
+ABNORMAL_MIN_ABSOLUTE_S = 1.8
 
 # [v3.23.227] Với câu CỰC NGẮN, ngưỡng dư tuyệt đối 1.0s là QUÁ LỎNG: "Ơ," (kỳ vọng
 # 0.40s) ngân 1.20s là dài GẤP BA, đủ để đè lên câu sau, nhưng phần dư chỉ 0.80s -> lọt
@@ -330,7 +342,6 @@ def total_speed_ratio(
     available_s: float,
     base_speed: float,
     max_speed: float,
-    quality_cap: float = QUALITY_STRETCH_CAP,
 ) -> float:
     """[v3.23.215] Tốc độ đọc TỔNG áp lên audio (hàm thuần) — ngữ nghĩa ĐÚNG.
 
@@ -340,22 +351,28 @@ def total_speed_ratio(
     tốc độ GỐC 1.0x, chậm hơn 30%% so với mong đợi, mà báo cáo vẫn ghi 1.30x.
 
     Ngữ nghĩa đúng: audio luôn được đọc TỐI THIỂU ở ``base_speed``; nếu vẫn không vừa
-    khung thì nén thêm cho vừa, chặn bởi ``max_speed`` (trần người dùng) và
-    ``quality_cap`` (ngưỡng vật lý 2.0 — nén hơn nữa làm tan formant, đo ở v201).
+    khung thì nén thêm cho vừa, chặn bởi ``max_speed`` — trần do NGƯỜI DÙNG đặt.
 
     Args:
         audio_duration_s: Độ dài audio gốc từ model (giây).
         available_s: Khung hiệu dụng của câu (giây).
         base_speed: Tốc độ đọc cơ bản người dùng đặt (x).
         max_speed: Trần tốc độ tổng người dùng đặt (x).
-        quality_cap: Trần nén giữ độ rõ giọng (x).
 
     Returns:
         Tỉ lệ nén áp lên audio gốc (>= 1.0; 1.0 = giữ nguyên tốc độ model).
     """
     fit_ratio = audio_duration_s / available_s if available_s > 0.0 else 1.0
     desired = max(float(base_speed), fit_ratio)
-    ceiling = min(float(max_speed), float(quality_cap))
+    # [v3.23.464] TÔN TRỌNG cài đặt người dùng: trần = ĐÚNG ``max_speed`` họ đặt, KHÔNG âm thầm
+    # ghi đè bằng ``QUALITY_STRETCH_CAP``. Trước đây ``min(max_speed, 2.0)`` khiến đặt 2.5 vẫn
+    # chạy 2.0 (set một đường chạy một nẻo). Trần chất lượng 2.0 nay chỉ là KHUYẾN NGHỊ, hiện ở
+    # tooltip (>2.0× nén hậu kỳ dễ thành "tiếng gió"); người dùng tự quyết.
+    # [v3.23.547] Bỏ hẳn tham số ``quality_cap`` khỏi chữ ký: từ v464 nó KHÔNG còn tác dụng, mà
+    # để lại thì người đọc sau này tin rằng truyền ``quality_cap=1.5`` sẽ kẹp — một cái bẫy im
+    # lặng. Không nơi nào trong mã nguồn hay bộ kiểm truyền tham số này.
+    # ``stretch_ratio_cap`` vẫn giữ ``quality_cap`` vì ở đó nó THẬT SỰ được dùng.
+    ceiling = float(max_speed)
     return max(1.0, min(desired, max(1.0, ceiling)))
 
 
@@ -585,12 +602,31 @@ def exceeds_window_even_compressed(
     return audio_duration_s / max_ratio > available_s + _EPS
 
 
+def audible_overlap_seconds(audio_s: float, available_s: float) -> float:
+    """[v3.23.601] Phần audio TRÀN khung mà người nghe thật sự nghe chồng (hàm thuần).
+
+    Câu được nén đúng bằng khung vẫn dư vài mẫu do làm tròn độ dài sau nén (vd 0.04 ms ở
+    24 kHz). Đếm phần dư đó là "lấn" khiến tóm tắt TTS báo 113 dòng chồng tiếng trong khi
+    chỉ 7 dòng lấn từ 1 ms trở lên (chuẩn đoán thật, VieNeu).
+
+    Args:
+        audio_s: Độ dài audio cuối cùng của câu (giây, đã nén + nghỉ).
+        available_s: Khung hiệu dụng của câu (giây).
+
+    Returns:
+        Số giây lấn; 0.0 khi lấn dưới ``AUDIBLE_OVERLAP_S``.
+    """
+    overlap = audio_s - available_s
+    return overlap if overlap >= AUDIBLE_OVERLAP_S - _EPS else 0.0
+
+
 def is_abnormally_long_vs_floor(
     audio_duration_s: float,
     syllable_count: int,
     ratio_threshold: float = ABNORMAL_VS_FLOOR_RATIO,
     min_base_s: float = MIN_SPEECH_BASE_S,
     min_per_syllable_s: float = MIN_SPEECH_PER_SYLLABLE_S,
+    min_absolute_s: float = ABNORMAL_MIN_ABSOLUTE_S,
 ) -> bool:
     """[v3.23.244] Hallucination đo so với BIÊN DƯỚI THEO ÂM TIẾT (không phải trung bình).
 
@@ -621,7 +657,9 @@ def is_abnormally_long_vs_floor(
     floor = min_speech_seconds(syllable_count, min_base_s, min_per_syllable_s)
     if floor <= 0.0:
         return False
-    return audio_duration_s > floor * ratio_threshold + _EPS
+    # [v3.23.458] Phải vượt CẢ floor×ratio LẪN sàn tuyệt đối → bỏ false-positive câu cực ngắn.
+    threshold = max(floor * ratio_threshold, min_absolute_s)
+    return audio_duration_s > threshold + _EPS
 
 
 def is_abnormally_long(
@@ -770,6 +808,26 @@ def syllable_budget_to_chars(
         Ngân sách ký tự tương đương.
     """
     return max(1, round(syllable_budget * chars_per_syllable))
+
+
+def reading_char_budget(available_s: float, reading_cps: float) -> int:
+    """[v3.23.439] Ngân sách ký tự để MẮT ĐỌC kịp trong ``available_s`` giây (hàm thuần).
+
+    Khác :func:`readable_syllable_budget` (tuned cho TTS ĐỌC — tốc độ NÓI, lỏng hơn), hàm này
+    tính theo tốc độ MẮT ĐỌC phụ đề (CPS - ký tự/giây). Chuẩn ngành ~17-21 CPS. Dùng cho chế độ
+    dịch CPS-aware: siết ``max_chars`` để phụ đề CJK→Việt (vốn dài hơn nguồn) không tràn thời
+    gian đọc.
+
+    Args:
+        available_s: Khung thời gian hiệu dụng của dòng (giây).
+        reading_cps: Tốc độ đọc mục tiêu (ký tự/giây); ``<= 0`` trả 0 (tắt).
+
+    Returns:
+        Số ký tự tối đa nên dùng để đọc kịp; 0 nếu tham số không hợp lệ.
+    """
+    if available_s <= 0.0 or reading_cps <= 0.0:
+        return 0
+    return int(available_s * reading_cps)
 
 
 def stretch_ratio_cap(

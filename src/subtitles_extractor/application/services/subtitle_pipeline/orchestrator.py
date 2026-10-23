@@ -23,6 +23,7 @@ Thứ tự pipeline:
     13. Reindex.
     13b. Strip Latin watermark prefix từ CJK multi-line events (v3.6+).
     13c. Strip persistent watermark lines theo tần suất (v3.6+).
+    13e. Mốc kết thúc = lúc chữ biến mất (độ giữ khung, v3.23.615).
     14. Reindex (final).
 """
 
@@ -39,12 +40,14 @@ from subtitles_extractor.application.services.subtitle_pipeline.box_filters impo
 )
 from subtitles_extractor.application.services.subtitle_pipeline.event_filters import (
     convert_groups_to_events,
+    extend_ends_by_display_hold,
     extend_group_timing_from_soft_drops,
     filter_echo_trail_events,
     filter_echo_trail_groups,
     split_stable_variant_groups,
     filter_short_duration_events,
     filter_short_text_events,
+    frame_display_hold,
     merge_adjacent_duplicates,
     post_merge_duplicates,
     reindex_events,
@@ -94,6 +97,13 @@ def text_similarity_cached(text_left: str, text_right: str) -> float:
     )
 
     return _actual_text_similarity(text_left, text_right)
+
+
+def _frame_boxes(frame: OcrFrameResult) -> list[tuple[int, int, int, int]]:
+    """Bbox các ô chữ có polygon của một khung (hàm thuần)."""
+    return [
+        box.bounding_box for box in frame.text_boxes if box.bounding_box is not None
+    ]
 
 
 class SubtitleBuilder:
@@ -238,6 +248,9 @@ class SubtitleBuilder:
         # [v3.7] Thu thập timestamp frame bị lọc nhưng có nội dung (soft-drop)
         # để dùng phục hồi timing biên sau giai đoạn grouping.
         soft_dropped_timestamps: list[float] = []
+        # [v3.23.616] Vị trí chữ của khung soft-drop: chỉ nới biên câu bằng khung có chữ
+        # nằm cùng chỗ với câu (xem ``extend_group_timing_from_soft_drops``).
+        soft_dropped_boxes: dict[float, list[tuple[int, int, int, int]]] = {}
         spatially_cleaned_frames: list[OcrFrameResult] = []
         for current_frame in purified_frames:
             cleaned_frame = clean_spatial_outliers(current_frame, roi, self._config)
@@ -246,6 +259,9 @@ class SubtitleBuilder:
             elif not current_frame.is_empty:
                 # Frame có nội dung nhưng spatial cleanup loại hết boxes → ghi ts
                 soft_dropped_timestamps.append(current_frame.timestamp_sec)
+                soft_dropped_boxes[current_frame.timestamp_sec] = _frame_boxes(
+                    current_frame
+                )
 
         # ── Stage 3: Confidence-based frame filter ──
         confident_frames = filter_noise_by_confidence(
@@ -259,6 +275,7 @@ class SubtitleBuilder:
         for f in spatially_cleaned_frames:
             if f.timestamp_sec not in confident_ts_set:
                 soft_dropped_timestamps.append(f.timestamp_sec)
+                soft_dropped_boxes[f.timestamp_sec] = _frame_boxes(f)
 
         soft_dropped_timestamps.sort()
 
@@ -295,6 +312,7 @@ class SubtitleBuilder:
                     merged_groups,
                     soft_dropped_timestamps,
                     self._config.sample_step_sec,
+                    soft_dropped_boxes,
                 )
 
             # ── Stage 7: Echo trail filter (group-level), lặp đến hội tụ ──
@@ -330,6 +348,13 @@ class SubtitleBuilder:
                 refine_final_events,
             )
             subtitle_events = refine_final_events(subtitle_events)
+
+            # ── Stage 13e: Mốc kết thúc = lúc chữ biến mất (độ giữ khung) ──
+            # Làm SAU mọi bộ lọc theo thời lượng để không đổi câu nào bị giữ/bỏ.
+            subtitle_events = extend_ends_by_display_hold(
+                subtitle_events,
+                frame_display_hold([frame.timestamp_sec for frame in frame_results]),
+            )
 
             # ── Stage 14: Reindex ──
             return reindex_events(subtitle_events)

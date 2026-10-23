@@ -80,6 +80,35 @@ def find_system_python() -> str | None:
     return None
 
 
+def whisperx_env_root() -> Path:
+    """[v3.23.403] Thư mục CHA của ``whisperx_env`` — nơi CÀI env.
+
+    * Bản ĐÓNG GÓI: ``<thư mục chứa exe>`` — env nằm CẠNH exe (bền, portable, sống sót khi
+      Windows dọn %TEMP%, nhất quán với ``models/``). Trước đây dùng
+      ``Path(__file__).parents[4]`` → trong one-file trỏ NHẦM vào ``%TEMP%`` (cha của ``_MEIPASS``).
+    * Chạy từ NGUỒN: gốc dự án (cùng cấp ``build_env``).
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[4]
+
+
+def whisperx_env_root_candidates() -> tuple[Path, ...]:
+    """Các thư mục CHA có thể chứa ``whisperx_env`` — để TÌM env (tương thích ngược).
+
+    Ưu tiên vị trí MỚI (cạnh exe), rồi vị trí CŨ (``%TEMP%`` = cha của ``_MEIPASS``) để env đã
+    cài từ bản trước vẫn dùng được, KHÔNG ép tải lại ~3GB.
+    """
+    roots: list[Path] = [whisperx_env_root()]
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            legacy = Path(meipass).resolve().parent  # vị trí cũ %TEMP%
+            if legacy not in roots:
+                roots.append(legacy)
+    return tuple(roots)
+
+
 def env_python_path(project_root: Path) -> Path:
     """Đường dẫn trình thông dịch bên trong môi trường riêng.
 

@@ -174,6 +174,19 @@ def install_package(pip_args: tuple[str, ...], timeout_sec: float = 1800.0) -> t
     return completed.returncode == 0, output[-4000:]
 
 
+def run_full_diagnosis() -> list[DependencyReport]:
+    """[v3.23.434] Chạy toàn bộ chẩn đoán phụ thuộc runtime.
+
+    Khôi phục hàm bị thiếu (``__all__`` khai báo nhưng không có định nghĩa → F822; test
+    ``test_full_diagnosis_lists_all`` gọi hàm này). Gom các phép kiểm phụ thuộc runtime chính
+    (FFmpeg CLI, WhisperX) thành một danh sách báo cáo để tầng UI hiển thị tổng quan.
+
+    Returns:
+        Danh sách ``DependencyReport`` cho từng phụ thuộc được kiểm.
+    """
+    return [check_ffmpeg_cli(), check_whisperx()]
+
+
 __all__ = [
     "DependencyStatus",
     "DependencyReport",

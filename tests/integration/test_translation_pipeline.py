@@ -53,7 +53,12 @@ def test_single_stage_pipeline() -> None:
 
 
 def test_multi_stage_runs_in_order() -> None:
-    translator = FakeSubtitleTranslator()
+    # [v3.23.553] Giai đoạn thô phải thực sự DỊCH (bỏ hết chữ Hán). Fake mặc định chỉ gắn
+    # tiền tố lên câu gốc, để chữ Hán sót lại → lưới "Dọn CJK sót" (đúng thiết kế) gọi
+    # thêm một lượt dịch thô, làm lệch danh sách lượt gọi mà test này cần kiểm.
+    translator = FakeSubtitleTranslator(
+        dictionary={"你好": "Xin chào", "再见": "Tạm biệt", "谢谢": "Cảm ơn"}
+    )
     use_case = TranslateSubtitlesUseCase(translator=translator)
     request = TranslateSubtitlesRequest(
         events=_events(),
@@ -104,7 +109,8 @@ def test_stage_outputs_accumulated_for_comparison() -> None:
 
 
 def test_consistent_dictionary_translation() -> None:
-    # Mô phỏng bản dịch nhất quán (như Translation Memory): câu trong từ điển dịch cố định.
+    # Mô phỏng bản dịch nhất quán (như Translation Memory): câu trong từ điển dịch cố
+    # định.
     translator = FakeSubtitleTranslator(
         dictionary={"你好": "Xin chào", "再见": "Tạm biệt", "谢谢": "Cảm ơn"}
     )

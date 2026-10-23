@@ -43,9 +43,11 @@ def test_tooltip_recommendation_still_intact() -> None:
 
 
 def test_max_speed_tooltip_explains_quality_cap() -> None:
-    # Người dùng phải BIẾT đặt max > 2.0 vô nghĩa với VieNeu/Gemini.
-    assert "VieNeu / Gemini: nén hậu kỳ nên bị chặn ở 2.0×" in _TTS_PAGE  # noqa: RUF001
-    assert "Edge TTS: dùng được tới 5.0×" in _TTS_PAGE  # noqa: RUF001
+    # Tooltip KHUYẾN NGHỊ ≤2.0 cho VieNeu/Gemini, NHƯNG nói rõ app TÔN TRỌNG cài đặt người dùng
+    # (không chặn cứng — set 2.5 thì chạy 2.5).
+    assert "LUÔN dùng ĐÚNG giá trị bạn đặt" in _TTS_PAGE  # noqa: RUF001
+    assert "KHUYẾN NGHỊ ≤ 2.0×" in _TTS_PAGE  # noqa: RUF001
+    assert "VẪN được áp dụng" in _TTS_PAGE  # noqa: RUF001
 
 
 def test_legacy_helpers_marked_deprecated() -> None:
@@ -57,6 +59,10 @@ def test_legacy_helpers_marked_deprecated() -> None:
 def test_total_speed_ratio_is_the_one_in_use() -> None:
     # Luồng chạy VieNeu dùng hàm mới, KHÔNG còn gọi hàm cũ.
     process_event = _VIENEU.split("def _process_event")[1]
-    assert "total_speed_ratio(" in process_event
+    # [v3.23.596] Tốc độ tính trong hàm đặt câu dùng chung với Gemini (``place_line``).
+    assert "place_line(" in process_event
+    assert "total_speed_ratio(" in pathlib.Path(
+        "src/subtitles_extractor/infrastructure/tts/line_placement.py"
+    ).read_text(encoding="utf-8")
     assert "stretch_ratio_cap(" not in process_event
     assert "compute_fit_stretch_ratio(" not in process_event

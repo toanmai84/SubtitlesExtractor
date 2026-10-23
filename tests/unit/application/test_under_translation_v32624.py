@@ -28,9 +28,12 @@ _TRANSLATOR_SRC = pathlib.Path(
 
 def _job(extra: list[tuple[int, str, str]]) -> list[tuple[int, str, str]]:
     """Nền một job dịch bình thường (tỉ lệ Việt/CJK ~2.5x) + các dòng cần kiểm."""
-    # 9 ký tự CJK -> 26 ký tự Việt (tỉ lệ ~2.9x, sát thực tế đo được)
+    # 9 chữ Hán -> 29 chữ cái Việt (tỉ lệ ~3.2x). [v3.23.553] Bộ đo nay đếm CHỮ CÁI thay
+    # vì ký tự (bỏ khoảng trắng/dấu câu); trung vị đo trên 5 lần chạy thật phim 3902 dòng
+    # là 3.13-3.20 chữ cái/chữ Hán, nên nền cũ (21 chữ cái = 2.33x) thấp phi thực tế.
     binh_thuong = [
-        (i, "你今天来这里做什么", "Hôm nay cháu tới đây làm gì") for i in range(1, 16)
+        (i, "你今天来这里做什么", "Hôm nay cháu tới chỗ này để làm gì vậy")
+        for i in range(1, 16)
     ]
     return binh_thuong + extra
 

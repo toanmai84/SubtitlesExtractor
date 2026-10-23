@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
+from subtitles_extractor.application.services.bidi_marks import strip_rtl_marks
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
 from subtitles_extractor.infrastructure.subtitle.encoding_detect import (
     read_subtitle_text,
 )
+from subtitles_extractor.domain.exceptions import ConfigurationError
 from subtitles_extractor.domain.value_objects.confidence import Confidence
 from subtitles_extractor.domain.value_objects.time_interval import TimeInterval
 
@@ -57,7 +60,7 @@ class SrtImporter:
         return events
 
 
-def _parse_srt(content: str):
+def _parse_srt(content: str) -> Iterator[SubtitleEvent]:
     """Generator yield :class:`SubtitleEvent` từ chuỗi SRT thô.
 
     [Robust Sequential Parser] Thay vì tách block bằng ``\\n\\s*\\n`` (dễ cắt nhầm
@@ -91,31 +94,47 @@ def _parse_srt(content: str):
 
         text_lines = lines[text_start:cursor]
         # Dòng cuối có thể là số thứ tự của block kế (đứng ngay trước timecode) → bỏ.
-        if text_lines and text_lines[-1].strip().isdigit():
+        # [v3.23.614] Chỉ khi CÒN block kế: ở block cuối tệp, dòng số chính là lời thoại
+        # ("520", "3" khi đếm ngược) — trước đây bị bỏ và mất cả câu.
+        if cursor < total and text_lines and text_lines[-1].strip().isdigit():
             text_lines = text_lines[:-1]
-        text = "\n".join(text_lines).strip()
+        # [v3.23.610] Gỡ dấu định hướng do bản xuất của ứng dụng thêm vào dòng RTL.
+        text = strip_rtl_marks("\n".join(text_lines).strip())
         line_index = cursor
 
         if not text:
             continue
-        try:
-            interval = TimeInterval(
-                start_sec=_to_seconds(
-                    int(timing_match["sh"]), int(timing_match["sm"]),
-                    int(timing_match["ss"]), _parse_milliseconds(timing_match["sms"]),
-                ),
-                end_sec=_to_seconds(
-                    int(timing_match["eh"]), int(timing_match["em"]),
-                    int(timing_match["es"]), _parse_milliseconds(timing_match["ems"]),
-                ),
-            )
-        except ValueError:
-            logger.warning("Block có timing không hợp lệ — bỏ qua: %r", text[:80])
+        start_sec = _to_seconds(
+            int(timing_match["sh"]), int(timing_match["sm"]),
+            int(timing_match["ss"]), _parse_milliseconds(timing_match["sms"]),
+        )
+        end_sec = _to_seconds(
+            int(timing_match["eh"]), int(timing_match["em"]),
+            int(timing_match["es"]), _parse_milliseconds(timing_match["ems"]),
+        )
+        interval = _safe_interval(start_sec, end_sec, text)
+        if interval is None:
             continue
         yield SubtitleEvent(
             index=counter, text=text, interval=interval, confidence=Confidence(1.0)
         )
         counter += 1
+
+
+def _safe_interval(start_sec: float, end_sec: float, text: str) -> TimeInterval | None:
+    """[v3.23.650] Khoảng thời gian của một block; ``end < start`` (lỗi gõ phổ biến) KHÔNG làm cả tệp không nạp được.
+
+    ``TimeInterval`` ném ``ConfigurationError`` (không phải ``ValueError``) nên bộ nạp từng để ngoại lệ trào ra: "Nạp tệp"
+    im lặng, dịch cả bộ đứng hàng đợi. Giữ lời thoại với thời lượng 0,5 s; mốc bắt đầu âm thì bỏ block.
+    """
+    try:
+        return TimeInterval(start_sec=start_sec, end_sec=end_sec)
+    except ConfigurationError:
+        if start_sec >= 0 and end_sec < start_sec:
+            logger.warning("Block có mốc kết thúc trước mốc bắt đầu — đặt thời lượng 0,5s: %r", text[:80])
+            return TimeInterval(start_sec=start_sec, end_sec=start_sec + 0.5)
+        logger.warning("Block có timing không hợp lệ — bỏ qua: %r", text[:80])
+        return None
 
 
 def _parse_milliseconds(fractional_digits: str) -> int:

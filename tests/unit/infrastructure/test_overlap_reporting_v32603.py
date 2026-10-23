@@ -78,13 +78,14 @@ def test_no_overlap_when_fits(monkeypatch, tmp_path) -> None:
 
 
 def test_ui_counts_overlap_from_results() -> None:
-    # Khoá điều kiện UI đếm: overlap_s > 0 (tts_page dòng ~1090).
+    # Khoá điều kiện UI đếm từ kết quả. [v3.23.601] Chỉ đếm chồng tiếng THẬT (≥1 ms):
+    # "overlap_s > 0" đếm cả phần dư làm tròn sau nén (113 báo cáo so với 7 dòng thật).
     import pathlib
 
     source = pathlib.Path(
         "src/subtitles_extractor/presentation/pages/tts_page.py"
     ).read_text(encoding="utf-8")
-    assert "r.overlap_s for r in ok if r.overlap_s > 0" in source
+    assert "r.overlap_s for r in ok if r.has_audible_overlap" in source
 
 
 def test_gemini_source_sets_overlap_both_paths() -> None:
@@ -93,4 +94,5 @@ def test_gemini_source_sets_overlap_both_paths() -> None:
     source = pathlib.Path(
         "src/subtitles_extractor/infrastructure/tts/gemini_tts_adapter.py"
     ).read_text(encoding="utf-8")
-    assert source.count("overlap_s=max(0.0,") >= 2  # đường thường + batch
+    # [v3.23.601] Cùng hàm bỏ phần dư làm tròn với VieNeu.
+    assert source.count("overlap_s=audible_overlap_seconds(") >= 2  # đường thường + batch

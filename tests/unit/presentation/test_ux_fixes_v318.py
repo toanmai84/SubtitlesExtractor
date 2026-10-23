@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("PyQt6")
+pytest.importorskip("PySide6")
 pytest.importorskip("qfluentwidgets")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402

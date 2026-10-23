@@ -15,7 +15,7 @@ tuyệt đối. Trước đây mpv và PyAV là hai decoder khác nhau, về ngu
 Nguyên tắc thiết kế
 -------------------
 * **KHÔNG phụ thuộc Qt** — nhờ vậy kiểm thử được đầy đủ, không cần màn hình.
-* **Timestamp luôn dùng ``PTS × time_base``**, TUYỆT ĐỐI không dùng ``frame_idx / fps``
+* **Timestamp luôn dùng ``PTS * time_base``**, TUYỆT ĐỐI không dùng ``frame_idx / fps``
   (nguyên tắc xuyên suốt dự án; bắt buộc để đúng với video VFR).
 * Seek chính xác tới frame: nhảy tới keyframe TRƯỚC mốc đích rồi giải mã tiến tới.
 
@@ -25,6 +25,7 @@ Module này chỉ lo GIẢI MÃ. Việc hiển thị (Qt) và đồng bộ âm t
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Final
 
@@ -80,6 +81,8 @@ class PyAvFrameDecoder:
         self._container: Any | None = None
         self._stream: Any | None = None
         self._current_frame: Any | None = None
+        # [v3.23.553] Iterator giải mã BỀN giữa các lần gọi — xem _decode_next_frame.
+        self._frame_iter: Iterator[Any] | None = None
         self._current_pts_sec: float = 0.0
         self._duration_sec: float = 0.0
         self._fps: float = _FALLBACK_FPS
@@ -103,7 +106,7 @@ class PyAvFrameDecoder:
 
     @property
     def position_sec(self) -> float:
-        """Mốc thời gian của frame hiện tại (giây), tính từ ``PTS × time_base``."""
+        """Mốc thời gian của frame hiện tại (giây), tính từ ``PTS * time_base``."""
         return self._current_pts_sec
 
     @property
@@ -174,10 +177,11 @@ class PyAvFrameDecoder:
         if self._container is not None:
             try:
                 self._container.close()
-            except Exception as exc:  # noqa: BLE001 — dọn dẹp: log rồi bỏ qua
+            except _av_error_types() as exc:
                 logger.debug("Bỏ qua lỗi khi đóng container: %s.", exc)
         self._container = None
         self._stream = None
+        self._frame_iter = None
         self._current_frame = None
         self._current_pts_sec = 0.0
         self._duration_sec = 0.0
@@ -216,7 +220,7 @@ class PyAvFrameDecoder:
         return _FALLBACK_FPS
 
     def _frame_pts_sec(self, frame: Any) -> float:
-        """Tính mốc thời gian của frame theo ``PTS × time_base``.
+        """Tính mốc thời gian của frame theo ``PTS * time_base``.
 
         TUYỆT ĐỐI không dùng ``frame_idx / fps`` — sai với video VFR.
 
@@ -241,14 +245,22 @@ class PyAvFrameDecoder:
         """
         if self._container is None or self._stream is None:
             return None
+        # [v3.23.553] Giữ MỘT iterator cho tới lần seek/open kế tiếp. Trước đây mỗi lần
+        # gọi tạo generator ``decode()`` mới rồi bỏ sau frame đầu: packet nào giải ra
+        # NHIỀU frame (nhất là packet flush cuối tệp) thì các frame còn lại MẤT theo
+        # generator → frame cuối không bao giờ hiện, phát không bao giờ tới EOF.
+        if self._frame_iter is None:
+            self._frame_iter = iter(self._container.decode(self._stream))
         try:
-            for frame in self._container.decode(self._stream):
-                self._current_frame = frame
-                self._current_pts_sec = self._frame_pts_sec(frame)
-                return frame
+            frame = next(self._frame_iter)
+        except StopIteration:
+            return None
         except _av_error_types() as exc:
             logger.debug("Kết thúc/lỗi giải mã: %s.", exc)
-        return None
+            return None
+        self._current_frame = frame
+        self._current_pts_sec = self._frame_pts_sec(frame)
+        return frame
 
     def next_frame(self) -> np.ndarray | None:
         """Tiến tới frame kế tiếp.
@@ -313,6 +325,8 @@ class PyAvFrameDecoder:
         if time_base is None:
             return
         target_ts = int(max(0.0, position_sec) / float(time_base))
+        # Sau seek, bộ giải mã bắt đầu lại từ keyframe — iterator cũ không còn hợp lệ.
+        self._frame_iter = None
         try:
             self._container.seek(
                 target_ts, stream=self._stream, backward=True, any_frame=False

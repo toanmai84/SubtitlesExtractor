@@ -51,3 +51,21 @@ def test_custom_max_speed() -> None:
 def test_exactly_at_frame_no_stretch() -> None:
     # Audio đúng bằng khung -> không nén.
     assert compute_fit_stretch_ratio(1.5, 1.5, max_speed=3.0) == 1.0
+
+
+# [v3.23.464] TÔN TRỌNG max_speed người dùng: không âm thầm ghi đè về 2.0 (quality_cap chỉ là
+# khuyến nghị ở tooltip). Set 2.5 → chạy 2.5; set 3.0 → chạy 3.0.
+from subtitles_extractor.infrastructure.tts.timing_math import total_speed_ratio
+
+
+def test_total_speed_ratio_honors_user_max_speed():
+    # audio 3s trong khung 1s → cần nén 3.0×; trần = đúng max_speed người dùng.
+    assert total_speed_ratio(3.0, 1.0, 1.3, 2.5) == 2.5   # honor 2.5 (không kẹp về 2.0)
+    assert total_speed_ratio(3.0, 1.0, 1.3, 3.0) == 3.0   # honor 3.0
+    assert total_speed_ratio(3.0, 1.0, 1.3, 2.0) == 2.0   # default 2.0 giữ nguyên
+    assert total_speed_ratio(3.0, 1.0, 1.3, 1.8) == 1.8   # trần thấp hơn cũng honor
+
+
+def test_total_speed_ratio_no_speedup_when_fits():
+    # Câu vừa khung ở tốc độ cơ bản → giữ base_speed, KHÔNG tăng vô cớ dù max cao.
+    assert total_speed_ratio(0.8, 1.0, 1.3, 2.5) == 1.3

@@ -70,7 +70,7 @@ class JsonFileRepository:
             with self._file_path.open("r", encoding="utf-8") as fh:
                 data = json.load(fh)
                 return data if isinstance(data, dict) else {}
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:   # [v3.23.638] ValueError gồm cả UnicodeDecodeError
             logger.warning(
                 "Không đọc được %s: %s — quay về cấu hình rỗng.",
                 self._file_path,

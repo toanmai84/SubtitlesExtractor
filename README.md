@@ -33,6 +33,11 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
 - Length-hint (`max_chars`) cho bản dịch súc tích, vừa thời lượng đọc TTS.
 - **Tinh chỉnh chuyên dụng**: dịch lại dòng đã chọn, sửa bản dịch tại chỗ, so sánh các giai đoạn,
   kiểm tra nhất quán thuật ngữ. Mọi chỉnh sửa được lưu bền vững và khôi phục khi mở lại.
+- **Quản lý giai đoạn** (bộ nhớ đệm từng giai đoạn, giữ lại sau khi dịch): xem giai đoạn nào đã
+  lưu, model nào, lần dịch tới sẽ dùng lại hay dịch lại (và vì sao); **sửa tay nội dung từng
+  giai đoạn** (dòng sửa tay luôn được giữ, kể cả khi giai đoạn bị dịch lại); xoá một giai đoạn
+  để dịch lại riêng nó. Đổi cấu hình hay sửa một giai đoạn thì lần dịch tới chỉ dịch phần thật
+  sự đổi — sửa 5 dòng dịch thô của phim 1246 dòng: 10 lượt gọi thay vì 42.
 
 ### 📚 Translation Memory cho phim bộ
 - Tự **nhớ câu đã dịch** theo từng phim bộ (gom theo thư mục) và truy hồi làm tham chiếu
@@ -123,7 +128,8 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src python -m pytest tests/unit -q
 3. Sang trang **Dịch**: dán API Key, nhấn *Phân tích toàn bộ phụ đề* để tự sinh ngữ cảnh +
    bảng thuật ngữ + nhân vật, rồi bật các giai đoạn dịch và chạy.
 4. Tinh chỉnh: *Dịch lại* dòng chưa ưng, *Sửa bản dịch* tại chỗ, *So sánh giai đoạn*,
-   *Kiểm tra thuật ngữ*.
+   *Kiểm tra thuật ngữ*, *Quản lý giai đoạn* (sửa một giai đoạn rồi bấm Dịch: các giai đoạn
+   sau chỉ dịch lại các lô có dòng đổi).
 5. Các tập sau (cùng thư mục): ứng dụng **tự kế thừa** câu dịch + thuật ngữ + nhân vật để
    nhất quán — chỉ cần bổ sung khi có nội dung mới.
 6. (Tuỳ chọn) Sang trang **TTS** để lồng tiếng bản dịch.

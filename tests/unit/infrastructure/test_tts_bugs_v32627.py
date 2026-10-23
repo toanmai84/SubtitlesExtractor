@@ -115,6 +115,10 @@ def test_sdk_khong_ho_tro_thi_khong_truyen_gi_them() -> None:
     # Nguyên tắc: dò bằng introspection, KHÔNG giả định tên tham số -> SDK cũ chạy y hệt.
     engine = _SdkKhongHoTro()
     adapter = VieNeuTtsAdapter.__new__(VieNeuTtsAdapter)
+    # [v3.23.547] Dựng ở dạng UNBOUND nên phải gắn tay các thuộc tính mà `_infer_once`
+    # đọc. Ép CPU để bài kiểm ở đúng phạm vi của nó: bộ tham số truyền cho `engine.infer`,
+    # không phải đường rẽ sang worker GPU (đã có bộ kiểm riêng).
+    adapter._force_cpu = True
     adapter._infer_once(engine, "Kiều Kiều à,", {})
     assert set(engine.kwargs) == {"text", "voice"}
 
@@ -128,6 +132,7 @@ def test_sdk_ho_tro_thi_nhan_duoc_tran() -> None:
 
     engine = _SdkHoTro()
     adapter = VieNeuTtsAdapter.__new__(VieNeuTtsAdapter)
+    adapter._force_cpu = True
     adapter._infer_once(engine, "Kiều Kiều à,", {})
     # [v3.23.262] Trần nay tính theo ÂM TIẾT (nhất quán lưới hallucination), không phải
     # ký tự — câu cùng số âm có cùng trần dù khác dấu câu.

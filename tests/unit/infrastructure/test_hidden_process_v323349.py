@@ -110,12 +110,22 @@ def test_gpu_server_is_shut_down_cleanly() -> None:
     assert '"quit": true' in source
 
 
-def test_gpu_server_stderr_is_devnull() -> None:
-    """Không ai đọc stderr của tiến trình này -> phải DEVNULL, tránh bế tắc."""
+def test_gpu_server_stderr_is_not_unread_pipe() -> None:
+    """stderr KHÔNG được là ống không ai đọc — sẽ đầy bộ đệm rồi treo tiến trình.
+
+    [v3.23.545] Yêu cầu thật là "không để ống treo", chứ không nhất thiết phải ``DEVNULL``. Mã
+    nguồn nay ghi stderr ra TỆP TẠM có tên (``vieneu_gpu_err_*.log``) — an toàn ngang ``DEVNULL``
+    về mặt bế tắc (ghi tệp không chặn như ống), lại giữ được thông tin để gỡ lỗi khi tiến trình
+    GPU chết. Bộ kiểm cũ khoá cứng ``DEVNULL`` nên báo đỏ đúng lúc mã nguồn đã TỐT HƠN.
+    """
     source = _tts_source()
     index = source.index("def _ensure_gpu_server")
-    window = source[index : index + 1500]
-    assert "stderr=subprocess.DEVNULL" in window
+    # Cửa sổ phải đủ rộng để chạm tới lời gọi Popen — docstring của hàm khá dài, cửa sổ 1500 ký
+    # tự của bản cũ dừng trước đó nên kiểm nhầm vào phần chú thích.
+    window = source[index : index + 4000]
+    assert "subprocess.Popen" in window, "không tìm thấy lời gọi Popen trong cửa sổ kiểm"
+    assert "stderr=subprocess.PIPE" not in window, "stderr là ống không ai đọc → nguy cơ treo"
+    assert "stderr=" in window, "phải chỉ định rõ stderr thay vì để kế thừa"
 
 
 def test_worker_supports_serve_mode() -> None:

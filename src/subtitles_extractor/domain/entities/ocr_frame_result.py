@@ -17,6 +17,7 @@ from __future__ import annotations
 import string
 from dataclasses import dataclass, field
 
+from subtitles_extractor.domain.value_objects.cjk_char import is_cjk_char
 from subtitles_extractor.domain.value_objects.confidence import Confidence
 
 Polygon = list[tuple[int, int]]
@@ -34,8 +35,6 @@ def _smart_join_boxes(texts: list[str]) -> str:
     """Nối Text thông minh, chuẩn Studio Quality.
     Được đưa ra Global Level để tránh Overhead khởi tạo lại hàm.
     """
-    from subtitles_extractor.application.services.cjk_utils import is_cjk_char
-
     if not texts:
         return ""
     res = texts[0].strip()
@@ -88,8 +87,6 @@ def _smart_join_boxes_with_gap_awareness(
            và cả 2 đều bao gồm CJK → insert space.
         4. Ngược lại fallback ``_smart_join_boxes`` behavior.
     """
-    from subtitles_extractor.application.services.cjk_utils import is_cjk_char
-
     if not line_items:
         return ""
 

@@ -41,9 +41,25 @@ class TestValidateFlexible:
         except _BatchPartialError as exc:
             assert exc.missing_line_nos == [100]
 
-    def test_overflow_raises(self) -> None:
-        # Dư nhiều → ValidationError (halving).
+    def test_overflow_but_batch_covered_is_filtered(self) -> None:
+        """[v3.23.512] Dư nhiều NHƯNG đủ dòng của lô → LỌC phần thừa, không dịch lại.
+
+        Đổi chính sách so với v3.23.18: log thật cho thấy khi lô chia còn 1 dòng, model
+        trả 26 dòng (1 dòng cần + 25 dòng ngữ cảnh). Coi đó là hỏng khiến app thử lại 5
+        lần rồi BỎ CUỘC giữ nguyên bản gốc — trong khi dòng cần dịch nằm sẵn trong kết
+        quả. Nay lọc đúng các dòng thuộc lô và đi tiếp.
+        """
         payload = {"subtitles": [{"line_no": i, "text": f"t{i}"} for i in range(1, 96)]}
+        _adapter()._validate_batch(payload, 25, 0)  # không được ném
+
+        assert [item["line_no"] for item in payload["subtitles"]] == list(range(1, 26))
+
+    def test_overflow_with_missing_batch_lines_still_raises(self) -> None:
+        """Dư nhiều mà LỌC XONG vẫn thiếu dòng của lô → vẫn phải báo hỏng."""
+        # Toàn bộ 95 dòng đều NGOÀI khoảng 1..25 của lô → không cứu được.
+        payload = {
+            "subtitles": [{"line_no": i, "text": f"t{i}"} for i in range(200, 295)]
+        }
         try:
             _adapter()._validate_batch(payload, 25, 0)
             raise AssertionError("không raise")

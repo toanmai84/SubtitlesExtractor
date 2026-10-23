@@ -46,6 +46,11 @@ class ListEmbeddedTracksWorker(QObject):
         except (OSError, RuntimeError) as exc:
             logger.exception("Tác vụ nền embedded_extract_worker thất bại.")
             self.failed.emit(f"Lỗi hệ thống khi đọc phụ đề nhúng: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            # [v3.23.650] Mọi ngoại lệ khác (ValueError/KeyError/cv2.error/MemoryError…) từng thoát khỏi run() không
+            # phát finished/failed → thread.quit không bao giờ chạy, trạng thái bận kẹt vĩnh viễn, nút bị khoá.
+            logger.exception("Tác vụ nền %s gặp lỗi không lường trước.", "embedded_extract_worker")
+            self.failed.emit(f"Lỗi không xác định: {exc}")
 
 
 class ExtractEmbeddedWorker(QObject):
@@ -85,6 +90,11 @@ class ExtractEmbeddedWorker(QObject):
         except (OSError, RuntimeError) as exc:
             logger.exception("Tác vụ nền embedded_extract_worker thất bại.")
             self.failed.emit(f"Lỗi hệ thống khi trích phụ đề nhúng: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            # [v3.23.650] Mọi ngoại lệ khác (ValueError/KeyError/cv2.error/MemoryError…) từng thoát khỏi run() không
+            # phát finished/failed → thread.quit không bao giờ chạy, trạng thái bận kẹt vĩnh viễn, nút bị khoá.
+            logger.exception("Tác vụ nền %s gặp lỗi không lường trước.", "embedded_extract_worker")
+            self.failed.emit(f"Lỗi không xác định: {exc}")
 
     def _on_progress(self, current: int, total: int, message: str) -> None:
         self.progress.emit(current, total, message)

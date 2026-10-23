@@ -177,9 +177,10 @@ class TestLengthAnomalyCjkAware:
         assert flags["counts"]["length_anomaly"] == 0
 
     def test_genuine_over_translation_still_flagged(self) -> None:
-        # Nguồn đủ dài nhưng bản dịch phồng bất thường (>2.5x hiệu dụng) -> CÒN cờ.
-        source = [_event(1, 0.0, 1.0, "你好朋友")]  # 4 Hán tự, eff=12
-        translated = [_event(1, 0.0, 1.0, "x" * 40)]  # 40/12 = 3.33 > 2.5
+        # [v3.23.465] Nguồn ĐỦ DÀI (eff ≥ 18, tránh nới lỏng thành ngữ ngắn) mà bản dịch phồng
+        # bất thường (>2.5x hiệu dụng) -> CÒN cờ length_anomaly.
+        source = [_event(1, 0.0, 1.0, "你好世界朋友们")]  # 7 Hán tự, eff ≈ 21 ≥ 18
+        translated = [_event(1, 0.0, 1.0, "x" * 70)]  # 70/21 ≈ 3.33 > 2.5
         flags = detect_quality_flags(source, translated)
         assert flags["counts"]["length_anomaly"] == 1
 
@@ -189,3 +190,24 @@ class TestLengthAnomalyCjkAware:
         translated = [_event(1, 0.0, 1.0, "[Bob:] Hello world friend")]
         flags = detect_quality_flags(source, translated)
         assert flags["identical_to_source_indices"] == [1]
+
+
+class TestUnderTranslationFlag:
+    """[v3.23.465] Cờ under_translation (job-median) vào QC có cấu trúc."""
+
+    def test_short_lines_flagged_relative_to_median(self) -> None:
+        # 18 dòng dịch bình thường + 2 dòng cụt (như 那个病人的信息 → 'Vâng,').
+        source = [_event(i, 0.0, 1.0, "你好世界这是一句普通的中文字幕行" ) for i in range(1, 21)]
+        translated = [_event(i, 0.0, 1.0, "Đây là một dòng phụ đề tiếng Việt bình thường") for i in range(1, 21)]
+        translated[4] = _event(5, 0.0, 1.0, "Vâng,")
+        translated[9] = _event(10, 0.0, 1.0, "Được,")
+        flags = detect_quality_flags(source, translated)
+        idxs = {d["index"] for d in flags.get("under_translation", [])}
+        assert 5 in idxs and 10 in idxs
+        assert flags["counts"]["under_translation"] >= 2
+
+    def test_all_normal_no_under_translation(self) -> None:
+        source = [_event(i, 0.0, 1.0, "你好世界这是普通字幕") for i in range(1, 11)]
+        translated = [_event(i, 0.0, 1.0, "Dòng phụ đề tiếng Việt bình thường") for i in range(1, 11)]
+        flags = detect_quality_flags(source, translated)
+        assert flags["counts"]["under_translation"] == 0

@@ -40,6 +40,7 @@ from subtitles_extractor.infrastructure.video.video_render_command import (
 from subtitles_extractor.presentation.fluent_compat import (
     BodyLabel,
     CaptionLabel,
+    CheckBox,
     ComboBox,
     HeaderCardWidget,
     InfoBar,
@@ -49,6 +50,7 @@ from subtitles_extractor.presentation.fluent_compat import (
     ProgressBar,
     PushButton,
     ScrollArea,
+    SpinBox,
     StrongBodyLabel,
 )
 from subtitles_extractor.presentation.workers.render_video_worker import RenderVideoWorker
@@ -80,7 +82,9 @@ _DUCK_CHOICES: tuple[tuple[str, DuckLevel], ...] = (
 )
 
 _ENCODER_CHOICES: tuple[tuple[str, str], ...] = (
-    ("publish.enc_auto", "h264_nvenc"),
+    # [v3.23.618] Trước là "h264_nvenc" cứng → máy không có GPU NVIDIA xuất lỗi. Nay "auto":
+    # render_video thử NVENC/QSV/AMF/VideoToolbox, không được thì libx264.
+    ("publish.enc_auto", "auto"),
     ("publish.enc_h264", "libx264"),
     ("publish.enc_h265", "libx265"),
 )
@@ -280,6 +284,31 @@ class PublishPage(QWidget):
         output_row.addWidget(output_browse)
         layout.addLayout(output_row)
 
+        # [v3.23.630] Xuất THỬ một đoạn: nghe/xem vài chục giây thay vì chờ xuất cả phim
+        # (log thật: 37 lần xuất cả phim 86 tập, mỗi lần ~3 phút).
+        self._preview_check = CheckBox(self._translator.translate("publish.chk_preview"))
+        self._preview_check.setToolTip(self._translator.translate("publish.tip_preview"))
+        self._preview_start = SpinBox()
+        self._preview_start.setRange(0, 100_000)
+        self._preview_start.setSuffix(self._translator.translate("publish.suffix_minute"))
+        self._preview_length = SpinBox()
+        self._preview_length.setRange(5, 900)
+        self._preview_length.setValue(90)
+        self._preview_length.setSuffix(self._translator.translate("publish.suffix_second"))
+        self._preview_start_label = BodyLabel(self._translator.translate("publish.lbl_preview_start"))
+        self._preview_length_label = BodyLabel(self._translator.translate("publish.lbl_preview_length"))
+        preview_row = QHBoxLayout()
+        preview_row.setSpacing(8)
+        for widget in (
+            self._preview_check, self._preview_start_label, self._preview_start,
+            self._preview_length_label, self._preview_length,
+        ):
+            preview_row.addWidget(widget)
+        preview_row.addStretch(1)
+        self._preview_check.toggled.connect(self._on_preview_toggled)
+        layout.addLayout(preview_row)
+        self._on_preview_toggled(False)
+
         self._progress = ProgressBar()
         self._progress.setValue(0)
         self._progress.setVisible(False)
@@ -327,6 +356,18 @@ class PublishPage(QWidget):
     @property
     def _selected_audio_mode(self) -> AudioMode:
         return _AUDIO_CHOICES[self._audio_combo.currentIndex()][1]
+
+    def _on_preview_toggled(self, checked: bool) -> None:
+        """Bật/tắt ô mốc + độ dài của đoạn xuất thử."""
+        for widget in (
+            self._preview_start_label, self._preview_start,
+            self._preview_length_label, self._preview_length,
+        ):
+            widget.setEnabled(checked)
+
+    def _preview_output_path(self, output: Path) -> Path:
+        """Tên tệp xuất thử: ``<tên>_xemthu<đuôi>`` — không ghi đè bản xuất đầy đủ."""
+        return output.with_name(f"{output.stem}_xemthu{output.suffix}")
 
     def _on_mode_changed(self) -> None:
         """Bật/tắt các ô không liên quan và cập nhật gợi ý theo cặp chế độ đang chọn."""
@@ -591,9 +632,15 @@ class PublishPage(QWidget):
             self._warn(self._translator.translate("publish.warn_nothing_selected"))
             return None
 
+        preview = self._preview_check.isChecked()
+        output_path = Path(output_text)
+        if preview:
+            output_path = self._preview_output_path(output_path)
         return RenderRequest(
             video_path=Path(video_text),
-            output_path=Path(output_text),
+            output_path=output_path,
+            clip_start_sec=float(self._preview_start.value() * 60) if preview else 0.0,
+            clip_duration_sec=float(self._preview_length.value()) if preview else 0.0,
             # `mode` giữ lại cho tương thích; hành vi thật do hai trường dưới quyết định.
             mode=RenderMode.SOFT_SUB,
             subtitle_mode=subtitle_mode,
@@ -640,10 +687,12 @@ class PublishPage(QWidget):
         # Ưu tiên các bản ĐÃ xuất bản (có hậu tố của khâu Xuất bản); nếu không có thì
         # hỏi người dùng có muốn nối TẤT CẢ video trong thư mục không.
         suffix = self._current_output_suffix()
-        videos = find_concat_videos(folder_path, name_filter=suffix)
+        # [v3.23.619] Loại tệp trọn bộ đầu ra của lần trước (như trang Trích xuất).
+        exclude = {default_concat_output(folder_path, []).name}
+        videos = find_concat_videos(folder_path, name_filter=suffix, exclude_names=exclude)
         used_published = bool(videos)
         if not videos:
-            videos = find_concat_videos(folder_path)
+            videos = find_concat_videos(folder_path, exclude_names=exclude)
         if len(videos) < 2:
             QMessageBox.information(
                 self, self._translator.translate("publish.concat_none_title"),
@@ -732,22 +781,38 @@ class PublishPage(QWidget):
                 videos = getattr(self, "_concat_videos", [])
                 output = getattr(self, "_concat_output", None)
                 if videos and output is not None:
-                    self._start_concat(videos, output, reencode=True)
+                    # [v3.23.613] Luồng nối cũ thường CHƯA được dọn (tín hiệu done về sau
+                    # failed) và _start_concat từ chối chạy khi còn luồng → bấm "Có" mà
+                    # không có gì xảy ra. Hẹn chạy ngay khi luồng cũ dọn xong.
+                    self._pending_reencode = (list(videos), output)
+                    if getattr(self, "_concat_thread", None) is None:
+                        self._start_pending_reencode()
                     return
         self._status.setText(self._translator.translate("publish.concat_failed"))
         QMessageBox.warning(self, self._translator.translate("publish.concat_failed_title"), message)
 
     def _cleanup_concat_thread(self) -> None:
-        """Dọn luồng nối video sau khi xong/lỗi."""
+        """Dọn luồng nối video sau khi xong/lỗi; chạy lượt nén lại nếu đã hẹn."""
         thread = getattr(self, "_concat_thread", None)
         if thread is not None:
             thread.quit()
             thread.wait(3000)
+            thread.deleteLater()
         self._concat_thread = None
         self._concat_worker = None
         self._concat_button.setEnabled(True)
         self._batch_button.setEnabled(True)
         self._start_button.setEnabled(True)
+        self._start_pending_reencode()
+
+    def _start_pending_reencode(self) -> None:
+        """Chạy lượt nén lại người dùng đã đồng ý (nếu có)."""
+        pending = getattr(self, "_pending_reencode", None)
+        if pending is None:
+            return
+        self._pending_reencode = None
+        videos, output = pending
+        self._start_concat(videos, output, reencode=True)
 
     def _on_batch_publish_clicked(self) -> None:
         """Quét thư mục phim bộ rồi xuất lần lượt các tập đã sẵn sàng."""
@@ -834,6 +899,11 @@ class PublishPage(QWidget):
             self._finish_batch_publish()
             return
 
+        if self._thread is not None:
+            # [v3.23.613] Tập trước báo xong (finished) nhưng tín hiệu done dọn luồng có
+            # thể chưa về; _start_render sẽ thoát im lặng và hàng đợi đứng yên. Chờ dọn.
+            QTimer.singleShot(50, self._run_next_publish)
+            return
         item = self._batch_items[self._batch_index]
         total = len(self._batch_items)
         self._status.setText(
@@ -890,12 +960,23 @@ class PublishPage(QWidget):
         self._status.setText(message.splitlines()[0])
         QMessageBox.information(self, self._translator.translate("publish.batch_complete_title"), message)
 
+    def _fail_current_batch_item(self) -> None:
+        """[v3.23.650] Tập hiện tại KHÔNG bắt đầu được (thiếu đầu vào / ngoài khoảng xem thử) khi đang xuất hàng loạt:
+        tính là lỗi và chuyển sang tập kế. Trước đây hàm thoát im lặng → hàng đợi đứng yên, và lần xuất tay sau đó bị
+        coi là một phần của hàng loạt zombie (không báo thành công, đẩy hàng đợi cũ)."""
+        items = getattr(self, "_batch_items", None)
+        if not items:
+            return
+        index = min(self._batch_index, len(items) - 1)
+        self._advance_batch_publish(failed=items[index].video_path.name)
+
     def _start_render(self) -> None:
         """Bắt đầu xuất trên luồng riêng."""
         if self._thread is not None:
             return
         request = self._build_request()
         if request is None:
+            self._fail_current_batch_item()
             return
 
         self._set_busy(True)
@@ -903,6 +984,14 @@ class PublishPage(QWidget):
         self._status.setText(self._translator.translate("publish.status_running"))
 
         duration = self._probe_duration_sec(request.video_path)
+        if request.is_clip and 0 < duration <= request.clip_start_sec:
+            self._set_busy(False)
+            self._warn(
+                self._translator.translate("publish.warn_preview_range")
+                .replace("{minutes}", f"{duration / 60:.1f}")
+            )
+            self._fail_current_batch_item()
+            return
         self._thread = QThread(self)
         self._worker = RenderVideoWorker(request, duration)
         self._worker.moveToThread(self._thread)

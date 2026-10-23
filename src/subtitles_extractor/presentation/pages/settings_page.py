@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 from subtitles_extractor.presentation.fluent_compat import InfoBar, InfoBarPosition, themeColor
+from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
 from subtitles_extractor.presentation.theme import colors as _c
 from subtitles_extractor.presentation.theme import metrics as _m
 from subtitles_extractor.presentation.theme.styles import caption_style
@@ -58,6 +59,7 @@ class SettingsPage(QWidget):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("settingsPage")
+        self._thread_keeper = WorkerThreadKeeper(self)
         self._translator = container.translator
         self._view_model = SettingsPageViewModel(container, parent=self)
 
@@ -228,6 +230,10 @@ class SettingsPage(QWidget):
 
         self._sp_batch_ocr = QSpinBox(); self._sp_batch_ocr.setRange(1, 512)
         hw_form.addRow(self._translator.translate("settings.rl_batch_ocr"), self._sp_batch_ocr)
+
+        self._sp_det_batch = QSpinBox(); self._sp_det_batch.setRange(1, 64)
+        self._sp_det_batch.setToolTip(self._translator.translate("settings.tip_det_batch"))
+        hw_form.addRow(self._translator.translate("settings.rl_det_batch"), self._sp_det_batch)
 
         self._sp_batch_roi = QSpinBox(); self._sp_batch_roi.setRange(1, 128)
         hw_form.addRow(self._translator.translate("settings.rl_batch_det"), self._sp_batch_roi)
@@ -620,6 +626,13 @@ class SettingsPage(QWidget):
         self._sp_pixel_diff = _make_double_spin(0.0, 1.0, 0.005, 3)
         form.addRow(self._translator.translate("settings.rl_pixel_diff"), self._sp_pixel_diff)
 
+        self._cb_white_gate = QCheckBox(self._translator.translate("settings.cb_white_gate"))
+        self._cb_white_gate.setToolTip(self._translator.translate("settings.tip_white_gate"))
+        form.addRow(self._translator.translate("settings.rl_white_gate"), self._cb_white_gate)
+        self._sp_white_luma = QSpinBox(); self._sp_white_luma.setRange(100, 250)
+        self._sp_white_luma.setToolTip(self._translator.translate("settings.tip_white_luma"))
+        form.addRow(self._translator.translate("settings.rl_white_luma"), self._sp_white_luma)
+
         self._sp_skip_intro = _make_double_spin(0.0, 600.0, 1.0, 1, suffix=" s")
         form.addRow(self._translator.translate("settings.rl_skip_start"), self._sp_skip_intro)
 
@@ -805,9 +818,17 @@ class SettingsPage(QWidget):
         )
         enc_form.addRow(self._translator.translate("settings.rl_resolution_height"), self._sp_vidctx_height)
 
-        self._sp_vidctx_fps = _make_double_spin(0.2, 5.0, 0.1, 1, suffix=" fps")
+        # [v3.23.473] Nâng trần fps 5→30 để người dùng GIỮ NGUYÊN fps gốc nếu muốn. LƯU Ý: Gemini
+        # phân tích video ở ~1fps → đặt cao hơn CHỦ YẾU tăng dung lượng upload + token, ít cải
+        # thiện chất lượng "xem". 1-2fps thường là tối ưu; 5-10fps cho cảnh hành động nhanh.
+        self._sp_vidctx_fps = _make_double_spin(0.2, 24.0, 0.1, 1, suffix=" fps")
         self._sp_vidctx_fps.setToolTip(
-            self._translator.translate("settings.tip_vidctx_fps")
+            "Số khung/giây khi phân tích video ngữ cảnh (nay ĐIỀU KHIỂN cả mức lấy mẫu của Gemini).\n\n"
+            "• 1 fps (mặc định): Gemini xem ~1 khung/giây — đủ cho đa số phim, tiết kiệm token.\n"
+            "• TĂNG (2-5 fps): Gemini xem NHIỀU khung hơn → bắt được chi tiết/cảnh nhanh, nhưng\n"
+            "  TỐN token gấp bội (dễ chạm quota, phân tích lâu hơn).\n"
+            "• Hạ xuống <1 fps để tiết kiệm cho phim tĩnh (ít chuyển cảnh).\n\n"
+            "Mẹo: nếu thấy phân tích 'thiếu chi tiết', tăng lên 2 fps thay vì để 1."
         )
         enc_form.addRow(self._translator.translate("settings.rl_framerate"), self._sp_vidctx_fps)
 
@@ -824,6 +845,18 @@ class SettingsPage(QWidget):
             self._translator.translate("settings.tip_vidctx_crf")
         )
         enc_form.addRow(self._translator.translate("settings.rl_cpu_crf"), self._sp_vidctx_crf)
+
+        # [v3.23.479] Bỏ cache cloud/DB: buộc cắt+tải lại video ngữ cảnh (dùng khi đã XOÁ file cloud).
+        self._chk_vidctx_ignore_cache = QCheckBox(
+            "Bỏ cache — luôn cắt + tải lại video ngữ cảnh"
+        )
+        self._chk_vidctx_ignore_cache.setToolTip(
+            "Mặc định ứng dụng TÁI DÙNG các đoạn video đã cắt+tải lên trước đó (nhanh).\n\n"
+            "Bật nếu bạn ĐÃ XOÁ file trên cloud (hoặc muốn làm mới) → ứng dụng sẽ BỎ mọi cache\n"
+            "và cắt+nén+tải lại từ đầu. Nhớ TẮT lại sau khi xong để tránh làm lại mỗi lần (tốn\n"
+            "thời gian + quota)."
+        )
+        enc_form.addRow("", self._chk_vidctx_ignore_cache)
         scroll_layout.addWidget(enc_group)
 
         # ── Nhóm 2: Cắt đoạn theo token ──────────────────────────────────
@@ -1060,6 +1093,7 @@ class SettingsPage(QWidget):
             _set_combo(self._cb_device, snapshot.hardware.device.value)
             _set_combo(self._cb_precision, snapshot.hardware.precision.value)
             self._sp_batch_ocr.setValue(snapshot.hardware.batch_size_ocr)
+            self._sp_det_batch.setValue(snapshot.hardware.det_batch_size)
             self._sp_batch_roi.setValue(snapshot.hardware.batch_size_roi)
             self._sp_workers.setValue(snapshot.hardware.workers)
             self._chk_auto_tune.setChecked(snapshot.hardware.auto_tune_batch)
@@ -1108,6 +1142,8 @@ class SettingsPage(QWidget):
             self._sp_sample_step.setValue(snapshot.frame.sample_step_sec)
             self._sp_phash.setValue(snapshot.frame.phash_distance)
             self._sp_pixel_diff.setValue(snapshot.frame.pixel_diff_ratio)
+            self._cb_white_gate.setChecked(snapshot.frame.white_text_gate)
+            self._sp_white_luma.setValue(snapshot.frame.white_text_luma)
             self._sp_skip_intro.setValue(snapshot.frame.skip_intro_sec)
             self._sp_skip_outro.setValue(snapshot.frame.skip_outro_sec)
 
@@ -1163,6 +1199,7 @@ class SettingsPage(QWidget):
             if vc is not None:
                 self._sp_vidctx_height.setValue(vc.resolution_height)
                 self._sp_vidctx_fps.setValue(vc.fps)
+                self._chk_vidctx_ignore_cache.setChecked(getattr(vc, "ignore_cloud_cache", False))
                 self._sp_vidctx_cq.setValue(vc.nvenc_cq)
                 self._sp_vidctx_crf.setValue(vc.cpu_crf)
                 self._sp_vidctx_tokens_chunk.setValue(vc.tokens_per_chunk)
@@ -1208,6 +1245,7 @@ class SettingsPage(QWidget):
                 "device": self._cb_device.currentData(),
                 "precision": self._cb_precision.currentData(),
                 "batch_size_ocr": self._sp_batch_ocr.value(),
+                "det_batch_size": self._sp_det_batch.value(),
                 "batch_size_roi": self._sp_batch_roi.value(),
                 "workers": self._sp_workers.value(),
                 "auto_tune_batch": self._chk_auto_tune.isChecked(),
@@ -1256,6 +1294,8 @@ class SettingsPage(QWidget):
                 "sample_step_sec": self._sp_sample_step.value(),
                 "phash_distance": self._sp_phash.value(),
                 "pixel_diff_ratio": self._sp_pixel_diff.value(),
+                "white_text_gate": self._cb_white_gate.isChecked(),
+                "white_text_luma": self._sp_white_luma.value(),
                 "skip_intro_sec": self._sp_skip_intro.value(),
                 "skip_outro_sec": self._sp_skip_outro.value(),
             },
@@ -1305,6 +1345,7 @@ class SettingsPage(QWidget):
             "video_context": {
                 "resolution_height": self._sp_vidctx_height.value(),
                 "fps": self._sp_vidctx_fps.value(),
+                "ignore_cloud_cache": self._chk_vidctx_ignore_cache.isChecked(),
                 "nvenc_cq": self._sp_vidctx_cq.value(),
                 "cpu_crf": self._sp_vidctx_crf.value(),
                 "tokens_per_chunk": self._sp_vidctx_tokens_chunk.value(),
@@ -1440,9 +1481,12 @@ class SettingsPage(QWidget):
         worker.progress.connect(self._on_mpv_download_progress)
         worker.finished.connect(self._on_mpv_install_finished)
         worker.failed.connect(self._on_mpv_install_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        # [v3.23.613] Một chủ sở hữu duy nhất cho worker (xem thread_keeper): KHÔNG gắn
+        # worker.deleteLater vào thread.finished — Qt xoá trong luồng nền song song với
+        # Python xoá ở luồng giao diện làm xoá hai lần, sập ứng dụng.
+        self._thread_keeper.keep(thread, worker)
         thread.finished.connect(thread.deleteLater)
 
         self._mpv_install_thread = thread
@@ -1560,15 +1604,20 @@ class SettingsPage(QWidget):
         worker = InstallCudaRuntimeWorker(python_exe, self._cuda_dir())
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progress.connect(
-            lambda pct, msg: self._lbl_gpu_ocr_status.setText(f"{msg} ({pct}%)")
-        )
+        # [v3.23.650] Slot của trang (luồng GUI) thay cho lambda: lambda chạy ở luồng worker → QLabel.setText sai luồng.
+        worker.progress.connect(self._on_cuda_install_progress)
         worker.finished.connect(self._on_cuda_install_finished)
         worker.failed.connect(self._on_cuda_install_failed)
         worker.done.connect(self._cleanup_cuda_thread, Qt.ConnectionType.QueuedConnection)
         self._cuda_thread = thread
         self._cuda_worker = worker
         thread.start()
+
+    def _on_cuda_install_progress(self, pct: int, msg: str) -> None:
+        self._lbl_gpu_ocr_status.setText(f"{msg} ({pct}%)")
+
+    def _on_paddle_install_progress(self, pct: int, msg: str) -> None:
+        self._lbl_paddle_status.setText(f"{msg} ({pct}%)")
 
     def _on_cuda_install_finished(self, _cuda_dir: object) -> None:
         self._lbl_gpu_ocr_status.setText(self._translator.translate("settings.gpu_ocr_done_status"))
@@ -1667,9 +1716,7 @@ class SettingsPage(QWidget):
         worker = InstallPaddleRuntimeWorker(python_exe, self._paddle_dir())
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progress.connect(
-            lambda pct, msg: self._lbl_paddle_status.setText(f"{msg} ({pct}%)")
-        )
+        worker.progress.connect(self._on_paddle_install_progress)
         worker.finished.connect(self._on_paddle_install_finished)
         worker.failed.connect(self._on_paddle_install_failed)
         worker.done.connect(self._cleanup_paddle_thread, Qt.ConnectionType.QueuedConnection)

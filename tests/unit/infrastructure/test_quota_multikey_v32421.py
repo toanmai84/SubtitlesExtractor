@@ -23,6 +23,9 @@ def test_quota_is_tracked_per_key_independently() -> None:
     # Dùng hết RPD=2 cho keyA.
     mgr.acquire("gemini-x", 10, key_id="keyA")
     mgr.acquire("gemini-x", 10, key_id="keyA")
+    # [v3.23.526] Bộ đếm nội bộ chạm trần KHÔNG còn chặn cứng — phải có xác nhận từ
+    # server, vì bộ đếm là ước lượng và từng làm ứng dụng tự khoá dù còn quota.
+    mgr.mark_daily_exhausted("gemini-x", key_id="keyA")
     with pytest.raises(QuotaExhaustedError):
         mgr.acquire("gemini-x", 10, key_id="keyA")
     # keyB vẫn còn nguyên quota (độc lập) — đây chính là bug đã sửa.

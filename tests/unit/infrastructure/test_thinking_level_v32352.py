@@ -68,12 +68,13 @@ class TestThinkingConfig:
         )
         assert cfg.kwargs["thinking_config"].kwargs == {"thinking_level": "low"}
 
-    def test_thinking_disabled_no_config(self) -> None:
+    def test_thinking_disabled_sends_the_lowest_level(self) -> None:
+        """[v3.23.610] Không gửi gì = model dùng mức mặc định (3.1-flash-lite: High)."""
         tr = _make_translator_with_fake_types()
         cfg = tr._build_config(
             0.2, {}, "sys", enable_thinking=False, model_name="gemini-3.1-flash-lite",
         )
-        assert "thinking_config" not in cfg.kwargs
+        assert cfg.kwargs["thinking_config"].kwargs == {"thinking_level": "minimal"}
 
     def test_budget_zero_disables_thinking(self) -> None:
         tr = _make_translator_with_fake_types()
@@ -81,4 +82,4 @@ class TestThinkingConfig:
             0.2, {}, "sys", enable_thinking=True, thinking_budget=0,
             model_name="gemini-3.1-flash-lite",
         )
-        assert "thinking_config" not in cfg.kwargs
+        assert cfg.kwargs["thinking_config"].kwargs == {"thinking_level": "minimal"}

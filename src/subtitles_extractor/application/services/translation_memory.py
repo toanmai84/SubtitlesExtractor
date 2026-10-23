@@ -252,6 +252,10 @@ def format_reference_block(
     )
 
 
+#: [v3.23.564] Thư mục cha là gốc ổ đĩa Windows ("D:") — không phải tên phim bộ.
+_DRIVE_ROOT_RE = re.compile(r"^[A-Za-z]:$")
+
+
 def _series_name_from_filename(file_stem: str) -> str:
     """Trích tên series từ tên tệp nếu có mẫu đánh số tập (SxxExx).
 
@@ -309,4 +313,12 @@ def derive_series_key(video_path: str | Path) -> str:
     # Ưu tiên 2: tên thư mục cha (phần tử áp cuối).
     if len(segments) < 2:
         return ""
-    return segments[-2].strip()
+    parent = segments[-2].strip()
+    # [v3.23.564] Tệp nằm ở GỐC ổ đĩa (``D:\phim.mp4``) và không có mẫu số tập: thư mục
+    # cha là CHỮ CÁI Ổ ĐĨA, không phải tên phim bộ. Trước đây trả "D:" → mọi phim lẻ ở
+    # gốc ổ bị gộp làm một "phim bộ": dùng chung bộ nhớ dịch, và phân tích lại CHÍNH phim
+    # đó bị ép "tái sử dụng tên đã chốt ở các tập trước" — tức bị neo vào bản phân tích
+    # cũ (ca thật: phân tích lại bằng gemini-3.8-flash bị buộc dùng lại roster 3.6-flash).
+    if _DRIVE_ROOT_RE.match(parent):
+        return ""
+    return parent

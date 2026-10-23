@@ -64,6 +64,10 @@ class TranscribeSpeechWorker(QObject):
         except (OSError, RuntimeError) as exc:
             logger.exception("Lỗi hệ thống khi phiên âm.")
             self.failed.emit(f"Lỗi hệ thống khi phiên âm: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            # [v3.23.650] Ngoại lệ lạ không được thoát khỏi run() (không phát failed → trạng thái bận kẹt mãi).
+            logger.exception("Lỗi không lường trước khi phiên âm.")
+            self.failed.emit(f"Lỗi không xác định: {exc}")
 
     def _on_progress(self, current: int, total: int, message: str) -> None:
         self.progress.emit(current, total, message)

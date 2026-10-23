@@ -28,6 +28,11 @@ def _adapter(emotion: str = "natural", precision: str | None = None) -> VieNeuTt
     a._mode = "standard"
     a._emotion = emotion
     a._precision = precision
+    # [v3.23.445] Factory qua __new__ phải set các attr mà _infer_once tham chiếu (trước đây
+    # thiếu _force_cpu → AttributeError, test fail sẵn từ các bản trước).
+    a._force_cpu = True
+    a._reading_cps_budget = 0.0
+    a._temperature = None
     return a
 
 

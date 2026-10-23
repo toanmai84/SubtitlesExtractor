@@ -42,5 +42,33 @@ class TestBuildConfigNoMediaResolution:
             system_instruction="x",
         )
         assert captured["response_mime_type"] == "application/json"
-        assert captured["temperature"] == 0.5
         assert "response_schema" in captured
+        assert captured["system_instruction"] == "x"
+
+    def test_temperature_chi_gui_cho_ho_model_cu(self) -> None:
+        """[v3.23.511] Chỉ họ model CŨ mới nhận ``temperature``.
+
+        Tài liệu Gemini (7/2026): từ 3.6 Flash trở đi tham số lấy mẫu bị bỏ qua, và các
+        thế hệ sau TRẢ HTTP 400 nếu vẫn gửi. Nên mặc định là KHÔNG gửi; chỉ gửi cho các
+        họ đã biết chắc còn hỗ trợ.
+        """
+        adapter, captured = self._adapter_with_fake_types()
+        adapter._build_config(
+            temperature=0.5,
+            response_schema={"type": "OBJECT"},
+            system_instruction="x",
+            model_name="gemini-2.5-flash",
+        )
+        assert captured["temperature"] == 0.5
+
+    def test_temperature_khong_gui_cho_model_moi(self) -> None:
+        """Model mới/lạ (kể cả khi không truyền tên) thì TUYỆT ĐỐI không gửi."""
+        for model_name in ("", "gemini-3.5-flash", "gemini-4-flash"):
+            adapter, captured = self._adapter_with_fake_types()
+            adapter._build_config(
+                temperature=0.5,
+                response_schema={"type": "OBJECT"},
+                system_instruction="x",
+                model_name=model_name,
+            )
+            assert "temperature" not in captured, model_name

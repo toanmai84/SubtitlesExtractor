@@ -433,6 +433,14 @@ try:
 except Exception as exc:  # noqa: BLE001 — khong cai (may khong GPU) thi bo qua
     print(f"[spec] Bỏ qua PyNvVideoCodec (không cài): {exc}")
 
+# [v3.23.607] Du lieu mui gio cho zoneinfo (Windows khong co san): moc doi ngay han muc
+# Gemini la 00:00 gio Thai Binh Duong. Thieu goi thi app van chay nho quy tac du phong.
+try:
+    datas.extend(collect_data_files("tzdata"))
+    hiddenimports.append("tzdata")
+except Exception as exc:  # noqa: BLE001 — chua cai tzdata thi bo qua
+    print(f"[spec] Bỏ qua tzdata (không cài): {exc}")
+
 # ── Loại trừ các package nặng KHÔNG bundle ───────────────────────────────────
 # [v3.23.333] WhisperX + torch LUÔN bị loại khỏi bundle — kể cả khi bật
 # SUBEXT_ENABLE_WHISPERX. Chúng được cài vào môi trường RIÊNG `whisperx_env` cạnh thư

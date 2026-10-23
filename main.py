@@ -71,6 +71,14 @@ def _qt_message_handler(msg_type: int, context: object, message: str) -> None:
         level = logging.DEBUG
 
     logger.log(level, "[Qt] %s", msg_stripped)
+    if level == logging.CRITICAL:
+        # [v3.23.650] Qt fatal → abort() ngay sau đó, bản ghi loguru (enqueue) bị mất: ghi đồng bộ vào fault.log.
+        try:
+            from subtitles_extractor.infrastructure.logging.crash_hooks import note_fatal
+
+            note_fatal(f"[Qt FATAL] {msg_stripped}")
+        except Exception:  # noqa: BLE001 - trình xử lý thông điệp không được ném
+            pass
 
 
 def _setup_python_path() -> None:
@@ -154,6 +162,21 @@ def main() -> int:
 
     install_chardet_shim()
 
+    # [v3.23.400] Đặt AppUserModelID TRƯỚC khi tạo QApplication (best practice Windows) — để
+    # nút trên thanh tác vụ nhận đúng danh tính app NGAY TỪ ĐẦU, không gộp dưới icon
+    # python/pythonw. Đặt sau QApplication đôi khi muộn: nút taskbar đã tạo với AppID mặc định.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "SubtitleStudio.App"
+            )
+        except (OSError, AttributeError) as appid_exc:
+            logging.getLogger(__name__).warning(
+                "Không đặt được AppUserModelID: %s", appid_exc
+            )
+
     # QApplication TRƯỚC khi import bất cứ thứ gì liên quan đến giao diện.
     from PySide6.QtCore import qInstallMessageHandler
     from PySide6.QtWidgets import QApplication
@@ -162,10 +185,9 @@ def main() -> int:
     qt_app.setApplicationName("SubtitlesExtractor")
     qt_app.setOrganizationName("SubtitlesExtractor")
 
-    # [v3.23.370] Icon ứng dụng + AppUserModelID — PHẢI đặt TRƯỚC khi tạo cửa sổ để cả
-    # thanh tiêu đề LẪN thanh tác vụ Windows hiện đúng icon (nếu không Windows gộp theo
-    # icon của python/pythonw.exe). Dùng _resolve_data_dir() để tìm app.ico đáng tin cả
-    # khi chạy nguồn lẫn bản đóng gói PyInstaller.
+    # [v3.23.370] Icon ứng dụng — đặt cho QApplication để cả thanh tiêu đề LẪN thanh tác vụ
+    # Windows hiện đúng icon. AppUserModelID đã đặt TRƯỚC QApplication ở trên. Dùng
+    # _resolve_data_dir() để tìm app.ico đáng tin cả khi chạy nguồn lẫn bản đóng gói.
     try:
         from subtitles_extractor.composition.bootstrap import _resolve_data_dir
 
@@ -174,13 +196,6 @@ def main() -> int:
             from PySide6.QtGui import QIcon
 
             qt_app.setWindowIcon(QIcon(str(_icon_path)))
-        if sys.platform == "win32":
-            import ctypes
-
-            # AppUserModelID riêng → Windows tách khỏi python.exe và dùng icon của app.
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "SubtitleStudio.App"
-            )
     except (ImportError, OSError, AttributeError) as icon_exc:
         logging.getLogger(__name__).warning("Không đặt được icon app: %s", icon_exc)
 
@@ -196,6 +211,12 @@ def main() -> int:
         window = MainWindow(container)
         window.show()
         exit_code = qt_app.exec()
+        try:
+            from subtitles_extractor.infrastructure.logging.crash_hooks import end_session
+
+            end_session()  # thoát bình thường → xoá dấu phiên
+        except Exception:  # noqa: BLE001
+            pass
     except (ImportError, RuntimeError, OSError):
         logger.exception("Ứng dụng kết thúc do lỗi không bắt được.")
         try:

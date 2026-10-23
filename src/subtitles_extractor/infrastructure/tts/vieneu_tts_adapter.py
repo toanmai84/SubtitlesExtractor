@@ -22,16 +22,14 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import json
 import logging
 import os
 import subprocess
-from subtitles_extractor.infrastructure.process.hidden_process import (
-    no_window_kwargs,
-)
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final
@@ -48,16 +46,30 @@ from subtitles_extractor.domain.ports.subtitle_tts_port import (
     TTSSegmentResult,
     TTSUnavailableError,
 )
+from subtitles_extractor.domain.value_objects.voice_profile import (
+    VoiceProfile,
+    gender_from_voice_label,
+    is_featured_label,
+    style_from_voice_label,
+)
+from subtitles_extractor.infrastructure.process.hidden_process import (
+    no_window_kwargs,
+)
+from subtitles_extractor.infrastructure.torch_import_blocker import without_torch_block
 from subtitles_extractor.infrastructure.tts.audio_utils import (
     is_effectively_silent,
     resample_audio,
     shorter_take,
+    speech_seconds,
     trim_edge_silence,
+)
+from subtitles_extractor.infrastructure.tts.line_placement import (
+    comfort_speed,
+    line_context,
+    place_line,
 )
 from subtitles_extractor.infrastructure.tts.text_prep import (
     dem_am_tiet,
-)
-from subtitles_extractor.infrastructure.tts.text_prep import (
     has_speakable_content,
 )
 from subtitles_extractor.infrastructure.tts.text_prep import (
@@ -67,10 +79,10 @@ from subtitles_extractor.infrastructure.tts.text_prep import (
     skip_from_request as _skip_from_request,
 )
 from subtitles_extractor.infrastructure.tts.timing_math import (
-    MAX_LEAD_IN_S as _MAX_LEAD_IN_S,
+    MASTER_TAIL_PAD_S as _MASTER_TAIL_PAD_S,  # noqa: F401  (re-export cho test)
 )
 from subtitles_extractor.infrastructure.tts.timing_math import (
-    MASTER_TAIL_PAD_S as _MASTER_TAIL_PAD_S,  # noqa: F401  (re-export cho test)
+    MAX_LEAD_IN_S as _MAX_LEAD_IN_S,
 )
 from subtitles_extractor.infrastructure.tts.timing_math import (
     QUALITY_STRETCH_CAP as _QUALITY_STRETCH_CAP,  # noqa: F401  (re-export cho test)
@@ -78,6 +90,7 @@ from subtitles_extractor.infrastructure.tts.timing_math import (
 from subtitles_extractor.infrastructure.tts.timing_math import (
     VIENEU_MIN_BASE_S,
     VIENEU_MIN_PER_SYLLABLE_S,
+    audible_overlap_seconds,
     compute_fit_stretch_ratio,
     effective_available_seconds,
     fit_limit_samples,
@@ -103,9 +116,31 @@ logger = logging.getLogger(__name__)
 # xuất 24kHz (GGUF) hoặc 48kHz (v3 Turbo); luôn resample về mức này trước hậu xử lý.
 _PIPELINE_SAMPLE_RATE = 24_000
 
+#: [v3.23.647] Điểm kiểm tra giữa lượt cả phim: mỗi ngần này dòng HOẶC ngần này giây (tuỳ cái nào tới trước).
+_CHECKPOINT_EVERY_LINES = 25
+_CHECKPOINT_EVERY_S = 30.0
+
+#: [v3.23.415] Dừng sớm retry "dài bất thường" khi không rút ngắn thêm: cần thử tối thiểu
+#: _OVERLONG_MIN_ATTEMPTS lần, và dừng nếu bản ngắn nhất chững lại _OVERLONG_STALL_LIMIT lần
+#: LIÊN TIẾP. Với thán từ ngắn (model ngân dài nhất quán) → dừng sau ~3-4 lần thay vì 10, giữ
+#: nguyên kết quả (bản ngắn nhất). Vẫn cho phép retry đủ khi model đang cải thiện dần.
+_OVERLONG_MIN_ATTEMPTS = 3
+_OVERLONG_STALL_LIMIT = 3
+
 # [v3.23.257] Frame rate v3 Turbo để quy đổi trần (giây -> max_new_frames). Đo từ
 # source vieneu 3.2.3: base.py hop_length=480 @ sr 48000 -> 100 frame/s.
 _V3TURBO_FRAMES_PER_SECOND = 100
+
+#: [v3.23.627] Frame codec THẬT của v3 Turbo (MOSS-Audio-Tokenizer-Nano): 3840 mẫu/frame @ 48 kHz
+#: = 12,5 frame/giây (vieneu_utils/core_utils.py: ``CODEC_SAMPLES_PER_FRAME = 3840``;
+#: ``max_new_frames`` đếm theo frame này). Hằng 100 ở trên là hop 480 của đường neucodec (chế độ
+#: standard): áp cho v3 Turbo thì "trần 6× kỳ vọng" thành ~48× — không chặn được gì.
+_V3TURBO_CODEC_FRAMES_PER_SECOND = 12.5
+
+
+def frames_per_second_for_mode(mode: str) -> float:
+    """Số frame sinh ra mỗi giây audio của chế độ VieNeu (để đổi trần giây → ``max_new_frames``)."""
+    return _V3TURBO_CODEC_FRAMES_PER_SECOND if mode == "v3turbo" else _V3TURBO_FRAMES_PER_SECOND
 
 # [v3.23.264] Chống ngân dài: phạt lặp token audio (mặc định SDK 1.2). Nâng nhẹ lên 1.3 để
 # giảm "ngân" (lặp frame nguyên âm) mà không gây méo. Đây là cách chống ngân AN TOÀN nhất
@@ -119,6 +154,9 @@ _VALID_MODES = ("standard", "turbo", "v3turbo")
 # từ tài liệu VieNeu 3.2.3 (pypi.org/project/vieneu/3.2.3): ``style`` nhận "tu_nhien"
 # (natural) | "tin_tuc" (news) | "doc_truyen" (storytelling), truyền per-call trong
 # ``infer`` hoặc ở constructor. App ánh xạ 2 sắc thái đang expose sang tên chính thức.
+#: [v3.23.595] Giá trị ``precision`` hợp lệ của VieNeu v3 Turbo (đường ONNX/CPU).
+_VIENEU_PRECISIONS = frozenset({"int8", "fp32"})
+
 _EMOTION_TO_STYLE = {
     "natural": "tu_nhien",
     "storytelling": "doc_truyen",
@@ -196,6 +234,180 @@ def _hidden_console_kwargs() -> dict[str, Any]:
     if sys.platform == "win32":
         return {"creationflags": subprocess.CREATE_NO_WINDOW}
     return {}
+
+
+def _strip_surrogates(value: Any) -> Any:
+    """[v3.23.411] Bỏ ký tự surrogate lạc khỏi chuỗi (đệ quy cho dict/list).
+
+    Text từ OCR/dịch đôi khi lẫn ký tự surrogate (U+DC80–U+DCFF — byte không giải mã được
+    UTF-8, lọt vào qua ``surrogateescape``). ``json.dumps(..., ensure_ascii=False)`` rồi ghi
+    vào stdin UTF-8 sẽ ném ``'utf-8' codec can't encode character '\\udcXX': surrogates not
+    allowed`` → câu TTS hỏng, 3 câu liên tiếp thì tắt GPU. Làm sạch trước khi gửi.
+
+    Args:
+        value: Chuỗi, hoặc dict/list chứa chuỗi (payload gửi worker).
+
+    Returns:
+        Cùng cấu trúc nhưng chuỗi đã bỏ surrogate.
+    """
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+            return value
+        except UnicodeEncodeError:
+            # 'ignore' loại BỎ surrogate (rác) thay vì thay bằng '?' (sẽ bị đọc thành tiếng).
+            return value.encode("utf-8", "ignore").decode("utf-8")
+    if isinstance(value, dict):
+        return {key: _strip_surrogates(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_strip_surrogates(item) for item in value]
+    return value
+
+
+def _json_line_safe(payload: dict[str, Any]) -> str:
+    """[v3.23.411] Tuần tự hoá payload thành 1 dòng JSON AN TOÀN cho stdin UTF-8.
+
+    Làm sạch surrogate trước, rồi ``json.dumps(ensure_ascii=False)``. Kết quả luôn encode được
+    UTF-8, không làm chết worker GPU.
+    """
+    return json.dumps(_strip_surrogates(payload), ensure_ascii=False) + "\n"
+
+
+def normalize_voice_candidates(voice_name: Any, speaker: Any = "") -> list[str]:
+    """[v3.23.407] Trả về danh sách ứng viên tên giọng đã làm sạch, ưu tiên giá trị.
+
+    UI có thể truyền ``voice_name`` là chuỗi HOẶC tuple/list ``(nhãn, giá_trị)``. Hàm thuần này
+    trải phẳng thành danh sách chuỗi ứng viên (giá trị đứng sau thường là ID đúng), kèm
+    ``speaker`` làm phương án cuối. Không phụ thuộc engine → test dễ.
+
+    Args:
+        voice_name: Giá trị ``request.voice_name`` (chuỗi hoặc tuple/list).
+        speaker: Giá trị ``request.speaker`` dự phòng.
+
+    Returns:
+        Danh sách chuỗi ứng viên (đã bỏ trống/trùng, giữ thứ tự).
+    """
+    raw_items: list[Any] = []
+    if isinstance(voice_name, (tuple, list)):
+        raw_items.extend(voice_name)
+    elif voice_name:
+        raw_items.append(voice_name)
+    if speaker:
+        raw_items.append(speaker)
+
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if text and text not in seen:
+            seen.add(text)
+            candidates.append(text)
+    return candidates
+
+
+#: [v3.23.626] Tên giọng CŨ của v3 Turbo → tên hiện hành (VieNeu 3.8.1-3.8.2 đổi tên; bảng
+#: `aliases` của voices_v3_turbo.json). Lựa chọn giọng đã lưu dưới tên cũ ("Minh Quân") trước
+#: đây không khớp preset nào nữa: bảng phân vai âm thầm bỏ lựa chọn, dòng của vai đọc bằng
+#: giọng chung. Dùng khi engine không tự có ``resolve_voice_name``.
+VIENEU_VOICE_ALIASES: dict[str, str] = {
+    "Minh Quân Pro": "Hải Đăng",
+    "Minh Quân": "Hải Đăng",
+    "Anh Khôi": "Thiện Minh",
+    "Mạnh Dũng": "Quốc Tuấn",
+}
+
+
+#: [v3.23.626] Bản VieNeu tối thiểu nên dùng. Dưới 3.8.0 có lỗi bộ mã hoá nối thêm frame đệm
+#: 455 NGHE ĐƯỢC vào clip giọng mẫu (nhân bản giọng và các giọng preset); 3.8.3 là bản mới nhất.
+VIENEU_RECOMMENDED_VERSION: tuple[int, ...] = (3, 8, 3)
+VIENEU_MIN_GOOD_VERSION: tuple[int, ...] = (3, 8, 0)
+
+
+def parse_version(text: str | None) -> tuple[int, ...]:
+    """``"3.8.3"``/``"3.8.3.post1"`` → ``(3, 8, 3)``; không đọc được → ``()``."""
+    parts: list[int] = []
+    for piece in (text or "").strip().split("."):
+        digits = ""
+        for char in piece:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def vieneu_version_advice(installed: str | None) -> str:
+    """Lời khuyên cập nhật VieNeu theo bản đang cài; rỗng khi đã đủ mới (hoặc không biết)."""
+    version = parse_version(installed)
+    if not version:
+        return ""
+    if version < VIENEU_MIN_GOOD_VERSION:
+        return (
+            f"VieNeu {installed} có lỗi âm thanh ở clip giọng mẫu (frame đệm nghe được) và "
+            "chưa có 25 giọng preset mới. Hãy cập nhật: pip install -U vieneu sea-g2p"
+        )
+    if version < VIENEU_RECOMMENDED_VERSION:
+        recommended = ".".join(map(str, VIENEU_RECOMMENDED_VERSION))
+        return (
+            f"VieNeu {installed} cũ hơn bản khuyên dùng {recommended} (đổi tên giọng, siết chặt "
+            "phục vụ). Cập nhật: pip install -U vieneu sea-g2p"
+        )
+    return ""
+
+
+def installed_vieneu_version() -> str | None:
+    """Bản VieNeu đang cài (``None`` nếu không đọc được)."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+    except ImportError:  # pragma: no cover
+        return None
+    try:
+        return version("vieneu")
+    except PackageNotFoundError:
+        return None
+
+
+def describe_vieneu_import_error(exc: BaseException, mode: str, vieneu_installed: bool) -> str:
+    """Thông báo cho ``ImportError`` khi dựng engine VieNeu (hàm thuần).
+
+    [v3.23.628] SDK ném ``ImportError`` KHÔNG có ``.name`` khi chế độ standard/turbo thiếu
+    ``llama-cpp-python`` ("Failed to import `llama_cpp`…"); bản trước coi mọi ImportError không
+    tên là "VieNeu chưa cài" nên người dùng đã cài vieneu 3.8.3 vẫn bị bảo ``pip install vieneu``.
+    """
+    detail = str(exc).strip()
+    if vieneu_installed:
+        hint = (
+            "Chế độ standard/turbo của VieNeu cần thêm llama-cpp-python (bản biên dịch lớn). "
+            "Hãy dùng chế độ 'v3 Turbo' — chạy ONNX, không cần llama-cpp."
+            if "llama" in detail.lower() and mode in ("standard", "turbo")
+            else "Cập nhật đầy đủ: pip install -U vieneu sea-g2p onnxruntime soundfile"
+        )
+        return f"VieNeu-TTS đã cài nhưng không nạp được chế độ '{mode}': {detail}\n{hint}"
+    return "VieNeu-TTS chưa cài. Chạy: pip install vieneu soundfile"
+
+
+def resolve_voice_alias(requested: str, engine: object | None = None) -> str:
+    """Tên giọng hiện hành của ``requested`` (nếu là tên cũ); không phải bí danh → giữ nguyên.
+
+    Ưu tiên bảng alias CỦA ENGINE (``resolve_voice_name``, luôn đúng với bản SDK đang cài);
+    không có thì dùng :data:`VIENEU_VOICE_ALIASES`.
+    """
+    resolver = getattr(engine, "resolve_voice_name", None)
+    if callable(resolver):
+        try:
+            resolved = resolver(requested)
+        except (RuntimeError, ValueError, TypeError):
+            resolved = None
+        if isinstance(resolved, str) and resolved:
+            return resolved
+    return VIENEU_VOICE_ALIASES.get((requested or "").strip(), requested)
+
+
+def aliases_of(voice_id: str) -> tuple[str, ...]:
+    """Các tên cũ trỏ về ``voice_id`` (theo bảng tĩnh)."""
+    return tuple(old for old, new in VIENEU_VOICE_ALIASES.items() if new == voice_id)
 
 
 def match_voice_name(requested: str, available: list[str]) -> str | None:
@@ -280,7 +492,7 @@ def describe_voice_error(error: Exception, force_cpu: bool) -> str:
 
 
 #: [v3.23.373] Ceiling transformers khớp torch mà whisperx_env cài (xem vieneu_gpu_plan).
-_COMPATIBLE_TRANSFORMERS_SPEC: Final[str] = "transformers<4.56"
+_COMPATIBLE_TRANSFORMERS_SPEC: Final[str] = "transformers<4.53"
 
 
 def _gpu_worker_failure_hint(reason: str) -> str:
@@ -346,7 +558,9 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
     """
 
     def __init__(
-        self, mode: str = "standard", emotion: str = "natural", force_cpu: bool = True
+        self, mode: str = "v3turbo", emotion: str = "natural", force_cpu: bool = True,
+        batch_size: int | None = None, emotion_cues: bool = False,
+        precision: str | None = None,
     ) -> None:
         """Khởi tạo adapter (chưa nạp model — lazy load khi generate).
 
@@ -357,12 +571,30 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                 (kể chuyện). Không hardcode: truyền vào để dễ cấu hình/test.
             force_cpu: True (mặc định) ép chạy CPU/ONNX, né lỗi PyTorch/cuDNN trên máy có
                 CUDA lệch phiên bản (WinError 127). False để SDK tự chọn CPU/GPU.
+            precision: [v3.23.595] Độ chính xác backbone ONNX/CPU của v3 Turbo: ``"int8"``
+                (nhanh hơn, cần CPU có VNNI) hoặc ``"fp32"``; ``None`` = mặc định SDK
+                (``fp32`` ở VieNeu 3.8).
         """
         self._mode: str = normalize_mode(mode)
         self._emotion: str = emotion if emotion in ("natural", "storytelling") else "natural"
+        # [v3.23.446] Emotion cues CHỈ v3 Turbo hỗ trợ → chỉ bật khi mode=v3turbo VÀ người dùng
+        # đồng ý (thử nghiệm). Chuyển interjection cười/thở dài → tag cho giọng biểu cảm.
+        self._emotion_cues: bool = bool(emotion_cues)
         self._force_cpu: bool = force_cpu
+        self._precision: str | None = (
+            precision if precision in _VIENEU_PRECISIONS else None
+        )
         self._engine: Any | None = None
         self._voice_data_cache: Any | None = None
+        #: [v3.23.647] Điểm kiểm tra giữa lượt cả phim: ``cb(kết quả các dòng đã xong, sample rate)``.
+        self._checkpoint_cb: Callable[[list[TTSSegmentResult], int], object] | None = None
+        self._checkpoint_every_lines: int = _CHECKPOINT_EVERY_LINES
+        self._checkpoint_every_s: float = _CHECKPOINT_EVERY_S
+        # [v3.23.593] Lồng tiếng: giọng riêng từng vai (ID yêu cầu -> (voice data, ID
+        # khớp)) và tra ngược voice data -> ID preset để worker GPU tự lấy đúng giọng.
+        self._line_voice_cache: dict[str, tuple[Any, str]] = {}
+        self._line_voice_presets: dict[int, str] = {}
+        self._batch_voices: list[str] = []
         # [v3.23.344] Ghi lại nguồn giọng để worker GPU tự giải quyết lại — không truyền
         # embedding qua ranh giới tiến trình (mảng lớn, tuần tự hoá vừa chậm vừa dễ sai).
         self._gpu_voice_preset: str = ""
@@ -373,9 +605,76 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         self._gpu_failure_streak: int = 0
         #: Tiến trình GPU thường trú (nạp model một lần cho cả phiên).
         self._gpu_server: Any | None = None
+        # [v3.23.412/416] Batch TTS GPU. Ưu tiên tham số truyền vào (từ Cài đặt); nếu None thì
+        # lùi về env SUBEXT_VIENEU_BATCH (tương thích ngược). 0/1 = TẮT (đường per-câu).
+        if batch_size is not None:
+            self._batch_size: int = max(0, int(batch_size))
+        else:
+            try:
+                self._batch_size = max(0, int(os.environ.get("SUBEXT_VIENEU_BATCH", "0")))
+            except (TypeError, ValueError):
+                self._batch_size = 0
+        #: Danh sách câu đã làm sạch (đặt đầu mỗi phiên tổng hợp) + cache audio theo idx.
+        self._batch_texts: list[str] = []
+        self._batch_cache: dict[int, Any] = {}
+        # [v3.23.420] Số CHUNK/forward GPU cho infer_batch (đòn bẩy VRAM/tốc độ THẬT — mặc định
+        # vieneu chỉ 4 → phí VRAM). Tự chọn theo VRAM (8GB→32), tính LƯỜI ở lần cần đầu tiên.
+        self._gpu_chunk_batch: int | None = None
         # [v3.23.264] Nhiệt độ tuỳ chọn (None -> giữ mặc định SDK 0.8). Không ép
         # thấp mặc định vì câu ngắn có thể bị model từ chối đọc ở temperature thấp.
         self._temperature: float | None = None
+
+    def set_checkpoint_callback(
+        self, callback: "Callable[[list[TTSSegmentResult], int], object] | None"
+    ) -> None:
+        """[v3.23.647] Đặt hàm nhận điểm kiểm tra định kỳ cho LẦN :meth:`generate` KẾ TIẾP (``None`` = tắt).
+
+        Dùng một lần: ``generate`` lấy hàm rồi xoá khỏi adapter, nên TTS lại vài dòng bằng cùng adapter không bao giờ ghi
+        điểm kiểm tra của lượt cũ (kết quả tập con dòng sẽ làm hỏng cache). Gọi trên luồng đang tổng hợp, sau khi dòng
+        đã ghi xong audio; lỗi của hàm không làm hỏng lượt TTS.
+        """
+        self._checkpoint_cb = callback
+
+    def _maybe_checkpoint(
+        self,
+        callback: Callable[[list[TTSSegmentResult], int], object] | None,
+        results: list[TTSSegmentResult],
+        sample_rate: int,
+        state: list[float],
+    ) -> None:
+        """Gửi điểm kiểm tra nếu đủ số dòng HOẶC đủ thời gian kể từ lần trước (``state = [số dòng, lúc]``)."""
+        if callback is None:
+            return
+        now = time.monotonic()
+        if (
+            len(results) - state[0] < self._checkpoint_every_lines
+            and now - state[1] < self._checkpoint_every_s
+        ):
+            return
+        state[0], state[1] = float(len(results)), now
+        try:
+            callback(list(results), sample_rate)
+        except Exception as exc:  # noqa: BLE001 - điểm kiểm tra là phụ: không được làm hỏng lượt TTS
+            logger.warning("VieNeu-TTS: ghi điểm kiểm tra lỗi (%s) — tiếp tục.", exc)
+
+    def _should_inject_cues(self) -> bool:
+        """[v3.23.446] True nếu nên chèn tag cảm xúc: bật toggle VÀ engine là v3 Turbo (chỉ v3
+        Turbo hỗ trợ). Các mode cũ (standard/turbo) không hiểu tag → giữ nguyên interjection."""
+        return self._emotion_cues and self._mode == "v3turbo"
+
+    #: [v3.23.630] Engine ghi audio RIÊNG từng dòng và tổng hợp lại được tập con dòng →
+    #: dùng được bộ nhớ đệm từng dòng (``tts_line_cache``).
+    supports_line_cache: bool = True
+
+    def line_cache_key(self) -> str:
+        """[v3.23.630] Dấu của engine + chế độ ảnh hưởng audio từng dòng (khoá cache).
+
+        Không gồm ``force_cpu``/``batch_size``: chỉ đổi nơi chạy, không đổi giọng đọc.
+        """
+        return (
+            f"vieneu|{self._mode}|{self._emotion}|cues={int(self._should_inject_cues())}"
+            f"|prec={self._precision or ''}"
+        )
 
     # ── Interface ─────────────────────────────────────────────────────────────
 
@@ -413,11 +712,46 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         Returns:
             Danh sách ID giọng preset, hoặc rỗng nếu không lấy được.
         """
+        return [voice_id for _label, voice_id in self._preset_voice_pairs()]
+
+    def list_voice_catalog(self, language: str) -> list[VoiceProfile]:
+        """[v3.23.593] Giọng preset kèm giới tính đọc từ nhãn VieNeu (để phân vai).
+
+        Args:
+            language: Bỏ qua — VieNeu chỉ tiếng Việt.
+
+        Returns:
+            Danh sách :class:`VoiceProfile`; rỗng nếu không lấy được.
+        """
+        return [
+            VoiceProfile(
+                voice_id=voice_id, label=str(label),
+                gender=gender_from_voice_label(str(label)),
+                style=style_from_voice_label(str(label)),
+                featured=is_featured_label(str(label)),
+                aliases=aliases_of(voice_id),
+            )
+            for label, voice_id in self._preset_voice_pairs()
+        ]
+
+    def _preset_voice_pairs(self) -> list[tuple[str, str]]:
+        """Cặp ``(nhãn, ID)`` giọng preset của chế độ hiện tại; rỗng nếu không lấy."""
         if not self.is_available():
             return []
+        # [v3.23.647] Engine chưa nạp thì đọc danh mục từ đĩa (lần trước đã lưu) — khỏi nạp VieNeu ~36 s chỉ để liệt kê giọng.
+        from subtitles_extractor.infrastructure.tts import voice_catalog_cache as catalog_cache
+
+        cache_file = catalog_cache.default_cache_path()
+        version = installed_vieneu_version()
+        if self._engine is None:
+            cached = catalog_cache.load_catalog(cache_file, self._mode, version)
+            if cached is not None:
+                return cached
         try:
             engine = self._get_or_load_engine("auto")
-            return [voice_id for _label, voice_id in engine.list_preset_voices()]
+            pairs = [(label, voice_id) for label, voice_id in engine.list_preset_voices()]
+            catalog_cache.save_catalog(cache_file, self._mode, version, pairs)
+            return pairs
         except TTSUnavailableError as exc:
             # [v3.23.256] VieNeu cài thiếu/lỗi dependency (vd sea_g2p ở bản 3.x)
             # -> KHÔNG để lỗi lọt ra thread UI (gây crash). Trả rỗng: UI dùng giọng mặc
@@ -511,8 +845,42 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             # Giải quyết giọng MỘT LẦN (encode ref / lấy preset dict) rồi tái dùng cho
             # mọi câu — tránh encode lại 498 lần (điểm hiệu năng then chốt).
             voice_data = self._resolve_voice_data(engine, request, use_cloning)
+            # [v3.23.593] Lồng tiếng nhiều vai: giọng riêng của từng dòng (rỗng = một
+            # giọng).
+            line_voices = self._resolve_line_voices(engine, request, voice_data)
+            self._batch_voices = [preset for _data, preset in line_voices]
+
+            # [v3.23.412] Chuẩn bị lô nếu bật batch (env SUBEXT_VIENEU_BATCH≥2) và đang dùng
+            # GPU. Làm sạch text y hệt _process_event để cache khớp; câu bỏ/rỗng để nguyên
+            # (sẽ không được yêu cầu). TẮT batch khi ép CPU (infer_batch CPU chạy tuần tự,
+            # không lợi).
+            self._batch_cache = {}
+            # [v3.23.450] Chuẩn bị thư mục segment nếu người dùng muốn giữ audio từng dòng
+            # (để nghe lại / TTS lại dòng chọn). Tạo sẵn thư mục MỘT LẦN.
+            self._segments_dir = None
+            if getattr(request, "keep_line_audio", False):
+                from subtitles_extractor.infrastructure.tts.segment_store import (
+                    segments_dir_for,
+                )
+                self._segments_dir = segments_dir_for(
+                    output_path, getattr(request, "segments_dir", "")
+                )
+                self._segments_dir.mkdir(parents=True, exist_ok=True)
+            if self._batch_size >= 2 and not self._force_cpu:
+                self._batch_texts = [
+                    _preprocess_tts_text(
+                        event.text, request.clean_tags, _skip_from_request(request),
+                        strip_speaker_tag=True,
+                        inject_emotion_cues=self._should_inject_cues(),
+                    )[0]
+                    for event in request.events
+                ]
+            else:
+                self._batch_texts = []
 
             prev_audio_end = 0.0
+            checkpoint_state = [0.0, time.monotonic()]
+            checkpoint_cb, self._checkpoint_cb = self._checkpoint_cb, None      # dùng một lần (xem setter)
             for idx, event in enumerate(request.events):
                 if cancel_cb and cancel_cb():
                     raise TTSCancelledError("Người dùng đã huỷ TTS.")
@@ -524,18 +892,20 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                 # ít gấp/méo). [v3.23.208] Câu CUỐI dùng thời lượng video làm biên ->
                 # nén nhẹ để VỪA biên thay vì bị cắt tại biên video (ca 第1集: cắt 0.42s
                 # -> sau fix nén 1.13x trọn vẹn); không biết thời lượng -> None như cũ.
-                next_start = (
-                    request.events[idx + 1].start_sec
-                    if idx + 1 < len(request.events)
-                    else getattr(request, "media_duration_s", None)
-                )
+                # [v3.23.596] Biên chung với Gemini (``line_context``): ngân trễ elastic,
+                # và mốc dòng kề THẬT khi TTS lại tập con.
+                context = line_context(request, idx, prev_audio_end)
                 result = self._process_event(
                     event=event, idx=idx, master=master, engine=engine,
-                    sr=sample_rate, request=request, voice_data=voice_data,
-                    next_start_sec=next_start, cancel_cb=cancel_cb,
-                    prev_audio_end_sec=prev_audio_end,
+                    sr=sample_rate, request=request,
+                    voice_data=line_voices[idx][0] if line_voices else voice_data,
+                    next_start_sec=context.next_start_sec, cancel_cb=cancel_cb,
+                    prev_audio_end_sec=context.prev_audio_end_sec,
+                    late_s=context.late_s,
+                    defer_s=context.defer_s,
                 )
                 results.append(result)
+                self._maybe_checkpoint(checkpoint_cb, results, sample_rate, checkpoint_state)
                 # [v3.23.218] Mốc audio câu này kết thúc -> câu sau biết còn bao nhiêu
                 # khoảng lặng để "ăn gian đầu" (không bao giờ đè lên tiếng câu trước).
                 if not result.was_skipped:
@@ -574,7 +944,13 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         """
         if self._engine is not None:
             return self._engine
-        cache_key = (self._mode, self._emotion)
+        # [v3.23.595] Engine int8 và fp32 là hai graph khác nhau: chọn int8 thì khoá có
+        # thêm độ chính xác; mặc định giữ khoá cũ.
+        precision = getattr(self, "_precision", None)
+        cache_key: tuple[str, ...] = (
+            (self._mode, self._emotion, precision) if precision
+            else (self._mode, self._emotion)
+        )
         cached = _ENGINE_CACHE.get(cache_key)  # đọc nhanh không lock (dict atomic)
         if cached is not None:
             self._engine = cached
@@ -601,6 +977,13 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                     blocker_installed = True
                 logger.info("VieNeu-TTS: ép chạy CPU/ONNX (chặn torch, né PyTorch/cuDNN).")
             try:
+                # [v3.23.628] onnxruntime mới từ chối graph có external data trỏ ra ngoài thư mục
+                # model — mà cache HF toàn symlink. Gỡ symlink ngay khi tải về.
+                from subtitles_extractor.infrastructure.tts.hf_cache_fix import (
+                    install_hf_materialize_patch,
+                )
+
+                install_hf_materialize_patch()
                 with temporary_env(resolve_device_env(self._force_cpu)):
                     from vieneu import Vieneu
 
@@ -621,8 +1004,12 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                         f"Nếu vẫn lỗi, gỡ rồi cài lại: "
                         f"pip uninstall -y vieneu sea-g2p && pip install vieneu"
                     ) from exc
+                import importlib.util
+
                 raise TTSUnavailableError(
-                    "VieNeu-TTS chưa cài. Chạy: pip install vieneu soundfile"
+                    describe_vieneu_import_error(
+                        exc, self._mode, importlib.util.find_spec("vieneu") is not None
+                    )
                 ) from exc
             except OSError as exc:
                 # WinError 127 (torch/cuDNN DLL) lọt ra dù đã chặn -> báo rõ ràng.
@@ -640,6 +1027,9 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             _ENGINE_CACHE[cache_key] = engine
             self._engine = engine
             logger.info("VieNeu-TTS model sẵn sàng.")
+            advice = vieneu_version_advice(installed_vieneu_version())
+            if advice:
+                logger.warning("%s", advice)
         return self._engine
 
     def _process_event(
@@ -647,6 +1037,8 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         request: TTSRequest, voice_data: Any, next_start_sec: float | None = None,
         cancel_cb: TTSCancellationCallback | None,
         prev_audio_end_sec: float = 0.0,
+        late_s: float = 0.0,
+        defer_s: float = 0.0,
     ) -> TTSSegmentResult:
         """Tổng hợp một câu, đặt vào master đúng mốc thời gian.
 
@@ -661,6 +1053,8 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             cancel_cb: Callback huỷ hợp tác.
             prev_audio_end_sec: Thời điểm audio câu TRƯỚC kết thúc thật (giây) — dùng
                 để "ăn gian đầu" vào khoảng lặng còn trống mà không đè lên tiếng.
+            late_s: [v3.23.596] Phần ngân trễ elastic cho phép (xem ``line_placement``).
+            defer_s: [v3.23.596] Phần được đọc lùi khi câu trước ngân trễ sang.
 
         Returns:
             Kết quả câu (:class:`TTSSegmentResult`), ``was_skipped=True`` nếu bỏ/lỗi.
@@ -668,6 +1062,7 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         text, is_dialog = _preprocess_tts_text(
             event.text, request.clean_tags, _skip_from_request(request),
             strip_speaker_tag=True,
+            inject_emotion_cues=self._should_inject_cues(),
         )
         start_sec: float = event.start_sec
         end_sec: float = event.end_sec
@@ -685,7 +1080,12 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         # ô vuông "□" rác từ OCR — đo thực: 34/896 dòng phụ đề gốc) -> model sinh im
         # lặng -> retry 10 lần VÔ ÍCH (~30s + 10 lần gọi API tốn quota) rồi báo sai
         # nguyên nhân. Bỏ NGAY với thông báo đúng (Edge đã làm; đồng bộ parity).
-        unspeakable = bool(text) and not has_speakable_content(text)
+        # [v3.23.547] Xét trên VĂN BẢN GỐC, không phải bản đã tiền xử lý: bước tiền xử lý
+        # có thể đã quét sạch ký hiệu rác ("□□□") thành chuỗi rỗng, khiến nhánh này rơi vào
+        # thông báo "text rỗng" — đúng kết quả (vẫn bỏ, vẫn không gọi model) nhưng SAI
+        # nguyên nhân, làm người dùng đi tìm lỗi ở chỗ không có lỗi.
+        raw_text = (event.text or "").strip()
+        unspeakable = bool(raw_text) and not has_speakable_content(raw_text)
         if not text or unspeakable or window_too_short:
             return TTSSegmentResult(
                 event_index=idx, start_sec=start_sec, end_sec=end_sec,
@@ -699,7 +1099,7 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
 
         audio = self._synthesize_with_retry(
             engine=engine, text=text, request=request, voice_data=voice_data,
-            cancel_cb=cancel_cb,
+            cancel_cb=cancel_cb, idx=idx,
         )
         if audio is None:
             return TTSSegmentResult(
@@ -734,20 +1134,25 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         # [v3.23.219] CHỈ ăn gian ĐÚNG MỨC CẦN: câu đã vừa khung ở tốc độ cơ bản thì giữ
         # NGUYÊN mốc phụ đề (bug v218: dời sớm 250ms cả 79/95 câu không cần -> toàn bộ
         # tiếng lệch trước khẩu hình -> nghe "không đồng bộ").
-        base_available = effective_available_seconds(start_sec, end_sec, next_start_sec)
-        needed_window = voice_duration / max(1.0, float(request.base_speed)) + pause_s
-        lead_s = lead_in_seconds(
-            start_sec,
-            prev_audio_end_sec,
+        # [v3.23.596] Một hàm đặt câu chung cho VieNeu/Gemini (``place_line``): giữ nguyên
+        # cách tính cũ khi tắt elastic; bật thì câu chật nén tới mức êm rồi ngân trễ.
+        placement = place_line(
+            start_sec=start_sec,
+            end_sec=end_sec,
+            next_start_sec=next_start_sec,
+            prev_audio_end_sec=prev_audio_end_sec,
+            voice_duration_s=voice_duration,
+            pause_s=pause_s,
+            base_speed=float(request.base_speed),
+            max_speed=max_speed,
             max_lead_s=float(getattr(request, "lead_in_s", _MAX_LEAD_IN_S)),
-            needed_lead_s=max(0.0, needed_window - base_available),
+            late_s=late_s,
+            comfort_speed=comfort_speed(request),
+            defer_s=defer_s,
         )
-        play_start_sec = start_sec - lead_s
-        effective_available = base_available + lead_s
-        available_for_voice = max(0.05, effective_available - pause_s)
-        stretch_ratio = total_speed_ratio(
-            voice_duration, available_for_voice, request.base_speed, max_speed
-        )
+        play_start_sec = placement.play_start_sec
+        effective_available = placement.effective_available_s
+        stretch_ratio = placement.speed
         speed_used = stretch_ratio
         if stretch_ratio > 1.0:
             from subtitles_extractor.infrastructure.tts.time_stretch import (
@@ -806,12 +1211,27 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         # cùng vượt khung hiệu dụng -> UI/debug đếm đúng "Có chồng tiếng (lấn)" (trước
         # đây VieNeu không set -> luôn báo 0 dù thực tế có, người dùng mất thông tin
         # để tự điều chỉnh max_speed / biên tập phụ đề).
-        final_overlap_s = max(0.0, (len(audio) / sr) - effective_available)
+        final_overlap_s = audible_overlap_seconds(len(audio) / sr, effective_available)
+        # [v3.23.450] Ghi audio RIÊNG của dòng này (nếu bật) để nghe lại / TTS lại dòng chọn.
+        segment_audio_path = self._save_segment_audio(audio, sr, idx)
+        # [v3.23.459] Đánh dấu dòng audio DÀI BẤT THƯỜNG (model ngân dài, mọi lần thử đều dài) để
+        # bảng TTS hiện cảnh báo → người dùng lọc/nghe lại/TTS lại nhanh.
+        # [v3.23.601] Đo trên TIẾNG đã cắt lặng, TRƯỚC khi nén — không phải audio cuối. Ca
+        # thật dòng 991 "Đúng thế.": mọi lần thử ra 2.16s tiếng (3.4 lần mức đọc gọn), bị
+        # nén 2.5x còn 0.86s nên lọt dưới ngưỡng 1.8s và bảng không báo dòng nào.
+        abnormal_length = is_abnormally_long_vs_floor(
+            voice_duration,
+            dem_am_tiet(text.strip()),
+            min_base_s=VIENEU_MIN_BASE_S,
+            min_per_syllable_s=VIENEU_MIN_PER_SYLLABLE_S,
+        )
         return TTSSegmentResult(
             event_index=idx, start_sec=start_sec, end_sec=end_sec,
             text=text, audio_duration_s=len(audio) / sr,
             speed_used=speed_used, was_truncated=was_truncated,
             overlap_s=final_overlap_s,
+            segment_audio_path=segment_audio_path,
+            abnormal_length=abnormal_length,
             # [v3.23.193] adjusted = mốc THẬT của tiếng -> use case nhận diện "có điều
             # chỉnh" -> XUẤT SRT đồng bộ TTS.
             # [v3.23.218] Mốc thật nay có thể sớm hơn phụ đề (ăn gian đầu) -> SRT đồng bộ
@@ -820,9 +1240,31 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             adjusted_end_sec=max(end_sec, play_start_sec + len(audio) / sr),
         )
 
+    def _save_segment_audio(self, audio: np.ndarray, sr: int, idx: int) -> str:
+        """[v3.23.450] Ghi audio một dòng ra WAV riêng (nếu bật keep_line_audio). Trả đường dẫn
+        (rỗng nếu không bật hoặc lỗi ghi — không chặn TTS chính)."""
+        segments_dir = getattr(self, "_segments_dir", None)
+        if segments_dir is None:
+            return ""
+        try:
+            import soundfile as sf
+
+            from subtitles_extractor.infrastructure.tts.segment_store import segment_path
+
+            path = segment_path(segments_dir, idx)
+            # [v3.23.452] Ghi PCM_16 (không phải float32): QMediaPlayer/Media Foundation trên
+            # Windows hay phát chập chờn/không phát với WAV float 32-bit. PCM_16 tương thích rộng.
+            # Re-merge đọc lại dtype=float32 (soundfile tự quy đổi) → không ảnh hưởng độ chính xác.
+            clipped = np.clip(audio, -1.0, 1.0)
+            sf.write(str(path), clipped, sr, subtype="PCM_16")
+            return str(path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Không ghi được segment audio dòng %d: %s", idx, exc)
+            return ""
+
     def _synthesize_with_retry(
         self, *, engine: Any, text: str, request: TTSRequest, voice_data: Any,
-        cancel_cb: TTSCancellationCallback | None,
+        cancel_cb: TTSCancellationCallback | None, idx: int = -1,
     ) -> np.ndarray | None:
         """Gọi VieNeu ``infer`` có retry, trả audio mono 24kHz hoặc None nếu thất bại.
 
@@ -857,11 +1299,21 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         # [v3.23.221] Ứng viên "hợp lệ nhưng DÀI BẤT THƯỜNG": không vứt đi (sẽ mất thoại),
         # giữ lại và thử tiếp; hết lượt thì trả bản NGẮN NHẤT đã thu được.
         overlong_best: np.ndarray | None = None
+        # [v3.23.415] Dừng sớm khi retry KHÔNG cải thiện: thán từ/từ ngắn ('Được.', 'Giá!')
+        # model ngân dài NHẤT QUÁN — mọi lần thử đều ~bằng nhau, retry tới 10 lần vô ích (mỗi
+        # lần 1 lần infer GPU). Nếu bản ngắn nhất không giảm thêm sau _OVERLONG_STALL_LIMIT lần
+        # LIÊN TIẾP (và đã thử tối thiểu _OVERLONG_MIN_ATTEMPTS) → dừng, dùng bản ngắn nhất.
+        # KHÔNG đổi kết quả (vẫn bản ngắn nhất), chỉ bỏ các lần thử thừa.
+        _overlong_best_size: int | None = None
+        _overlong_stall = 0
         for attempt in range(retry_count):
             if cancel_cb and cancel_cb():
                 raise TTSCancelledError("Huỷ trong khi tổng hợp VieNeu-TTS.")
             try:
-                raw_audio = self._infer_once(engine, text, voice_data)
+                raw_audio = self._infer_once(
+                    engine, text, voice_data,
+                    idx=idx if attempt == 0 else -1,
+                )
                 audio = self._to_mono_pipeline_rate(
                     raw_audio, getattr(engine, "sample_rate", None)
                 )
@@ -869,7 +1321,13 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                 # như thất bại -> retry, giống audio rỗng (ca thực tế: câu #58 "Ý chú
                 # là" 2.2s im lặng lọt lưới size>0 -> mất thoại mà báo OK).
                 if audio.size > 0 and not is_effectively_silent(audio):
-                    duration_s = audio.size / engine_sr
+                    # [v3.23.601] Đo PHẦN TIẾNG, không đo độ dài thô. Khâu đặt câu cắt
+                    # lặng biên ngay sau bước này, nên im lặng đầu/cuối không bao giờ tới
+                    # tai người nghe. Nhật ký thật (giọng Ngọc Huyền, 1-3 âm tiết): 27 lần
+                    # lấy mẫu lại vì bản THÔ 2.16-2.88s vượt ngưỡng 1.8-2.1s, trong khi
+                    # bản được giữ của chính các dòng đó có 0.57-2.08s tiếng (VieNeu sinh
+                    # im lặng đầu câu tới 1.42s — đo ở v3.23.204).
+                    duration_s = speech_seconds(audio, engine_sr)
                     # [v3.23.221] Dạng lỗi NGƯỢC LẠI của im lặng: model "ngân dài" một âm
                     # tiết (ca thực: "Ừm." 3 ký tự -> 2.55s, +7.7σ) -> bị nén kịch trần
                     # 2.0x (tan formant) và đè lên câu sau. Lấy mẫu lại thường cho bản
@@ -884,7 +1342,21 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                         min_per_syllable_s=VIENEU_MIN_PER_SYLLABLE_S,
                     ):
                         return audio
-                    overlong_best = shorter_take(overlong_best, audio)
+                    # [v3.23.601] "Ngắn nhất" theo phần TIẾNG: bản thô dài vì im lặng biên
+                    # vẫn là bản đọc gọn.
+                    overlong_best = shorter_take(overlong_best, audio, sr=engine_sr)
+                    # [v3.23.415] Theo dõi cải thiện; dừng sớm nếu chững lại.
+                    best_speech_samples = round(
+                        speech_seconds(overlong_best, engine_sr) * engine_sr
+                    )
+                    if (
+                        _overlong_best_size is not None
+                        and best_speech_samples >= _overlong_best_size
+                    ):
+                        _overlong_stall += 1
+                    else:
+                        _overlong_stall = 0
+                    _overlong_best_size = best_speech_samples
                     # Lấy mẫu lại NGAY: model offline + ngẫu nhiên, chờ vô ích.
                     wait_before_next = False
                     logger.warning(
@@ -892,6 +1364,16 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                         "('%s…') — nghi model ngân dài, lấy mẫu lại.",
                         attempt + 1, retry_count, duration_s, syllable_count, text[:25],
                     )
+                    if (
+                        attempt + 1 >= _OVERLONG_MIN_ATTEMPTS
+                        and _overlong_stall >= _OVERLONG_STALL_LIMIT
+                    ):
+                        logger.info(
+                            "VieNeu-TTS: retry không rút ngắn thêm sau %d lần cho '%s…' — "
+                            "dừng sớm, dùng bản ngắn nhất (tiết kiệm %d lần infer).",
+                            attempt + 1, text[:25], retry_count - (attempt + 1),
+                        )
+                        break
                 else:
                     # Im lặng cũng là lỗi CHẤT LƯỢNG -> không chờ.
                     wait_before_next = False
@@ -917,7 +1399,7 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             logger.warning(
                 "VieNeu-TTS: mọi lần thử đều dài bất thường cho '%s…' — dùng bản ngắn "
                 "nhất (%.2fs).",
-                text[:25], overlong_best.size / engine_sr,
+                text[:25], speech_seconds(overlong_best, engine_sr),
             )
             return overlong_best
         return None
@@ -954,7 +1436,11 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         self._gpu_reference_wav = (
             str(request.ref_audio_path) if use_cloning and request.ref_audio_path else ""
         )
-        self._gpu_voice_preset = str(getattr(request, "voice_name", "") or "")
+        # [v3.23.407] Chuẩn hoá tên giọng cho worker GPU. Trước đây dùng thẳng
+        # str(request.voice_name); nhưng UI có thể truyền TUPLE (nhãn, giá_trị) → str(tuple)
+        # cho ra "('Minh Đức — …', 'Minh Đức')" → worker báo Voice not found (đường CPU không
+        # dính vì dùng request.speaker + khớp mềm). Tách giá trị hợp lệ + khớp mềm y như CPU.
+        self._gpu_voice_preset = self._normalize_gpu_voice_name(engine, request)
 
         try:
             if use_cloning:
@@ -992,6 +1478,112 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         self._voice_data_cache = voice_data
         return voice_data
 
+    def _resolve_line_voices(
+        self, engine: Any, request: TTSRequest, default_voice_data: Any
+    ) -> list[tuple[Any, str]]:
+        """[v3.23.593] Giọng của TỪNG dòng khi lồng tiếng nhiều vai.
+
+        Args:
+            engine: Instance VieNeu đã nạp.
+            request: Yêu cầu TTS (``line_voices`` theo vị trí dòng).
+            default_voice_data: Giọng chung của phiên (preset hoặc nhân bản).
+
+        Returns:
+            ``(voice data, ID preset cho worker GPU)`` theo vị trí dòng; ID rỗng = giọng
+            chung. Danh sách rỗng khi yêu cầu chỉ dùng một giọng.
+        """
+        if not request.line_voices:
+            return []
+        resolved: list[tuple[Any, str]] = []
+        for position in range(len(request.events)):
+            requested = request.voice_at(position, "")
+            if not requested:
+                resolved.append((default_voice_data, ""))
+                continue
+            if requested not in self._line_voice_cache:
+                self._line_voice_cache[requested] = self._resolve_line_voice(
+                    engine, requested
+                )
+            voice_data, preset = self._line_voice_cache[requested]
+            resolved.append((voice_data, preset) if preset else (default_voice_data, ""))
+        return resolved
+
+    def _resolve_line_voice(self, engine: Any, requested: str) -> tuple[Any, str]:
+        """Lấy dữ liệu một giọng preset của vai; không có thì báo để đọc bằng giọng chung.
+
+        Khác :meth:`_preset_voice_with_soft_match` (lùi về giọng ĐẦU TIÊN): một vai
+        thiếu giọng mà lấy giọng đầu tiên sẽ trùng giọng vai khác — lùi về giọng chung
+        người dùng đã chọn thì dễ nhận ra hơn.
+
+        Args:
+            engine: Instance VieNeu đã nạp.
+            requested: ID giọng yêu cầu cho vai.
+
+        Returns:
+            ``(voice data, ID khớp)``; ``(None, "")`` nếu không lấy được.
+        """
+        try:
+            available = [voice_id for _label, voice_id in engine.list_preset_voices()]
+        except (AttributeError, TypeError, RuntimeError, ValueError):
+            available = []
+        requested = resolve_voice_alias(requested, engine)
+        matched = match_voice_name(requested, available) if available else None
+        if matched is None:
+            logger.warning(
+                "VieNeu-TTS: chế độ %s không có giọng '%s' — các dòng của vai này đọc "
+                "bằng giọng chung.", self._mode, requested,
+            )
+            return None, ""
+        try:
+            voice_data = engine.get_preset_voice(matched)
+        except (RuntimeError, OSError, ValueError, KeyError) as exc:
+            logger.warning(
+                "VieNeu-TTS: không lấy được giọng '%s' (%s) — đọc bằng giọng chung.",
+                matched, exc,
+            )
+            return None, ""
+        self._line_voice_presets[id(voice_data)] = matched
+        return voice_data, matched
+
+    def _normalize_gpu_voice_name(self, engine: Any, request: Any) -> str:
+        """[v3.23.407] Chọn tên giọng HỢP LỆ để gửi worker GPU (xử lý tuple + khớp mềm).
+
+        Trải phẳng ``voice_name`` (có thể là tuple ``(nhãn, giá_trị)``) + ``speaker`` thành ứng
+        viên, rồi khớp mềm với danh sách giọng của engine (y hệt đường CPU). Trả tên khớp; nếu
+        không khớp được thì trả ứng viên cuối (để worker tự fallback) hoặc rỗng.
+
+        Args:
+            engine: Instance VieNeu đã nạp (để lấy danh sách giọng khả dụng).
+            request: TTSRequest chứa ``voice_name``/``speaker``.
+
+        Returns:
+            Tên giọng hợp lệ (chuỗi), hoặc rỗng nếu không có ứng viên nào.
+        """
+        candidates = normalize_voice_candidates(
+            getattr(request, "voice_name", ""), getattr(request, "speaker", "")
+        )
+        if not candidates:
+            return ""
+        try:
+            available = [voice_id for _label, voice_id in engine.list_preset_voices()]
+        except (AttributeError, TypeError, RuntimeError, ValueError):
+            available = []
+        if available:
+            for candidate in candidates:
+                matched = match_voice_name(resolve_voice_alias(candidate, engine), available)
+                if matched is not None:
+                    if matched != candidate:
+                        logger.info(
+                            "VieNeu-TTS (GPU): giọng '%s' khớp mềm với '%s'.",
+                            candidate, matched,
+                        )
+                    return matched
+            logger.warning(
+                "VieNeu-TTS (GPU): không khớp giọng %s với %s — để worker tự fallback.",
+                candidates, available,
+            )
+        return candidates[-1]
+
     def _preset_voice_with_soft_match(self, engine: Any, requested: str) -> Any:
         """Lấy voice dict theo tên có KHỚP MỀM; không thấy -> fallback giọng đầu tiên.
 
@@ -1008,6 +1600,7 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         """
         presets = engine.list_preset_voices()
         available_names = [voice_id for _label, voice_id in presets]
+        requested = resolve_voice_alias(requested, engine)
         matched = match_voice_name(requested, available_names)
         if matched is not None:
             if matched != requested:
@@ -1041,6 +1634,8 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         * ``emotion``-> truyền nếu nhận (API cũ).
         * ``style``  -> nếu KHÔNG có ``emotion`` nhưng CÓ ``style``, ánh xạ giá trị
           emotion của app sang tên style tương ứng (xem :data:`_EMOTION_TO_STYLE`).
+        * ``precision`` -> truyền nếu chữ ký nhận, hoặc nếu là factory ``**kwargs`` của
+          VieNeu 3.8 ở mode ``v3turbo`` (lớp duy nhất có tham số này).
 
         Nếu không nội soi được chữ ký (vd C-extension), thử lần lượt ``{mode}`` rồi ``{}``
         (mặc định hoàn toàn) — luôn khởi tạo được engine thay vì sập.
@@ -1052,9 +1647,18 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             Instance ``Vieneu`` đã khởi tạo.
         """
         try:
-            params = frozenset(inspect.signature(vieneu_cls).parameters)
+            signature_params = inspect.signature(vieneu_cls).parameters
         except (AttributeError, TypeError, ValueError):
-            params = frozenset()
+            signature_params = {}
+        params = frozenset(signature_params)
+        # [v3.23.595] ``vieneu.Vieneu`` 3.8 là hàm factory ``Vieneu(mode, **kwargs)`` chuyển
+        # tiếp kwargs cho lớp của từng mode, nên chữ ký KHÔNG liệt kê ``precision`` — dò tên
+        # tham số thì không bao giờ truyền được (ứng dụng Gradio chính thức gọi
+        # ``Vieneu(mode="v3turbo", precision=...)``).
+        forwards_kwargs = any(
+            param.kind is inspect.Parameter.VAR_KEYWORD
+            for param in signature_params.values()
+        )
 
         kwargs: dict[str, Any] = {}
         if "mode" in params:
@@ -1066,11 +1670,13 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             # tên style; nếu tên không khớp giá trị SDK chấp nhận, khối except bên dưới sẽ
             # lùi về khởi tạo mặc định thay vì sập.
             kwargs["style"] = _EMOTION_TO_STYLE.get(self._emotion, "tu_nhien")
-        # [v3.23.255] VieNeu 3.x nhận ``precision`` ("int8" mặc định — nhanh ~1.6×,
-        # nhỏ ~4×, "quality preserved"; "fp32" — chất lượng tối đa). Chỉ truyền khi app
-        # có đặt (``self._precision``) VÀ constructor nhận; None -> SDK tự dùng int8.
+        # [v3.23.255] VieNeu 3.x nhận ``precision``. [v3.23.595] Ở VieNeu 3.8 mặc định là
+        # "fp32" (chất lượng tối đa); "int8" nhanh ~3x mỗi frame trên CPU có VNNI (chú
+        # thích SDK). Chỉ truyền khi app có đặt VÀ constructor nhận.
         _precision = getattr(self, "_precision", None)
-        if _precision and "precision" in params:
+        if _precision and (
+            "precision" in params or (forwards_kwargs and self._mode == "v3turbo")
+        ):
             kwargs["precision"] = _precision
 
         try:
@@ -1078,6 +1684,11 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         except TypeError:
             # Chữ ký không nội soi được, hoặc giá trị style không hợp lệ -> thử tối giản
             # dần: chỉ mode, rồi mặc định hoàn toàn. Luôn có engine thay vì sập cả phiên.
+            if "precision" in kwargs:
+                logger.warning(
+                    "VieNeu-TTS: bản SDK này không nhận precision=%s — chạy độ chính xác "
+                    "mặc định.", kwargs["precision"],
+                )
             for fallback in ({"mode": self._mode} if self._mode else {}, {}):
                 try:
                     return vieneu_cls(**fallback)
@@ -1107,7 +1718,9 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             # năng PHỤ (truyền trần thời lượng).
             return frozenset()
 
-    def _infer_once(self, engine: Any, text: str, voice_data: Any) -> Any:
+    def _infer_once(
+        self, engine: Any, text: str, voice_data: Any, idx: int = -1
+    ) -> Any:
         """Gọi một lần ``engine.infer`` với voice data dict đã giải quyết.
 
         [v3.23.227] Nếu SDK hỗ trợ trần thời lượng, truyền vào để CHẶN NGAY ca model ngân
@@ -1145,7 +1758,9 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             # với v3 Turbo. Nay quy đổi cap giây -> frames. +50 frame đệm để câu hợp lệ
             # không chạm trần (chỉ chặn thảm hoạ).
             if "max_new_frames" in supported:
-                kwargs["max_new_frames"] = int(cap_s * _V3TURBO_FRAMES_PER_SECOND) + 50
+                kwargs["max_new_frames"] = (
+                    int(cap_s * frames_per_second_for_mode(self._mode)) + 50
+                )
         # [v3.23.255] VieNeu 3.x nhận ``style`` per-call trong ``infer`` ("tu_nhien"/
         # "tin_tuc"/"doc_truyen"). Đây là nơi ánh xạ sắc thái đọc của app khi infer nhận
         # style. Introspection -> an toàn với bản cũ (không có 'style' thì không truyền).
@@ -1171,7 +1786,16 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         # ONNX/CPU: cài đủ gói mà vẫn không dùng được GPU.
         # Nay khi bật GPU, đẩy lời gọi sang worker chạy bằng Python của môi trường riêng.
         if not self._force_cpu:
-            result = self._infer_via_gpu_worker(text, kwargs)
+            # [v3.23.412] Lần thử đầu (idx>=0) + bật batch: lấy audio từ lô infer_batch.
+            if idx >= 0 and self._batch_size >= 2:
+                batched = self._get_batched_audio(idx, kwargs)
+                if batched is not None:
+                    return batched
+            # [v3.23.593] Worker GPU tự giải quyết giọng — gửi kèm ID preset của vai.
+            gpu_preset = getattr(self, "_line_voice_presets", {}).get(id(voice_data), "")
+            result = self._infer_via_gpu_worker(
+                text, {**kwargs, "voice_preset": gpu_preset} if gpu_preset else kwargs
+            )
             if result is not None:
                 return result
         return engine.infer(**kwargs)
@@ -1199,7 +1823,7 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         import json
         import tempfile
 
-        if self._gpu_worker_disabled:
+        if getattr(self, "_gpu_worker_disabled", False):
             return None
         process = self._ensure_gpu_server()
         if process is None:
@@ -1214,13 +1838,14 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                     name: kwargs[name]
                     for name in (
                         "max_new_frames", "style", "repetition_penalty", "temperature",
+                        "voice_preset",
                     )
                     if name in kwargs
                 },
             }
             try:
                 assert process.stdin is not None and process.stdout is not None
-                process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+                process.stdin.write(_json_line_safe(request))
                 process.stdin.flush()
                 reply_line = process.stdout.readline()
             except (OSError, ValueError, AssertionError) as exc:
@@ -1264,6 +1889,163 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                 return None
             self._gpu_failure_streak = 0
             return samples
+
+    def _resolve_gpu_chunk_batch(self) -> int:
+        """[v3.23.420] Số chunk/forward GPU cho ``infer_batch`` (tự chọn theo VRAM, cache).
+
+        Mặc định vieneu chỉ gộp 4 chunk/forward → dùng rất ít VRAM. Ta nâng theo VRAM thực
+        (8GB→32, 12GB→48, 16GB→64…) để tận dụng bộ nhớ dư → nhanh hơn rõ rệt. Dò LƯỜI một lần
+        (nvidia-smi) rồi cache. Nếu lô lớn OOM, worker tự bắt lỗi và lùi per-câu.
+
+        Returns:
+            Số chunk mỗi forward (≥4).
+        """
+        if self._gpu_chunk_batch is None:
+            from subtitles_extractor.infrastructure.tts.vieneu_batch_tuning import (
+                suggest_gpu_chunk_batch,
+            )
+
+            self._gpu_chunk_batch = suggest_gpu_chunk_batch()
+            logger.info(
+                "VieNeu GPU: %d chunk/forward (tự chọn theo VRAM để tăng tốc batch).",
+                self._gpu_chunk_batch,
+            )
+        return self._gpu_chunk_batch
+
+    def _get_batched_audio(
+        self, idx: int, kwargs: dict[str, Any]
+    ) -> Any | None:
+        """[v3.23.412] Trả audio thô cho câu ``idx`` từ CACHE batch (điền theo nhóm nếu trống).
+
+        Chỉ dùng ở LẦN THỬ ĐẦU (attempt 0). Nếu ``idx`` chưa có trong cache, tổng hợp cả NHÓM
+        ``[idx, idx+batch_size)`` bằng một lời gọi ``infer_batch`` qua worker (GPU gộp forward →
+        nhanh) rồi lưu cache. Câu "dài bất thường" ở tầng trên vẫn được thử lại per-câu (attempt
+        > 0 không gọi hàm này).
+
+        Args:
+            idx: Chỉ số câu hiện tại.
+            kwargs: Tham số chung (temperature…) cho lô.
+
+        Returns:
+            Mảng mẫu thô, hoặc ``None`` nếu batch không khả dụng (tầng trên tự lùi per-câu).
+        """
+        if idx in self._batch_cache:
+            return self._batch_cache.pop(idx)
+        texts = self._batch_texts
+        if not texts or idx >= len(texts):
+            return None
+        end = min(idx + self._batch_size, len(texts))
+        # [v3.23.593] Một lô = MỘT giọng (worker gọi infer_batch với một voice): khi lồng
+        # tiếng, chỉ gom các câu cùng giọng với câu hiện tại và chưa có trong cache.
+        known_voices: list[str] = getattr(self, "_batch_voices", [])
+        voices = known_voices + [""] * max(0, end - len(known_voices))
+        voice = voices[idx]
+        group_idx = [
+            j for j in range(idx, end)
+            if j == idx or (j not in self._batch_cache and voices[j] == voice)
+        ]
+        group_texts = [texts[j] for j in group_idx]
+        audios = self._infer_batch_via_gpu_worker(
+            group_texts, {**kwargs, "voice_preset": voice} if voice else kwargs
+        )
+        if audios is None:
+            return None
+        # [v3.23.434] Cảnh báo nếu worker trả số audio LỆCH số câu gửi (contract violation).
+        # zip cắt theo bên ngắn hơn — câu thiếu không được cache → tự rơi về tổng hợp per-câu
+        # (an toàn, không mất ngầm), nhưng cần log để phát hiện lỗi worker.
+        if len(audios) != len(group_idx):
+            logger.warning(
+                "Batch TTS lệch: nhận %d audio cho %d câu — câu thiếu sẽ tổng hợp lại per-câu.",
+                len(audios), len(group_idx),
+            )
+        for j, audio in zip(group_idx, audios):  # noqa: B905 — thiếu→fallback per-câu (cố ý)
+            if audio is not None:
+                self._batch_cache[j] = audio
+        return self._batch_cache.pop(idx, None)
+
+    def _infer_batch_via_gpu_worker(
+        self, texts: list[str], kwargs: dict[str, Any]
+    ) -> list[Any] | None:
+        """[v3.23.412] Tổng hợp một LÔ câu qua worker GPU (``infer_batch``), trả list audio.
+
+        Worker ghi mỗi WAV ra một tệp tạm; đọc lại theo thứ tự. Item lỗi → ``None`` trong list
+        (tầng trên lùi per-câu cho item đó). Cả lô lỗi/không dùng được → trả ``None``.
+
+        Args:
+            texts: Danh sách câu (đã làm sạch) — chung một giọng.
+            kwargs: Tham số chung (temperature…).
+
+        Returns:
+            List audio (cùng thứ tự ``texts``; phần tử có thể ``None``), hoặc ``None``.
+        """
+        import json
+        import tempfile
+
+        if getattr(self, "_gpu_worker_disabled", False) or not texts:
+            return None
+        process = self._ensure_gpu_server()
+        if process is None:
+            return None
+
+        with tempfile.TemporaryDirectory(prefix="subext_vieneu_batch_") as temp_dir:
+            outputs = [str(Path(temp_dir) / f"b{i}.wav") for i in range(len(texts))]
+            request = {
+                "batch": [
+                    {"text": text, "output": out}
+                    for text, out in zip(texts, outputs)
+                ],
+                # [v3.23.420] Số chunk/forward GPU (đòn bẩy VRAM). Tự chọn theo VRAM lần đầu.
+                "gpu_subbatch": self._resolve_gpu_chunk_batch(),
+                **{
+                    name: kwargs[name]
+                    for name in (
+                        "max_new_frames", "repetition_penalty", "temperature",
+                        "voice_preset",
+                    )
+                    if name in kwargs
+                },
+            }
+            try:
+                assert process.stdin is not None and process.stdout is not None
+                process.stdin.write(_json_line_safe(request))
+                process.stdin.flush()
+                reply_line = process.stdout.readline()
+            except (OSError, ValueError, AssertionError) as exc:
+                logger.warning("Mất liên lạc với worker GPU (batch): %s", exc)
+                self._shutdown_gpu_server()
+                return None
+            if not reply_line:
+                logger.warning("Worker GPU thoát bất ngờ (batch).")
+                self._shutdown_gpu_server()
+                return None
+            try:
+                reply = json.loads(reply_line)
+            except ValueError:
+                return None
+            if not reply.get("ok"):
+                logger.warning(
+                    "Worker GPU không hỗ trợ/thất bại batch (%s) — lùi per-câu.",
+                    str(reply.get("error") or "?"),
+                )
+                return None
+
+            written = reply.get("batch") or []
+            try:
+                import soundfile as sf
+            except ImportError:
+                return None
+            results: list[Any] = []
+            for out in outputs:
+                path = out if out in written and Path(out).is_file() else None
+                if path is None:
+                    results.append(None)
+                    continue
+                try:
+                    samples, _sr = sf.read(path, dtype="float32")
+                    results.append(samples)
+                except (OSError, RuntimeError):
+                    results.append(None)
+            return results
 
     def _ensure_gpu_server(self) -> Any | None:
         """Khởi động tiến trình GPU thường trú nếu chưa có.
@@ -1324,7 +2106,7 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         }
         try:
             assert process.stdin is not None and process.stdout is not None
-            process.stdin.write(json.dumps(config, ensure_ascii=False) + "\n")
+            process.stdin.write(_json_line_safe(config))
             process.stdin.flush()
             # Đợi worker báo đã nạp xong model — mất khoảng 15 giây, MỘT LẦN duy nhất.
             handshake = process.stdout.readline()
@@ -1394,6 +2176,89 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             reason,
             hint,
         )
+        # [v3.23.401] Nếu là lỗi transformers-quá-mới (hint khác rỗng), TỰ SỬA 1 lần ở nền:
+        # force-hạ transformers khớp torch trong whisperx_env → phiên SAU dùng được GPU mà
+        # người dùng KHÔNG phải gõ lệnh tay hay xoá môi trường.
+        if hint:
+            self._maybe_auto_repair_transformers()
+
+    def _maybe_auto_repair_transformers(self) -> None:
+        """[v3.23.401] Tự hạ transformers khớp torch trong whisperx_env — CHẠY TỐI ĐA 1 LẦN.
+
+        Chạy pip ở luồng nền (không chặn TTS đang chạy CPU). Dùng file mốc trong whisperx_env
+        để KHÔNG lặp (tránh vòng lặp sửa nếu vẫn lỗi). Có hiệu lực ở lần khởi động app kế tiếp.
+        """
+        import threading
+
+        try:
+            from subtitles_extractor.infrastructure.tts.vieneu_gpu_plan import (
+                VIENEU_TRANSFORMERS_SPEC,
+                build_gpu_tts_plan,
+                build_transformers_repair_command,
+            )
+
+            plan = build_gpu_tts_plan()
+            python_exe = plan.python_exe
+            if not python_exe:
+                return
+            marker = Path(python_exe).resolve().parent.parent / ".vieneu_tf_repaired"
+            # [v3.23.402] Mốc chứa CHÍNH spec đã sửa. Nếu app cập nhật pin (vd hạ thấp hơn vì
+            # 4.53 vẫn lỗi), spec MỚI khác nội dung mốc → auto-repair CHẠY LẠI với pin mới,
+            # KHÔNG bị kẹt vĩnh viễn. Chỉ bỏ qua khi đã sửa với ĐÚNG spec hiện tại.
+            if marker.exists():
+                try:
+                    if marker.read_text(encoding="utf-8").strip() == VIENEU_TRANSFORMERS_SPEC:
+                        return
+                except OSError:
+                    pass
+        except (ImportError, OSError):
+            return
+
+        command = build_transformers_repair_command(python_exe)
+
+        def _run_repair() -> None:
+            try:
+                # [v3.23.403] Ghi phiên bản torch + transformers HIỆN TẠI để chẩn đoán chính
+                # xác ngưỡng tương thích (nếu pin vẫn chưa đủ thấp, log này chỉ ra torch nào).
+                try:
+                    probe = subprocess.run(
+                        [
+                            python_exe, "-c",
+                            "import torch,transformers;"
+                            "print('torch',torch.__version__,'| transformers',"
+                            "transformers.__version__)",
+                        ],
+                        capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", timeout=120, check=False,
+                        **no_window_kwargs(),
+                    )
+                    logger.info(
+                        "VieNeu chẩn đoán phiên bản (trước khi hạ): %s",
+                        (probe.stdout or probe.stderr or "?").strip(),
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+                logger.info("VieNeu: tự hạ transformers khớp torch (nền)…")
+                result = subprocess.run(
+                    command, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=900,
+                    check=False, **no_window_kwargs(),
+                )
+                if result.returncode == 0:
+                    marker.write_text(VIENEU_TRANSFORMERS_SPEC, encoding="utf-8")
+                    logger.info(
+                        "VieNeu: đã hạ transformers xong — KHỞI ĐỘNG LẠI app để dùng GPU cho TTS."
+                    )
+                else:
+                    logger.warning(
+                        "VieNeu: tự hạ transformers thất bại: %s",
+                        (result.stderr or result.stdout or "")[-300:],
+                    )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                logger.warning("VieNeu: tự hạ transformers gặp lỗi: %s", exc)
+
+        threading.Thread(target=_run_repair, name="vieneu-tf-repair", daemon=True).start()
 
     @staticmethod
     def _to_mono_pipeline_rate(
@@ -1450,6 +2315,7 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             time.sleep(0.1)
             elapsed += 0.1
 
+    @without_torch_block
     def _finalize_and_write(
         self, master: np.ndarray, sr: int, request: TTSRequest,
         output_path: Path, progress_cb: TTSProgressCallback | None,

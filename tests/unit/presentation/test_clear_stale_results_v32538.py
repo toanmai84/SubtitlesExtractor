@@ -15,6 +15,18 @@ from subtitles_extractor.presentation.pages.translate_page import TranslatePage
 from subtitles_extractor.presentation.pages.tts_page import TTSPage
 
 
+class _FakeTranslator:
+    """[v3.23.547] Bộ dịch giả: trả về chính KHOÁ để nhãn vẫn là chuỗi thật.
+
+    Từ đợt Việt hoá/i18n, các trang gọi ``self._translator.translate(key)`` để lấy nhãn.
+    Bộ kiểm dựng trang ở dạng UNBOUND nên phải gắn bộ dịch giả, nếu không sẽ vấp
+    ``AttributeError`` trước khi chạm tới hành vi cần kiểm (xoá kết quả cũ).
+    """
+
+    def translate(self, key: str) -> str:
+        return key
+
+
 def test_translate_clear_results_wipes_table_and_details() -> None:
     page = TranslatePage.__new__(TranslatePage)
     page._table = MagicMock()
@@ -39,6 +51,7 @@ def test_translate_source_changed_clears_old_results() -> None:
     # Các widget/nhánh khác mà _on_source_changed đụng tới khi count>0.
     page._lbl_source = MagicMock()
     page._stage_label = MagicMock()
+    page._translator = _FakeTranslator()
     page._source_video_path = ""
     page._video_path = ""
     page._update_action_states = MagicMock()
@@ -61,6 +74,7 @@ def test_tts_source_changed_clears_old_results() -> None:
     page._lbl_source = MagicMock()
     page._stage_lbl = MagicMock()
     page._update_action_states = MagicMock()
+    page._translator = _FakeTranslator()
     page._last_results = ["cũ"]
 
     page._on_source_changed(3)

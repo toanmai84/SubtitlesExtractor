@@ -38,7 +38,19 @@ def test_request_nhận_temperature_tuỳ_chỉnh() -> None:
 
 # ── Adapter truyền temperature vào cả hai đường ─────────────────────────────
 def test_standard_tts_truyền_temperature() -> None:
-    assert 'temperature=getattr(request, "gemini_temperature", None)' in _GEMINI_SRC
+    """[v3.23.547] v3.23.419 dựng config qua ``config_kwargs`` để tắt AFC có điều kiện.
+
+    Nhiệt độ vì thế chuyển từ đối số từ khoá sang MỘT MỤC trong dict rồi mới bung vào
+    ``GenerateContentConfig(**config_kwargs)``. Hành vi y hệt; bộ kiểm bám theo dạng mới.
+    """
+    # [v3.23.595] Chỉ gửi khi người dùng đặt VÀ model còn nhận tham số lấy mẫu (3.6+,
+    # Flash-Lite 3.5+ và TTS 3.8 bỏ qua) — hành vi kiểm ở test_gemini_tts_38_v323595.
+    assert 'temperature = getattr(request, "gemini_temperature", None)' in _GEMINI_SRC
+    assert (
+        "if temperature is not None and not sampling_params_deprecated(model):"
+        in _GEMINI_SRC
+    )
+    assert "types.GenerateContentConfig(**config_kwargs)" in _GEMINI_SRC
 
 
 def test_native_audio_chỉ_thêm_khi_có_giá_trị() -> None:
@@ -56,4 +68,5 @@ def test_view_model_truyền_temperature() -> None:
 # ── Preamble áp cho cả standard TTS ─────────────────────────────────────────
 def test_standard_tts_bọc_transcript() -> None:
     # generateContent cũng phải bọc (cookbook: luôn bảo model "say/read").
-    assert "contents=wrap_transcript_for_tts(text)" in _GEMINI_SRC
+    # [v3.23.595] Trừ model TTS 3.8+: đọc nguyên văn, lời dẫn sẽ bị đọc thành tiếng.
+    assert "else wrap_transcript_for_tts(text)" in _GEMINI_SRC

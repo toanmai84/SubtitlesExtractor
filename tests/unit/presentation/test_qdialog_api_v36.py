@@ -1,7 +1,10 @@
-"""Test bảo vệ PyQt6 QInputDialog.getDouble() keyword argument names.
+"""Test bảo vệ cách gọi QInputDialog.getDouble() ở nút "Tách câu".
 
-PyQt6 đổi tên: minValue/maxValue (PyQt5) → min/max (PyQt6).
-Dùng wrong args gây TypeError ngay khi user click "Tách câu".
+[v3.23.613] Bản v3.6 giả định PyQt6 (tên tham số ``min``/``max``) nhưng ứng dụng chạy
+PySide6, nơi tên là ``minValue``/``maxValue`` → ``min=`` làm getDouble ném TypeError ngay
+khi bấm "Tách câu" (đo trên PySide6 6.11.2). Tên tham số khác nhau giữa các binding nên
+cận dưới/cận trên phải truyền THEO VỊ TRÍ — đúng với mọi binding. Hành vi thật được kiểm
+ở ``test_ui_bug_sweep_v323613.py::TestEditorSplit``.
 """
 from pathlib import Path
 
@@ -11,26 +14,18 @@ _PAGE = (
 )
 
 
-def test_get_double_uses_pyqt6_min_max_args() -> None:
-    """getDouble phải dùng min= và max= (PyQt6), KHÔNG dùng minValue/maxValue (PyQt5)."""
-    source = _PAGE.read_text(encoding="utf-8")
-    assert "minValue=" not in source, (
-        "Tìm thấy 'minValue=' — PyQt6 dùng 'min=' thay vì 'minValue='. "
-        "Sẽ gây TypeError: 'minValue' is not a valid keyword argument."
-    )
-    assert "maxValue=" not in source or "cv2" in source.split("maxValue=")[0].rsplit("\n", 1)[-1], (
-        "Tìm thấy 'maxValue=' không phải từ cv2 — PyQt6 dùng 'max=' thay vì 'maxValue='."
-    )
-
-
-def test_get_double_split_has_correct_args() -> None:
-    """_on_split_clicked phải gọi getDouble với min= và max=."""
+def _split_snippet() -> str:
     source = _PAGE.read_text(encoding="utf-8")
     split_start = source.find("def _on_split_clicked(self)")
     split_end = source.find("\n    def ", split_start + 1)
-    snippet = source[split_start:split_end]
+    return source[split_start:split_end]
 
-    assert "min=" in snippet, "getDouble trong _on_split_clicked phải có min="
-    assert "max=" in snippet, "getDouble trong _on_split_clicked phải có max="
-    assert "minValue=" not in snippet
-    assert "maxValue=" not in snippet
+
+def test_get_double_bounds_are_positional() -> None:
+    """Không dùng tên tham số phụ thuộc binding cho cận dưới/cận trên."""
+    snippet = _split_snippet()
+    call = snippet[snippet.find("QInputDialog.getDouble("):]
+    call = call[: call.find("\n        )") + 10]
+    for keyword in ("min=", "max=", "minValue=", "maxValue="):
+        assert keyword not in call, f"getDouble không được dùng {keyword!r}"
+    assert "start + 0.001" in call and "end - 0.001" in call

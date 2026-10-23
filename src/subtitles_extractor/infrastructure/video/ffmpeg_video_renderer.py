@@ -8,17 +8,30 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Final
 
 from subtitles_extractor.infrastructure.media import find_ffmpeg, missing_ffmpeg_message
+from subtitles_extractor.infrastructure.video.video_encoder_selector import (
+    is_hardware_encoder,
+    mark_encoder_broken,
+    pick_video_encoder,
+    software_fallback,
+)
+from subtitles_extractor.infrastructure.video.subtitle_clip import clip_subtitle_file
 from subtitles_extractor.infrastructure.video.video_render_command import (
+    AUTO_VIDEO_ENCODER,
     RenderRequest,
+    SubtitleMode,
     VideoRenderError,
     build_render_command,
+    resolve_modes,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,7 +101,35 @@ def render_video(
     if ffmpeg is None:
         raise VideoRenderError(missing_ffmpeg_message(feature="Xuất video kèm phụ đề"))
 
-    command = build_render_command(ffmpeg, request)
+    # [v3.23.630] Xuất thử một đoạn: cắt phụ đề về mốc 0 (hình/tiếng bắt đầu từ 0 sau -ss).
+    if request.is_clip:
+        temp_dir = Path(tempfile.mkdtemp(prefix="subext_clip_"))
+        try:
+            if request.subtitle_path is not None and resolve_modes(request)[0] is not SubtitleMode.NONE:
+                request = replace(request, subtitle_path=clip_subtitle_file(
+                    request.subtitle_path, temp_dir,
+                    request.clip_start_sec, request.clip_duration_sec,
+                ))
+            return _render_resolved(
+                ffmpeg, request, request.clip_duration_sec, on_progress, is_cancelled
+            )
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    return _render_resolved(ffmpeg, request, total_duration_sec, on_progress, is_cancelled)
+
+
+def _render_resolved(
+    ffmpeg: str,
+    request: RenderRequest,
+    total_duration_sec: float,
+    on_progress: ProgressCallback | None,
+    is_cancelled: CancelCallback | None,
+) -> Path:
+    """Dò bộ mã hoá, chạy lệnh xuất; bộ mã hoá GPU lỗi thì xuất lại bằng CPU."""
+
+    # [v3.23.618] "Tự động (GPU nếu có)": dò bộ mã hoá dùng được thật trên máy này.
+    if request.video_encoder == AUTO_VIDEO_ENCODER:
+        request = replace(request, video_encoder=pick_video_encoder(ffmpeg, "h264"))
     request.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info(
@@ -97,7 +138,36 @@ def render_video(
         request.video_path.name,
         request.output_path.name,
     )
+    try:
+        return _run_render(
+            build_render_command(ffmpeg, request), request,
+            total_duration_sec, on_progress, is_cancelled,
+        )
+    except VideoRenderError:
+        cancelled = is_cancelled is not None and is_cancelled()
+        encoder = request.video_encoder
+        uses_encoder = f"-c:v {encoder}" in " ".join(build_render_command(ffmpeg, request))
+        if cancelled or not is_hardware_encoder(encoder) or not uses_encoder:
+            raise
+        # Bộ mã hoá GPU lỗi khi chạy thật (hết phiên NVENC, thiếu VRAM, driver cũ…).
+        fallback = software_fallback(encoder)
+        logger.warning("Bộ mã hoá %s lỗi — xuất lại bằng %s.", encoder, fallback)
+        mark_encoder_broken(ffmpeg, encoder)
+        request = replace(request, video_encoder=fallback)
+        return _run_render(
+            build_render_command(ffmpeg, request), request,
+            total_duration_sec, on_progress, is_cancelled,
+        )
 
+
+def _run_render(
+    command: list[str],
+    request: RenderRequest,
+    total_duration_sec: float,
+    on_progress: ProgressCallback | None,
+    is_cancelled: CancelCallback | None,
+) -> Path:
+    """Chạy một lệnh xuất ffmpeg, báo tiến độ, hỗ trợ huỷ."""
     process = subprocess.Popen(
         command,
         stdout=subprocess.DEVNULL,

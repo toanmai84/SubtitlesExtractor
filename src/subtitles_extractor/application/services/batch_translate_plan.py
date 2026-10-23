@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -24,6 +25,7 @@ from pathlib import Path
 from subtitles_extractor.application.services.batch_publish_plan import (
     find_episode_videos,
 )
+from subtitles_extractor.application.services.output_variants import find_output_variants
 from subtitles_extractor.domain.value_objects.output_naming import (
     extracted_subtitle_path,
     translated_subtitle_path,
@@ -146,7 +148,7 @@ def find_existing_translation(
     except OSError:
         pass
     try:
-        matches = sorted(preferred.parent.glob(f"{video_path.stem}.translate.*.srt"))
+        matches = find_output_variants(preferred.parent, video_path.stem, "translate")
     except OSError:
         return None
     return matches[0] if matches else None
@@ -223,6 +225,30 @@ def estimate_requests(plan: list[TranslateItem], batch_size: int = 40) -> int:
     return total
 
 
+def estimate_requests_by_model(
+    plan: list[TranslateItem], stages: Sequence[tuple[str, int]]
+) -> dict[str, int]:
+    """[v3.23.609] Số request ước tính theo TỪNG model cho mọi giai đoạn đang bật.
+
+    Mỗi giai đoạn dịch lại toàn bộ phụ đề theo lô của nó, và hạn mức ngày tính theo
+    model — trước đây chỉ ước lượng một lượt với cỡ lô cố định 40 nên con số thấp hơn
+    thật vài lần, và không bao giờ cảnh báo vượt hạn mức.
+
+    Args:
+        plan: Kế hoạch đã lập.
+        stages: ``(tên model, cỡ lô thực)`` của từng giai đoạn đang bật.
+
+    Returns:
+        ``tên model → số request``, theo thứ tự xuất hiện.
+    """
+    totals: dict[str, int] = {}
+    for model_name, batch_size in stages:
+        totals[model_name] = totals.get(model_name, 0) + estimate_requests(
+            plan, batch_size=batch_size
+        )
+    return totals
+
+
 def quota_warning(
     estimated_requests: int, daily_limit: int | None
 ) -> str | None:
@@ -279,6 +305,7 @@ __all__ = [
     "build_translate_plan",
     "count_subtitle_lines",
     "estimate_requests",
+    "estimate_requests_by_model",
     "find_episode_videos",
     "find_existing_translation",
     "find_source_subtitle",

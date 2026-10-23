@@ -76,8 +76,8 @@ class TestProviderUsesSettings:
             cache_db_path=tmp_path / "b.db", work_dir=tmp_path,
             max_tokens_per_chunk=300_000, tokens_per_second=300, max_chunk_minutes=60.0,
         )
-        with patch.object(prov_lo, "_ffprobe_duration_sec", return_value=11901.0), \
-             patch.object(prov_hi, "_ffprobe_duration_sec", return_value=11901.0):
+        with patch.object(prov_lo, "_read_duration_sec", return_value=11901.0), \
+             patch.object(prov_hi, "_read_duration_sec", return_value=11901.0):
             plan_lo = prov_lo.plan_chunks(fake)
             plan_hi = prov_hi.plan_chunks(fake)
         assert len(plan_hi.chunks) > len(plan_lo.chunks)

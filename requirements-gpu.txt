@@ -18,7 +18,7 @@ setuptools<80
 
 # ── OCR Engine ──
 # paddlepaddle-gpu==3.3.1  <- CAI RIENG o buoc 2 (xem ghi chu dau file / build_windows.bat)
-paddleocr
+paddleocr>=3.7.0  # [v3.23.595] PP-OCRv6 (model mac dinh) can 3.7.0+
 
 # ── Video player & decoder phần cứng ──
 # python-mpv: embed mpv vào widget Qt, hỗ trợ NVDEC/VAAPI/VideoToolbox/D3D11VA/Vulkan
@@ -38,8 +38,8 @@ pynvvideocodec
 
 # [v3.23.292] VieNeu-TTS: engine TTS tieng Viet OFFLINE (Apache 2.0 — an toan thuong mai).
 # CPU torch-free (chi ONNX Runtime). Model tai runtime lan dau tu HuggingFace.
-vieneu           # SDK chinh (keo theo sea-g2p, onnxruntime, soxr, tokenizers, hf_hub)
-sea-g2p>=0.7.11  # phonemizer Rust torch-free
+vieneu>=3.8.3    # SDK chinh (keo theo sea-g2p, onnxruntime, soxr, tokenizers, hf_hub). [v3.23.626] >=3.8.3: sua frame dem 455 trong clip giong mau, giong preset doi ten
+sea-g2p>=0.9.1   # phonemizer Rust torch-free (theo pyproject vieneu 3.8.3)
 onnxruntime>=1.20.0  # chay ONNX v3 Turbo
 soxr             # resampling cho voice cloning
 tokenizers>=0.20 # phoneme tokenizer
@@ -48,6 +48,7 @@ tokenizers>=0.20 # phoneme tokenizer
 opencv-python
 numpy>=2.3.5
 soundfile
+Pillow>=10.0     # giải mã phụ đề ảnh PGS/VobSub
 
 # ── PyAV (libav) — decode nhanh hơn OpenCV 2-3× cho H.264/H.265 ──
 # frame_decoder_backend='pyav'
@@ -66,7 +67,7 @@ rapidfuzz
 # ── Dịch phụ đề bằng AI (trang "Dịch phụ đề") ──
 # Bộ dịch đa giai đoạn dùng Google Gemini. Import lazy: nếu thiếu, trang Dịch
 # chỉ ở chế độ không khả dụng, phần còn lại của ứng dụng vẫn chạy bình thường.
-google-genai
+google-genai>=2.29,<3  # [v3.23.595] VoiceConfig.voice cho Gemini TTS 3.8
 
 # ── Sửa JSON hỏng từ LLM (v3.23.143) ──
 # Thuần Python, zero phụ thuộc bắt buộc. Import tuỳ chọn: nếu thiếu, tự lùi về bộ
@@ -95,7 +96,7 @@ PySide6-Fluent-Widgets
 # Giọng đọc neural của Microsoft (GPL v3). Adapter đã viết đầy đủ, chạy cách ly
 # subprocess. Phụ thuộc bắt buộc (pip tự kéo): aiohttp, certifi, tabulate,
 # typing-extensions — trong đó `tabulate` là gói DUY NHẤT chưa có sẵn trong bản build.
-edge-tts
+edge-tts>=7.0
 
 # Kéo giãn thời gian chất lượng cao (GPL v3, nhân Rubber Band). App tự xếp hạng
 # pedalboard > librosa > WSOLA nên cài vào là tự động nâng cấp, không phải sửa code.
@@ -107,3 +108,4 @@ fastembed
 
 # Gom cụm DBSCAN cho tự động dò ROI (BSD-3). bbox_analyzer đã có cờ HAS_SKLEARN sẵn.
 scikit-learn
+tzdata>=2024.1   # mốc đổi ngày hạn mức Gemini trên Windows

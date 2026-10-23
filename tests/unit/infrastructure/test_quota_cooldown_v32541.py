@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
+from tests.unit.infrastructure.gemini_call_harness import install_fake_clock
 from subtitles_extractor.infrastructure.translation.gemini_quota_manager import (
     GeminiQuotaManager,
     RateLimit,
@@ -26,7 +29,9 @@ def test_video_tokens_per_sec_mapping() -> None:
     assert video_tokens_per_sec("LOW") == 100  # không phân biệt hoa-thường
 
 
-def test_note_rate_limited_sets_cooldown_and_acquire_waits() -> None:
+def test_note_rate_limited_sets_cooldown_and_acquire_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    # [v3.23.643] Đồng hồ giả: trước đây ngủ THẬT 30 s dù wait_cb đã xoá cooldown.
+    install_fake_clock(monkeypatch)
     mgr = _manager()
     calls: list[tuple[float, str]] = []
 

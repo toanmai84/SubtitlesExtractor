@@ -17,6 +17,7 @@ Mọi method công khai bắt cụ thể ``(RuntimeError)`` và các exception t
 from __future__ import annotations
 
 import contextlib
+import time
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -46,6 +47,15 @@ def _get_mpv_errors() -> tuple[type[Exception], ...]:
     return tuple(errors)
 
 
+# Tuỳ chọn tắt script Lua/ytdl — ứng dụng chỉ nhúng mpv để phát khung hình, không cần chúng.
+_LEAN_MPV_OPTIONS: dict[str, Any] = {
+    "load_scripts": False,
+    "ytdl": False,
+    "load_stats_overlay": False,
+    "load_osd_console": False,
+}
+
+
 class MpvPlayerAdapter:
     def __init__(self, wid: int, *, mpv_options: dict[str, Any] | None = None) -> None:
         try:
@@ -70,7 +80,14 @@ class MpvPlayerAdapter:
     @staticmethod
     def _init_mpv_with_fallback(mpv_module: Any, kwargs: dict[str, Any], wid: int) -> Any:
         try:
-            instance = mpv_module.MPV(**kwargs)
+            # [v3.23.651] Tắt script Lua (ytdl_hook/stats/console/osc…): log crash cho thấy hàng chục ngoại lệ LuaJIT
+            # (0xe24c4a02) xen với `access violation` trong mpv. Ta không dùng script nào; nếu bản libmpv không biết một
+            # tuỳ chọn thì lùi về cấu hình gốc ngay bên dưới.
+            try:
+                instance = mpv_module.MPV(**{**_LEAN_MPV_OPTIONS, **kwargs})
+            except _get_mpv_errors() as lean_exc:
+                logger.info("libmpv không nhận tuỳ chọn tắt script ({}) — dùng cấu hình gốc.", lean_exc)
+                instance = mpv_module.MPV(**kwargs)
             logger.info("Mpv player khởi tạo THÀNH CÔNG: wid={}, hwdec={}, vo={}.", wid, kwargs.get("hwdec", "?"), kwargs.get("vo", "?"))
             return instance
         except _get_mpv_errors() as exc:
@@ -146,15 +163,34 @@ class MpvPlayerAdapter:
                 self._mpv.sid = "no"
             except _get_mpv_errors(): pass
 
+            # [v3.23.651] Log crash thật trên Windows: `access violation` trong libmpv/python-mpv trong lúc luồng giao diện
+            # đứng chờ ở `wait_until_playing` (đăng ký observer thuộc tính + Future, callback chạy ở luồng sự kiện).
+            # Nay: đặt pause TRƯỚC khi nạp (không phát tiếng) và chỉ đọc thuộc tính thường để chờ tệp sẵn sàng — không
+            # observer, không Future.
+            with contextlib.suppress(*_get_mpv_errors()):
+                self._mpv.pause = True
             self._mpv.command("loadfile", str(video_path), "replace")
-            with contextlib.suppress(TimeoutError): self._mpv.wait_until_playing(timeout=_LOAD_WAIT_TIMEOUT_SEC)
-
+            self._wait_until_file_ready(_LOAD_WAIT_TIMEOUT_SEC)
             self._mpv.pause = True
             self._loaded_path = video_path
         except _get_mpv_errors() as exc:
             raise RuntimeError(f"Không nạp được video qua mpv: {exc}.") from exc
         except OSError as exc:
             raise RuntimeError(f"Lỗi IO: {exc}") from exc
+
+    def _wait_until_file_ready(self, timeout_sec: float) -> bool:
+        """Chờ tới khi mpv nạp xong tệp (``idle-active`` = False và có ``duration``) bằng đọc thuộc tính thường."""
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        while time.monotonic() < deadline:
+            try:
+                idle = bool(getattr(self._mpv, "idle_active", True))
+                duration = getattr(self._mpv, "duration", None)
+            except _get_mpv_errors():
+                idle, duration = True, None
+            if not idle and duration:
+                return True
+            time.sleep(0.02)
+        return False
 
     def play(self) -> None:
         if not hasattr(self, "_mpv") or self._mpv is None: return

@@ -70,6 +70,13 @@ class InstallCudaRuntimeWorker(QObject):
                 return
             if result.returncode != 0:
                 tail = (result.stderr or result.stdout or "").strip()
+                # [v3.23.547] Ghi TOÀN BỘ đuôi log ra tệp trước khi rút gọn cho hộp thoại:
+                # người dùng chỉ thấy 4 dòng, còn chẩn đoán cần nhiều hơn thế.
+                logger.error(
+                    "Tải CUDA runtime thất bại (mã thoát %s). Đuôi log:\n%s",
+                    result.returncode,
+                    tail[-4000:],
+                )
                 self.failed.emit(
                     "Tải CUDA runtime thất bại:\n"
                     + "\n".join(tail.splitlines()[-4:])
@@ -78,6 +85,7 @@ class InstallCudaRuntimeWorker(QObject):
             self.progress.emit(100, "Hoàn tất.")
             self.finished.emit(self._cuda_dir)
         except subprocess.TimeoutExpired:
+            logger.error("Tải CUDA runtime quá thời gian cho phép (giới hạn 3600s).")
             self.failed.emit("Tải CUDA runtime quá thời gian cho phép (mạng chậm?).")
         except (OSError, ValueError) as exc:
             logger.exception("Lỗi hệ thống khi tải CUDA runtime.")

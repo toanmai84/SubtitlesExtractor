@@ -23,7 +23,7 @@ class TestVideoTokenEstimate:
         captured = {}
 
         def fake_call(model, prompt, config, validator, cancel_cb=None,
-                      video_files=None, est_tokens=0):
+                      video_files=None, est_tokens=0, **_extra):
             captured["est"] = est_tokens
             return {"subtitles": [{"line_no": 1, "text": "x"}]}
 
@@ -45,7 +45,7 @@ class TestVideoTokenEstimate:
         captured = {}
 
         def fake_call(model, prompt, config, validator, cancel_cb=None,
-                      video_files=None, est_tokens=0):
+                      video_files=None, est_tokens=0, **_extra):
             captured["est"] = est_tokens
             return {"subtitles": [{"line_no": 1, "text": "x"}]}
 

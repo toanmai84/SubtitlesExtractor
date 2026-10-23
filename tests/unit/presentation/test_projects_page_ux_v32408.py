@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import pytest
+from unittest.mock import MagicMock
 
 from subtitles_extractor.domain.entities.project_record import ProjectRecord
 from subtitles_extractor.presentation.pages.projects_page import ProjectsPage
+
+
+def _fake_translator() -> MagicMock:
+    """[v3.23.544] Bản giả trả CHUỖI cho ``translate``.
+
+    ``MagicMock()`` trần trả về MagicMock, mà trang truyền thẳng kết quả vào ``QLabel`` /
+    ``QPushButton`` — Qt từ chối vì không phải str. Trả lại chính khoá dịch là đủ cho test giao diện.
+    """
+    translator = MagicMock()
+    translator.translate.side_effect = lambda key, *args, **kwargs: str(key)
+    return translator
 
 
 class _FakeRepo:
@@ -37,7 +49,7 @@ def _app():
 
 
 def test_empty_state_shown_when_no_projects(_app) -> None:
-    page = ProjectsPage(_FakeRepo([]))
+    page = ProjectsPage(_FakeRepo([]), translator=_fake_translator())
     assert page._empty_label.isVisibleTo(page)
     assert not page._table.isVisibleTo(page)
     # Không có lựa chọn -> nút Mở/Xoá tắt
@@ -46,7 +58,9 @@ def test_empty_state_shown_when_no_projects(_app) -> None:
 
 
 def test_table_shown_and_buttons_follow_selection(_app) -> None:
-    page = ProjectsPage(_FakeRepo([_rec("phim1", "h1"), _rec("phim2", "h2")]))
+    page = ProjectsPage(
+        _FakeRepo([_rec("phim1", "h1"), _rec("phim2", "h2")]), translator=_fake_translator()
+    )
     assert page._table.isVisibleTo(page)
     assert not page._empty_label.isVisibleTo(page)
     # Chưa chọn -> nút tắt

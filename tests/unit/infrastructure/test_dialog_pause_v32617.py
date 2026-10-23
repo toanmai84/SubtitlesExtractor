@@ -110,8 +110,9 @@ def test_gemini_both_paths_synced() -> None:
     source = pathlib.Path(
         "src/subtitles_extractor/infrastructure/tts/gemini_tts_adapter.py"
     ).read_text(encoding="utf-8")
-    # Khung dành cho giọng đã trừ pause, ở CẢ 2 đường.
-    assert source.count("available_for_voice = max(0.05, effective_available - pause_s)") == 2
-    assert source.count("voice_dur, available_for_voice") >= 2  # +1 dòng log debug
+    # Khung dành cho giọng đã trừ pause, ở CẢ 2 đường — [v3.23.596] tính trong hàm đặt
+    # câu dùng chung, cả hai đường đều truyền pause vào đó.
+    assert source.count("pause_s=pause_s") >= 2
+    assert "max(0.05, available - pause_s)" in pathlib.Path("src/subtitles_extractor/infrastructure/tts/line_placement.py").read_text(encoding="utf-8")
     # Pause chèn SAU nén, cả 2 đường (không còn prepend trước khi tính tỉ lệ).
     assert source.count("if pause_s > 0.0:") == 2

@@ -41,9 +41,11 @@ def test_on_generate_chặn_khi_đang_nạp() -> None:
     idx = _PAGE_SRC.find("def _on_generate")
     end = _PAGE_SRC.find("def ", idx + 10)
     doan = _PAGE_SRC[idx:end]
-    assert "_vieneu_voice_loader" in doan
-    assert "isRunning()" in doan
+    # [v3.23.650] kiểm tra qua hàm trung tâm `_voice_loader_running` (an toàn khi đối tượng C++ đã bị deleteLater).
+    assert "_voice_loader_running()" in doan
     assert "Đang nạp giọng" in doan
+    helper = _PAGE_SRC[_PAGE_SRC.find("def _voice_loader_running"):_PAGE_SRC.find("def _on_vieneu_voices_loaded")]
+    assert "_vieneu_voice_loader" in helper and "isRunning()" in helper
 
 
 def test_update_action_states_tôn_trọng_loader() -> None:
@@ -52,7 +54,7 @@ def test_update_action_states_tôn_trọng_loader() -> None:
     doan = _PAGE_SRC[idx:end]
     # Chỉ khoá khi engine hiện tại là VieNeu VÀ loader đang chạy.
     assert "_ENGINE_VIENEU" in doan
-    assert "isRunning()" in doan
+    assert "_voice_loader_running()" in doan
 
 
 def test_bật_lại_nút_khi_nạp_xong() -> None:

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
+
+from subtitles_extractor.infrastructure.database.db_guard import prepare_database
 import threading
 from pathlib import Path
 
@@ -33,6 +35,8 @@ class SqliteTranslationMemoryStore:
         """
         self._db_path = str(db_path)
         self._lock: threading.RLock = threading.RLock()
+        # [v3.23.649] Kiểm tra / sao lưu / tự phục hồi tệp trước khi kết nối.
+        prepare_database(self._db_path, background=True)
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with contextlib.suppress(sqlite3.Error):

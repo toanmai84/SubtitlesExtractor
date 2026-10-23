@@ -24,9 +24,11 @@ class TestDependencyDoctor:
 
     def test_whisperx_missing_in_sandbox(self) -> None:
         report = check_whisperx()
-        # Sandbox không cài whisperx → MISSING_PACKAGE + có lệnh pip.
+        # Sandbox không có whisperx_env → MISSING_PACKAGE.
         assert report.status == DependencyStatus.MISSING_PACKAGE
-        assert report.pip_args == ("whisperx",)
+        # [v3.23.335] KHÔNG có pip_args (cố ý): auto-install whisperx vào env chính sẽ hạ cấp
+        # huggingface-hub làm hỏng VieNeu/Paddle → chỉ hướng dẫn tạo env riêng.
+        assert report.pip_args == ()
         assert "whisperx" in report.install_hint.lower()
 
     def test_full_diagnosis_lists_all(self) -> None:

@@ -74,7 +74,7 @@ class TestBug6LoadVideoErrorShown:
     """Bug 6: ``load_video`` show InfoBar.error nếu exception."""
 
     def test_infobar_error_called_on_exception(self, editor_source: str) -> None:
-        idx = editor_source.index("def load_video(self, path: Path)")
+        idx = editor_source.index("def load_video(self, path")
         snippet = editor_source[idx:idx + 2000]
         # Phải có InfoBar.error trong except block.
         assert "InfoBar.error(" in snippet

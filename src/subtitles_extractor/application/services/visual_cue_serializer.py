@@ -70,3 +70,32 @@ def deserialize_visual_cues(raw: str | None) -> list[VisualCue]:
         )
     cues.sort(key=lambda cue: cue.line_no)
     return cues
+
+
+def remap_visual_cues_to_subset(raw: str | None, positions: list[int]) -> str:
+    """[v3.23.609] Visual Cues cho một TẬP CON dòng, đánh số lại theo tập con (hàm thuần).
+
+    Cues gắn theo số thứ tự dòng của cả phim. "Dịch lại các dòng đã chọn" gửi tập con mà
+    khâu dịch đánh số lại 1..k, nên nếu chuyển nguyên cues thì dòng thứ nhất của tập con
+    (vd dòng 723 của phim) nhận người nói/người nghe của dòng 1 của phim → sai xưng hô.
+
+    Args:
+        raw: JSON Visual Cues của cả phim.
+        positions: Vị trí (từ 0) trong cả phim của từng dòng tập con, theo thứ tự gửi.
+
+    Returns:
+        JSON Visual Cues chỉ gồm các dòng của tập con, ``line_no`` theo tập con; rỗng
+        nếu không còn cue nào.
+    """
+    by_line = {cue.line_no: cue for cue in deserialize_visual_cues(raw)}
+    remapped = [
+        VisualCue(
+            line_no=subset_no,
+            speaker=by_line[position + 1].speaker,
+            addressee=by_line[position + 1].addressee,
+            scene=by_line[position + 1].scene,
+        )
+        for subset_no, position in enumerate(positions, start=1)
+        if position + 1 in by_line
+    ]
+    return serialize_visual_cues(remapped) if remapped else ""

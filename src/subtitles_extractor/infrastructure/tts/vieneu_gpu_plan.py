@@ -58,19 +58,31 @@ TORCH_PATH_REQUIREMENTS: Final[tuple[str, ...]] = (
 #:
 #: [v3.23.346] Dùng ``vieneu[legacy]`` chứ KHÔNG phải ``vieneu`` trần. Metadata của gói
 #: khai báo ``transformers`` chỉ ở extra ``legacy``, nên bản trần KHÔNG cài transformers
-#: — mà đường PyTorch (đường DUY NHẤT chạy được GPU) lại cần nó. Log thực tế cho thấy
-#: hậu quả: worker thất bại 55 lần liên tiếp với "Try: pip install transformers -U".
+#: — mà đường PyTorch (đường DUY NHẤT chạy được GPU) lại cần nó.
 #:
-#: [v3.23.373] GHIM TRẦN ``transformers``. WhisperX cài ``torch`` bản CUDA rồi bị chính
-#: whisperx ghim xuống bản cũ hơn; nếu ``vieneu[legacy]`` kéo ``transformers`` MỚI NHẤT thì
-#: nó import các symbol torch quá mới (``ScalingType`` từ ``torch.nn.functional``) → worker
-#: GPU chết bằng ImportError và rơi về ONNX/CPU. Trần này giữ ``transformers`` khớp torch
-#: mà whisperx_env thực có, để đường PyTorch/GPU import được.
-VIENEU_TRANSFORMERS_SPEC: Final[str] = "transformers<4.56"
+#: [v3.23.410] GỠ pin ``transformers`` (trước đây ghim ``<4.53`` ở v373/400–403). Điều tra
+#: v3.23.405–406 đã xác định THỦ PHẠM thật của lỗi ``ScalingType`` KHÔNG phải transformers
+#: (transformers 4.52.4 sạch), mà là một gói trong chuỗi vieneu[legacy] (build cho torch
+#: nightly) import symbol FP8 chỉ-có-ở-nightly. Đã trị GỐC bằng SHIM
+#: (``vieneu_gpu_subprocess._shim_torch_scaling_type``) tiêm các symbol đó vào
+#: ``torch.nn.functional``. Vì vậy KHÔNG cần ghim transformers nữa → để vieneu[legacy] cài
+#: deps tự nhiên (bản mới nhất 3.2.8+, sạch, đúng ý tác giả gói).
+#:
+#: Giữ hằng ``VIENEU_TRANSFORMERS_SPEC`` cho cơ chế auto-repair cũ (nay DORMANT vì shim đã
+#: thông import — worker GPU không còn thất bại theo hint transformers), phòng trường hợp môi
+#: trường lạ vẫn cần hạ khẩn cấp.
+VIENEU_TRANSFORMERS_SPEC: Final[str] = "transformers<4.53"
 VIENEU_INSTALL_SPECS: Final[tuple[str, ...]] = (
-    "vieneu[legacy]",
-    "sea-g2p",
-    VIENEU_TRANSFORMERS_SPEC,
+    # [v3.23.423] Ghim khoảng 3.x: vẫn lấy bản mới nhất 3.x (đã kiểm chứng API v3turbo:
+    # infer/infer_batch/list_preset_voices/get_preset_voice/encode_reference ổn định từ 3.2→3.3),
+    # nhưng CHẶN 4.0 (có thể đổi/bỏ API v3turbo, phá vỡ worker GPU). `_supported_infer_params`
+    # chịu được thêm/bớt THAM SỐ, nhưng đổi tên PHƯƠNG THỨC/mode thì cần ghim này bảo vệ.
+    #
+    # [v3.23.626] Sàn nâng lên 3.8.3 (bản mới nhất 10/2026): 3.8.0 sửa lỗi bộ mã hoá nối thêm
+    # frame đệm 455 NGHE ĐƯỢC vào clip giọng mẫu (nhân bản giọng + 25 giọng preset mới), 3.8.1-3.8.2
+    # đổi tên giọng (kèm bí danh), 3.8.3 siết chặt phần phục vụ. sea-g2p ≥ 0.9.1 theo pyproject.
+    "vieneu[legacy]>=3.8.3,<4",
+    "sea-g2p>=0.9.1",
 )
 
 #: Tên gói dùng để KIỂM đã cài hay chưa (bỏ phần extra trong ngoặc vuông).
@@ -235,6 +247,26 @@ def repair_command(python_exe: str) -> tuple[str, ...]:
         Lệnh pip cần chạy.
     """
     return (python_exe, "-m", "pip", "install", "--upgrade", *VIENEU_INSTALL_SPECS)
+
+
+def build_transformers_repair_command(python_exe: str) -> tuple[str, ...]:
+    """[v3.23.401] Lệnh FORCE hạ ``transformers`` về bản khớp torch (sửa env CŨ đã cài bản mới).
+
+    Khác ``repair_command``: dùng ``--force-reinstall --no-deps`` để ĐẢM BẢO đổi đúng phiên bản
+    ``transformers`` kể cả khi env đã có sẵn bản mới hơn. ``--no-deps`` để KHÔNG đụng tới
+    ``torch`` (đúng phần cần giữ nguyên — chỉ hạ transformers cho khớp).
+
+    Args:
+        python_exe: Trình thông dịch của ``whisperx_env``.
+
+    Returns:
+        Lệnh pip cần chạy.
+    """
+    return (
+        python_exe, "-m", "pip", "install",
+        "--force-reinstall", "--no-deps",
+        VIENEU_TRANSFORMERS_SPEC,
+    )
 
 
 def why_onnxruntime_gpu_does_not_help() -> str:

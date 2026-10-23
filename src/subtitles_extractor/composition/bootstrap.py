@@ -72,9 +72,24 @@ def _prepare_process_for_paddle() -> None:
     install_torch_import_blocker()
 
 
+def _install_crash_hooks(log_dir: Path) -> None:
+    """[v3.23.643] Cài hook ghi ngoại lệ chưa bắt + faulthandler (lỗi cài hook không được chặn khởi động)."""
+    try:
+        from subtitles_extractor.infrastructure.logging.crash_hooks import install_crash_hooks
+
+        from subtitles_extractor.infrastructure.logging.crash_hooks import begin_session
+
+        install_crash_hooks(log_dir)
+        begin_session(log_dir)  # [v3.23.650] dấu "đang chạy" — còn lại ở lần sau = kết thúc bất thường
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không cài được hook ghi lỗi chưa bắt: %s.", exc)
+
+
 def bootstrap_for_gui(*, organization: str = "SubtitlesExtractor", application_name: str = "PaddleOCR", log_level: int = logging.INFO) -> ApplicationContainer:
     user_dir = _resolve_user_data_dir(application_name)
     setup_logging(level=log_level, log_dir=user_dir / "logs")
+    # [v3.23.643] Ngoại lệ chưa bắt (slot Qt, luồng nền) và crash native phải để lại dấu vết trong nhật ký.
+    _install_crash_hooks(user_dir / "logs")
     _inject_mpv_dll_path_if_available(user_dir)
 
     # [v3.23] KHÔNG import torch ở tiến trình chính nữa. WhisperX chạy ở TIẾN TRÌNH
@@ -99,7 +114,7 @@ def bootstrap_for_gui(*, organization: str = "SubtitlesExtractor", application_n
     try:
         from loguru import logger as _loguru_logger
 
-        _loguru_logger.add(container.log_bridge.loguru_sink, level="DEBUG", enqueue=True)
+        container.log_bridge.attach(_loguru_logger, level="DEBUG")
         logger.debug("Đã gắn cầu nối log Loguru → trang Nhật ký.")
     except (ImportError, ValueError) as exc:
         logger.warning("Không gắn được cầu nối log cho trang Nhật ký: %s.", exc)
@@ -148,6 +163,8 @@ def _apply_saved_ui_settings(container: ApplicationContainer) -> None:
 def bootstrap_for_cli(*, config_file: Path | None = None, log_level: int = logging.INFO) -> ApplicationContainer:
     user_dir = _resolve_user_data_dir()
     setup_logging(level=log_level, log_dir=user_dir / "logs")
+    # [v3.23.643] Ngoại lệ chưa bắt (slot Qt, luồng nền) và crash native phải để lại dấu vết trong nhật ký.
+    _install_crash_hooks(user_dir / "logs")
     _inject_mpv_dll_path_if_available(user_dir)
     # [v3.23.394] Chuẩn bị paddle GIỐNG bootstrap_for_gui (sys.path lõi paddle tải-lúc-chạy +
     # cuDNN + chặn torch) — nếu không, đường CLI/headless sẽ không import được paddle.

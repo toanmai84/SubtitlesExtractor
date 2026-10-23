@@ -83,8 +83,13 @@ class OcrBasedAutoRoiDetector:
         show_review_ui: bool = True,
         parent_widget: object | None = None,
         analyzer_kwargs_provider: "Callable[[], dict] | None" = None,
+        analysis_max_side: int | None = None,
     ) -> None:
         self._ocr_engine = ocr_engine
+        # [v3.23.619] Cạnh dài tối đa của khung khi OCR để DÒ VỊ TRÍ phụ đề (None = nguyên
+        # cỡ). Bước này chỉ cần toạ độ các ô chữ, không cần đọc đúng chữ; khung được thu
+        # nhỏ trước khi OCR rồi quy toạ độ về khung gốc. Bước trích xuất chính không đổi.
+        self._analysis_max_side = analysis_max_side
         self._frame_sampler = frame_sampler
         self._show_review_ui = show_review_ui
         self._parent_widget = parent_widget
@@ -342,9 +347,10 @@ class OcrBasedAutoRoiDetector:
         def _flush_ocr_batch() -> None:
             if not batch_rgb_images:
                 return
+            analysis_images, scale = self._shrink_for_analysis(batch_rgb_images)
             try:
                 ocr_results = self._ocr_engine.infer_batch(
-                    images_rgb=batch_rgb_images,
+                    images_rgb=analysis_images,
                     frame_indices=batch_frame_indices,
                     timestamps_sec=batch_timestamps_sec,
                 )
@@ -374,7 +380,9 @@ class OcrBasedAutoRoiDetector:
                     continue
 
                 for text_box in valid_boxes:
-                    x_min, y_min, x_max, y_max = text_box.bounding_box  # type: ignore[misc]
+                    x_min, y_min, x_max, y_max = (
+                        v / scale for v in text_box.bounding_box  # type: ignore[union-attr]
+                    )
                     all_raw_bboxes.append(
                         RawBBox(
                             coord_x_min=float(x_min),
@@ -412,7 +420,7 @@ class OcrBasedAutoRoiDetector:
                     metadata, roi=None, config=temp_sampling_config
                 )
             ):
-                if sampled_frame.is_duplicate or sampled_frame.is_error:
+                if sampled_frame.is_duplicate or sampled_frame.is_error or sampled_frame.is_blank:
                     continue
                 if iteration_idx > _MAX_ITERATIONS_FOR_AUTO_ROI:
                     logger.info(
@@ -452,6 +460,20 @@ class OcrBasedAutoRoiDetector:
             rgb_img for _, _, rgb_img in all_top_entries[:_COMPOSITE_FRAME_COUNT]
         ]
         return top_rgb_images, all_raw_bboxes
+
+    def _shrink_for_analysis(
+        self, images: list[np.ndarray]
+    ) -> tuple[list[np.ndarray], float]:
+        """Thu nhỏ khung để cạnh dài ≤ ``analysis_max_side``; trả (ảnh, tỉ lệ đã thu)."""
+        limit = self._analysis_max_side
+        if not limit or not images:
+            return images, 1.0
+        height, width = images[0].shape[:2]
+        scale = limit / max(height, width)
+        if scale >= 1.0:
+            return images, 1.0
+        size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        return [cv2.resize(img, size, interpolation=cv2.INTER_AREA) for img in images], scale
 
     def _build_composite_image(
         self, top_rgb_images: list[np.ndarray], width: int, height: int

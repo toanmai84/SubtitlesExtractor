@@ -14,6 +14,9 @@ from pathlib import Path
 
 import pytest
 
+from subtitles_extractor.infrastructure.translation import (
+    gemini_video_context as video_context_module,
+)
 from subtitles_extractor.infrastructure.translation.gemini_video_context import (
     GeminiVideoContextProvider,
     VideoChunk,
@@ -64,7 +67,18 @@ def test_gpu_full_failure_remembered_per_source(provider, tmp_path, monkeypatch)
         out.write_bytes(b"0" * 2048)
         return subprocess.CompletedProcess(cmd, 0)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    # [v3.23.547] v3.23.461 đổi seam: encode gọi ``run_ffmpeg_hardened`` (Popen + kill
+    # cây tiến trình) thay cho ``subprocess.run``. Vá đúng seam mới, nếu không bộ kiểm
+    # sẽ gọi ffmpeg THẬT và đỏ vì không có file video.
+    monkeypatch.setattr(video_context_module, "run_ffmpeg_hardened", fake_run)
+    # [v3.23.462] Sau khi chạy xong, encode còn XÁC NHẬN file ra có KHUNG VIDEO thật
+    # (tier CPU-nhanh có thể ra file chỉ-audio). File giả 2KB ở đây không qua được bước
+    # đó, nên khoá luôn kết quả xác nhận — bài kiểm này xét cơ chế NHỚ tầng GPU hỏng.
+    monkeypatch.setattr(
+        GeminiVideoContextProvider,
+        "_output_has_video_frames",
+        lambda _self, _ffmpeg, _path: True,
+    )
     provider._encode_low_res_chunk("ffmpeg", source, chunk)
 
     assert str(source) in provider._gpu_full_failed_sources

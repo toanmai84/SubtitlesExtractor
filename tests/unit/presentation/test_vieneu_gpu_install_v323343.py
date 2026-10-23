@@ -127,12 +127,25 @@ def test_worker_module_is_valid() -> None:
 
 # ── Hai lỗi build script đã sửa ──────────────────────────────────────────────
 def test_only_one_bundle_check_in_build_script() -> None:
-    """Từng có HAI khối kiểm bundle gọi hai công cụ trùng chức năng."""
+    """Từng có HAI khối kiểm bundle gọi hai công cụ trùng chức năng.
+
+    [v3.23.547] Đếm số LẦN CHẠY công cụ, không đếm số lần chuỗi ``check_bundle`` xuất
+    hiện: kịch bản build nay còn chú thích và dòng ``echo`` nhắc tới tên công cụ (giải
+    thích vì sao chế độ one-file bỏ qua bước này) — đó là tài liệu, không phải lời gọi
+    trùng lặp mà bộ kiểm muốn chặn.
+    """
     script = _project_root() / "build_windows.bat"
     if not script.is_file():
         pytest.skip("Không tìm thấy build_windows.bat")
     text = script.read_text(encoding="utf-8", errors="replace")
-    assert text.count("check_bundle") == 1
+
+    invocations = [
+        line.strip()
+        for line in text.splitlines()
+        if "check_bundle.py" in line
+        and not line.lstrip().upper().startswith(("REM", "ECHO"))
+    ]
+    assert len(invocations) == 1, f"Có {len(invocations)} lời gọi: {invocations}"
 
 
 def test_duplicate_bundle_tool_removed() -> None:

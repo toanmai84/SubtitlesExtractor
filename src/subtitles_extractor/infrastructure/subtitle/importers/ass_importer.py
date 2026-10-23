@@ -11,10 +11,12 @@ import logging
 import re
 from pathlib import Path
 
+from subtitles_extractor.application.services.bidi_marks import strip_rtl_marks
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
 from subtitles_extractor.infrastructure.subtitle.encoding_detect import (
     read_subtitle_text,
 )
+from subtitles_extractor.domain.exceptions import ConfigurationError
 from subtitles_extractor.domain.value_objects.confidence import Confidence
 from subtitles_extractor.domain.value_objects.time_interval import TimeInterval
 
@@ -86,13 +88,18 @@ def _parse_ass(content: str):
         except (KeyError, ValueError):
             continue
 
-        text = _clean_ass_text(text_raw)
+        # [v3.23.610] Gỡ dấu định hướng do bản xuất của ứng dụng thêm vào dòng RTL.
+        text = strip_rtl_marks(_clean_ass_text(text_raw))
         if not text:
             continue
         try:
             interval = TimeInterval(start_sec=start_sec, end_sec=end_sec)
-        except ValueError:
-            continue
+        except ConfigurationError:
+            # [v3.23.650] ConfigurationError không phải ValueError: end < start làm cả tệp không nạp được.
+            if start_sec >= 0 and end_sec < start_sec:
+                interval = TimeInterval(start_sec=start_sec, end_sec=start_sec + 0.5)
+            else:
+                continue
 
         yield SubtitleEvent(
             index=counter,

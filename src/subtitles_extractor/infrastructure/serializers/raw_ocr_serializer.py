@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -70,7 +71,7 @@ class RawOcrMeta:
     score_threshold: float
     saved_at: str
     roi_xywh: list[int] | None = None
-    app_version: str = "3.23.399"
+    app_version: str = "3.23.651"
     preprocess: dict[str, Any] | None = None
     advanced_ocr: dict[str, Any] | None = None
 
@@ -142,15 +143,20 @@ def load_raw_ocr(input_path: Path) -> tuple[list[OcrFrameResult], RawOcrMeta]:
         raise FileNotFoundError(f"Không tìm thấy file: {input_path}")
 
     if input_path.suffix.lower() == ".gz":
-        with gzip.open(input_path, "rb") as fp:
-            raw_bytes = fp.read()
+        try:
+            with gzip.open(input_path, "rb") as fp:
+                raw_bytes = fp.read()
+        except (EOFError, zlib.error) as exc:   # [v3.23.638] tệp .gz cụt / hỏng giữa chừng
+            raise ValueError(f"File nén không hợp lệ: {exc}") from exc
     else:
         raw_bytes = input_path.read_bytes()
 
     try:
         payload = json.loads(raw_bytes.decode("utf-8"))
-    except json.JSONDecodeError as exc:
+    except ValueError as exc:   # [v3.23.638] gồm UnicodeDecodeError (tệp nhị phân / sai bảng mã)
         raise ValueError(f"File JSON không hợp lệ: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("File JSON không hợp lệ: gốc phải là một đối tượng.")
 
     version = payload.get("version", "")
     if not _is_compatible_version(version):

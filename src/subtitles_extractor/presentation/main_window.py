@@ -17,6 +17,7 @@ from PySide6.QtCore import QSize, Signal
 from PySide6.QtGui import QCloseEvent
 from subtitles_extractor.presentation.fluent_compat import FluentIcon, FluentWindow, NavigationItemPosition
 
+from subtitles_extractor.application.services.dubbing_cast import DubbingSource
 from subtitles_extractor.composition.container import ApplicationContainer
 from subtitles_extractor.domain.entities.project_record import WorkflowStage
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
@@ -114,6 +115,9 @@ class MainWindow(FluentWindow):
         # Cho trang TTS lấy phụ đề từ Biên tập và bản dịch từ trang Dịch.
         self._tts_page.set_editor_event_provider(self._collect_editor_events)
         self._tts_page.set_translate_event_provider(self._collect_translated_events)
+        self._tts_page.set_dubbing_source_provider(self._collect_dubbing_source)
+        # [v3.23.629] Khoá API + model + ngôn ngữ cho nút "Rút gọn dòng quá dài (AI)" của trang TTS.
+        self._tts_page.set_shorten_provider(self._collect_shorten_settings)
         # Liên thông: TTS xong → lưu đường dẫn WAV + cài đặt vào dự án.
         self._tts_page.tts_completed.connect(self._persist_tts_project)
         # [v3.23.315] Trang Xuất bản lấy dữ liệu từ 3 trang trước.
@@ -134,6 +138,10 @@ class MainWindow(FluentWindow):
         self._settings_page.view_model.ui_changed.connect(
             self._editor_page.apply_ui_settings
         )
+        # [v3.23.645] "Đo tốc độ OCR → Áp dụng" ghi thẳng vào cài đặt: form Cài đặt phải nạp lại.
+        self._extract_page._view_model.benchmark_settings_applied.connect(
+            self._settings_page.view_model.reload
+        )
 
         # [v3.23.316] Theo dõi trang trước để biết lúc nào người dùng RỜI một trang.
         self._previous_page: object | None = None
@@ -149,6 +157,10 @@ class MainWindow(FluentWindow):
         from PySide6.QtCore import QTimer
 
         QTimer.singleShot(800, self._maybe_prompt_paddle_download)
+        # [v3.23.649] Cơ sở dữ liệu bị hỏng đã được tự phục hồi lúc khởi động → báo cho người dùng biết (một lần).
+        QTimer.singleShot(1200, self._notify_database_recovery)
+        # [v3.23.650] Lần chạy trước kết thúc bất thường (crash native / bị tắt đột ngột) → chỉ chỗ lấy nhật ký.
+        QTimer.singleShot(2500, self._notify_previous_crash)
 
     def _install_workflow_bar(self) -> None:
         """Chèn thanh tiến độ quy trình lên PHÍA TRÊN vùng nội dung.
@@ -188,6 +200,45 @@ class MainWindow(FluentWindow):
             self._refresh_workflow_bar()
         except Exception as exc:  # noqa: BLE001 — không có thanh vẫn dùng app được
             logger.warning("Không gắn được thanh tiến độ quy trình: %s", exc)
+
+    def _notify_previous_crash(self) -> None:
+        """[v3.23.650] Báo (không modal) nếu lần chạy trước kết thúc bất thường, kèm đường dẫn nhật ký."""
+        try:
+            from subtitles_extractor.infrastructure.logging.crash_hooks import pop_previous_crash
+
+            info = pop_previous_crash()
+            if not info:
+                return
+            fault_log = info.get("fault_log")
+            where = str(fault_log) if fault_log else str(info.get("log_dir"))
+            from subtitles_extractor.presentation.fluent_compat import InfoBar, InfoBarPosition
+
+            InfoBar.warning(
+                title="Lần chạy trước bị tắt đột ngột",
+                content=(
+                    f"Nhật ký lỗi: {where} — gửi tệp này (và app.log cùng thư mục) cho người phát triển để sửa."
+                    + (" Trình phát mpv bị crash nên TẠM TẮT (dùng trình xem dự phòng); xoá tệp mpv_disabled.flag trong thư mục logs để bật lại."
+                       if info.get("mpv_disabled") else "")
+                ),
+                parent=self, position=InfoBarPosition.TOP_RIGHT, duration=20000,
+            )
+        except Exception as exc:  # noqa: BLE001 - thông báo chẩn đoán không được làm hỏng khởi động
+            logger.debug("Không báo được lần chạy trước bất thường: %s.", exc)
+
+    def _notify_database_recovery(self) -> None:
+        """[v3.23.649] Báo người dùng nếu tệp cơ sở dữ liệu hỏng và đã được phục hồi/dựng lại lúc khởi động."""
+        from subtitles_extractor.infrastructure.database.db_guard import pop_notices
+
+        notices = pop_notices()
+        if not notices:
+            return
+        from PySide6.QtWidgets import QMessageBox
+
+        QMessageBox.warning(
+            self, "Cơ sở dữ liệu đã được phục hồi",
+            "\n\n".join(notices)
+            + "\n\nTệp hỏng không bị xoá — bạn có thể gửi lại cho người phát triển nếu cần cứu thêm dữ liệu.",
+        )
 
     def _maybe_prompt_paddle_download(self) -> None:
         """[v3.23.388] Nhắc tải lõi OCR (paddle) nếu bản build chưa kèm và chưa tải.
@@ -357,8 +408,12 @@ class MainWindow(FluentWindow):
             if current_video_metadata is not None:
                 if loaded:
                     self._editor_page.load_video(current_video_metadata.path)
-                # Luôn lưu vào dự án dù người dùng giữ bản đang sửa -> kết quả không mất.
-                self._persist_extracted_project(current_video_metadata.path, events)
+                    # Luôn lưu vào dự án dù người dùng giữ bản đang sửa -> kết quả không mất.
+                    self._persist_extracted_project(current_video_metadata.path, events)
+                else:
+                    # [v3.23.650] Giữ bản đang sửa: Editor vẫn là phim CŨ. Chỉ lưu bản ghi dự án của phim mới, KHÔNG
+                    # đổi `_current_video_hash` / gợi ý nguồn Dịch & TTS (đã gây ghi dữ liệu phim cũ vào dự án phim mới).
+                    self._persist_extracted_project(current_video_metadata.path, events, adopt_as_current=False)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Không thể tự động đồng bộ Video Preview: %s.", exc)
 
@@ -375,7 +430,7 @@ class MainWindow(FluentWindow):
         )
 
     def _persist_extracted_project(
-        self, video_path: str, events: list[SubtitleEvent]
+        self, video_path: str | Path, events: list[SubtitleEvent], *, adopt_as_current: bool = True
     ) -> None:
         """Lưu phụ đề gốc vào CSDL theo hash video để có thể mở lại sau này."""
         try:
@@ -389,7 +444,6 @@ class MainWindow(FluentWindow):
             from subtitles_extractor.infrastructure.video.video_hasher import (
                 compute_video_hash,
             )
-            from pathlib import Path
 
             video_hash = compute_video_hash(video_path)
             srt_text = SrtExporter._build_content(events)
@@ -418,9 +472,10 @@ class MainWindow(FluentWindow):
             if record.stage < WorkflowStage.EXTRACTED:
                 record.stage = WorkflowStage.EXTRACTED
             repo.save(record)
-            self._current_video_hash = video_hash
-            self._tts_page.suggest_output_path(video_path)
-            self._translate_page.suggest_source_path(video_path)
+            if adopt_as_current:
+                self._current_video_hash = video_hash
+                self._tts_page.suggest_output_path(video_path)
+                self._translate_page.suggest_source_path(video_path)
             self._projects_page.refresh()
             logger.info(
                 "Đã lưu dự án '%s' (hash %s) vào thư viện.",
@@ -441,13 +496,23 @@ class MainWindow(FluentWindow):
                 events = list(_parse_srt(record.original_subtitle))
                 if events:
                     loaded = self._editor_page.load_events(events)
+                    if not loaded:
+                        # [v3.23.613] Người dùng GIỮ bản đang sửa: không đổi video và
+                        # dự án hiện hành — nếu đổi, bảng phụ đề (phim cũ) đi cùng
+                        # video/dự án mới, các khâu sau ghi vào nhầm dự án.
+                        logger.info(
+                            "Giữ bản đang sửa — không mở dự án %s.",
+                            getattr(record, "video_name", ""),
+                        )
+                        return
             except (ValueError, AttributeError) as exc:
                 logger.warning("Không nạp được phụ đề gốc của dự án: %s.", exc)
 
         video_path = getattr(record, "video_path", "")
         if video_path:
             try:
-                self._editor_page.load_video(video_path)
+                # Đường dẫn lưu trong CSDL là chuỗi; trình chỉnh sửa dùng Path.
+                self._editor_page.load_video(Path(video_path))
             except Exception:  # noqa: BLE001
                 logger.debug("Bỏ qua nạp video preview cho dự án mở lại.")
             self._tts_page.suggest_output_path(video_path)
@@ -649,6 +714,32 @@ class MainWindow(FluentWindow):
         """Cung cấp bản dịch từ trang Dịch cho trang TTS."""
         return self._translate_page._view_model.translated_events
 
+    def _collect_shorten_settings(self) -> tuple[str, str, str]:
+        """[v3.23.629] ``(khoá API Gemini, model, ngôn ngữ đích)`` từ trang Dịch cho bước rút gọn."""
+        page = self._translate_page
+        return (
+            page._combined_keys_text(), "gemini-3.1-flash-lite",
+            page._lang_combo.currentText() or "Vietnamese",
+        )
+
+    def _collect_dubbing_source(self) -> DubbingSource:
+        """[v3.23.593] Ngữ cảnh phân vai lồng tiếng cho trang TTS.
+
+        Visual Cues đánh số theo câu GỐC của trang Dịch, nên kèm mốc thời gian từng câu
+        gốc để trang TTS ghép đúng dòng (kể cả khi bản dịch đã chỉnh mốc).
+        """
+        characters, visual_cues = self._translate_page.get_speaker_context()
+        source_events = self._translate_page._view_model.source_events
+        spans = tuple(
+            (float(event.start_sec), float(event.end_sec)) for event in source_events
+        )
+        # [v3.23.599] Câu gốc để soát người nói (tiếng gọi tên chính người được gán).
+        texts = tuple(str(getattr(event, "text", "") or "") for event in source_events)
+        return DubbingSource(
+            characters=characters, visual_cues=visual_cues, source_spans=spans,
+            source_texts=texts,
+        )
+
     def _push_translated_to_editor(self, events: list[SubtitleEvent]) -> None:
         """Nhận bản dịch từ trang Dịch, nạp vào trang Biên tập.
 
@@ -716,8 +807,26 @@ class MainWindow(FluentWindow):
         )
         logger.info("Debugger: Đã nạp %d câu phụ đề vào Editor.", len(events))
 
+    def _page_objects(self) -> list[object]:
+        names = ("_extract_page", "_editor_page", "_translate_page", "_tts_page", "_publish_page", "_settings_page",
+                 "_debug_page", "_projects_page", "_log_page")
+        return [page for page in (getattr(self, n, None) for n in names) if page is not None]
+
     def _collect_close_warnings(self) -> list[str]:
         """[v3.23.113] Liệt kê các việc sẽ mất nếu thoát ngay (để hỏi xác nhận)."""
+        warnings = self._collect_base_close_warnings()
+        try:
+            from subtitles_extractor.presentation.workers.thread_shutdown import running_threads
+
+            # Chỉ xét luồng mà TRANG giữ bằng thuộc tính (xuất bản/ghép/cài đặt/rút gọn/nạp giọng): `findChildren`
+            # còn gồm luồng hạ tầng luôn chạy của sóng âm → lần đóng nào cũng hiện hộp xác nhận.
+            if running_threads(None, self._page_objects()):
+                warnings.append("• Có tác vụ nền đang chạy (xuất bản/ghép video, cài đặt, rút gọn AI…) — sẽ bị huỷ")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Không kiểm được luồng nền khi đóng: %s.", exc)
+        return warnings
+
+    def _collect_base_close_warnings(self) -> list[str]:
         return _build_close_warnings(
             getattr(self, "_editor_page", None),
             getattr(self, "_extract_page", None),
@@ -768,11 +877,21 @@ class MainWindow(FluentWindow):
 
         try:
             # ── Bước 1: Yêu cầu hủy tất cả tác vụ đang chạy ──
-            if hasattr(self._extract_page, "cancel_extraction"):
+            if hasattr(self._extract_page, "begin_shutdown"):
+                self._extract_page.begin_shutdown()
+            elif hasattr(self._extract_page, "cancel_extraction"):
                 self._extract_page.cancel_extraction()
 
             if hasattr(self._editor_page, "cancel_reocr"):
                 self._editor_page.cancel_reocr()
+
+            # [v3.23.619] Đóng hẳn cửa sổ video tách (F11) — nếu còn, ứng dụng không thoát
+            # (Qt chờ cửa sổ cuối cùng đóng) và chạy ngầm sau khi đã dọn container.
+            if hasattr(self._editor_page, "dispose_detached_window"):
+                try:
+                    self._editor_page.dispose_detached_window()
+                except RuntimeError as exc:
+                    logger.debug("Lỗi khi đóng cửa sổ video tách: %s.", exc)
 
             # [v3.7 fix Q2] Dọn worker dịch (huỷ + chờ) để tránh crash
             # "QThread: Destroyed while thread is still running" khi đang dịch.
@@ -790,6 +909,17 @@ class MainWindow(FluentWindow):
                     waveform.close_widget()
                 except (RuntimeError, AttributeError) as exc:
                     logger.debug("Lỗi khi đóng waveform widget: %s.", exc)
+
+            # [v3.23.650] Giải phóng tường minh mọi lõi mpv TRƯỚC khi Qt huỷ HWND (slot `destroyed` không bao giờ
+            # chạy và widget con không nhận closeEvent → lõi mpv sống tiếp trên cửa sổ đã chết).
+            try:
+                from subtitles_extractor.presentation.widgets.mpv_video_widget import release_all_mpv_players
+
+                released = release_all_mpv_players()
+                if released:
+                    logger.info("Đã giải phóng %d lõi mpv.", released)
+            except (ImportError, RuntimeError, AttributeError) as exc:
+                logger.debug("Không giải phóng được mpv khi đóng: %s.", exc)
 
             # ── Bước 2: CHỜ threads kết thúc TRƯỚC khi shutdown container ──
             # CRITICAL: container.shutdown() giải phóng GPU model. Nếu gọi khi
@@ -813,6 +943,14 @@ class MainWindow(FluentWindow):
                         logger.warning("Extract thread không kết thúc đúng hạn — buộc terminate.")
                         extract_thread.terminate()
                         extract_thread.wait(2000)
+
+                bench_thread = getattr(vm, "active_benchmark_thread", None)
+                if bench_thread is not None and bench_thread.isRunning():
+                    logger.info("Chờ luồng đo tốc độ OCR kết thúc...")
+                    _pump_ui()
+                    if not bench_thread.wait(_THREAD_WAIT_MS):
+                        bench_thread.terminate()
+                        bench_thread.wait(2000)
 
                 detect_thread = getattr(vm, "active_detect_thread", None)
                 if detect_thread is not None and detect_thread.isRunning():
@@ -861,6 +999,26 @@ class MainWindow(FluentWindow):
                     "tiếp tục shutdown.",
                     thread_pool.activeThreadCount(),
                 )
+
+            # [v3.23.650] SAU Bước 2 (OCR được chờ 8 s thay vì 4 s trước khi terminate): dừng MỌI luồng nền còn lại (xuất bản/ghép video, cài đặt, rút gọn AI, nạp giọng…):
+            # cửa sổ bị huỷ khi chúng còn chạy ⇒ Qt abort() ("Destroyed while thread is still running").
+            try:
+                from subtitles_extractor.presentation.workers.thread_shutdown import (
+                    request_cancel_workers,
+                    running_threads,
+                    stop_threads,
+                )
+
+                pages = self._page_objects()
+                request_cancel_workers(pages)
+                leftovers = running_threads(self, pages)
+                if leftovers:
+                    logger.info("Dừng %d luồng nền còn chạy…", len(leftovers))
+                    from PySide6.QtWidgets import QApplication as _QApp
+
+                    stop_threads(leftovers, pump=_QApp.processEvents)
+            except Exception as exc:  # noqa: BLE001 - mỗi bước đóng phải độc lập
+                logger.warning("Không dừng hết luồng nền khi đóng: %s.", exc)
 
             # ── Bước 3: Shutdown container (giải phóng GPU, SQLite, settings) ──
             self._container.shutdown()

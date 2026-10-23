@@ -19,6 +19,19 @@ from subtitles_extractor.infrastructure.tts.timing_math import (
 )
 
 
+def _bare_translator() -> "GeminiSubtitleTranslator":
+    """[v3.23.536] Thực thể TRỐNG để gọi các hàm thuần cần ``self``.
+
+    ``_length_hint``, ``_line_to_payload`` và ``_line_to_dual_payload`` là phương thức thực thể
+    (không phải staticmethod); phần thân chỉ dùng vài thuộc tính tuỳ chọn nên dựng bằng ``__new__``
+    là đủ, không cần API key.
+    """
+    instance = GeminiSubtitleTranslator.__new__(GeminiSubtitleTranslator)
+    instance._reading_cps_budget = 0.0
+    instance._emotion_cues = False
+    return instance
+
+
 def _ngan_sach(khung_s: float) -> int:
     """[v3.23.238] Ngân sách nay tính theo ÂM TIẾT rồi quy sang ký tự (xem v32638).
 
@@ -35,43 +48,43 @@ class TestLengthHint:
     def test_short_line_small_hint(self) -> None:
         line = TranslationLine(index=1, start_ms=0, end_ms=500, text="这")
         # Khung 0.5s: ngân sách nhỏ (trừ chi phí cố định ~0.3s) nhưng không bóp về 0.
-        hint = GeminiSubtitleTranslator._length_hint(line)
+        hint = _bare_translator()._length_hint(line)
         assert hint == _ngan_sach(0.5)
         assert MIN_CHAR_BUDGET <= hint < 20
 
     def test_long_line_larger_hint(self) -> None:
         line = TranslationLine(index=1, start_ms=0, end_ms=3000, text="x")
         # Khung dài: ngân sách RỘNG HƠN công thức cũ (48) — cũ ép cắt nghĩa vô ích.
-        hint = GeminiSubtitleTranslator._length_hint(line)
+        hint = _bare_translator()._length_hint(line)
         assert hint == _ngan_sach(3.0)
         assert hint > 48
 
     def test_no_timing_no_hint(self) -> None:
         line = TranslationLine(index=1, start_ms=0, end_ms=0, text="x")
-        assert GeminiSubtitleTranslator._length_hint(line) == 0
+        assert _bare_translator()._length_hint(line) == 0
 
     def test_minimum_floor(self) -> None:
         # Dòng cực ngắn vẫn cho tối thiểu MIN_CHAR_BUDGET ký tự (tránh ép cắt ý).
         line = TranslationLine(index=1, start_ms=0, end_ms=100, text="x")
-        assert GeminiSubtitleTranslator._length_hint(line) == MIN_CHAR_BUDGET
+        assert _bare_translator()._length_hint(line) == MIN_CHAR_BUDGET
 
     def test_hint_tang_theo_khung(self) -> None:
         ngan = TranslationLine(index=1, start_ms=0, end_ms=1000, text="x")
         dai = TranslationLine(index=2, start_ms=0, end_ms=2500, text="x")
-        assert GeminiSubtitleTranslator._length_hint(ngan) < GeminiSubtitleTranslator._length_hint(dai)
+        assert _bare_translator()._length_hint(ngan) < _bare_translator()._length_hint(dai)
 
     def test_payload_includes_hint(self) -> None:
         line = TranslationLine(index=1, start_ms=0, end_ms=1000, text="你好")
-        payload = GeminiSubtitleTranslator._line_to_payload(line)
+        payload = _bare_translator()._line_to_payload(line)
         assert payload["max_chars"] == _ngan_sach(1.0)
         assert payload["line_no"] == 1
         assert payload["text"] == "你好"
 
     def test_dual_payload_includes_hint(self) -> None:
         line = TranslationLine(index=1, start_ms=0, end_ms=2000, text="bản nháp")
-        payload = GeminiSubtitleTranslator._line_to_dual_payload(line)
+        payload = _bare_translator()._line_to_dual_payload(line)
         assert payload["max_chars"] == _ngan_sach(2.0)
 
     def test_no_hint_field_when_no_timing(self) -> None:
         line = TranslationLine(index=1, start_ms=5, end_ms=5, text="x")
-        assert "max_chars" not in GeminiSubtitleTranslator._line_to_payload(line)
+        assert "max_chars" not in _bare_translator()._line_to_payload(line)

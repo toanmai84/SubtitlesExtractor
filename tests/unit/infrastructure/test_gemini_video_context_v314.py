@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+# [v3.23.539] Hàm lấy thời lượng đã đổi tên thành ``_read_duration_sec``.
+
 from subtitles_extractor.infrastructure.translation.gemini_video_context import (
     GeminiVideoContextProvider,
 )
@@ -90,7 +92,7 @@ class TestSmartTruncation:
         video.write_bytes(b"x")
         # Phim 80 tập giả lập: 8 giờ → ~7.5 triệu token, vượt xa trần 600K.
         monkeypatch.setattr(
-            GeminiVideoContextProvider, "_ffprobe_duration_sec",
+            GeminiVideoContextProvider, "_read_duration_sec",
             staticmethod(lambda _p: 8 * 3600.0),
         )
         provider = GeminiVideoContextProvider(
@@ -114,7 +116,7 @@ class TestSmartTruncation:
         video = tmp_path / "long_movie.mp4"
         video.write_bytes(b"x")
         monkeypatch.setattr(
-            GeminiVideoContextProvider, "_ffprobe_duration_sec",
+            GeminiVideoContextProvider, "_read_duration_sec",
             staticmethod(lambda _p: 8 * 3600.0),
         )
         provider = GeminiVideoContextProvider(
@@ -129,7 +131,7 @@ class TestSmartTruncation:
         video = tmp_path / "short.mp4"
         video.write_bytes(b"x")
         monkeypatch.setattr(
-            GeminiVideoContextProvider, "_ffprobe_duration_sec",
+            GeminiVideoContextProvider, "_read_duration_sec",
             staticmethod(lambda _p: 120.0),
         )
         plan = GeminiVideoContextProvider(work_dir=tmp_path).plan_chunks(video)

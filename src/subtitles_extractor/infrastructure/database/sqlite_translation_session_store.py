@@ -22,15 +22,18 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+
+from subtitles_extractor.infrastructure.database.db_guard import prepare_database
 import threading
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field, replace
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,92 @@ class CloudVideoFile:
             end_sec=float(data.get("end_sec", 0.0)),
             uploaded_at=str(data.get("uploaded_at", "")),
         )
+
+
+CLOUD_FILE_MAX_AGE = timedelta(hours=48)
+"""Gemini Files API tự xoá file sau 48 giờ — bản ghi cũ hơn chắc chắn đã không còn."""
+
+
+def _uploaded_before(cloud_file: CloudVideoFile, cutoff: datetime) -> bool:
+    """True nếu file được tải trước ``cutoff`` (không rõ thời điểm → False)."""
+    if not cloud_file.uploaded_at:
+        return False
+    try:
+        uploaded = datetime.fromisoformat(cloud_file.uploaded_at)
+    except ValueError:
+        return False
+    if uploaded.tzinfo is None:
+        uploaded = uploaded.replace(tzinfo=UTC)
+    return uploaded < cutoff
+
+
+def _earlier_iso(left: str, right: str) -> bool:
+    """True nếu mốc ISO ``left`` sớm hơn ``right`` (thiếu múi giờ coi là UTC)."""
+    try:
+        left_dt = datetime.fromisoformat(left)
+        right_dt = datetime.fromisoformat(right)
+    except ValueError:
+        return False
+    if left_dt.tzinfo is None:
+        left_dt = left_dt.replace(tzinfo=UTC)
+    if right_dt.tzinfo is None:
+        right_dt = right_dt.replace(tzinfo=UTC)
+    return left_dt < right_dt
+
+
+def merge_cloud_files(
+    existing: Sequence[CloudVideoFile],
+    uploaded: Iterable[CloudVideoFile],
+    now: datetime,
+    max_age: timedelta = CLOUD_FILE_MAX_AGE,
+) -> list[CloudVideoFile]:
+    """[v3.23.609] Thêm các file vừa tải vào danh sách đã ghi (hàm thuần).
+
+    Trước đây mỗi lần phân tích GHI ĐÈ danh sách, nên file của lần trước (vẫn còn trên
+    cloud tới 48 giờ) bị quên và nút "Xoá file cloud" không xoá được nữa.
+
+    Args:
+        existing: Danh sách đang lưu trong phiên.
+        uploaded: Các file vừa tải.
+        now: Thời điểm hiện tại (UTC).
+        max_age: Bản ghi cũ hơn mức này bị bỏ (file đã bị Gemini xoá).
+
+    Returns:
+        Danh sách mới: bản ghi cũ còn hạn, rồi các file vừa tải; mỗi tên file một lần.
+
+    [v3.23.615] File được TÁI DÙNG (đã có trên cloud) được ghi lại mỗi lần dùng; giữ mốc
+    tải lên CŨ của nó, vì Gemini đếm 48 giờ từ lúc tải chứ không từ lúc dùng. Chẩn đoán
+    thật 14/10: ``files/6iip7kcgg24f`` tải lúc 08:27 nhưng ghi ``uploaded_at`` 09:23 (lần
+    tái dùng khi dịch) — bản ghi sống quá hạn thật gần một giờ.
+    """
+    cutoff = now - max_age
+    first_seen = {
+        cf.remote_name: cf.uploaded_at
+        for cf in existing
+        if cf.remote_name and cf.uploaded_at and not _uploaded_before(cf, cutoff)
+    }
+    fresh = [
+        replace(cf, uploaded_at=first_seen[cf.remote_name])
+        if cf.remote_name in first_seen
+        and _earlier_iso(first_seen[cf.remote_name], cf.uploaded_at)
+        else cf
+        for cf in uploaded
+        if cf.remote_name
+    ]
+    fresh_names = {cf.remote_name for cf in fresh}
+    kept = [
+        cf for cf in existing
+        if cf.remote_name
+        and cf.remote_name not in fresh_names
+        and not _uploaded_before(cf, cutoff)
+    ]
+    merged: list[CloudVideoFile] = []
+    seen: set[str] = set()
+    for cf in [*kept, *fresh]:
+        if cf.remote_name not in seen:
+            seen.add(cf.remote_name)
+            merged.append(cf)
+    return merged
 
 
 @dataclass(frozen=True)
@@ -121,6 +210,8 @@ class SqliteTranslationSessionStore:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
         self._lock: threading.RLock = threading.RLock()
+        # [v3.23.649] Kiểm tra / sao lưu / tự phục hồi tệp trước khi kết nối.
+        prepare_database(self._db_path, background=True)
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with contextlib.suppress(sqlite3.Error):
@@ -273,6 +364,67 @@ class SqliteTranslationSessionStore:
                 """,
                 (characters, overview, glossary, visual_cues, source_lang, target_lang,
                  input_hash, source_hash, source_hash, _utc_now_iso(), key),
+            )
+
+    def save_analysis_texts(
+        self,
+        video_key: str | Path,
+        *,
+        characters: str,
+        overview: str,
+        glossary: str,
+        visual_cues: str,
+    ) -> None:
+        """[v3.23.567] Cập nhật PHẦN VĂN BẢN của phân tích, giữ hash/ngôn ngữ như cũ.
+
+        Dùng khi ngữ cảnh đã lưu được sửa tất định (vd phiên âm tên sai âm Hán-Việt) —
+        phân tích vẫn hợp lệ với phụ đề hiện tại nên không đụng ``analysis_input_hash``.
+
+        Args:
+            video_key: Đường dẫn/khoá video.
+            characters: Bảng nhân vật.
+            overview: Tóm tắt phim.
+            glossary: Bảng thuật ngữ.
+            visual_cues: Chuỗi JSON Visual Cues.
+
+        Raises:
+            ValueError: Nếu ``video_key`` rỗng.
+        """
+        key = self._normalize_key(video_key)
+        if not key:
+            raise ValueError("video_key không được rỗng.")
+        with self._lock, self._conn:
+            self._ensure_row(key)
+            self._conn.execute(
+                "UPDATE translation_session SET analysis_characters = ?, "
+                "analysis_overview = ?, analysis_glossary = ?, analysis_visual_cues = ?, "
+                "updated_at = ? WHERE video_key = ?",
+                (characters, overview, glossary, visual_cues, _utc_now_iso(), key),
+            )
+
+    def save_visual_cues(self, video_key: str | Path, visual_cues: str) -> None:
+        """[v3.23.559] Chỉ cập nhật Visual Cues của phân tích, giữ nguyên mọi phần khác.
+
+        Dùng khi khâu dịch đã quét BỔ SUNG cues cho các dòng mà phân tích ngữ cảnh bỏ
+        trống: lưu lại để lần dịch sau và file chuẩn đoán thấy đúng độ phủ thật.
+        Không đụng ``analysis_input_hash`` nên phân tích vẫn hợp lệ như trước.
+
+        Args:
+            video_key: Đường dẫn/khoá video.
+            visual_cues: Chuỗi JSON Visual Cues đã gộp.
+
+        Raises:
+            ValueError: Nếu ``video_key`` rỗng.
+        """
+        key = self._normalize_key(video_key)
+        if not key:
+            raise ValueError("video_key không được rỗng.")
+        with self._lock, self._conn:
+            self._ensure_row(key)
+            self._conn.execute(
+                "UPDATE translation_session SET analysis_visual_cues = ?, updated_at = ? "
+                "WHERE video_key = ?",
+                (visual_cues, _utc_now_iso(), key),
             )
 
     def save_stage(self, video_key: str | Path, stage: StageResult) -> None:

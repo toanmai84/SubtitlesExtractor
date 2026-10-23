@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
+
+from subtitles_extractor.infrastructure.database.db_guard import prepare_database
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -42,6 +44,8 @@ class SqliteTranslationContextStore:
         # Cho phép truy cập an toàn từ worker dịch (QThread) nếu store được dùng
         # xuyên luồng; RLock tuần tự hoá mọi thao tác trên connection chia sẻ.
         self._lock: threading.RLock = threading.RLock()
+        # [v3.23.649] Kiểm tra / sao lưu / tự phục hồi tệp trước khi kết nối.
+        prepare_database(self._db_path, background=True)
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with contextlib.suppress(sqlite3.Error):

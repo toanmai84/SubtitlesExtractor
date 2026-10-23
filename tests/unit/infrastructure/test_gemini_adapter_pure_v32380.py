@@ -130,13 +130,23 @@ class TestValidateBatchBlankDetection:
         except _BatchPartialError as exc:
             assert 5 in exc.missing_line_nos
 
+    def test_excess_items_are_filtered_when_batch_is_covered(self) -> None:
+        """[v3.23.512] Dư dòng NGỮ CẢNH mà đủ dòng của lô → lọc, không dịch lại."""
+        tr = self._translator()
+        payload = self._payload([f"d {i}" for i in range(15)])  # dư so với expected 10
+        tr._validate_batch(payload, expected_count=10, start_idx=0)  # không được ném
+
+        assert [item["line_no"] for item in payload["subtitles"]] == list(range(1, 11))
+
     def test_excess_items_triggers_validation_error(self) -> None:
+        """Dư dòng mà KHÔNG dòng nào thuộc lô → vẫn phải báo hỏng để chia nhỏ."""
         from subtitles_extractor.infrastructure.translation.gemini_translation_adapter import (  # noqa: E501
             _BatchValidationError,
         )
 
         tr = self._translator()
-        payload = self._payload([f"d {i}" for i in range(15)])  # dư so với expected 10
+        # line_no 101..115: nằm hoàn toàn ngoài khoảng 1..10 của lô.
+        payload = self._payload([f"d {i}" for i in range(15)], start_idx=100)
         try:
             tr._validate_batch(payload, expected_count=10, start_idx=0)
             raise AssertionError("Phải ném _BatchValidationError khi trả dư dòng")

@@ -41,6 +41,11 @@ _FLASH_ECHO_SIMILARITY: float = 0.66
 #: Cửa sổ thời gian (s) tìm event lân cận khi kiểm echo.
 _FLASH_ECHO_WINDOW_SEC: float = 4.0
 
+#: [v3.23.616] Event chỉ có chữ số/dấu câu dài tối đa chừng này ký tự (bỏ khoảng trắng)...
+_DIGIT_GARBAGE_MAX_LEN: int = 4
+#: ...và conf dưới mức này là rác OCR trong phim phụ đề CJK.
+_DIGIT_GARBAGE_MAX_CONFIDENCE: float = 0.90
+
 _PURE_LATIN_REGEX = re.compile(r"^[A-Za-z]+$")
 _TRAILING_LATIN_REGEX = re.compile(r"[A-Z]{2,8}$")
 _DIGIT_ONLY_LINE_REGEX = re.compile(r"^\d+$")
@@ -130,6 +135,40 @@ def drop_pure_latin_watermark_events(
     return kept
 
 
+def _is_digit_garbage(text: str, confidence: float) -> bool:
+    """Chuỗi chỉ gồm chữ số + dấu câu, ngắn, conf chưa cao (hàm thuần)."""
+    compact = "".join(text.split())
+    return (
+        0 < len(compact) <= _DIGIT_GARBAGE_MAX_LEN
+        and any(ch.isdigit() for ch in compact)
+        and not any(ch.isalpha() for ch in compact)
+        and confidence < _DIGIT_GARBAGE_MAX_CONFIDENCE
+    )
+
+
+def drop_digit_garbage_events(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
+    """[v3.23.616] Drop event chỉ có chữ số/dấu câu, ngắn, conf thấp trong phim CJK.
+
+    OCR thật 14/10 (phim "天骄女友退婚" tập 1, cả hai lần trích): khoen thắt lưng và hoạ
+    tiết áo lọt vùng phụ đề sinh "00" (7 khung, 0.32s, conf 0.70) và "0.." (conf 0.83).
+    Hai event này dài hơn ngưỡng mảnh flash nên lọt mọi bộ lọc; cả hai lần người dùng
+    phải xoá tay trong trình sửa. Số thật trong thoại CJK được viết kèm chữ ("二十万",
+    "20万") hoặc được OCR đọc rõ (conf >= 0.90) nên không bị đụng.
+
+    Args:
+        events: Events đã dựng.
+
+    Returns:
+        Events đã loại rác chữ số; nguyên danh sách nếu phim không phải CJK chủ đạo.
+    """
+    if not _events_are_cjk_dominant(events):
+        return events
+    return [
+        event for event in events
+        if not _is_digit_garbage(event.text, float(event.confidence))
+    ]
+
+
 def drop_flash_fragments(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
     """Drop mảnh flash cực ngắn (< 0.18s) CÓ THÊM bằng chứng rác.
 
@@ -182,7 +221,8 @@ def drop_flash_fragments(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
 
 
 def refine_final_events(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
-    """Pipeline tinh lọc cuối: suffix watermark → pure-Latin watermark → flash."""
+    """Tinh lọc cuối: đuôi watermark → watermark Latin → rác chữ số → mảnh flash."""
     refined = strip_latin_suffix_from_cjk_events(events)
     refined = drop_pure_latin_watermark_events(refined)
+    refined = drop_digit_garbage_events(refined)
     return drop_flash_fragments(refined)

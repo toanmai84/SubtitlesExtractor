@@ -706,13 +706,23 @@ class _DetachedVideoWindow(QWidget):
         self.lay.addWidget(video_widget, stretch=1)
         video_widget.show()
 
+    #: [v3.23.619] Đặt True khi ứng dụng đóng: cửa sổ được đóng hẳn thay vì gắn video lại.
+    closing_for_good: bool = False
+
     def keyPressEvent(self, event: QKeyEvent) -> None:
         k = event.key()
-        if k == Qt.Key.Key_Escape: self._parent_page._on_detach_reattach()
+        if k == Qt.Key.Key_Escape and is_valid(self._parent_page): self._parent_page._on_detach_reattach()
         elif k == Qt.Key.Key_F11: self.showNormal() if self.isFullScreen() else self.showFullScreen()
         else: super().keyPressEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        # [v3.23.619] Ứng dụng đang đóng, hoặc trang Biên tập đã bị huỷ → đóng hẳn. Trước
+        # đây luôn "gắn video lại + ẩn" và bỏ qua lệnh đóng: đóng cửa sổ chính khi video
+        # đang tách thì ứng dụng KHÔNG thoát (còn cửa sổ video), bấm X tiếp thì không còn
+        # cửa sổ nào nhưng tiến trình vẫn chạy ngầm; gắn vào trang đã huỷ thì RuntimeError.
+        if self.closing_for_good or not is_valid(self._parent_page):
+            event.accept()
+            return
         self._parent_page._on_detach_reattach()
         event.ignore()
 
@@ -1319,8 +1329,11 @@ class EditorPage(QWidget):
         self._edit_text.textChanged.connect(self._on_text_editing)
         self._edit_text.focusOutEvent = self._on_text_focus_out
 
-        self._table_model.text_edit_requested.connect(self._view_model.update_text)
-        self._table_model.time_edit_requested.connect(self._view_model.update_timing)
+        # [v3.23.650] Sửa xong là model bị reset (set_events); reset ngay trong setData/commitData làm index proxy mà
+        # view/delegate đang cầm thành con trỏ treo (SIGSEGV). Slot trực tiếp CHỈ ghi nhận uid dòng rồi hoãn việc áp dụng
+        # sang vòng lặp sự kiện kế tiếp; khi áp dụng, tra lại chỉ số theo uid (dòng đã dời/xoá giữa chừng → bỏ qua).
+        self._table_model.text_edit_requested.connect(self._on_table_text_edit)
+        self._table_model.time_edit_requested.connect(self._on_table_time_edit)
         self._table_model.timing_error_occurred.connect(self._show_error)
 
         self._table.selectionModel().selectionChanged.connect(self._on_selection_changed)
@@ -1378,7 +1391,7 @@ class EditorPage(QWidget):
                 self._toggle_loop()
 
     def _on_canvas_state_changed(self, is_playing: bool) -> None:
-        if hasattr(self, 'btn_play'):
+        if hasattr(self, '_btn_play'):
             self._btn_play.setIcon(
                 (FluentIcon.PAUSE if is_playing else FluentIcon.PLAY).icon()
             )
@@ -1514,9 +1527,25 @@ class EditorPage(QWidget):
         )
 
     def _current_row(self) -> int:
-        indexes = self._table.selectionModel().selectedRows()
-        if not indexes: return -1
-        return self._proxy_model.mapToSource(indexes[0]).row()
+        """Hàng NGUỒN đang là dòng hiện tại (-1 nếu chưa chọn).
+
+        [v3.23.650] Không dùng ``selectedRows()``: nó duyệt từng ô qua ``flags()`` của proxy (O(dòng×cột), 150–400 ms
+        với 3649 dòng đang chọn hết) và thứ tự trả về không xác định khi chọn nhiều dòng → khung sửa và thao tác
+        sửa/tách/gộp có thể rơi vào hai dòng khác nhau. Dùng ``currentIndex`` (khớp khung sửa), nếu nó không nằm
+        trong vùng chọn thì lấy dòng đầu của vùng chọn đầu tiên.
+        """
+        selection_model = self._table.selectionModel()
+        selection = selection_model.selection()
+        if selection.isEmpty():
+            return -1
+        current = selection_model.currentIndex()
+        if current.isValid() and selection_model.isRowSelected(current.row()):
+            proxy_index = current
+        else:
+            proxy_index = self._proxy_model.index(selection[0].top(), 0)
+        if not proxy_index.isValid():
+            return -1
+        return self._proxy_model.mapToSource(proxy_index).row()
 
     def _jump_to_current_event(self) -> None:
         idx = self._current_row()
@@ -1531,7 +1560,7 @@ class EditorPage(QWidget):
             self._waveform_widget.set_current_time(start_sec)
             self._waveform_widget.set_active_row(row_idx)
 
-        mpv_player = self._video_widget.player()
+        mpv_player = self._video_widget.peek_player()
         if mpv_player:
             mpv_player.seek(start_sec)
         else:
@@ -1635,6 +1664,51 @@ class EditorPage(QWidget):
         if stored_text != new_text:
             self._view_model.update_text(idx, new_text)
 
+    def _on_table_text_edit(self, row: int, new_text: str) -> None:
+        events = self._table_model.events
+        if not (0 <= row < len(events)):
+            return
+        uid = events[row].uid
+        QTimer.singleShot(0, lambda: self._apply_table_edit(uid, lambda i: self._view_model.update_text(i, new_text)))
+
+    def _on_table_time_edit(self, row: int, start_sec: float, end_sec: float) -> None:
+        events = self._table_model.events
+        if not (0 <= row < len(events)):
+            return
+        uid = events[row].uid
+        QTimer.singleShot(
+            0, lambda: self._apply_table_edit(uid, lambda i: self._view_model.update_timing(i, start_sec, end_sec)))
+
+    def _apply_table_edit(self, uid: str, apply) -> None:
+        for index, event in enumerate(self._table_model.events):
+            if event.uid == uid:
+                apply(index)
+                return
+
+    def _event_uids(self) -> list[str]:
+        return [event.uid for event in self._table_model.events]
+
+    def _step_selected_row(self, delta: int) -> None:
+        """Ctrl+↑/↓: chọn dòng liền trước/sau (theo thứ tự đang hiển thị) và tua video tới đó.
+
+        [v3.23.650] Hàng của proxy phải đổi sang hàng NGUỒN trước khi tua: khi đang lọc, hai số này khác nhau nên
+        video từng tua tới sai câu.
+        """
+        selection_model = self._table.selectionModel()
+        if selection_model.selection().isEmpty():
+            return
+        current = selection_model.currentIndex()
+        if not (current.isValid() and selection_model.isRowSelected(current.row())):
+            current = self._proxy_model.index(selection_model.selection()[0].top(), 0)
+        last = self._proxy_model.rowCount() - 1
+        if not current.isValid() or last < 0:
+            return
+        proxy_row = max(0, min(last, current.row() + delta))
+        self._table.selectRow(proxy_row)
+        if not self._video_widget.is_playing:
+            source_row = self._proxy_model.mapToSource(self._proxy_model.index(proxy_row, 0)).row()
+            self._jump_to_event_at(source_row)
+
     def _show_context_menu(self, pos: QPoint) -> None:
         menu = QMenu(self)
         idx = self._current_row()
@@ -1647,6 +1721,8 @@ class EditorPage(QWidget):
                 menu.addAction(self._translator.translate("editor.ed_ctx_merge"), self._on_merge_clicked)
             menu.addAction(self._translator.translate("editor.ed_ctx_split"), self._on_split_clicked)
             menu.exec(self._table.viewport().mapToGlobal(pos))
+        # [v3.23.650] Menu có parent=self nên không tự biến mất: mỗi lần mở là thêm một đối tượng con (rò rỉ).
+        menu.deleteLater()
 
     def _insert_event_at(self, target_idx: int) -> None:
         self._view_model.insert_after(target_idx)
@@ -1680,6 +1756,7 @@ class EditorPage(QWidget):
         bbox.accepted.connect(dlg.accept)
         lay.addWidget(bbox)
         dlg.exec()
+        dlg.deleteLater()  # [v3.23.650] parent=self → không tự giải phóng
 
     def _show_undo_history(self) -> None:
         dlg = QDialog(self)
@@ -1842,7 +1919,7 @@ class EditorPage(QWidget):
             return True
             
         if k == Qt.Key.Key_M and not (ctrl or alt or shift):
-            player = self._video_widget.player()
+            player = self._video_widget.peek_player()
             if player:
                 is_muted = getattr(self, '_is_muted', False)
                 self._is_muted = not is_muted
@@ -1866,22 +1943,12 @@ class EditorPage(QWidget):
                 self._video_widget.seek(ts)
             return True
         if k == Qt.Key.Key_Up and ctrl:
-            indexes = self._table.selectionModel().selectedRows()
-            if indexes:
-                pr = max(0, indexes[0].row() - 1)
-                self._table.selectRow(pr)
-                if not self._video_widget.is_playing:
-                    self._jump_to_event_at(pr)
+            self._step_selected_row(-1)
             return True
         if k == Qt.Key.Key_Down and ctrl:
-            indexes = self._table.selectionModel().selectedRows()
-            if indexes:
-                pr = min(self._proxy_model.rowCount() - 1, indexes[0].row() + 1)
-                self._table.selectRow(pr)
-                if not self._video_widget.is_playing:
-                    self._jump_to_event_at(pr)
+            self._step_selected_row(+1)
             return True
-            
+
         if k == Qt.Key.Key_S and ctrl: self._on_export_clicked(); return True
         if k == Qt.Key.Key_Z and ctrl: self._view_model.undo(); return True
         if k == Qt.Key.Key_Y and ctrl: self._view_model.redo(); return True
@@ -1937,7 +2004,7 @@ class EditorPage(QWidget):
             with contextlib.suppress(ValueError): player.set_speed(float(text.replace("x", "")))
 
     def _change_speed(self, delta_rate: float) -> None:
-        player = self._video_widget.player()
+        player = self._video_widget.peek_player()
         if not player or not player.is_loaded: return
 
         try: current_speed = float(self._speed_combo.currentText().replace("x", ""))
@@ -2099,7 +2166,9 @@ class EditorPage(QWidget):
 
         fixes = self._view_model.auto_fix_timeline()
         if fixes > 0:
-            self._video_widget._schedule_geometry_update()
+            # [v3.23.619] API chung của hai widget video (trước gọi hàm riêng của MPV →
+            # AttributeError trên máy không có libmpv, dùng VideoCanvas).
+            self._video_widget.schedule_overlay_refresh()
             InfoBar.success(self._translator.translate("editor.ib_autofix_t"), self._translator.translate("editor.ib_autofix_c").replace("{n}", str(fixes)), parent=self, duration=3000)
 
     def _on_merge_similar_dialog(self) -> None:
@@ -2182,12 +2251,21 @@ class EditorPage(QWidget):
 
         # [v3.6 bugfix DLG-4]: deleteLater cho preview dialog. Đọc trạng thái
         # checkbox TRONG try (trước khi hủy), apply merge ngoài try.
+        uids_before = self._event_uids()
         try:
             if preview_dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             groups_to_merge = [grp for i, grp in enumerate(groups) if checkboxes[i].isChecked()]
         finally:
             preview_dlg.deleteLater()
+
+        # [v3.23.650] Hộp thoại modal chạy vòng lặp sự kiện lồng nhau: Re-OCR/nạp phụ đề có thể đổi danh sách trong
+        # lúc mở. `groups` là CHỈ SỐ → áp dụng trên danh sách đã đổi sẽ gộp nhầm câu. Danh sách đổi thì huỷ.
+        if groups_to_merge and self._event_uids() != uids_before:
+            InfoBar.warning(
+                self._translator.translate("editor.ib_scan_t"),
+                self._translator.translate("editor.ib_list_changed"), parent=self, duration=4000)
+            return
 
         if groups_to_merge:
             applied = self._view_model.apply_merge_groups(groups_to_merge)
@@ -2203,15 +2281,32 @@ class EditorPage(QWidget):
             self._player_panel.layout().removeWidget(self._video_widget)
             self._detached_window.attach_widget(self._video_widget)
             self._detached_window.show()
+            self._video_widget.rebind_if_window_changed()  # [v3.23.650] HWND có thể đã đổi sau reparent
+
+    def dispose_detached_window(self) -> None:
+        """[v3.23.619] Gắn video về trang rồi đóng HẲN cửa sổ video tách (khi thoát ứng dụng)."""
+        window = self._detached_window
+        if window is None or not is_valid(window):
+            self._detached_window = None
+            return
+        if window.isVisible():
+            self._on_detach_reattach()
+        window.closing_for_good = True
+        window.close()
+        window.deleteLater()
+        self._detached_window = None
 
     def _on_detach_reattach(self) -> None:
+        if not is_valid(self._video_widget):
+            return
         if self._detached_window is not None and is_valid(self._detached_window):
             self._detached_window.lay.removeWidget(self._video_widget)
             self._video_stack.insertWidget(1, self._video_widget)
             self._video_stack.setCurrentIndex(1)
             self._video_widget.show()
             self._detached_window.hide()
-            QTimer.singleShot(50, self._video_widget._schedule_geometry_update)
+            self._video_widget.rebind_if_window_changed()  # [v3.23.650] HWND có thể đã đổi sau reparent
+            QTimer.singleShot(50, self._video_widget.schedule_overlay_refresh)  # [v3.23.619] API chung
 
     def _on_video_roi_changed(self, roi: Roi) -> None: pass
 
@@ -2299,7 +2394,7 @@ class EditorPage(QWidget):
             explicit_ranges.append(TimeRange(start_sec=new_start, end_sec=new_end))
 
         if not explicit_ranges:
-            self.error_occurred.emit(self._translator.translate("editor.err_bad_range"))
+            self._show_error(self._translator.translate("editor.err_bad_range"))
             return
 
         self._waveform_widget.set_reocr_region(new_start, new_end)
@@ -2438,7 +2533,13 @@ class EditorPage(QWidget):
         path = getattr(self, "_current_video_path", None)
         return str(path) if path else None
 
-    def load_video(self, path: Path) -> None:
+    def load_video(self, path: Path | str) -> None:
+        """Nạp video vào trình phát và sóng âm.
+
+        Args:
+            path: Đường dẫn video; nhận cả chuỗi (dự án lưu trong CSDL là chuỗi).
+        """
+        path = Path(path)
         try:
             # [Ghost OCR Boxes] Xoá overlay OCR của video cũ TRƯỚC khi nạp video mới,
             # tránh các hộp vàng của phim trước còn lơ lửng trên khung hình mới.
@@ -2473,24 +2574,34 @@ class EditorPage(QWidget):
             return
         self._last_waveform_seek_time = now
 
-        self._is_syncing_from_waveform = True 
-        self._video_widget.seek(timestamp_sec)
-        
-        row_idx = self._view_model._service.find_event_index_at_time(timestamp_sec)
-        if row_idx >= 0 and row_idx != self._current_row():
-            source_index = self._table_model.index(row_idx, 0)
-            proxy_index = self._proxy_model.mapFromSource(source_index)
-            if proxy_index.isValid():
-                self._table.selectionModel().selectionChanged.disconnect(self._on_selection_changed)
-                self._table.selectRow(proxy_index.row())
-                
-                if self._btn_auto_scroll.isChecked():
-                    self._table.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
-                    
-                self._table.selectionModel().selectionChanged.connect(self._on_selection_changed)
-                self._on_selection_changed()
-        
-        self._is_syncing_from_waveform = False
+        # [v3.23.650] try/finally: ngoại lệ giữa chừng (seek, cuộn bảng…) từng để cờ kẹt True + selectionChanged
+        # mất kết nối vĩnh viễn → khung sửa không còn theo dòng chọn. Và _on_selection_changed phải CHẠY (bỏ qua
+        # chỉ phần tua video) — trước đây nó thoát sớm khiến khung sửa giữ chữ dòng cũ rồi focus-out ghi đè
+        # chữ đó lên dòng mới (mất dữ liệu).
+        self._is_syncing_from_waveform = True
+        selection_model = self._table.selectionModel()
+        disconnected = False
+        try:
+            self._video_widget.seek(timestamp_sec)
+
+            row_idx = self._view_model._service.find_event_index_at_time(timestamp_sec)
+            if row_idx >= 0 and row_idx != self._current_row():
+                source_index = self._table_model.index(row_idx, 0)
+                proxy_index = self._proxy_model.mapFromSource(source_index)
+                if proxy_index.isValid():
+                    with contextlib.suppress(RuntimeError, TypeError):
+                        selection_model.selectionChanged.disconnect(self._on_selection_changed)
+                        disconnected = True
+                    self._table.selectRow(proxy_index.row())
+
+                    if self._btn_auto_scroll.isChecked():
+                        self._table.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
+                    self._on_selection_changed()
+        finally:
+            if disconnected:
+                with contextlib.suppress(RuntimeError, TypeError):
+                    selection_model.selectionChanged.connect(self._on_selection_changed)
+            self._is_syncing_from_waveform = False
 
     def _on_open_clicked(self) -> None:
         if not self._confirm_discard_unsaved():
@@ -2510,7 +2621,7 @@ class EditorPage(QWidget):
         # chạy nhưng dialog không mở" (có log). Bọc try/except vì PySide6 NUỐT exception
         # trong slot → trước đây lỗi ở đây làm nút "không thấy chạy gì" mà không báo.
         logger.debug(
-            "Editor: bấm Xuất tệp (events=%d, is_busy=%s).",
+            "Editor: bấm Xuất tệp (events={}, is_busy={}).",
             len(self._table_model.events),
             self._view_model._is_busy,
         )
@@ -2614,16 +2725,28 @@ class EditorPage(QWidget):
         end = event.end_sec
         midpoint = (start + end) / 2.0
 
+        # [v3.23.613] Truyền THEO VỊ TRÍ: tên tham số khác nhau giữa các binding (PySide6
+        # "minValue"/"maxValue", PyQt6 "min"/"max"). Bản cũ dùng "min"/"max" nên với
+        # PySide6 getDouble ném TypeError ngay → nút Tách dòng chết im lặng.
         value, ok = QInputDialog.getDouble(
             self,
             self._translator.translate("editor.dialog_split_title"),
             self._translator.translate("editor.dialog_split_prompt"),
-            value=midpoint,
-            min=start + 0.001,
-            max=end - 0.001,
-            decimals=3,
+            midpoint,
+            start + 0.001,
+            end - 0.001,
+            3,
         )
-        if ok: self._view_model.split_event(idx, value)
+        if not ok:
+            return
+        # [v3.23.650] Danh sách có thể đã đổi trong lúc hộp thoại mở (Re-OCR xong): chỉ tách nếu vẫn đúng câu đó.
+        current = self._table_model.events
+        if idx >= len(current) or current[idx].uid != event.uid:
+            InfoBar.warning(
+                self._translator.translate("editor.ib_scan_t"),
+                self._translator.translate("editor.ib_list_changed"), parent=self, duration=4000)
+            return
+        self._view_model.split_event(idx, value)
 
     def _on_merge_clicked(self) -> None:
         idx = self._current_row()
@@ -2634,8 +2757,8 @@ class EditorPage(QWidget):
         if offset != 0.0: self._view_model.shift_all(offset)
 
     def _on_selection_changed(self) -> None:
-        if getattr(self, '_is_syncing_from_waveform', False):
-            return
+        # Đang đồng bộ từ waveform: video đã được tua đúng vị trí, chỉ cập nhật khung sửa (không tua lại về đầu dòng).
+        syncing = getattr(self, '_is_syncing_from_waveform', False)
 
         idx = self._current_row()
         has_row = idx >= 0
@@ -2676,7 +2799,7 @@ class EditorPage(QWidget):
         if hasattr(self, '_waveform_widget'):
             self._waveform_widget.set_active_row(idx)
 
-        if not self._video_widget.is_playing:
+        if not syncing and not self._video_widget.is_playing:
             self._pending_seek_row = idx
             self._debounced_seek_timer.start()
 
@@ -2684,6 +2807,18 @@ class EditorPage(QWidget):
             self._loop_start_time = start_sec
             self._loop_end_time = end_sec
             self._waveform_widget.set_loop_region(start_sec, end_sec)
+
+    @staticmethod
+    def _merged_selected_row_ranges(selection_model) -> list[tuple[int, int]]:
+        """Các khoảng hàng (top, bottom) đang chọn, đã gộp liền kề, tính trực tiếp từ range (không duyệt ô)."""
+        spans = sorted((r.top(), r.bottom()) for r in selection_model.selection())
+        merged: list[tuple[int, int]] = []
+        for top, bottom in spans:
+            if merged and top <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], bottom))
+            else:
+                merged.append((top, bottom))
+        return merged
 
     def _refresh_table(self, state: EditorState) -> None:
         selection_model = self._table.selectionModel()
@@ -2694,28 +2829,27 @@ class EditorPage(QWidget):
         # còn phải BẬT LẠI nút Xuất. Trước đây một lỗi ở đây làm nút Xuất kẹt disable
         # vĩnh viễn → người dùng bấm "Lưu tệp" không thấy gì (đúng lỗi đang gặp).
         try:
-            selected_rows = [idx.row() for idx in selection_model.selectedRows()]
+            # [v3.23.650] Gom thành các khoảng hàng liên tiếp: Ctrl+A rồi sửa một dòng từng tạo 3649 range riêng,
+            # khiến mọi thao tác sau đó chậm 10–30 lần (UI đơ) — nay luôn là vài range.
+            selected_ranges = self._merged_selected_row_ranges(selection_model)
 
             with contextlib.suppress(RuntimeError, TypeError):
                 selection_model.selectionChanged.disconnect(self._on_selection_changed)
 
             self._table_model.set_events(state.events)
 
-            if selected_rows:
+            if selected_ranges:
                 selection_model.clearSelection()
                 batch_selection = QItemSelection()
                 cols = self._proxy_model.columnCount() - 1
-
-                last_valid_proxy_index = None
                 max_row = self._proxy_model.rowCount() - 1
-
-                for r in selected_rows:
-                    safe_r = min(r, max_row)
-                    if safe_r >= 0:
-                        idx_start = self._proxy_model.index(safe_r, 0)
-                        idx_end = self._proxy_model.index(safe_r, cols)
-                        batch_selection.select(idx_start, idx_end)
-                        last_valid_proxy_index = idx_start
+                last_valid_proxy_index = None
+                for top, bottom in selected_ranges:
+                    top, bottom = min(top, max_row), min(bottom, max_row)
+                    if top < 0:
+                        continue
+                    batch_selection.select(self._proxy_model.index(top, 0), self._proxy_model.index(bottom, cols))
+                    last_valid_proxy_index = self._proxy_model.index(bottom, 0)
 
                 if last_valid_proxy_index is not None and last_valid_proxy_index.isValid():
                     selection_model.select(batch_selection, QItemSelectionModel.SelectionFlag.Select)
@@ -2810,7 +2944,7 @@ class EditorPage(QWidget):
     def _schedule_preview(self) -> None: self._preview_timer.start()
 
     def _generate_ass_preview(self) -> None:
-        player = self._video_widget.player()
+        player = self._video_widget.peek_player()
         if player is None or not player.is_loaded: return
         events = self._view_model.current_events
         if not events: return
@@ -2836,7 +2970,7 @@ class EditorPage(QWidget):
             logger.debug("generate_ass_preview thất bại: {}.", exc)
 
     def _cleanup_old_preview_tracks(self, current_path: str) -> None:
-        player = self._video_widget.player()
+        player = self._video_widget.peek_player()
         if player is None:
             return
         raw_mpv = getattr(player, "_mpv", None)

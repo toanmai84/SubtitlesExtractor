@@ -19,13 +19,17 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
     QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QMessageBox, QProgressBar, QScrollArea, QSpinBox,
-    QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit,
+    QStackedWidget, QTableWidget, QTextEdit,
     QVBoxLayout, QWidget,
 )
 from subtitles_extractor.presentation.fluent_compat import (
     PrimaryPushButton, PushButton, ToolButton,
 )
 
+from subtitles_extractor.application.services.dubbing_cast import (
+    CAST_MODE_TWO_VOICES,
+    DubbingSource,
+)
 from subtitles_extractor.composition.container import ApplicationContainer
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
 from subtitles_extractor.domain.ports.subtitle_tts_port import TTSSegmentResult
@@ -33,6 +37,8 @@ from subtitles_extractor.infrastructure.tts.edge_tts_adapter import _EDGE_VOICE_
 from subtitles_extractor.infrastructure.tts.gemini_tts_adapter import (
     GEMINI_TTS_VOICES, GEMINI_TTS_MODELS,
 )
+from subtitles_extractor.presentation.qt_compat import is_deleted
+from subtitles_extractor.presentation.utils.table_selection import select_rows_bulk
 from subtitles_extractor.presentation.view_models.tts_page_view_model import TTSPageViewModel
 from subtitles_extractor.presentation.utils import safe_dialogs as _safe_dialogs
 from subtitles_extractor.presentation.utils.wheel_guard import protect_scroll_widgets
@@ -43,6 +49,17 @@ from subtitles_extractor.presentation.utils.error_humanizer import (
 )
 from subtitles_extractor.presentation.theme import metrics as _m
 from subtitles_extractor.presentation.widgets.section_card import SectionCard
+from subtitles_extractor.presentation.widgets.dubbing_cast_panel import DubbingCastPanel
+from subtitles_extractor.presentation.pages.tts_dubbing import TTSDubbingCoordinator
+from subtitles_extractor.presentation.pages.tts_line_edits import (
+    COLUMN_COUNT as _COLUMN_COUNT,
+    TTSLineEditsController,
+    editable_text_item,
+    format_row_time,
+    read_only_item,
+    row_head_item,
+    selected_positions,
+)
 from subtitles_extractor.presentation.utils.accessibility import set_accessible_name
 from subtitles_extractor.infrastructure.process.hidden_process import (
     no_window_kwargs,
@@ -64,23 +81,34 @@ class _VieNeuVoiceLoader(QThread):
 
     voices_loaded = Signal(str, list)  # (mode, danh sách tên giọng)
     load_failed = Signal(str)          # (mode)
+    # [v3.23.593] (mode, list[VoiceProfile]) — giọng kèm giới tính cho bảng phân vai.
+    catalog_loaded = Signal(str, list)
 
-    def __init__(self, container, mode: str, parent=None) -> None:
+    def __init__(self, container, mode: str, parent=None, precision: str = "") -> None:
         super().__init__(parent)
         self._container = container
         self._mode = mode
+        # [v3.23.595] Cùng độ chính xác với lần tổng hợp → dùng chung engine đã nạp (khoá
+        # cache gồm độ chính xác), không nạp model hai lần.
+        self._precision = precision
 
     def run(self) -> None:  # noqa: D102 — QThread API
         try:
-            adapter = self._container.make_vieneu_tts_adapter(mode=self._mode)
+            adapter = self._container.make_vieneu_tts_adapter(
+                mode=self._mode, precision=self._precision or None
+            )
             if not adapter.is_available():
                 self.load_failed.emit(self._mode)
                 return
             voice_ids = adapter.list_speakers("vi-VN") or []
-        except (RuntimeError, OSError, ValueError) as exc:
+            catalog = adapter.list_voice_catalog("vi-VN") or []
+        except Exception as exc:  # noqa: BLE001
+            # [v3.23.650] MỌI lỗi đều phải phát load_failed: ngoại lệ lạ (TypeError/KeyError khi vieneu đổi API…) từng
+            # thoát khỏi run() không phát tín hiệu → combo giọng kẹt "Đang nạp…" và nút Tổng hợp tắt tới khi khởi động lại.
             logger.warning("Nạp giọng VieNeu (nền) lỗi: %s", exc)
             self.load_failed.emit(self._mode)
             return
+        self.catalog_loaded.emit(self._mode, list(catalog))
         self.voices_loaded.emit(self._mode, list(voice_ids))
 
 # [v3.23.206] Ngưỡng CẢNH BÁO lấn (giây): câu chồng sang câu sau quá mức này được tô
@@ -99,13 +127,15 @@ _EDGE_ONLY_HINT = " — chỉ áp dụng cho Edge TTS"
 # Các trường TTSRequest CHỈ Edge đọc (đã quét mã 3 adapter). Khi engine khác chạy,
 # debug config phải ĐÁNH DẤU rõ để không gây hiểu nhầm lúc phân tích kết quả.
 _EDGE_ONLY_FIELDS = frozenset({
-    "edge_concurrency", "timing_strategy", "elastic_timing", "double_pass",
-    "high_quality", "max_drift_s", "last_line_max_extend_s",
-    "min_stretch_ratio", "comfort_speed_ratio", "min_pause_ratio",
+    "edge_concurrency", "timing_strategy", "double_pass",
+    "high_quality", "last_line_max_extend_s",
+    "min_stretch_ratio", "min_pause_ratio",
     "max_intra_gap_s", "anchor_gap_s", "max_segment_s",
 })
 # [v3.23.218] ``lead_in_s`` ("Ăn gian đầu") ĐÃ RA KHỎI danh sách trên: VieNeu/Gemini nay
 # cũng dùng nó để đọc sớm vào khoảng lặng câu trước -> nén nhẹ hơn, giọng rõ hơn.
+# [v3.23.596] ``elastic_timing`` / ``max_drift_s`` / ``comfort_speed_ratio`` cũng ra:
+# VieNeu và Gemini nay ngân trễ câu chật (xem ``infrastructure.tts.line_placement``).
 
 
 _ENGINE_EDGE   = "edge"
@@ -152,6 +182,8 @@ class TTSPage(QWidget):
         self._gpu_install_worker = None
         self._editor_event_provider: Callable[[], list[SubtitleEvent]] | None = None
         self._translate_event_provider: Callable[[], list[SubtitleEvent]] | None = None
+        # [v3.23.593] Giọng VieNeu kèm giới tính theo chế độ (nạp ở luồng nền).
+        self._vieneu_catalog: dict[str, list] = {}
 
         self._build_ui()
         self._connect_signals()
@@ -172,6 +204,10 @@ class TTSPage(QWidget):
 
     def set_translate_event_provider(self, p: Callable[[], list[SubtitleEvent]]) -> None:
         self._translate_event_provider = p
+
+    def set_dubbing_source_provider(self, p: Callable[[], DubbingSource]) -> None:
+        """[v3.23.593] Nguồn phân vai lồng tiếng (nhân vật + Visual Cues ở trang Dịch)."""
+        self._dubbing.set_source_provider(p)
 
     def suggest_output_path(self, video_path: str) -> None:
         """Cập nhật đường dẫn WAV theo tên video (``<tên>.wav``) khi nạp video.
@@ -260,6 +296,10 @@ class TTSPage(QWidget):
             ),
             "🎚 Âm thanh & Xuất",
         )
+        self._config_tabs.addTab(
+            self._make_config_tab(self._build_dubbing_group()),
+            self._translator.translate("tts.tab_dubbing"),
+        )
         left_col.addWidget(self._config_tabs, 1)
         left_col.addWidget(self._build_actions_group())
         left.setMinimumWidth(480)
@@ -273,6 +313,44 @@ class TTSPage(QWidget):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([700, 700])
         root.addWidget(splitter, 1)
+
+    # ── Lồng tiếng ────────────────────────────────────────────────────────────
+
+    def _build_dubbing_group(self) -> QWidget:
+        """[v3.23.593] Thẻ lồng tiếng: mỗi nhân vật một giọng (điều phối: tts_dubbing)."""
+        self._dubbing_panel = DubbingCastPanel(self._translator)
+        self._dubbing = TTSDubbingCoordinator(
+            self._dubbing_panel, self._view_model, self._settings,
+            self._translator.translate, self._dubbing_catalog, parent=self,
+            main_voice_provider=self._dubbing_main_voice,
+        )
+        return self._dubbing_panel
+
+    def _dubbing_main_voice(self) -> str:
+        """[v3.23.597] Giọng chung của engine hiện tại (mặc định cho chế độ 2 giọng)."""
+        engine_id = self._engine_combo.currentData() or _ENGINE_EDGE
+        if engine_id == _ENGINE_VIENEU:
+            return str(self._vieneu_voice.currentData() or "")
+        if engine_id == _ENGINE_GEMINI:
+            return self._gemini_voice.currentText()
+        return self._edge_voice.currentText()
+
+    def _dubbing_catalog(self) -> tuple[str, list]:
+        """(khoá engine, bộ giọng) của engine đang chọn cho bảng phân vai."""
+        engine_id = self._engine_combo.currentData() or _ENGINE_EDGE
+        if engine_id == _ENGINE_VIENEU:
+            mode = self._vieneu_mode.currentData() or "standard"
+            return f"vieneu_{mode}", list(self._vieneu_catalog.get(mode, []))
+        if engine_id == _ENGINE_GEMINI:
+            return _ENGINE_GEMINI, self._view_model.voice_catalog(_ENGINE_GEMINI, "")
+        language = self._edge_lang.currentData() or "vi-VN"
+        return f"edge_{language}", self._view_model.voice_catalog(_ENGINE_EDGE, language)
+
+    def _on_vieneu_catalog_loaded(self, mode: str, catalog: list) -> None:
+        """Giọng VieNeu (kèm giới tính) về từ luồng nền → cập nhật bảng phân vai."""
+        self._vieneu_catalog[mode] = list(catalog)
+        if (self._engine_combo.currentData() or _ENGINE_EDGE) == _ENGINE_VIENEU:
+            self._dubbing.refresh_catalog()
 
     # ── Source ────────────────────────────────────────────────────────────────
 
@@ -412,10 +490,10 @@ class TTSPage(QWidget):
         self._gemini_model.addItems(GEMINI_TTS_MODELS)
         self._gemini_model.setToolTip(
             "Standard TTS: nhanh, ổn định, 1 API call/dòng\n"
-            "Native Audio Dialog: tự nhiên hơn, cảm xúc hơn, dùng Live API (WebSocket)"
-        )
-        self._gemini_model.setToolTip(
-            "Standard TTS: nhanh, ổn định, 1 API call/dòng\n"
+            "  ★ gemini-3.8-flash-lite-tts — GA 9/2026, nhanh/rẻ, hợp phụ đề dài\n"
+            "  • gemini-3.8-flash-tts — GA 9/2026, giọng biểu cảm nhất\n"
+            "  • gemini-3.1-flash-tts-preview — preview, được 3.8 Flash-Lite thay thế\n"
+            "  • gemini-2.5-*-tts — đời cũ, Google giới hạn cho người đã dùng gần đây\n"
             "Native Audio Dialog (Live API): giọng tự nhiên, cảm xúc hơn\n"
             "  ★ gemini-2.5-flash-native-audio-latest — Recommended tracking alias\n"
             "  • gemini-2.5-flash-preview-native-audio-dialog — Affective Dialog (v1alpha)\n"
@@ -496,16 +574,23 @@ class TTSPage(QWidget):
 
         # Chế độ engine (chất lượng vs tốc độ).
         self._vieneu_mode = QComboBox()
+        # [v3.23.445] v3 Turbo (48kHz) nay là MẶC ĐỊNH của SDK VieNeu + chất lượng CAO NHẤT
+        # (đã hết "thử nghiệm" từ bản 3.3.0) → đưa lên ĐẦU làm mặc định. Standard/Turbo (24kHz)
+        # giữ lại cho máy yếu / tương thích ngược.
+        self._vieneu_mode.addItem(self._translator.translate("tts.vn_mode_v3turbo"), userData="v3turbo")
         self._vieneu_mode.addItem(self._translator.translate("tts.vn_mode_standard"), userData="standard")
         self._vieneu_mode.addItem(self._translator.translate("tts.vn_mode_turbo"), userData="turbo")
-        self._vieneu_mode.addItem(self._translator.translate("tts.vn_mode_v3turbo"), userData="v3turbo")
         self._vieneu_mode.setToolTip(
-            "Standard: chất lượng cao nhất (khuyến nghị cho phụ đề — nhiều câu ngắn).\n"
-            "Turbo: nhanh hơn NHƯNG chất lượng thấp hơn và có thể lỗi/nhiễu với câu "
-            "rất ngắn (< 5 từ) — theo cảnh báo của tác giả VieNeu.\n"
-            "v3 Turbo: 48kHz, thử nghiệm."
+            "v3 Turbo: 48kHz, chất lượng CAO NHẤT & là mặc định chính thức của VieNeu "
+            "(kiến trúc mới, giọng tự nhiên nhất) — KHUYẾN NGHỊ.\n"
+            "Standard: 24kHz, model cũ ổn định (dùng nếu máy yếu hoặc v3 Turbo lỗi).\n"
+            "Turbo: 24kHz nhanh hơn NHƯNG chất lượng thấp & có thể nhiễu với câu rất "
+            "ngắn (< 5 từ)."
         )
         self._vieneu_mode.currentIndexChanged.connect(self._on_vieneu_mode_changed)
+        self._vieneu_mode.currentIndexChanged.connect(
+            lambda _idx: self._sync_vieneu_mode_controls()
+        )
         form.addRow(self._translator.translate("tts.tts_mode"), self._vieneu_mode)
 
         # Sắc thái giọng.
@@ -514,6 +599,18 @@ class TTSPage(QWidget):
         self._vieneu_emotion.addItem(self._translator.translate("tts.vn_emo_story"), userData="storytelling")
         self._vieneu_emotion.setToolTip(self._translator.translate("tts.tip_emotion"))
         form.addRow(self._translator.translate("tts.tts_emotion"), self._vieneu_emotion)
+
+        # [v3.23.446] Tag cảm xúc VieNeu v3 Turbo (thử nghiệm): tự chuyển interjection cười/thở
+        # dài trong bản dịch thành [cười]/[thở dài] để giọng đọc biểu cảm hơn. CHỈ tác động
+        # audio (phụ đề giữ nguyên). Chỉ có tác dụng ở mode v3 Turbo.
+        self._vieneu_emotion_cues = QCheckBox("Tag cảm xúc (v3 Turbo, thử nghiệm)")
+        self._vieneu_emotion_cues.setChecked(False)
+        self._vieneu_emotion_cues.setToolTip(
+            "Thử nghiệm (chỉ v3 Turbo): tự chuyển tiếng cười/thở dài rõ ràng trong lời "
+            "thoại (haha, khà khà, haizz…) thành tag [cười]/[thở dài] để giọng đọc phát "
+            "biểu cảm THẬT thay vì đọc chữ. KHÔNG ảnh hưởng file phụ đề (chỉ audio)."
+        )
+        form.addRow("", self._vieneu_emotion_cues)
 
         # Ép chạy CPU/ONNX — né lỗi PyTorch/cuDNN (WinError 127) trên máy CUDA lệch bản.
         self._vieneu_force_cpu = QCheckBox(self._translator.translate("tts.opt_force_cpu"))
@@ -524,6 +621,52 @@ class TTSPage(QWidget):
             "được cài (xem ghi chú bên dưới)."
         )
         form.addRow(self._translator.translate("tts.tts_device"), self._vieneu_force_cpu)
+
+        # [v3.23.595] VieNeu 3.8: backbone ONNX/CPU của v3 Turbo có bản int8 — nhanh
+        # ~3x mỗi frame theo chú thích SDK, nhưng cần CPU có VNNI để không méo tiếng.
+        # Mặc định tắt.
+        self._vieneu_int8 = QCheckBox(self._translator.translate("tts.opt_vieneu_int8"))
+        self._vieneu_int8.setChecked(False)
+        self._vieneu_int8.setToolTip(self._vieneu_int8_tooltip())
+        form.addRow("", self._vieneu_int8)
+
+        # [v3.23.416] Kích thước LÔ khi chạy GPU (tăng tốc phim dài). Tắt = từng câu (ổn định
+        # nhất). Auto = tự chọn theo VRAM. Chỉ có tác dụng khi BỎ tick "Ép chạy CPU".
+        self._vieneu_batch = QComboBox()
+        self._vieneu_batch.addItem(
+            self._translator.translate("tts.tts_batch_off"), userData=0
+        )
+        self._vieneu_batch.addItem(
+            self._translator.translate("tts.tts_batch_auto"), userData=-1
+        )
+        self._vieneu_batch.addItem(
+            self._translator.translate("tts.tts_batch_all"), userData=-2
+        )
+        _batch_n_tpl = self._translator.translate("tts.tts_batch_n")
+        for _bs in (8, 16, 24, 32, 64, 128, 256, 512):
+            label = (
+                _batch_n_tpl.format(n=_bs)
+                if "{n}" in _batch_n_tpl
+                else f"{_bs} câu/lô"
+            )
+            self._vieneu_batch.addItem(label, userData=_bs)
+        self._vieneu_batch.setCurrentIndex(0)  # mặc định TẮT (an toàn)
+        self._vieneu_batch.setToolTip(
+            "Gộp nhiều câu trong một lần suy luận GPU → nhanh hơn cho phim dài.\n"
+            "• Tắt: tổng hợp từng câu (ổn định nhất, mặc định).\n"
+            "• Một lô cho TẤT CẢ câu: gom hết vào một lần gọi (cần ~2GB RAM, không thấy\n"
+            "  tiến độ tới khi xong; GPU vẫn xử lý chunk theo nhóm nên không nhanh hơn nhiều).\n"
+            "• Tự động / số câu: số CÂU gom mỗi lần gọi GPU (giảm vòng lặp).\n"
+            "• Số CHUNK/forward GPU được tự chọn theo VRAM (8GB→32, 16GB→64…) để tận dụng\n"
+            "  VRAM dư — đây mới là yếu tố tăng tốc chính (mặc định vieneu chỉ 4 chunk).\n"
+            "• Thiếu VRAM → tự lùi về từng câu cho lô đó (không lỗi).\n"
+            "• Câu 'ngân dài' luôn thử lại từng câu (giữ chất lượng).\n"
+            "Chỉ tác dụng khi BỎ tick 'Ép chạy CPU'."
+        )
+        form.addRow(
+            self._translator.translate("tts.tts_batch"),
+            self._vieneu_batch,
+        )
 
         # [v3.23.342] NÓI THẬT về khả năng dùng GPU. Trước đây bỏ tick ô trên KHÔNG có
         # tác dụng gì trong bản đóng gói: torch bị loại khỏi bundle, nên VieNeu gặp
@@ -552,6 +695,7 @@ class TTSPage(QWidget):
         self._vieneu_force_cpu.toggled.connect(
             lambda _checked: self._refresh_vieneu_gpu_note()
         )
+        self._sync_vieneu_mode_controls()
 
         # Giọng preset (điền động khi engine sẵn sàng).
         self._vieneu_voice = QComboBox()
@@ -607,20 +751,15 @@ class TTSPage(QWidget):
         # -> đặt max > 2.0 KHÔNG có tác dụng với 2 engine này (Edge dùng được cao hơn
         # nhờ đọc nhanh phía máy chủ, không phải nén hậu kỳ).
         self._max_speed.setToolTip(
-            "Trần tốc độ đọc TỔNG của một câu.\n\n"
-            "• Edge TTS: dùng được tới 5.0× (đọc nhanh phía máy chủ, chất lượng tốt).\n"
-            "• VieNeu / Gemini: nén hậu kỳ nên bị chặn ở 2.0× — đặt cao hơn KHÔNG có\n"
-            "  tác dụng (nén quá 2× làm giọng mất rõ, thành 'tiếng gió').\n\n"
-            "Câu quá dài không nén đủ sẽ TRÀN sang câu sau (nếu bật 'Cho phép chồng\n"
-            "tiếng') — trọn nội dung, ưu tiên nghe rõ."
+            "Trần tốc độ đọc TỔNG của một câu. Ứng dụng LUÔN dùng ĐÚNG giá trị bạn đặt.\n\n"
+            "• Edge TTS: tới 5.0× vẫn tốt (tăng tốc phía máy chủ, giữ chất lượng).\n"
+            "• VieNeu / Gemini: nén hậu kỳ. KHUYẾN NGHỊ ≤ 2.0× — nén quá 2× dễ làm\n"
+            "  giọng mất rõ, thành 'tiếng gió'. Đặt cao hơn VẪN được áp dụng (bạn tự\n"
+            "  quyết đánh đổi tốc độ ↔ độ rõ).\n\n"
+            "Câu quá dài không nén đủ trong trần này sẽ TRÀN sang câu sau (nếu bật\n"
+            "'Cho phép chồng tiếng') — giữ trọn nội dung, ưu tiên nghe rõ."
         )
         self._max_speed.setSingleStep(0.1); self._max_speed.setDecimals(1); self._max_speed.setValue(2.0)
-        self._max_speed.setToolTip(
-            "Tốc độ tối đa để khớp timing (post-processing time-stretch).\n"
-            "Edge TTS: ưu tiên rate qua API tới 3.0× (giữ pitch tự nhiên).\n"
-            "Gemini/VieNeu: time-stretch sau generate, 2-3× thường vẫn rõ ràng.\n"
-            "Luôn ≥ tốc độ cơ bản."
-        )
         # Ràng buộc UX: max_speed không bao giờ nhỏ hơn tốc độ cơ bản, tránh cấu
         # hình mâu thuẫn (base > max làm logic tốc độ vô nghĩa).
         self._speed.valueChanged.connect(self._on_base_speed_changed)
@@ -818,7 +957,10 @@ class TTSPage(QWidget):
             "Nếu câu quá dài nhưng sau đó có khoảng trống, DỜI các câu sau về sau\n"
             "(trong dung sai) để câu hiện tại đọc chậm, tự nhiên hơn.\n"
             "Tự lấy lại đồng bộ khi gặp khoảng lặng đủ lớn.\n"
-            "→ Xuất kèm file .srt mới khớp lời thoại đã dời."
+            "→ Xuất kèm file .srt mới khớp lời thoại đã dời.\n"
+            "VieNeu/Gemini: câu chật được nén tới mức 'Nén êm' trước, còn thiếu mới\n"
+            "ngân trễ qua mốc câu sau tối đa min(Dung sai cộng dồn, 0,5 s) — câu sau\n"
+            "đọc lùi tương ứng, không chồng tiếng."
         )
         timing_form.addRow(self._translator.translate("tts.tts_elastic"), self._elastic_timing)
 
@@ -988,6 +1130,12 @@ class TTSPage(QWidget):
         self._progress = QProgressBar(); self._progress.setRange(0, 100)
         self._stage_lbl = QLabel(self._translator.translate("tts.status_ready_short"))
         lay.addWidget(self._progress); lay.addWidget(self._stage_lbl)
+        # [v3.23.630] Chỉ tổng hợp lại dòng đã đổi (dùng lại audio cũ) — log thật: 21 lượt cả
+        # phim × 18 phút dù mỗi lần chỉ sửa vài chục dòng.
+        self._incremental = QCheckBox(self._translator.translate("tts.opt_incremental"))
+        self._incremental.setChecked(True)
+        self._incremental.setToolTip(self._translator.translate("tts.tip_incremental"))
+        lay.addWidget(self._incremental)
         btn_row = QHBoxLayout()
         # [v3.23.331] Tổng hợp cả bộ — mô hình chỉ nạp MỘT LẦN cho toàn bộ hàng đợi,
         # tiết kiệm ~15 giây nạp lại cho mỗi tập.
@@ -1037,12 +1185,18 @@ class TTSPage(QWidget):
         filter_row.addStretch()
         lay.addLayout(filter_row)
 
-        self._table = QTableWidget(0, 7)
+        # [v3.23.598] Cột thứ 8 "Người nói · Giọng" do TTSLineEditsController dựng (hiện
+        # cạnh cột Nội dung khi bật lồng tiếng).
+        self._table = QTableWidget(0, _COLUMN_COUNT)
         self._table.setHorizontalHeaderLabels(
             ["#", "Thời gian", "Nội dung", "Thời lượng", "Tốc độ", "Loại", "Trạng thái"]
         )
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        # [v3.23.450] Cho SỬA nội dung bằng double-click (chỉ cột Nội dung được set editable
+        # ở _populate_table). itemChanged → cập nhật kết quả + event nguồn để TTS lại đúng.
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
+        self._table.itemChanged.connect(self._on_result_item_edited)
+        self._table.itemSelectionChanged.connect(self._on_result_selection_changed)
         self._table.setWordWrap(True); self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setDefaultSectionSize(36)
         hdr = self._table.horizontalHeader()
@@ -1070,8 +1224,48 @@ class TTSPage(QWidget):
         btn_row.addWidget(self._btn_open)
         btn_row.addWidget(self._btn_open_file)
         btn_row.addWidget(self._btn_export)
+        # [v3.23.450] Nghe lại + TTS lại các dòng ĐANG CHỌN (dùng audio segment per-line).
+        self._btn_play_sel = PushButton("▶ Nghe dòng chọn")
+        self._btn_play_sel.setEnabled(False)
+        self._btn_play_sel.setToolTip("Phát audio của dòng đang chọn (đã tổng hợp).")
+        self._btn_play_sel.clicked.connect(self._on_play_selected)
+        self._btn_resynth = PushButton("🔄 TTS lại dòng chọn")
+        self._btn_resynth.setEnabled(False)
+        self._btn_resynth.setToolTip(
+            "Tổng hợp lại các dòng đang chọn (kể cả nội dung vừa sửa) rồi ghép lại "
+            "file audio — không phải chạy lại toàn bộ."
+        )
+        self._btn_resynth.clicked.connect(self._on_resynthesize_selected)
+        # [v3.23.459] Chọn nhanh MỌI dòng "dài bất thường" để nghe/TTS lại (không phải nghe dò).
+        self._btn_select_abnormal = PushButton("⚠ Chọn dòng bất thường")
+        self._btn_select_abnormal.setEnabled(False)
+        self._btn_select_abnormal.setToolTip(
+            "Chọn tất cả dòng có audio dài bất thường (model ngân dài) để TTS lại hàng loạt."
+        )
+        self._btn_select_abnormal.clicked.connect(self._on_select_abnormal)
         btn_row.addStretch()
         lay.addLayout(btn_row)
+        # [v3.23.601] Nút theo DÒNG sang hàng riêng: sáu nút một hàng bị bóp còn ~120 px
+        # ở cửa sổ 1500 px ("⚠ Chọn dòng bất thường", "📊 Xuất chi tiết (debug)" bị cắt).
+        line_row = QHBoxLayout()
+        line_row.addWidget(self._btn_play_sel)
+        line_row.addWidget(self._btn_resynth)
+        line_row.addWidget(self._btn_select_abnormal)
+        line_row.addStretch()
+        lay.addLayout(line_row)
+        # [v3.23.598] Sửa tay từng dòng: người nói (giọng) + lời thoại, trước/sau khi TTS.
+        self._line_edits = TTSLineEditsController(
+            self._table, self._view_model, self._dubbing, self._dubbing_panel,
+            self._settings, self._translator.translate,
+            commit_edit=self._commit_active_edit,
+            show_status=self._stage_lbl.setText,
+            context_buttons=(self._btn_play_sel, self._btn_resynth),
+            rebuild_table=self._rebuild_after_structure,
+            resynthesize=self._resynthesize_positions,
+            shorten=self._start_shorten,
+            parent=self,
+        )
+        lay.addLayout(self._line_edits.button_row())
         g.add_layout(lay)
         return g
 
@@ -1080,6 +1274,8 @@ class TTSPage(QWidget):
     def _connect_signals(self) -> None:
         vm = self._view_model
         vm.source_changed.connect(self._on_source_changed)
+        # [v3.23.598] SAU khi trang xoá kết quả cũ: khôi phục sửa tay + hiện các dòng mới.
+        vm.source_changed.connect(self._line_edits.on_source_changed)
         vm.busy_changed.connect(self._on_busy_changed)
         vm.progress_changed.connect(lambda r, l: (
             self._progress.setValue(int(r * 100)),
@@ -1090,18 +1286,29 @@ class TTSPage(QWidget):
         vm.source_changed.connect(self._on_source_changed_for_batch)
         vm.error_occurred.connect(self._on_error_for_batch)
         vm.status_message.connect(self._stage_lbl.setText)
-        vm.tts_cancelled.connect(lambda: (
-            self._progress.setValue(0),
-            self._stage_lbl.setText(self._translator.translate("tts.status_cancelled")),
-            self._show_info(self._translator.translate("tts.toast_cancelled_t"), self._translator.translate("tts.toast_cancelled_b"))
-        ))
+        vm.tts_cancelled.connect(self._on_tts_cancelled)
         vm.engine_available.connect(self._on_engine_available)
 
     # ── Handlers ─────────────────────────────────────────────────────────────
 
+    def _on_tts_cancelled(self) -> None:
+        self._progress.setValue(0)
+        self._stage_lbl.setText(self._translator.translate("tts.status_cancelled"))
+        # [v3.23.650] Huỷ khi đang chạy CẢ BỘ: dọn hàng đợi. Trước đây `_batch_items` còn nguyên → lần TTS thường kế
+        # tiếp bị coi là một tập của hàng đợi (không báo thành công, nuốt lỗi, hiện hộp "Đã huỷ…" cũ).
+        if self._batch_items:
+            self._batch_cancelled = True
+            self._finish_batch_tts()
+            return
+        self._show_info(self._translator.translate("tts.toast_cancelled_t"), self._translator.translate("tts.toast_cancelled_b"))
+
     def _clear_results(self) -> None:
         """[1.5] Quét sạch bảng + tóm tắt kết quả TTS cũ khi đổi nguồn dữ liệu."""
         self._last_results = []
+        # [v3.23.452] Trạng thái phát audio per-line (khởi tạo lười; phát KHI media nạp xong).
+        self._audio_player = None
+        self._audio_out = None
+        self._pending_play = False
         self._table.clearContents()
         self._table.setRowCount(0)
         self._lbl_summary.setText(self._translator.translate("tts.status_no_result"))
@@ -1149,8 +1356,14 @@ class TTSPage(QWidget):
         import csv
         import statistics as _st
 
+        # [v3.23.428] Tên nhất quán có timestamp → mỗi lần xuất một tệp riêng, không ghi đè.
+        from subtitles_extractor.application.services.diagnostic_naming import (
+            build_diagnostic_filename,
+        )
+
+        _tts_default = build_diagnostic_filename(None, "tts_debug", "csv")
         path = _safe_dialogs.save_file(
-            self, "Xuất chi tiết TTS", "tts_debug.csv", "CSV (*.csv)"
+            self, "Xuất chi tiết TTS", _tts_default, "CSV (*.csv)"
         )
         if not path:
             return
@@ -1171,8 +1384,9 @@ class TTSPage(QWidget):
                     "Thời lượng audio (s)", "Lấn (s)",
                     "Nén (cách)", "Tỉ lệ nén (×)", "Cắt (ms)",
                     "Nghỉ (ms)", "Dìm câu trước (s)",
-                    "Bị cắt", "Bị bỏ", "Lỗi",
+                    "Bị cắt", "Bị bỏ", "Lỗi", "Giọng",
                 ])
+                last_request = getattr(self._view_model, "last_request", None)
                 for i, r in enumerate(self._last_results, 1):
                     adj_start = r.adjusted_start_sec if r.adjusted_start_sec >= 0 else r.start_sec
                     adj_end = r.adjusted_end_sec if r.adjusted_end_sec >= 0 else r.end_sec
@@ -1188,6 +1402,10 @@ class TTSPage(QWidget):
                         r.stretch_method or "", f"{r.stretch_ratio:.3f}", f"{r.cut_amount_ms:.0f}",
                         f"{r.pause_ms:.0f}", f"{r.ducked_prev_s:.3f}",
                         _b(r.was_truncated), _b(r.was_skipped), r.error_msg or "",
+                        # [v3.23.593] Giọng thật đọc dòng này (lồng tiếng: theo vai).
+                        last_request.voice_at(
+                            int(r.event_index), last_request.speaker or "mặc định"
+                        ) if last_request is not None else "",
                     ])
 
             self._write_debug_config(Path(path), _st)
@@ -1215,7 +1433,8 @@ class TTSPage(QWidget):
             ((r.adjusted_start_sec if r.adjusted_start_sec >= 0 else r.start_sec) - r.start_sec) * 1000.0
             for r in ok
         ]
-        overlaps = [r.overlap_s for r in ok if r.overlap_s > 0]
+        # [v3.23.601] Chỉ đếm chồng tiếng THẬT (≥1 ms), bỏ phần dư làm tròn sau nén.
+        overlaps = [r.overlap_s for r in ok if r.has_audible_overlap]
         stretched = [r for r in ok if r.stretch_method]
         lines: list[str] = []
         lines.append("=" * 60)
@@ -1285,6 +1504,17 @@ class TTSPage(QWidget):
             # -> người dùng (và cả việc phân tích debug) tưởng "Elastic timing: Bật" có
             # tác dụng khi chạy VieNeu, thực tế bị bỏ qua hoàn toàn.
             is_edge = (self._engine_combo.currentData() or _ENGINE_EDGE) == _ENGINE_EDGE
+            line_voices = tuple(getattr(req, "line_voices", ()) or ())
+            if line_voices:
+                distinct = sorted({voice for voice in line_voices if voice})
+                # [v3.23.597] Ghi kèm cách phân giọng để soi chẩn đoán.
+                two_voices = self._dubbing_panel.cast_mode() == CAST_MODE_TWO_VOICES
+                lines.append(
+                    f"{'Lồng tiếng':<24}: {len(distinct)} giọng cho "
+                    f"{sum(1 for voice in line_voices if voice)}/{len(line_voices)} dòng "
+                    f"({', '.join(distinct)})"
+                    + (" — chế độ chỉ 2 giọng nam/nữ" if two_voices else "")
+                )
             for label, attr in fields:
                 if hasattr(req, attr):
                     value = _fmt(getattr(req, attr))
@@ -1358,6 +1588,11 @@ class TTSPage(QWidget):
         # max_speed dùng cho tất cả engines (time-stretch post-processing)
         self._max_speed.setVisible(True)
         self._sync_edge_only_controls(engine_id)
+        # [v3.23.593] Mỗi engine một bộ giọng → bảng phân vai đổi theo (thẻ lồng tiếng
+        # dựng SAU bộ chọn engine nên có thể chưa tồn tại khi tín hiệu phát lúc dựng
+        # giao diện).
+        if hasattr(self, "_dubbing"):
+            self._dubbing.refresh_catalog()
         # [v3.23.195] Nạp giọng VieNeu CHỈ khi trang đang hiển thị (người dùng tương tác
         # thật). Nạp lúc khởi động (restore engine đã lưu) sẽ tải model ~9s CHẶN app mở
         # (log thực tế: model nạp trước cả MainWindow). Trang chưa hiện -> hoãn tới
@@ -1385,9 +1620,9 @@ class TTSPage(QWidget):
                 ``_ENGINE_VIENEU``).
         """
         is_edge = engine_id == _ENGINE_EDGE
+        # [v3.23.596] "Elastic timing" và "Nén êm" nay áp cho cả VieNeu/Gemini.
         for widget in (
-            self._strategy, self._high_quality, self._double_pass,
-            self._elastic_timing, self._comfort_ratio, self._min_pause,
+            self._strategy, self._high_quality, self._double_pass, self._min_pause,
         ):
             widget.setEnabled(is_edge)
             edge_hint = self._translator.translate("tts.edge_only_hint")
@@ -1413,8 +1648,7 @@ class TTSPage(QWidget):
         2 loader song song (đổi chế độ giữa chừng -> ghi nhận, nạp lại khi xong).
         """
         mode = self._vieneu_mode.currentData() or "standard"
-        loader = getattr(self, "_vieneu_voice_loader", None)
-        if loader is not None and loader.isRunning():
+        if self._voice_loader_running():
             # Đang nạp: handler khi xong sẽ tự so chế độ hiện tại và nạp lại nếu khác.
             return
         self._vieneu_voice.blockSignals(True)
@@ -1427,12 +1661,24 @@ class TTSPage(QWidget):
         # Nút bật lại khi nạp xong/lỗi.
         if (self._engine_combo.currentData() or _ENGINE_EDGE) == _ENGINE_VIENEU:
             self._btn_gen.setEnabled(False)
-        loader = _VieNeuVoiceLoader(self._view_model._container, mode, parent=self)
+        loader = _VieNeuVoiceLoader(
+            self._view_model._container, mode, parent=self,
+            precision=self._vieneu_precision(),
+        )
         loader.voices_loaded.connect(self._on_vieneu_voices_loaded)
+        loader.catalog_loaded.connect(self._on_vieneu_catalog_loaded)
         loader.load_failed.connect(self._on_vieneu_voices_failed)
         loader.finished.connect(loader.deleteLater)
         self._vieneu_voice_loader = loader
         loader.start()
+
+    def _voice_loader_running(self) -> bool:
+        """[v3.23.650] Loader giọng còn chạy? An toàn khi đối tượng C++ đã bị ``deleteLater`` (finished → deleteLater
+        trong lúc Python còn giữ wrapper làm ``isRunning()`` ném "Internal C++ object already deleted")."""
+        loader = getattr(self, "_vieneu_voice_loader", None)
+        if loader is None or is_deleted(loader):
+            return False
+        return bool(loader.isRunning())
 
     def _on_vieneu_voices_loaded(self, mode: str, voice_ids: list) -> None:
         """Nhận danh sách giọng từ thread nền; bỏ qua kết quả STALE nếu đã đổi chế độ."""
@@ -1453,6 +1699,13 @@ class TTSPage(QWidget):
         for voice_id in voice_ids:
             self._vieneu_voice.addItem(voice_id, userData=voice_id)
         restore = self._vieneu_voice.findData(current)
+        if restore < 0 and current:
+            # [v3.23.626] Giọng lưu dưới tên cũ (VieNeu 3.8 đổi tên: "Minh Quân" → "Hải Đăng").
+            from subtitles_extractor.infrastructure.tts.vieneu_tts_adapter import (
+                resolve_voice_alias,
+            )
+
+            restore = self._vieneu_voice.findData(resolve_voice_alias(current))
         if restore >= 0:
             self._vieneu_voice.setCurrentIndex(restore)
         else:
@@ -1479,12 +1732,44 @@ class TTSPage(QWidget):
         # bắt đầu nạp). Dùng giọng mặc định vẫn chạy được, không nên kẹt nút.
         self._update_action_states()
 
+    def _vieneu_int8_tooltip(self) -> str:
+        """Chú thích ô int8 kèm kết quả dò VNNI của máy này."""
+        from subtitles_extractor.infrastructure.tts.cpu_features import cpu_vnni_support
+
+        support = cpu_vnni_support()
+        key = {
+            True: "tts.vnni_yes", False: "tts.vnni_no", None: "tts.vnni_unknown",
+        }[support]
+        return (
+            f"{self._translator.translate('tts.tip_vieneu_int8')}\n"
+            f"{self._translator.translate(key)}"
+        )
+
+    def _vieneu_precision(self) -> str:
+        """``"int8"`` khi người dùng bật CPU nhanh cho v3 Turbo; rỗng = mặc định SDK."""
+        mode = self._vieneu_mode.currentData() or "standard"
+        return "int8" if (mode == "v3turbo" and self._vieneu_int8.isChecked()) else ""
+
+    def _sync_vieneu_mode_controls(self) -> None:
+        """[v3.23.595] Bật/tắt các tuỳ chọn theo chế độ VieNeu.
+
+        * Sắc thái giọng: VieNeu 3.8 bỏ ``style`` ở v3 Turbo (nhận nhưng bỏ qua — phong cách
+          đọc nằm trong giọng mẫu), nên ô này không có tác dụng ở v3 Turbo.
+        * CPU nhanh int8: chỉ v3 Turbo có graph int8.
+        """
+        is_v3turbo = (self._vieneu_mode.currentData() or "standard") == "v3turbo"
+        self._vieneu_emotion.setEnabled(not is_v3turbo)
+        self._vieneu_emotion.setToolTip(
+            self._translator.translate(
+                "tts.tip_emotion_v3turbo" if is_v3turbo else "tts.tip_emotion"
+            )
+        )
+        if hasattr(self, "_vieneu_int8"):
+            self._vieneu_int8.setEnabled(is_v3turbo)
+
     def _on_vieneu_mode_changed(self, _idx: int = 0) -> None:
         """Đổi chế độ VieNeu -> nạp lại danh sách giọng của chế độ mới (thread nền)."""
-        loader = getattr(self, "_vieneu_voice_loader", None)
-        if getattr(self, "_vieneu_voices_loaded", False) or (
-            loader is not None and loader.isRunning()
-        ):
+        if getattr(self, "_vieneu_voices_loaded", False) or self._voice_loader_running():
             self._vieneu_voices_loaded = False  # danh sách cũ không còn đúng chế độ
             self._load_vieneu_voices()
 
@@ -1504,6 +1789,8 @@ class TTSPage(QWidget):
         if idx >= 0:
             self._edge_voice.setCurrentIndex(idx)
         self._edge_voice.blockSignals(False)
+        if hasattr(self, "_dubbing"):
+            self._dubbing.refresh_catalog()
 
     def _on_browse_vieneu_ref(self) -> None:
         """Chọn file audio nhân bản giọng cho VieNeu-TTS (tuỳ chọn)."""
@@ -1531,6 +1818,8 @@ class TTSPage(QWidget):
             self._output.setText(str(_P(p).with_suffix(f".{fmt}")))
 
     def _on_generate(self) -> None:
+        # [v3.23.598] Ô lời đang mở sửa phải vào dữ liệu trước khi đọc phụ đề để tổng hợp.
+        self._commit_active_edit()
         out = self._output.text().strip()
         if not out:
             self._show_warning(self._translator.translate("tts.toast_nopath_t"), self._translator.translate("tts.toast_no_wav_path"))
@@ -1569,8 +1858,7 @@ class TTSPage(QWidget):
             # [v3.23.252] Đang nạp giọng VieNeu (thread nền) -> combo chưa sẵn
             # sàng, bấm chạy sẽ lỗi. Chặn sớm với thông báo rõ. Loader đang chạy
             # = giọng chưa nạp xong.
-            _loader = getattr(self, "_vieneu_voice_loader", None)
-            if _loader is not None and _loader.isRunning():
+            if self._voice_loader_running():
                 self._show_warning(
                     self._translator.translate("tts.toast_loading_voices_t"),
                     self._translator.translate("tts.toast_loading_voices_b"),
@@ -1654,9 +1942,25 @@ class TTSPage(QWidget):
                           ref_audio_path=self._vieneu_ref_path.text().strip(),
                           ref_text="",
                           vieneu_mode=self._vieneu_mode.currentData() or "standard",
-                          vieneu_emotion=self._vieneu_emotion.currentData() or "natural",
-                          vieneu_force_cpu=self._vieneu_force_cpu.isChecked())
+                          # [v3.23.595] v3 Turbo bỏ qua style → luôn "natural" để dùng
+                          # chung engine đã nạp (khoá cache gồm sắc thái).
+                          vieneu_emotion=(
+                              "natural"
+                              if (self._vieneu_mode.currentData() or "") == "v3turbo"
+                              else self._vieneu_emotion.currentData() or "natural"
+                          ),
+                          vieneu_precision=self._vieneu_precision(),
+                          vieneu_emotion_cues=self._vieneu_emotion_cues.isChecked(),
+                          vieneu_force_cpu=self._vieneu_force_cpu.isChecked(),
+                          vieneu_batch_size=self._vieneu_batch.currentData())
         kwargs["media_duration_s"] = getattr(self, "_media_duration_s", None)
+        kwargs["incremental"] = self._incremental.isChecked()
+        # [v3.23.593] Lồng tiếng: giọng riêng từng dòng theo bảng phân vai (rỗng = một
+        # giọng).
+        kwargs["line_voices"] = self._dubbing.line_voices()
+        # [v3.23.594] Nhớ bộ giọng (engine + ngôn ngữ/chế độ) của lần chạy này: TTS
+        # lại vài dòng chỉ lấy bảng phân vai hiện tại khi vẫn cùng bộ giọng.
+        self._last_dubbing_key = self._dubbing_catalog()[0]
         self._view_model.start_tts(**kwargs)
 
     @staticmethod
@@ -1915,7 +2219,21 @@ class TTSPage(QWidget):
             logger.warning("Cả bộ: %s không nạp được phụ đề.", name)
             self._advance_batch_tts(failed=name)
             return
-        QTimer.singleShot(0, self._on_generate)
+        QTimer.singleShot(0, self._generate_for_batch)
+
+    def _generate_for_batch(self) -> None:
+        """Bấm "Tổng hợp" cho tập hiện tại của hàng đợi; nếu không khởi động được (engine chưa cài, thiếu khoá, giọng
+        mẫu thiếu…) thì dừng HẲN hàng đợi — trước đây ``_on_generate`` thoát sớm và hàng đợi đứng yên vĩnh viễn."""
+        index_before = self._batch_index
+        self._on_generate()
+        # `error_occurred` phát đồng bộ (vd engine không khả dụng) đã tự tính lỗi và sang tập kế (`_batch_index` đổi):
+        # khi đó KHÔNG xử lý lần hai (trước đây tập kế bị tính lỗi theo và cả hàng đợi bị huỷ).
+        if self._batch_items and self._batch_index == index_before and not self._view_model.is_busy:
+            index = min(self._batch_index, len(self._batch_items) - 1)
+            name = self._batch_items[index].video_path.name
+            logger.warning("Cả bộ: không khởi động được tổng hợp cho %s — dừng hàng đợi.", name)
+            self._batch_cancelled = True
+            self._advance_batch_tts(failed=name)
 
     def _on_error_for_batch(self, message: str) -> None:
         """Nhận lỗi TTS: đang chạy hàng loạt thì ghi nhận rồi chạy tiếp."""
@@ -2023,14 +2341,342 @@ class TTSPage(QWidget):
         if not busy and (
             self._engine_combo.currentData() or _ENGINE_EDGE
         ) == _ENGINE_VIENEU:
-            _loader = getattr(self, "_vieneu_voice_loader", None)
-            if _loader is not None and _loader.isRunning():
+            if self._voice_loader_running():
                 self._btn_gen.setEnabled(False)
         # Disable nguồn + output khi đang bận
         for btn in (self._btn_load, self._btn_editor, self._btn_trans, self._btn_out):
             btn.setEnabled(not busy)
         if not busy:
             self._update_action_states()
+
+    def _selected_event_indices(self) -> list[int]:
+        """[v3.23.450] event_index của các dòng đang chọn (đọc từ UserRole cột 0)."""
+        return selected_positions(self._table)
+
+    def _result_by_event_index(self, event_index: int):
+        for r in self._last_results:
+            if int(r.event_index) == event_index:
+                return r
+        return None
+
+    def _on_result_selection_changed(self) -> None:
+        """Bật/tắt nút Nghe & TTS-lại theo dòng đang chọn."""
+        if not hasattr(self, "_btn_play_sel"):
+            return
+        sel = self._selected_event_indices()
+        busy = self._view_model.is_busy if hasattr(self._view_model, "is_busy") else False
+        # Nghe: đúng 1 dòng có audio segment. TTS lại: ≥1 dòng, không bận.
+        one = len(sel) == 1
+        has_audio = False
+        if one:
+            r = self._result_by_event_index(sel[0])
+            has_audio = bool(r and r.segment_audio_path)
+        self._btn_play_sel.setEnabled(one and has_audio and not busy)
+        # [v3.23.598] Chỉ khi lần TTS gần nhất giữ audio từng dòng (VieNeu). Bản trước bật
+        # cả sau Edge/Gemini: tổng hợp xong các dòng chọn mới báo lỗi ghép.
+        can_resynth = bool(getattr(self._view_model, "can_resynthesize", True))
+        self._btn_resynth.setEnabled(bool(sel) and not busy and can_resynth)
+        self._btn_resynth.setToolTip(self._translator.translate(
+            "tts.tip_resynth" if can_resynth or not self._last_results
+            else "tts.tip_resynth_unsupported"
+        ))
+        # [v3.23.459] Nút chọn dòng bất thường: bật khi có ≥1 dòng bất thường + không bận.
+        if hasattr(self, "_btn_select_abnormal"):
+            n_abnormal = len(self._abnormal_event_indices())
+            self._btn_select_abnormal.setEnabled(n_abnormal > 0 and not busy)
+            self._btn_select_abnormal.setText(
+                f"⚠ Chọn dòng bất thường ({n_abnormal})" if n_abnormal
+                else "⚠ Chọn dòng bất thường"
+            )
+
+    def _on_result_item_edited(self, item) -> None:
+        """[v3.23.453] Ghi nội dung SỬA (cột 2) vào dòng nguồn để TTS lại đọc ĐÚNG.
+
+        LƯU Ý: ``TTSSegmentResult`` là dataclass FROZEN → KHÔNG gán ``r.text=`` (ném
+        FrozenInstanceError, khiến hàm dừng giữa chừng và bỏ qua cập nhật source — chính là
+        bug 'TTS lại với nội dung cũ'). Cập nhật source TRƯỚC, rồi thay result bằng ``replace``.
+        """
+        if item.column() != 2:
+            return
+        row0 = self._table.item(item.row(), 0)
+        if row0 is None:
+            return
+        ev_idx = row0.data(Qt.ItemDataRole.UserRole)
+        if ev_idx is None:
+            return
+        ev_idx = int(ev_idx)
+        new_text = item.text().strip()
+        # 1. QUAN TRỌNG: cập nhật dòng nguồn để lần TTS lại đọc nội dung mới.
+        self._view_model.update_event_text(ev_idx, new_text)
+        # 2. Đồng bộ hiển thị trong _last_results (frozen → thay bằng bản replace).
+        from dataclasses import replace as _dc_replace
+
+        for i, r in enumerate(self._last_results):
+            if int(r.event_index) == ev_idx:
+                try:
+                    self._last_results[i] = _dc_replace(r, text=new_text)
+                except (TypeError, ValueError):
+                    pass
+                break
+
+    def _on_play_selected(self) -> None:
+        """Phát audio segment của dòng đang chọn."""
+        sel = self._selected_event_indices()
+        if len(sel) != 1:
+            return
+        r = self._result_by_event_index(sel[0])
+        if not r or not r.segment_audio_path:
+            self._show_warning("Chưa có audio", "Dòng này chưa có audio để nghe.")
+            return
+        path = Path(r.segment_audio_path)
+        if not path.exists():
+            self._show_warning("Thiếu file", f"Không tìm thấy: {path.name}")
+            return
+        self._play_audio_file(path)
+
+    #: [v3.23.455] Im lặng chèn trước tiếng nói khi nghe thử (giây) — cho thiết bị âm thanh
+    #: khởi động xong, tránh nuốt đầu câu / rè "tẹt tẹt".
+    _PREVIEW_SILENCE_S = 0.8
+
+    def _play_audio_file(self, path: Path) -> None:
+        """[v3.23.455] Nghe thử một dòng ĐÁNG TIN CẬY.
+
+        Hai lớp chống lỗi:
+        1. ``setSource()`` bất đồng bộ → phát trong ``_on_media_status`` khi ĐÃ nạp xong +
+           ``setPosition(0)`` (luôn phát từ đầu, sửa "chỉ nghe vài chữ cuối" khi phát lại).
+        2. Thiết bị âm thanh có độ trễ khởi động → tạo WAV xem trước = [im lặng ~0.8s][segment]
+           để thiết bị "nóng máy" xong mới tới tiếng nói (tránh nuốt đầu câu / rè "tẹt tẹt").
+        """
+        try:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+        except ImportError:
+            self._show_warning("Thiếu QtMultimedia", "Không phát được audio trên máy này.")
+            return
+        # Ưu tiên phát bản có đệm im lặng; nếu tạo lỗi thì phát thẳng file gốc.
+        play_path = self._make_preview_wav(path) or path
+        if self._audio_player is None:
+            self._audio_out = QAudioOutput()
+            self._audio_out.setVolume(1.0)
+            self._audio_player = QMediaPlayer()
+            self._audio_player.setAudioOutput(self._audio_out)
+            self._audio_player.mediaStatusChanged.connect(self._on_media_status)
+            self._audio_player.errorOccurred.connect(self._on_media_error)
+        self._audio_player.stop()
+        self._pending_play = True
+        # Xoá source cũ trước → buộc phát lại được cùng một file (không bị cache "đã nạp").
+        self._audio_player.setSource(QUrl())
+        self._audio_player.setSource(QUrl.fromLocalFile(str(play_path)))
+
+    def _make_preview_wav(self, path: Path) -> Path | None:
+        """Tạo WAV xem trước = im lặng + segment. Luân phiên 2 tên file tạm để tránh khoá file
+        khi phát lại nhanh trên Windows. Trả None nếu lỗi (gọi phát thẳng file gốc)."""
+        try:
+            import tempfile
+
+            import soundfile as sf
+
+            from subtitles_extractor.infrastructure.tts.audio_preview import prepend_silence
+
+            audio, sr = sf.read(str(path), dtype="float32")
+            padded = prepend_silence(audio, sr, self._PREVIEW_SILENCE_S)
+            self._preview_idx = (getattr(self, "_preview_idx", 0) + 1) % 2
+            tmp = Path(tempfile.gettempdir()) / f"subext_tts_preview_{self._preview_idx}.wav"
+            sf.write(str(tmp), padded, sr, subtype="PCM_16")
+            return tmp
+        except (OSError, RuntimeError, ImportError, ValueError) as exc:
+            logger.debug("Không tạo được WAV nghe thử có đệm im lặng: %s", exc)
+            return None
+
+    def _on_media_status(self, status) -> None:
+        """Phát ngay khi media ĐÃ NẠP XONG (chống race của setSource bất đồng bộ)."""
+        from PySide6.QtMultimedia import QMediaPlayer
+
+        loaded = (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        )
+        if self._pending_play and status in loaded:
+            self._pending_play = False
+            if self._audio_player is not None:
+                self._audio_player.setPosition(0)  # luôn phát từ ĐẦU
+                self._audio_player.play()
+
+    def _on_media_error(self, error, error_string: str = "") -> None:
+        """Báo lỗi phát (thay vì im lặng)."""
+        self._pending_play = False
+        logger.warning("Lỗi phát audio dòng: %s", error_string or error)
+
+    def _commit_active_edit(self) -> None:
+        """[v3.23.453] Buộc COMMIT ô đang sửa (nếu có) TRƯỚC khi đọc trạng thái.
+
+        Lỗi Qt kinh điển: bấm nút trong lúc còn con trỏ trong ô đang sửa → Qt xử lý click
+        TRƯỚC khi editor commit → nội dung sửa CHƯA vào model → TTS lại đọc nội dung CŨ. Gọi
+        hàm này để đẩy giá trị editor vào model (kích hoạt itemChanged → update_event_text)
+        trước khi tiếp tục.
+        """
+        try:
+            from PySide6.QtWidgets import (
+                QAbstractItemDelegate,
+                QAbstractItemView,
+                QApplication,
+            )
+            if self._table.state() != QAbstractItemView.State.EditingState:
+                return
+            editor = QApplication.focusWidget()
+            if editor is not None:
+                try:
+                    self._table.commitData(editor)
+                    self._table.closeEditor(
+                        editor, QAbstractItemDelegate.EndEditHint.NoHint
+                    )
+                except (RuntimeError, TypeError, AttributeError):
+                    pass
+            # Fallback: nếu VẪN đang sửa, rời ô hiện hành sang cột 0 (không editable) → Qt tự
+            # commit editor cột 2 (đổi ô hiện hành luôn kích hoạt commit).
+            if self._table.state() == QAbstractItemView.State.EditingState:
+                row = self._table.currentRow()
+                if row >= 0:
+                    self._table.setCurrentCell(row, 0)
+        except (ImportError, RuntimeError, TypeError, AttributeError) as exc:
+            logger.debug("Không commit được editor đang mở: %s", exc)
+
+    def set_shorten_provider(self, provider: Callable[[], tuple[str, str, str]]) -> None:
+        """[v3.23.629] Nguồn khoá API / model / ngôn ngữ cho bước rút gọn bằng AI (trang Dịch)."""
+        self._shorten_provider = provider
+
+    def _start_shorten(self, fits: list) -> None:
+        """Gửi các dòng không vừa khung cho AI rút gọn (luồng nền) rồi hiện xem trước."""
+        # [v3.23.650] Bấm "Rút gọn" lần hai khi lần đầu còn chạy: gán đè ``_shorten_worker`` làm QThread (không parent)
+        # đang chạy bị Python giải phóng → "Destroyed while thread is still running" → abort().
+        previous = getattr(self, "_shorten_worker", None)
+        if previous is not None and not is_deleted(previous) and previous.isRunning():
+            return
+        provider = getattr(self, "_shorten_provider", None)
+        keys, model, lang = provider() if provider is not None else ("", "", "")
+        if not keys.strip():
+            self._stage_lbl.setText(self._translator.translate("tts.shorten_no_key"))
+            self._show_warning(
+                self._translator.translate("tts.btn_shorten"),
+                self._translator.translate("tts.shorten_no_key"),
+            )
+            return
+        from subtitles_extractor.application.use_cases.shorten_for_speech import (
+            ShortenForSpeechUseCase,
+        )
+        from subtitles_extractor.presentation.workers.shorten_worker import ShortenWorker
+
+        vm = self._view_model
+        texts = [str(getattr(e, "text", "") or "").replace("\n", " ") for e in vm.source_events]
+        contexts = [vm.line_context(p) for p in range(len(texts))]
+        translator = self._container.make_subtitle_translator(keys, retry_count=3)
+        self._shorten_worker = ShortenWorker(
+            ShortenForSpeechUseCase(translator), fits, texts, lang or "Vietnamese",
+            model or "gemini-3.1-flash-lite",
+            source_texts=[c[0] for c in contexts], speakers=[c[1] for c in contexts],
+            addressees=[c[2] for c in contexts],
+        )
+        self._shorten_worker.finished_ok.connect(self._on_shortened)
+        self._shorten_worker.failed.connect(self._on_shorten_failed)
+        self._shorten_worker.cancelled.connect(self._on_shorten_cancelled)
+        self._shorten_worker.finished.connect(self._shorten_worker.deleteLater)
+        self._stage_lbl.setText(
+            self._translator.translate("tts.shorten_running").replace("{count}", str(len(fits)))
+        )
+        self._shorten_worker.start()
+
+    def _on_shorten_cancelled(self) -> None:
+        # [v3.23.650] Slot của trang (chạy ở luồng GUI) thay cho lambda (chạy ở luồng worker → QLabel.setText sai luồng).
+        self._stage_lbl.setText("…")
+
+    def _on_shortened(self, lines: list) -> None:
+        self._line_edits.apply_shortened(list(lines))
+
+    def _on_shorten_failed(self, message: str) -> None:
+        text = self._translator.translate("tts.shorten_failed").replace("{error}", message)
+        self._stage_lbl.setText(text)
+        self._show_warning(self._translator.translate("tts.btn_shorten"), text)
+
+    def _rebuild_after_structure(self) -> None:
+        """[v3.23.625] Vẽ lại bảng dòng sau khi thêm/xoá dòng."""
+        results = list(self._view_model.last_results)
+        if results:
+            self._last_results = results
+            self._populate_table(results)
+            self._on_result_selection_changed()
+        else:
+            self._last_results = []
+            self._line_edits.show_source_rows()
+
+    def _resynthesize_positions(self, positions: set[int]) -> None:
+        """[v3.23.625] TTS lại các dòng ``positions`` (dòng vừa thêm) rồi ghép lại master."""
+        if not self._view_model.resynthesize_lines(
+            set(positions), line_voices=self._resynthesis_line_voices()
+        ):
+            self._stage_lbl.setText(self._translator.translate("tts.line_added_retts"))
+
+    def _resynthesis_line_voices(self) -> tuple[str, ...] | None:
+        """[v3.23.594] Giọng từng dòng cho TTS lại: theo bảng phân vai HIỆN TẠI.
+
+        Bản 593 luôn dùng giọng của lần TTS trước: đổi giọng một vai rồi TTS lại các dòng
+        của vai đó vẫn ra giọng cũ. Chỉ lấy bảng hiện tại khi lồng tiếng đang bật và vẫn
+        cùng bộ giọng với lần chạy trước (adapter TTS lại là adapter cũ — giọng engine
+        khác nó không đọc được).
+
+        Returns:
+            Giọng theo vị trí dòng, hoặc ``None`` để giữ giọng của lần TTS trước.
+        """
+        if not self._dubbing_panel.is_dubbing_enabled():
+            return None
+        if self._dubbing_catalog()[0] != getattr(self, "_last_dubbing_key", None):
+            return None
+        return self._dubbing.line_voices() or None
+
+    def _on_resynthesize_selected(self) -> None:
+        """TTS lại các dòng đang chọn (kể cả nội dung vừa sửa)."""
+        sel = self._selected_event_indices()  # capture TRƯỚC khi commit (commit có thể đổi ô)
+        if not sel:
+            return
+        self._commit_active_edit()  # đảm bảo nội dung vừa sửa đã vào model + source_events
+        ok = self._view_model.resynthesize_lines(
+            set(sel), line_voices=self._resynthesis_line_voices()
+        )
+        if not ok:
+            self._show_warning(
+                "Không TTS lại được",
+                self._translator.translate("tts.tip_resynth_unsupported")
+                if self._view_model.has_result and not self._view_model.can_resynthesize
+                else "Cần đã chạy TTS một lần (engine VieNeu) và còn file audio gốc.",
+            )
+
+    def _abnormal_event_indices(self) -> list[int]:
+        """[v3.23.459] event_index của các dòng audio dài bất thường."""
+        return [
+            int(r.event_index)
+            for r in self._last_results
+            if getattr(r, "abnormal_length", False) and not r.was_skipped
+        ]
+
+    def _on_select_abnormal(self) -> None:
+        """Chọn tất cả dòng dài bất thường trong bảng (để TTS lại hàng loạt)."""
+        abnormal = set(self._abnormal_event_indices())
+        if not abnormal:
+            self._show_warning("Không có dòng bất thường", "Không tìm thấy dòng nào dài bất thường.")
+            return
+        # [v3.23.650] Một lần chọn hàng loạt (selectRow từng hàng: 81 s với 1825 dòng).
+        rows: list[int] = []
+        for row in range(self._table.rowCount()):
+            item0 = self._table.item(row, 0)
+            if item0 is None:
+                continue
+            ev = item0.data(Qt.ItemDataRole.UserRole)
+            if ev is not None and int(ev) in abnormal:
+                rows.append(row)
+        select_rows_bulk(self._table, rows)
+        first_row = rows[0] if rows else -1
+        if first_row >= 0:
+            self._table.scrollToItem(self._table.item(first_row, 0))
+        self._stage_lbl.setText(f"Đã chọn {len(abnormal)} dòng dài bất thường — bấm '🔄 TTS lại dòng chọn' để làm lại.")
 
     def _on_result_ready(self, results) -> None:
         rs: list[TTSSegmentResult] = list(results)
@@ -2058,10 +2704,17 @@ class TTSPage(QWidget):
         self._lbl_summary.setText(
             self._translator.translate("tts.res_summary").replace("{ok}", str(n_ok)).replace("{ts}", ts_info).replace("{trunc}", str(n_trunc)).replace("{skip}", str(n_skip))
             + (f"  →  {out.name}{size_txt}" if out else "")
+            # [v3.23.459] Nhắc số dòng dài bất thường (nếu có) để người dùng biết cần soi lại.
+            + (f"  ·  ⚠ {len(self._abnormal_event_indices())} dòng dài bất thường"
+               if self._abnormal_event_indices() else "")
+            + self._incremental_note()
         )
         self._btn_open.setEnabled(bool(out and out.parent.exists()))
         self._btn_open_file.setEnabled(bool(out and out.exists()))
         self._btn_export.setEnabled(bool(rs))
+        # [v3.23.450] Cập nhật trạng thái nút nghe/TTS-lại theo kết quả mới (connect 1 lần ở
+        # _build_result_group để tránh nối trùng).
+        self._on_result_selection_changed()
 
         # Cảnh báo chất lượng: nếu nhiều câu phải nén nhanh hoặc lệch đồng bộ
         # lớn, gợi ý người dùng dịch súc tích hơn (gốc rễ là bản dịch quá dài).
@@ -2107,6 +2760,18 @@ class TTSPage(QWidget):
             logger.debug("UI: phát tín hiệu tts_completed để lưu dự án.")
             self.tts_completed.emit(str(out))
         logger.info("UI: hoàn tất hiển thị kết quả TTS.")
+
+    def _incremental_note(self) -> str:
+        """[v3.23.630] Đoạn cuối dòng tóm tắt: lượt này dùng lại bao nhiêu dòng cũ."""
+        summary = self._view_model.reuse_summary
+        if summary is None:
+            return ""
+        reused, total, changed = summary
+        return "  ·  " + (
+            self._translator.translate("tts.status_incremental_note")
+            .replace("{reused}", str(reused)).replace("{total}", str(total))
+            .replace("{changed}", str(changed))
+        )
 
     def _on_engine_available(self, name: str, available: bool) -> None:
         icon = "✅" if available else "❌"
@@ -2164,6 +2829,8 @@ class TTSPage(QWidget):
         s.setValue("gemini_temperature", self._gemini_temperature.value())
         s.setValue("vieneu_mode", self._vieneu_mode.currentData() or "standard")
         s.setValue("vieneu_emotion", self._vieneu_emotion.currentData() or "natural")
+        s.setValue("vieneu_emotion_cues", self._vieneu_emotion_cues.isChecked())
+        s.setValue("vieneu_int8", self._vieneu_int8.isChecked())
         # Chỉ ghi đè giọng đã lưu khi danh sách giọng ĐÃ nạp (combo phản ánh lựa chọn
         # thật); chưa nạp -> giữ nguyên giá trị cũ, tránh mất giọng người dùng đã chọn.
         if getattr(self, "_vieneu_voices_loaded", False):
@@ -2175,6 +2842,7 @@ class TTSPage(QWidget):
         s.setValue("retry", self._retry.value())
         s.setValue("retry_delay", self._retry_delay.value())
         s.setValue("normalize", self._normalize.isChecked())
+        s.setValue("incremental", self._incremental.isChecked())
         s.setValue("voice_clarity", self._voice_clarity.isChecked())
         s.setValue("high_quality", self._high_quality.isChecked())
         s.setValue("target_lufs", self._lufs.currentData())
@@ -2254,6 +2922,10 @@ class TTSPage(QWidget):
             self._vieneu_ref_path.setText(p)
         if s.contains("vieneu_force_cpu"):
             self._vieneu_force_cpu.setChecked(s.value("vieneu_force_cpu", type=bool))
+        if s.contains("vieneu_int8"):
+            self._vieneu_int8.setChecked(s.value("vieneu_int8", type=bool))
+        if s.contains("vieneu_emotion_cues"):
+            self._vieneu_emotion_cues.setChecked(s.value("vieneu_emotion_cues", type=bool))
         # Giọng VieNeu: danh sách nạp lazy (khi mở panel) — lưu tạm để khôi phục sau nạp.
         self._vieneu_saved_voice = s.value("vieneu_voice", "", type=str)
         # Common
@@ -2264,6 +2936,7 @@ class TTSPage(QWidget):
             if s.contains(key): spin.setValue(s.value(key, type=float))
         if s.contains("retry"): self._retry.setValue(s.value("retry", type=int))
         if s.contains("normalize"): self._normalize.setChecked(s.value("normalize", type=bool))
+        if s.contains("incremental"): self._incremental.setChecked(s.value("incremental", type=bool))
         if s.contains("voice_clarity"): self._voice_clarity.setChecked(s.value("voice_clarity", type=bool))
         if s.contains("high_quality"): self._high_quality.setChecked(s.value("high_quality", type=bool))
         if s.contains("target_lufs"):
@@ -2331,8 +3004,7 @@ class TTSPage(QWidget):
         # [v3.23.252] Nếu ĐANG chọn VieNeu và giọng đang nạp, giữ nút khoá — giọng
         # chưa sẵn sàng thì chạy sẽ lỗi. Engine khác không phụ thuộc loader này.
         if (self._engine_combo.currentData() or _ENGINE_EDGE) == _ENGINE_VIENEU:
-            _loader = getattr(self, "_vieneu_voice_loader", None)
-            if _loader is not None and _loader.isRunning():
+            if self._voice_loader_running():
                 has = False
         self._btn_gen.setEnabled(has)
 
@@ -2357,11 +3029,11 @@ class TTSPage(QWidget):
             self._table.setRowCount(0)
 
             self._table.setRowCount(len(results))
+            # [v3.23.598] Ô chỉ đọc (trước đây mọi ô đều nhấp đúp sửa được, kể cả "#",
+            # "Thời gian", "Trạng thái"); chỉ cột Nội dung sửa được.
+            _it = read_only_item
             for row, r in enumerate(results):
-                def _it(t, align=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter):
-                    it = QTableWidgetItem(t); it.setTextAlignment(align); return it
-
-                ts  = f"{int(r.start_sec//60):02d}:{r.start_sec%60:06.3f}"
+                ts = format_row_time(r.start_sec)
                 dur = f"{r.audio_duration_s:.2f}s" if not r.was_skipped else "—"
                 spd = f"{r.speed_used:.2f}×" if not r.was_skipped else "—"
 
@@ -2386,15 +3058,29 @@ class TTSPage(QWidget):
                     st = self._translator.translate("tts.st_overlap").replace("{s}", f"{r.overlap_s:.1f}")
                 else:
                     st = self._translator.translate("tts.st_ok")
+                # [v3.23.459] Đánh dấu audio DÀI BẤT THƯỜNG (model ngân dài) — thêm cảnh báo vào
+                # trạng thái để người dùng lọc/nghe lại/TTS lại nhanh (không phải nghe dò).
+                is_abnormal = getattr(r, "abnormal_length", False) and not r.was_skipped
+                if is_abnormal:
+                    st = f"⚠ {st} · dài bất thường"
 
-                self._table.setItem(row, 0, _it(str(row+1),
-                    Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                # [v3.23.450] Lưu event_index vào row để map khi nghe lại / TTS lại dòng chọn.
+                item0 = row_head_item(int(r.event_index))
+                item0.setText(str(row + 1))
+                self._table.setItem(row, 0, item0)
                 self._table.setItem(row, 1, _it(ts))
-                self._table.setItem(row, 2, _it(r.text))
+                # [v3.23.450] Cột Nội dung CHO PHÉP SỬA (double-click) để chỉnh rồi TTS lại.
+                self._table.setItem(row, 2, editable_text_item(r.text))
                 self._table.setItem(row, 3, _it(dur))
                 self._table.setItem(row, 4, _it(spd))
                 self._table.setItem(row, 5, _it(kind))
-                self._table.setItem(row, 6, _it(st))
+                st_item = _it(st)
+                self._table.setItem(row, 6, st_item)
+                # Tô nền vàng nhạt cho ô trạng thái dòng bất thường (nổi bật, dễ thấy).
+                if is_abnormal:
+                    from PySide6.QtGui import QColor
+                    st_item.setBackground(QColor(255, 244, 200))
+                    st_item.setForeground(QColor(140, 90, 0))
         finally:
             # Luôn bật lại updates dù có lỗi giữa chừng — tránh bảng "đóng băng".
             self._table.setUpdatesEnabled(True)
@@ -2405,6 +3091,8 @@ class TTSPage(QWidget):
         if len(results) <= 1500:
             self._table.resizeRowsToContents()
         self._apply_row_filter()
+        # [v3.23.598] Cột "Người nói · Giọng" + tô dòng đã sửa chưa TTS lại.
+        self._line_edits.refresh()
 
     def _apply_row_filter(self) -> None:
         """Ẩn/hiện hàng theo bộ lọc đang chọn (dùng setRowHidden — không tạo lại ô)."""

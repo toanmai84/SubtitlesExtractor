@@ -13,6 +13,7 @@ import numpy as np
 from subtitles_extractor.domain.entities.video_metadata import VideoMetadata
 from subtitles_extractor.domain.exceptions import VideoDecodeError, VideoNotFoundError
 from subtitles_extractor.domain.ports.frame_sampler_port import (
+    SAMPLE_TIME_TOLERANCE_SEC,
     FrameSamplingConfig,
     SampledFrame,
 )
@@ -146,18 +147,26 @@ class MpvFrameSampler:
         last_hash: int | None = None
         last_image: np.ndarray | None = None
         frame_counter: int = 0
-        timestamp_sec = max(0.0, config.skip_intro_sec)
+        start_sec = max(0.0, config.skip_intro_sec)
+        # [v3.23.615] Mốc thứ k tính bằng NHÂN (không cộng dồn), tua tới mốc + dung sai:
+        # mốc cộng dồn trôi dấu phẩy động, hụt khung đích một phần tỉ giây thì "exact"
+        # seek trả khung TRƯỚC — lấy trùng một khung, bỏ mất khung đích (như PyAV/NVDEC).
+        step_index = 0
+        timestamp_sec = start_sec
 
         while timestamp_sec <= end_sec:
             try:
-                instance.command("seek", timestamp_sec, "absolute", "exact")
+                instance.command(
+                    "seek", timestamp_sec + SAMPLE_TIME_TOLERANCE_SEC, "absolute", "exact"
+                )
                 screenshot = instance.screenshot_raw()
             except _get_mpv_errors() as exc:
                 # Bắt tất cả lỗi libmpv kể cả ShutdownError
                 logger.debug(
                     "Bỏ qua mốc %.3fs do mpv lỗi: %s.", timestamp_sec, exc
                 )
-                timestamp_sec += step_sec
+                step_index += 1
+                timestamp_sec = start_sec + step_index * step_sec
                 continue
 
             image_rgb = _screenshot_to_rgb(screenshot)
@@ -166,7 +175,8 @@ class MpvFrameSampler:
             # Ép giải phóng NGAY sau khi đã chuyển sang RGB.
             del screenshot
             if image_rgb is None:
-                timestamp_sec += step_sec
+                step_index += 1
+                timestamp_sec = start_sec + step_index * step_sec
                 continue
 
             cropped = self._apply_roi(image_rgb, roi)
@@ -184,14 +194,16 @@ class MpvFrameSampler:
                 if hamming_distance(current_hash, last_hash) <= config.phash_distance_threshold and pixel_diff_ratio(cropped, last_image) <= config.pixel_diff_threshold:
                     yield SampledFrame(frame_index=frame_counter, timestamp_sec=actual_sec, image_rgb=np.empty(0), is_duplicate=True)
                     frame_counter += 1
-                    timestamp_sec += step_sec
+                    step_index += 1
+                    timestamp_sec = start_sec + step_index * step_sec
                     continue
 
             yield SampledFrame(frame_index=frame_counter, timestamp_sec=actual_sec, image_rgb=cropped, is_duplicate=False)
             last_hash = current_hash
             last_image = cropped
             frame_counter += 1
-            timestamp_sec += step_sec
+            step_index += 1
+            timestamp_sec = start_sec + step_index * step_sec
 
     @staticmethod
     def _apply_roi(image_rgb: np.ndarray, roi: Roi | None) -> np.ndarray:

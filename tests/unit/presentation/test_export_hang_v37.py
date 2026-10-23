@@ -33,15 +33,15 @@ def _snip(source: str, method: str) -> str:
 
 class TestEditorExportDialogNonNative:
     def test_export_uses_non_native_option(self) -> None:
-        snippet = _snip(_EDITOR.read_text(encoding="utf-8"), "_on_export_clicked")
+        snippet = _snip(_EDITOR.read_text(encoding="utf-8"), "_do_export_clicked")
         assert "getSaveFileName" in snippet
         assert "options=self._FILE_DIALOG_OPTIONS" in snippet, (
-            "EXPORT-HANG: _on_export_clicked PHẢI truyền options=self._FILE_DIALOG_OPTIONS "
+            "EXPORT-HANG: _do_export_clicked PHẢI truyền options=self._FILE_DIALOG_OPTIONS "
             "(DontUseNativeDialog) để tránh deadlock shell dialog với GPU/MPV."
         )
 
     def test_export_pauses_video_first(self) -> None:
-        snippet = _snip(_EDITOR.read_text(encoding="utf-8"), "_on_export_clicked")
+        snippet = _snip(_EDITOR.read_text(encoding="utf-8"), "_do_export_clicked")
         dialog_pos = snippet.find("getSaveFileName")
         prepare_pos = snippet.find("_prepare_for_file_dialog")
         assert prepare_pos != -1, "Phải gọi _prepare_for_file_dialog() trước khi mở dialog."

@@ -85,7 +85,7 @@ def test_controls_have_accessible_name(page_file: str) -> None:
 
 def test_helper_sets_name_and_tooltip() -> None:
     """Hành vi helper: đặt accessibleName; đặt tooltip nếu chưa có (không ghi đè)."""
-    pytest.importorskip("PyQt6.QtWidgets")
+    pytest.importorskip("PySide6.QtWidgets")
     from PySide6.QtWidgets import QApplication, QPushButton
 
     app = QApplication.instance() or QApplication([])

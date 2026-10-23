@@ -51,6 +51,9 @@ class ExtractSubtitlesRequest:
     debug_frames_dir: str = ""
     keep_temp_files: bool = False
     skip_export: bool = False
+    use_frame_cache: bool = True
+    """[v3.23.645] Lượt chạy kiểu Re-OCR (không xuất tệp) giữ khung đã giải mã trong bộ nhớ đệm để lần sau khỏi giải mã lại.
+    Phép đo tốc độ OCR đặt False: nén JPEG khung vào bộ đệm sẽ tính vào giờ đo và xoá bộ đệm của người dùng."""
     raw_ocr_output_path: Path | None = None
     export_raw_images: bool = False
     """Nếu True và raw_ocr_output_path được cấu hình, hệ thống sẽ xuất thêm

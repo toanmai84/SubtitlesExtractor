@@ -15,6 +15,11 @@ import re
 from dataclasses import dataclass
 
 from subtitles_extractor.domain.ports.subtitle_tts_port import TTSRequest
+from subtitles_extractor.infrastructure.tts.emotion_cues import (
+    has_real_words_besides_cues,
+    inject_emotion_cues as _inject_emotion_cues,
+    strip_brackets_keep_cues,
+)
 
 __all__ = [
     "SkipOptions",
@@ -107,6 +112,7 @@ def preprocess_tts_text(
     clean_tags: bool,
     skip: SkipOptions | None = None,
     strip_speaker_tag: bool = False,
+    inject_emotion_cues: bool = False,
 ) -> tuple[str, bool]:
     """Làm sạch một dòng phụ đề cho TTS (hàm thuần).
 
@@ -116,12 +122,23 @@ def preprocess_tts_text(
         skip: Tuỳ chọn bỏ qua nội dung (ngoặc, ký hiệu nhạc…); None = không bỏ gì.
         strip_speaker_tag: True (khi tổng hợp AUDIO) để bỏ tag người nói đầu dòng; False
             (khi xuất FILE PHỤ ĐỀ) để giữ nhãn cho người xem.
+        inject_emotion_cues: [v3.23.446] True (chỉ khi AUDIO + engine v3 Turbo) để chuyển
+            interjection cười/thở dài rõ ràng thành tag ``[cười]``/``[thở dài]`` cho giọng đọc
+            biểu cảm hơn. KHÔNG dùng cho file phụ đề (giữ text sạch cho người xem).
 
     Returns:
         Cặp ``(văn_bản_sạch, là_dòng_hội_thoại)``. ``là_dòng_hội_thoại`` = True khi dòng
         bắt đầu bằng gạch đầu dòng (dùng để chèn khoảng nghỉ tách lượt thoại).
     """
     text = raw_text.replace("\\N", " ").replace("\n", " ")
+    # [v3.23.413] Loại surrogate lạc (U+DC80–U+DCFF — byte không giải mã được UTF-8, lọt qua
+    # surrogateescape từ OCR/dịch) NGAY tại nguồn. Nếu còn, khi gửi text qua stdin UTF-8 tới
+    # worker GPU sẽ ném "surrogates not allowed" → câu hỏng. Làm sạch ở đây bao phủ MỌI engine
+    # (VieNeu/Edge/Gemini) và mọi đường (per-câu, batch, CPU).
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = text.encode("utf-8", "ignore").decode("utf-8")
     if clean_tags:
         text = _HTML_TAG_RE.sub("", text)
         text = _ASS_TAG_RE.sub("", text)
@@ -146,7 +163,9 @@ def preprocess_tts_text(
         if skip.paren:
             text = _PAREN_RE.sub(" ", text)
         if skip.square:
-            text = _SQUARE_RE.sub(" ", text)
+            # [v3.23.446] Giữ tag cảm xúc VieNeu ([cười]/[thở dài]/[hắng giọng]) khi xoá []
+            # rác — để chúng tới được engine v3 Turbo.
+            text = strip_brackets_keep_cues(text)
         if skip.curly:
             text = _CURLY_RE.sub(" ", text)
         text = _MULTISPACE_RE.sub(" ", text).strip()
@@ -155,6 +174,16 @@ def preprocess_tts_text(
     # phải .strip() để đưa dấu '-' về đầu chuỗi, nếu không '(Cười) - Xin chào'
     # → ' - Xin chào' khiến .startswith('-') trượt và mất khoảng lặng hội thoại.
     text = text.strip()
+    # [v3.23.446] Chèn tag cảm xúc CHỈ cho AUDIO v3 Turbo (strip_speaker_tag=True + toggle).
+    # Chuyển interjection cười/thở dài rõ ràng → tag để giọng đọc biểu cảm. Làm SAU khi đã sạch
+    # tag rác nhưng TRƯỚC khi dò gạch đầu dòng.
+    if inject_emotion_cues and strip_speaker_tag and text:
+        text = _inject_emotion_cues(text)
+    # [v3.23.456] Dòng CHỈ có tag cảm xúc / dấu câu (không còn chữ-số thật, vd '[cười]!',
+    # '[cười][cười]', '?!') làm VieNeu ngân dài/méo (app_log: audio ~4.5s cho 1 tag). Cho RỖNG
+    # HẲN → TTS bỏ qua, tránh tiếng ngân. Chỉ áp cho AUDIO (strip_speaker_tag=True).
+    if strip_speaker_tag and text and not has_real_words_besides_cues(text):
+        text = ""
     is_dialog = text.startswith(_DIALOG_DASHES)
     if is_dialog:
         text = text.lstrip("-\u2013\u2014").strip()

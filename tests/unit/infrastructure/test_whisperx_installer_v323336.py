@@ -141,7 +141,27 @@ def test_uses_current_interpreter_when_not_frozen(
 
 
 def test_frozen_build_searches_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bản đóng gói: ``sys.executable`` là .exe nên phải tìm Python ngoài."""
+    """Bản đóng gói: ``sys.executable`` là .exe nên phải tìm Python ngoài.
+
+    [v3.23.553] Trước đây test dùng ``sys.executable`` THẬT của môi trường test — nó chính
+    là Python nằm trên PATH, nên ``shutil.which`` trả đúng đường dẫn đó và test hỏng tuỳ
+    máy. Nay giả lập tệp exe + PATH để kết quả tất định.
+    """
+    import shutil
+
     monkeypatch.setattr(sys, "frozen", True, raising=False)
-    result = find_system_python()
-    assert result != sys.executable or result is None
+    monkeypatch.setattr(sys, "executable", "/opt/SubtitleStudio/SubtitleStudio.exe")
+    fake_path = {"python3": "/usr/bin/python3"}
+    monkeypatch.setattr(shutil, "which", lambda name: fake_path.get(name))
+    assert find_system_python() == "/usr/bin/python3"
+
+
+def test_frozen_build_without_python_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import shutil
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", "/opt/SubtitleStudio/SubtitleStudio.exe")
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert find_system_python() is None

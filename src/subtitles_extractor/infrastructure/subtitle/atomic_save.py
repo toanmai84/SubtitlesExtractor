@@ -25,8 +25,9 @@ import contextlib
 import gc
 import logging
 import os
+import secrets
+import stat
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -135,6 +136,58 @@ def _replace_with_retry(
             delay *= 2.0
 
 
+#: Cờ mở tệp tạm giống ``tempfile.mkstemp`` (nhị phân trên Windows để Python tự đổi
+#: xuống dòng một lần, không kế thừa handle, không đi theo symlink).
+_TEMP_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_BINARY", 0)
+    | getattr(os, "O_NOINHERIT", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+_TEMP_NAME_ATTEMPTS = 100
+
+
+def _create_temp_file(target: Path) -> tuple[int, str]:
+    """[v3.23.610] Tạo tệp tạm cạnh ``target`` với quyền theo umask.
+
+    ``tempfile.mkstemp`` tạo tệp quyền 0600, và sau ``os.replace`` tệp phụ đề xuất ra chỉ
+    chủ sở hữu đọc được (Linux/macOS). Mở bằng quyền 0666 để hệ điều hành áp umask như
+    mọi tệp thường.
+
+    Returns:
+        ``(file descriptor, đường dẫn tệp tạm)``.
+
+    Raises:
+        FileExistsError: Không tìm được tên tệp tạm còn trống.
+        OSError: Không tạo được tệp.
+    """
+    for _ in range(_TEMP_NAME_ATTEMPTS):
+        token = secrets.token_hex(4)
+        candidate = target.parent / f"{target.stem}_{token}{target.suffix}.tmp"
+        try:
+            return os.open(candidate, _TEMP_FLAGS, 0o666), str(candidate)
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"Không tạo được tệp tạm cạnh {target}.")
+
+
+def _copy_permissions(target: Path, tmp_path: str) -> None:
+    """[v3.23.610] Ghi đè tệp đã có thì giữ nguyên quyền truy cập của nó."""
+    try:
+        mode = stat.S_IMODE(target.stat().st_mode)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.debug("atomic_write: không đọc được quyền của %s: %s", target.name, exc)
+        return
+    try:
+        os.chmod(tmp_path, mode)
+    except OSError as exc:
+        logger.debug("atomic_write: không chép được quyền sang tệp tạm: %s", exc)
+
+
 def atomic_write_text(
     target: Path,
     content: str,
@@ -178,11 +231,7 @@ def atomic_write_text(
     )
     _t0 = time.perf_counter()
 
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=target.stem + "_",
-        suffix=target.suffix + ".tmp",
-        dir=str(target.parent),
-    )
+    fd, tmp_path = _create_temp_file(target)
     logger.debug("atomic_write: tạo tệp tạm → %s", Path(tmp_path).name)
 
     try:
@@ -233,6 +282,7 @@ def atomic_write_text(
             else:
                 logger.debug("atomic_write: fsync() bỏ qua (skip_fsync=%s, timeout=%.1f)", _SKIP_FSYNC, fsync_timeout_sec)
 
+        _copy_permissions(target, tmp_path)
         # ── atomic rename: temp → target ──────────────────────────────────
         # Đây là bước quan trọng nhất: nếu thành công, file đích sẽ luôn
         # hoàn chỉnh (không bao giờ partial). os.replace là atomic trên POSIX

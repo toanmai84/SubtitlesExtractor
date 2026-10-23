@@ -7,6 +7,8 @@ có thể mở lại để tiếp tục công việc dở dang, hoặc xoá dự
 
 from __future__ import annotations
 
+import sqlite3
+
 import logging
 from collections.abc import Callable
 
@@ -173,7 +175,9 @@ class ProjectsPage(QWidget):
     def refresh(self) -> None:
         """Nạp lại danh sách dự án từ cơ sở dữ liệu."""
         try:
-            self._records = self._repo.list_all()
+            # [v3.23.643] Danh sách chỉ cần cột nhẹ; bản ghi đầy đủ nạp khi MỞ dự án (``_on_open``).
+            list_rows = getattr(self._repo, "list_summaries", None) or self._repo.list_all
+            self._records = list_rows()
         except Exception as exc:  # noqa: BLE001 — hiển thị mọi lỗi DB cho người dùng
             logger.error("Không thể đọc danh sách dự án: %s", exc)
             self._records = []
@@ -211,7 +215,12 @@ class ProjectsPage(QWidget):
             return
         if self._open_callback is not None:
             logger.info("Mở lại dự án %s (%s)", rec.video_name, rec.video_hash)
-            self._open_callback(rec)
+            try:
+                full = self._repo.get(rec.video_hash)
+            except Exception as exc:  # noqa: BLE001 — lỗi DB: dùng bản tóm tắt thay vì không mở được
+                logger.warning("Không nạp được bản ghi đầy đủ %s: %s", rec.video_hash, exc)
+                full = None
+            self._open_callback(full or rec)
 
     def _on_delete(self) -> None:
         rec = self._selected_record()
@@ -225,7 +234,9 @@ class ProjectsPage(QWidget):
         if confirm == QMessageBox.StandardButton.Yes:
             try:
                 self._repo.delete(rec.video_hash)
-            except (OSError, RuntimeError, ValueError) as exc:
+            except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                # [v3.23.650] + sqlite3.Error ("database is locked" không phải OSError): trước đây ngoại lệ trào ra
+                # khỏi slot, người dùng không thấy phản hồi.
                 logger.error("Xoá dự án %s thất bại: %s", rec.video_hash, exc)
                 _feedback.show_error(
                     self, self._translator.translate("projects.del_err_t"),

@@ -10,7 +10,9 @@ CẢI TIẾN ĐỘT PHÁ (V3.37 - Thread Safe & Event Throttling):
 from __future__ import annotations
 
 import logging
+import math
 import threading
+import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 _SHUTDOWN_WAIT_MS: int = 10000
 
+# [v3.23.650] Service có QThread KHÔNG parent: nếu stop() hết hạn chờ mà Python giải phóng service khi luồng còn
+# chạy → "QThread: Destroyed while thread is still running" → abort. Giữ sống đến khi luồng thật sự kết thúc.
+_ORPHANED_SERVICES: set[PreviewSeekService] = set()
+
 def _ndarray_to_qimage(image_rgb: np.ndarray) -> QImage:
     height, width, _ = image_rgb.shape
     contiguous = np.ascontiguousarray(image_rgb)
@@ -38,6 +44,16 @@ def _ndarray_to_qimage(image_rgb: np.ndarray) -> QImage:
         QImage.Format.Format_RGB888,
     ).copy()
     return qimage
+
+
+def _stop_thread_blocking(thread: QThread) -> None:
+    """Dừng một QThread còn chạy (gọi từ weakref.finalize khi service bị giải phóng)."""
+    try:
+        if thread.isRunning():
+            thread.quit()
+            thread.wait(_SHUTDOWN_WAIT_MS)
+    except RuntimeError:
+        pass
 
 
 class PreviewSeekService(QObject):
@@ -66,6 +82,8 @@ class PreviewSeekService(QObject):
         self._is_decoding: bool = False
 
         self._thread = QThread()
+        # [v3.23.650] Service bị GC mà chưa stop() → QThread (không parent) bị huỷ khi còn chạy → abort.
+        weakref.finalize(self, _stop_thread_blocking, self._thread)
 
     def start(self) -> None:
         if self._thread.isRunning():
@@ -83,6 +101,10 @@ class PreviewSeekService(QObject):
         self._thread.start()
 
     def request_seek(self, timestamp_sec: float) -> None:
+        # [v3.23.650] NaN/inf làm `int(ts / time_base)` ném OverflowError trong luồng giải mã; âm → 0.
+        if not math.isfinite(timestamp_sec):
+            return
+        timestamp_sec = max(0.0, timestamp_sec)
         with self._lock:
             if self._is_shutting_down:
                 return
@@ -110,6 +132,8 @@ class PreviewSeekService(QObject):
                     "PreviewSeekService: worker thread không dừng trong %dms — Bỏ qua để tránh deadlock.",
                     _SHUTDOWN_WAIT_MS,
                 )
+                _ORPHANED_SERVICES.add(self)
+                self._thread.finished.connect(lambda: _ORPHANED_SERVICES.discard(self))
         else:
             # Nếu Thread chưa kịp chạy mà đã gọi stop, dọn dẹp luôn
             if self._reader is not None:
@@ -161,7 +185,7 @@ class PreviewSeekService(QObject):
     def _decode_and_emit(self, timestamp_sec: float) -> None:
         try:
             frame_rgb = self._reader.seek(timestamp_sec)
-        except (RuntimeError, OSError) as exc:
+        except Exception as exc:  # noqa: BLE001 - mọi lỗi giải mã đều chỉ bỏ qua khung này, không được thoát khỏi slot
             logger.debug(
                 "PreviewSeekService decode lỗi tại %.3fs: %s.",
                 timestamp_sec, exc,

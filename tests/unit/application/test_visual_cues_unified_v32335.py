@@ -103,7 +103,9 @@ class _DictTranslator:
 
     def translate_stage(self, *, stage, context, source_lines, input_lines,
                        has_prior_translation, progress_cb, cancel_cb,
-                       video_refs, attach_video):
+                       video_refs, attach_video,
+        **_extra,
+    ):
         self.seen_speakers = [ln.speaker for ln in input_lines]
         return input_lines
 
@@ -113,7 +115,12 @@ class TestTranslateReusesContextCues:
         from subtitles_extractor.application.services.visual_cue_serializer import (
             serialize_visual_cues,
         )
-        cues_json = serialize_visual_cues([VisualCue(line_no=1, speaker="Lâm Côn")])
+        # [v3.23.559] Cues phải phủ đủ (≥ MIN_CONTEXT_CUE_COVERAGE): dưới ngưỡng đó khâu dịch
+        # CỐ Ý quét bổ sung các dòng thiếu — xem test_cue_top_up_v323559.py.
+        cues_json = serialize_visual_cues([
+            VisualCue(line_no=1, speaker="Lâm Côn"),
+            VisualCue(line_no=2, speaker="Lâm Côn"),
+        ])
         translator = _DictTranslator()
         uc = TranslateSubtitlesUseCase(translator)
         req = TranslateSubtitlesRequest(

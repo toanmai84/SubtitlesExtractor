@@ -132,12 +132,16 @@ def resolve_whisperx_python() -> str | None:
     if explicit and Path(explicit).is_file():
         return explicit
 
-    # Môi trường riêng đặt cạnh gốc dự án (cùng cấp với build_env).
-    project_root = Path(__file__).resolve().parents[4]
-    for relative in ("Scripts/python.exe", "bin/python", "bin/python3"):
-        candidate = project_root / WHISPERX_ENV_DIRNAME / relative
-        if candidate.is_file():
-            return str(candidate)
+    # [v3.23.403] Môi trường riêng: TÌM ở nhiều vị trí — CẠNH exe (mới, bền) rồi %TEMP% (cũ).
+    from subtitles_extractor.infrastructure.stt.whisperx_installer import (
+        whisperx_env_root_candidates,
+    )
+
+    for project_root in whisperx_env_root_candidates():
+        for relative in ("Scripts/python.exe", "bin/python", "bin/python3"):
+            candidate = project_root / WHISPERX_ENV_DIRNAME / relative
+            if candidate.is_file():
+                return str(candidate)
 
     # Chạy từ mã nguồn và whisperx nằm sẵn trong môi trường hiện tại.
     if not getattr(sys, "frozen", False):
@@ -394,7 +398,7 @@ class WhisperXAdapter:
                             detected_language=detected_language or "",
                             raw_segments=segments,
                         )
-                except (json.JSONDecodeError, OSError):
+                except (ValueError, OSError):   # [v3.23.638] gồm UnicodeDecodeError
                     pass
             detail = "; ".join(error_lines) or f"Tiến trình WhisperX thoát mã {return_code}."
             # [v3.23.338] Mã 2 + KHÔNG có dòng lỗi nào = dấu hiệu đặc trưng của việc
@@ -430,7 +434,7 @@ class WhisperXAdapter:
             raise SpeechToTextError("Tiến trình WhisperX không tạo kết quả.")
         try:
             payload = json.loads(output_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+        except (ValueError, OSError) as exc:   # [v3.23.638] gồm UnicodeDecodeError
             raise SpeechToTextError(f"Không đọc được kết quả WhisperX: {exc}") from exc
 
         segments = payload.get("segments", [])
@@ -550,7 +554,7 @@ class WhisperXAdapter:
         try:
             payload = json.loads(out_path.read_text(encoding="utf-8"))
             return payload.get("segments") or None
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):   # [v3.23.638] gồm UnicodeDecodeError
             return None
 
     def _extract_audio(self, media_path: Path, audio_path: Path) -> None:

@@ -45,6 +45,7 @@ from subtitles_extractor.presentation.workers.extract_subtitles_worker import (
 from subtitles_extractor.presentation.workers.qt_progress_reporter import (
     QtProgressReporter,
 )
+from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +76,17 @@ class ExtractPageViewModel(QObject):
     transcribe_failed = Signal(str)
     transcribe_raw_ready = Signal(object, str, str)  # raw_segments, lang, model
 
+    # [v3.23.645] Đo A/B tốc độ OCR ngay trong ứng dụng.
+    benchmark_progress = Signal(int, int, str)
+    benchmark_finished = Signal(object, object, bool)   # kết quả, đề xuất | None, đã huỷ
+    benchmark_failed = Signal(str)
+    #: [v3.23.645] Đã ghi cấu hình đề xuất vào Cài đặt — trang Cài đặt phải nạp lại form, nếu không
+    #: lần Lưu kế tiếp sẽ ghi đè lại giá trị cũ.
+    benchmark_settings_applied = Signal()
+
     def __init__(self, container: ApplicationContainer, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        self._thread_keeper = WorkerThreadKeeper(self)
         self._container = container
         self._video: VideoMetadata | None = None
         self._roi: Roi | None = None
@@ -90,6 +100,8 @@ class ExtractPageViewModel(QObject):
         # [V3.12 STABILITY FIX] Expose Threads cho Safe Teardown
         self.active_extract_thread: QThread | None = None
         self.active_detect_thread: QThread | None = None
+        self.active_benchmark_thread: QThread | None = None
+        self._benchmark_reporter: QtProgressReporter | None = None
 
     @property
     def video(self) -> VideoMetadata | None:
@@ -282,6 +294,7 @@ class ExtractPageViewModel(QObject):
         self._set_busy(True)
 
         from PySide6.QtWidgets import QApplication
+
         from subtitles_extractor.infrastructure.video.ocr_based_auto_roi_detector import (
             OcrBasedAutoRoiDetector,
             _clusters_to_rois,
@@ -331,11 +344,14 @@ class ExtractPageViewModel(QObject):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         done_signal = getattr(worker, "done", None)
-        if done_signal is not None: done_signal.connect(thread.quit)
+        if done_signal is not None: done_signal.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         else:
-            worker.finished.connect(thread.quit)
-            worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
+            worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+            worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        # [v3.23.613] Một chủ sở hữu duy nhất cho worker (xem thread_keeper): KHÔNG gắn
+        # worker.deleteLater vào thread.finished — Qt xoá trong luồng nền song song với
+        # Python xoá ở luồng giao diện làm xoá hai lần, sập ứng dụng.
+        self._thread_keeper.keep(thread, worker)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_detection_thread_finished)
 
@@ -392,7 +408,7 @@ class ExtractPageViewModel(QObject):
             track_language = getattr(track, "language", "") or ""
             paddle_lang = resolve_paddle_lang(track_language) or ""
         logger.info(
-            "OCR phụ đề nhúng dùng ngôn ngữ: {} (track lang='{}').",
+            "OCR phụ đề nhúng dùng ngôn ngữ: %s (track lang='%s').",
             describe_paddle_lang(paddle_lang),
             getattr(track, "language", ""),
         )
@@ -433,12 +449,12 @@ class ExtractPageViewModel(QObject):
         try:
             events = use_case.load(subtitle_path)
         except (FileNotFoundError, KeyError, ValueError, OSError) as exc:
-            logger.warning("Nạp phụ đề rời '{}' thất bại: {}", subtitle_path, exc)
+            logger.warning("Nạp phụ đề rời '%s' thất bại: %s", subtitle_path, exc)
             self.sidecar_load_failed.emit(
                 f"Không nạp được phụ đề '{subtitle_path.name}': {exc}"
             )
             return
-        logger.info("Đã nạp {} câu từ phụ đề rời '{}'.", len(events), subtitle_path.name)
+        logger.info("Đã nạp %s câu từ phụ đề rời '%s'.", len(events), subtitle_path.name)
         self.sidecar_load_finished.emit(events)
 
     def is_stt_available(self) -> bool:
@@ -688,6 +704,76 @@ class ExtractPageViewModel(QObject):
         )
         self._launch_extract_worker(probed_requests, is_raw_export=False)
 
+    def start_ocr_benchmark(
+        self, scenario_keys: list[str], probe_seconds: float = 60.0, center_ratio: float = 0.5,
+    ) -> bool:
+        """[v3.23.645] Đo từng kịch bản OCR trên một đoạn phim ngắn bằng video + ROI + cài đặt HIỆN TẠI.
+
+        Returns:
+            ``True`` nếu đã bắt đầu; ``False`` khi chưa có video / đang bận / không có kịch bản hợp lệ.
+        """
+        from subtitles_extractor.application.services.ocr_benchmark import DEFAULT_SCENARIOS
+        from subtitles_extractor.application.services.ocr_probe_window import compute_probe_window
+
+        if self._video is None or self._is_busy:
+            return False
+        wanted = set(scenario_keys) | {"current"}
+        scenarios = [s for s in DEFAULT_SCENARIOS if s.key in wanted]
+        requests = self._build_requests()
+        if not requests:
+            return False
+        window = compute_probe_window(
+            self._video.duration_sec, probe_seconds=probe_seconds, center_ratio=center_ratio,
+        )
+        use_case = self._container.make_benchmark_ocr_use_case()
+        reporter = QtProgressReporter()
+        reporter.progress_changed.connect(self.benchmark_progress)
+
+        from subtitles_extractor.presentation.workers.ocr_benchmark_worker import OcrBenchmarkWorker
+
+        thread = QThread(self)
+        worker = OcrBenchmarkWorker(use_case, requests[0], scenarios, window, reporter)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.benchmark_finished)
+        worker.failed.connect(self.benchmark_failed)
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        self._thread_keeper.keep(thread, worker)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_benchmark_thread_finished)
+
+        self.active_benchmark_thread = thread
+        self._benchmark_reporter = reporter
+        self._set_busy(True)
+        thread.start()
+        logger.info(
+            "Đo tốc độ OCR: %d kịch bản trên đoạn %s.", len(scenarios), window.label_vi,
+        )
+        return True
+
+    def _on_benchmark_thread_finished(self) -> None:
+        if self.sender() is not getattr(self, "active_benchmark_thread", None):
+            return
+        self.active_benchmark_thread = None
+        self._benchmark_reporter = None
+        self._set_busy(False)
+
+    def apply_benchmark_recommendation(self, recommendation: object) -> bool:
+        """[v3.23.645] Ghi cấu hình đề xuất vào Cài đặt (và áp dụng ngay cho bộ OCR)."""
+        patch = getattr(recommendation, "settings_patch", None)
+        if not patch:
+            return False
+        try:
+            self._container.settings_service.update(**patch)
+            self._container.apply_settings_changes()
+        except Exception as exc:  # noqa: BLE001 - hiển thị cho người dùng, không sập giao diện
+            logger.error("Không áp dụng được cấu hình OCR đề xuất: %s", exc)
+            return False
+        logger.info("Đã áp dụng cấu hình OCR đề xuất: %s.", patch)
+        self.benchmark_settings_applied.emit()
+        return True
+
     def start_extraction_with_raw_export(self, raw_ocr_output_path: Path, export_images: bool = False) -> None:
         if self._video is None or self._is_busy: return
         requests = self._build_requests(raw_ocr_output_path=raw_ocr_output_path, export_images=export_images)
@@ -711,9 +797,12 @@ class ExtractPageViewModel(QObject):
             worker.finished.connect(self._on_extract_finished)
 
         worker.failed.connect(self._on_extract_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        # [v3.23.613] Một chủ sở hữu duy nhất cho worker (xem thread_keeper): KHÔNG gắn
+        # worker.deleteLater vào thread.finished — Qt xoá trong luồng nền song song với
+        # Python xoá ở luồng giao diện làm xoá hai lần, sập ứng dụng.
+        self._thread_keeper.keep(thread, worker)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_extract_thread_finished)
 
@@ -726,6 +815,8 @@ class ExtractPageViewModel(QObject):
     def cancel_extraction(self) -> None:
         if getattr(self, "_extract_reporter", None) is not None:
             self._extract_reporter.request_cancel()
+        if getattr(self, "_benchmark_reporter", None) is not None:
+            self._benchmark_reporter.request_cancel()
         # [v3.22] Hủy cả worker nguồn mới (embedded OCR bitmap / STT WhisperX) — chúng
         # hỗ trợ dừng mềm giữa chừng qua request_cancel.
         for worker_attr in ("_embedded_worker", "_transcribe_worker"):
@@ -828,6 +919,7 @@ class ExtractPageViewModel(QObject):
             sampling=FrameSamplingConfig(
                 sample_step_sec=snapshot.frame.sample_step_sec, phash_distance_threshold=snapshot.frame.phash_distance,
                 pixel_diff_threshold=snapshot.frame.pixel_diff_ratio, skip_intro_sec=snapshot.frame.skip_intro_sec, skip_outro_sec=snapshot.frame.skip_outro_sec,
+                white_text_gate=snapshot.frame.white_text_gate, white_text_luma=snapshot.frame.white_text_luma,
                 apply_median_blend=snapshot.preprocess.apply_median_blend,
                 median_blend_frames=snapshot.preprocess.median_blend_frames,
                 vram_upscale_small_text=vram_upscale, vram_upscale_target_height_px=snapshot.preprocess.upscale_target_height_px,
@@ -852,6 +944,7 @@ class ExtractPageViewModel(QObject):
                 use_tensorrt=snapshot.hardware.use_tensorrt,
                 precision=PrecisionMode(snapshot.hardware.precision.value),
                 batch_size=snapshot.hardware.batch_size_ocr,
+                det_batch_size=snapshot.hardware.det_batch_size,
                 parallel_workers=snapshot.hardware.workers,
                 preprocess=PreprocessConfig(
                     upscale_small_text=cpu_upscale, upscale_target_height_px=snapshot.preprocess.upscale_target_height_px,

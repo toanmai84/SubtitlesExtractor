@@ -261,13 +261,20 @@ class SeekWorker(QObject):
 
     def run(self) -> None:
         frame_rgb = None
-        if self._persistent_reader is not None:
-            if self._is_sequential_play:
-                frame_rgb = self._persistent_reader.next_frame()
+        try:
+            if self._persistent_reader is not None:
+                if self._is_sequential_play:
+                    frame_rgb = self._persistent_reader.next_frame()
+                else:
+                    frame_rgb = self._persistent_reader.seek(self._timestamp_sec)
             else:
-                frame_rgb = self._persistent_reader.seek(self._timestamp_sec)
-        else:
-            frame_rgb = self._read_frame_without_reader()
+                frame_rgb = self._read_frame_without_reader()
+        except Exception as exc:  # noqa: BLE001
+            # [v3.23.650] Ngoại lệ lạ (vd OverflowError với mốc vô cực) từng thoát khỏi run() → luồng seek không
+            # bao giờ kết thúc, bản xem trước đứng vĩnh viễn.
+            logger.exception("Seek video lỗi không lường trước: %s", exc)
+            self.failed.emit(f"Không thể đọc khung hình: {exc}")
+            return
 
         if frame_rgb is None:
             self.failed.emit(

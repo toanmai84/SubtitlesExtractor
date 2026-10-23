@@ -73,13 +73,19 @@ def test_skip_overlap_evaluated_after_stretch(monkeypatch, tmp_path) -> None:
 
 
 def test_skip_overlap_still_skips_when_residual_exceeds(monkeypatch, tmp_path) -> None:
-    # Audio 10s / khung 1s (không gap): sau nén tối đa 2x còn 5s -> lấn dư 4s+ (hiệu
-    # dụng 1s + nới 2s câu cuối = 3s) vượt ngưỡng 500ms -> vẫn bỏ đúng thiết kế.
+    """Nén hết cỡ mà vẫn lấn quá ngưỡng -> vẫn BỎ, đúng thiết kế.
+
+    [v3.23.547] Cập nhật số liệu theo v3.23.464: trần nén nay là ĐÚNG ``max_speed``
+    người dùng đặt, không còn bị kẹp cứng về 2.0. Với ``max_speed=3.0`` cũ, audio 10s
+    nén còn 3.33s — chỉ lấn 0.33s so với khung hiệu dụng 3s, DƯỚI ngưỡng 500ms nên
+    không bỏ nữa. Đặt ``max_speed=2.0`` để giữ đúng tình huống mà bài kiểm muốn xét:
+    audio 10s -> 5s, khung hiệu dụng 3s (1s khung + 2s nới câu cuối) -> lấn dư 2s.
+    """
     adapter = VieNeuTtsAdapter()
     _prime(adapter, _LongAudioEngine(10.0), monkeypatch)
     request = TTSRequest(
         events=[_Event(0.0, 1.0, "Quá dài")], speaker="a",
-        normalize=False, skip_overlap_ms=500, base_speed=1.0, max_speed=3.0,
+        normalize=False, skip_overlap_ms=500, base_speed=1.0, max_speed=2.0,
     )
     results = adapter.generate(request, tmp_path / "out")
     assert results[0].was_skipped

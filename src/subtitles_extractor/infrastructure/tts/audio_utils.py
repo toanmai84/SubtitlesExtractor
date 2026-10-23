@@ -51,17 +51,99 @@ def _torch_none_bypassed() -> Iterator[None]:
             sys.modules[root] = None  # type: ignore[assignment]
 
 __all__ = [
+    "EDGE_ISLAND_CORE_DB",
+    "EDGE_ISLAND_MAX_S",
+    "EDGE_ISLAND_MIN_GAP_S",
     "RESAMPLE_PATIENCE",
     "cap_nhat_ban_tot_nhat",
     "is_effectively_silent",
     "resample_audio",
     "shorter_take",
+    "speech_seconds",
+    "speech_span",
     "trim_edge_silence",
 ]
 
+#: [v3.23.615] Đảo tiếng ở BIÊN audio ngắn hơn mức này (giây) mà cách phần lời ít nhất
+#: :data:`EDGE_ISLAND_MIN_GAP_S` là tạp âm model sinh thêm, không phải lời. Âm tiết ngắn
+#: nhất ("à", "ừ") dài trên 80ms; tiếng bật của phụ âm tắc nằm sát nguyên âm (dưới 80ms).
+EDGE_ISLAND_MAX_S = 0.06
+
+#: [v3.23.615] Khoảng lặng tối thiểu (giây) tách đảo tạp âm khỏi phần lời.
+EDGE_ISLAND_MIN_GAP_S = 0.15
+
+#: [v3.23.616] Độ dài một đảo đo trên LÕI của nó: các khung to trong vòng chừng này dB
+#: dưới đỉnh của CHÍNH đảo. Đếm mọi khung trên ngưỡng "có tiếng" (rất thấp, sát sàn nhiễu)
+#: thì đuôi hiện/tắt dần và hai mép cửa sổ 20ms bị tính cả: tiếng "tách" 52ms thành 80ms.
+EDGE_ISLAND_CORE_DB = -20.0
+
+
+def speech_span(
+    voiced: np.ndarray,
+    frame_s: float,
+    max_island_s: float = EDGE_ISLAND_MAX_S,
+    min_gap_s: float = EDGE_ISLAND_MIN_GAP_S,
+    levels: np.ndarray | None = None,
+) -> tuple[int, int] | None:
+    """[v3.23.615] Biên ``[đầu, cuối]`` của phần LỜI, bỏ đảo tạp âm lẻ ở hai đầu.
+
+    Hàm thuần.
+
+    Đo trên FLAC lồng tiếng thật 14/10 (VieNeu, 95 câu): câu "Hôm nay muội đến đây" nói
+    xong ở 0.78s, im 305ms rồi có một tiếng "tách" 30ms (-24 dB) đúng ở cuối; câu "Hả?!"
+    cũng vậy (230ms lặng rồi 20ms tạp âm). Cắt lặng theo khung CUỐI có tiếng giữ nguyên cả
+    khoảng lặng lẫn tiếng tách: người nghe nghe một tiếng "click" sau lời thoại, và khung
+    lời bị tính dài hơn thực tế (khoảng lặng bị nén theo).
+
+    Args:
+        voiced: Cờ "có tiếng" theo từng khung.
+        frame_s: Độ dài một khung (giây) — để đổi ngưỡng giây sang số khung.
+        max_island_s: Đảo biên dài tối đa chừng này mới bị coi là tạp âm.
+        min_gap_s: Đảo phải cách phần lời ít nhất chừng này.
+        levels: [v3.23.616] Mức (RMS) từng khung, cùng độ dài ``voiced``. Có thì độ dài
+            đảo chỉ tính các khung to trong vòng :data:`EDGE_ISLAND_CORE_DB` dưới đỉnh
+            của chính đảo; không có thì đếm mọi khung "có tiếng" như cũ.
+
+    Returns:
+        ``(khung đầu, khung cuối)`` (bao gồm) của phần lời; ``None`` nếu không có khung
+        nào có tiếng. Không bao giờ bỏ đảo cuối cùng còn lại.
+    """
+    indices = np.flatnonzero(voiced)
+    if indices.size == 0:
+        return None
+    breaks = np.flatnonzero(np.diff(indices) > 1)
+    starts = np.concatenate(([indices[0]], indices[breaks + 1]))
+    ends = np.concatenate((indices[breaks], [indices[-1]]))
+    if frame_s <= 0:
+        return int(starts[0]), int(ends[-1])
+    max_island = max(1, round(max_island_s / frame_s))
+    min_gap = max(1, round(min_gap_s / frame_s))
+    core_ratio = 10.0 ** (EDGE_ISLAND_CORE_DB / 20.0)
+
+    def island_frames(position: int) -> int:
+        if levels is None:
+            return int(ends[position] - starts[position] + 1)
+        island_levels = levels[starts[position]: ends[position] + 1]
+        return int(np.count_nonzero(island_levels >= island_levels.max() * core_ratio))
+
+    first, last = 0, len(starts) - 1
+    while (
+        first < last
+        and island_frames(first) <= max_island
+        and starts[first + 1] - ends[first] - 1 >= min_gap
+    ):
+        first += 1
+    while (
+        last > first
+        and island_frames(last) <= max_island
+        and starts[last] - ends[last - 1] - 1 >= min_gap
+    ):
+        last -= 1
+    return int(starts[first]), int(ends[last])
+
 
 def shorter_take(
-    current_best: np.ndarray | None, candidate: np.ndarray
+    current_best: np.ndarray | None, candidate: np.ndarray, sr: int | None = None
 ) -> np.ndarray:
     """[v3.23.221] Chọn bản thu NGẮN HƠN giữa hai lần tổng hợp (hàm thuần).
 
@@ -73,13 +155,39 @@ def shorter_take(
     Args:
         current_best: Ứng viên tốt nhất tới hiện tại (None nếu chưa có).
         candidate: Bản thu vừa sinh.
+        sr: [v3.23.601] Có tần số lấy mẫu thì so độ dài PHẦN TIẾNG
+            (:func:`speech_seconds`) thay vì độ dài thô — khâu đặt câu cắt lặng biên nên
+            im lặng không làm bản thu "dài" hơn. None giữ cách so độ dài thô như cũ.
 
     Returns:
         Bản ngắn hơn trong hai bản (ưu tiên ``current_best`` khi bằng nhau).
     """
     if current_best is None:
         return candidate
+    if sr:
+        shorter = speech_seconds(candidate, sr) < speech_seconds(current_best, sr)
+        return candidate if shorter else current_best
     return candidate if candidate.size < current_best.size else current_best
+
+
+def speech_seconds(audio: np.ndarray, sr: int) -> float:
+    """[v3.23.601] Độ dài PHẦN TIẾNG của bản thu — sau khi cắt lặng biên (hàm thuần).
+
+    Lưới "dài bất thường" phải đo đúng thứ người nghe sẽ nghe. Khâu đặt câu cắt lặng
+    đầu/cuối (:func:`trim_edge_silence`, ngưỡng tự dò) ngay sau khi tổng hợp, nên một bản
+    thô 2.2 giây gồm 0.7 giây tiếng và 1.5 giây im lặng là bản đọc GỌN, không phải bản
+    "ngân dài".
+
+    Args:
+        audio: Tín hiệu mono float32 vừa tổng hợp.
+        sr: Tần số lấy mẫu (Hz).
+
+    Returns:
+        Số giây tiếng sau khi cắt lặng biên; 0.0 khi ``sr`` không hợp lệ.
+    """
+    if sr <= 0:
+        return 0.0
+    return trim_edge_silence(audio, sr, adaptive=True).size / sr
 
 
 def is_effectively_silent(audio: np.ndarray, rms_threshold: float = 0.005) -> bool:
@@ -142,11 +250,16 @@ def trim_edge_silence(
         return audio
     frame_rms = np.sqrt((audio[:usable].reshape(-1, window) ** 2).mean(axis=1))
     thr = _adaptive_voice_threshold(frame_rms) if adaptive else threshold
-    voiced = np.nonzero(frame_rms > thr)[0]
-    if voiced.size == 0:
+    # [v3.23.615] Bỏ đảo tạp âm lẻ ở hai đầu (xem :func:`speech_span`).
+    # [v3.23.616] Đo đảo trên lõi của nó (``levels``): FLAC lồng tiếng thật 14/10 câu
+    # "nhưng đường tu tiên" còn một tiếng 52ms (-13 dB) sau 270ms lặng ở cuối — đếm theo
+    # ngưỡng "có tiếng" nó dài 80ms, quá ngưỡng đảo 60ms nên không bị cắt.
+    span = speech_span(frame_rms > thr, window / sr, levels=frame_rms)
+    if span is None:
         return audio  # toàn im lặng — giữ nguyên cho lớp retry/skip quyết định
-    start = max(0, voiced[0] * window - int(keep_head_s * sr))
-    end = min(len(audio), (voiced[-1] + 1) * window + int(keep_tail_s * sr))
+    first_voiced, last_voiced = span
+    start = max(0, first_voiced * window - int(keep_head_s * sr))
+    end = min(len(audio), (last_voiced + 1) * window + int(keep_tail_s * sr))
     return audio[start:end]
 
 

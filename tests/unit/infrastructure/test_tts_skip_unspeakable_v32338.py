@@ -32,7 +32,7 @@ class TestPlanKeepsAllChunks:
         prov = self._provider(tmp_path)
         fake = tmp_path / "v.mp4"
         fake.write_bytes(b"x")
-        with patch.object(prov, "_ffprobe_duration_sec", return_value=11901.0):
+        with patch.object(prov, "_read_duration_sec", return_value=11901.0):
             plan = prov.plan_chunks(fake)  # mặc định KHÔNG truncate
         assert plan.is_truncated is False
         # Các đoạn phủ KÍN toàn bộ thời lượng (không thiếu giây nào).
@@ -44,7 +44,7 @@ class TestPlanKeepsAllChunks:
         prov = self._provider(tmp_path)
         fake = tmp_path / "v.mp4"
         fake.write_bytes(b"x")
-        with patch.object(prov, "_ffprobe_duration_sec", return_value=11901.0):
+        with patch.object(prov, "_read_duration_sec", return_value=11901.0):
             full = prov.plan_chunks(fake)
             truncated = prov.plan_chunks(fake, allow_truncation=True)
         # allow_truncation giữ ÍT đoạn hơn (hoặc bằng nếu vừa token).
@@ -54,7 +54,7 @@ class TestPlanKeepsAllChunks:
         prov = self._provider(tmp_path)
         fake = tmp_path / "v.mp4"
         fake.write_bytes(b"x")
-        with patch.object(prov, "_ffprobe_duration_sec", return_value=600.0):
+        with patch.object(prov, "_read_duration_sec", return_value=600.0):
             plan = prov.plan_chunks(fake)
         assert len(plan.chunks) == 1
         assert plan.chunks[0].is_full_video is True

@@ -49,8 +49,14 @@ def test_base_speed_applied_when_audio_shorter() -> None:
 
 
 def test_fit_wins_when_longer_than_base() -> None:
-    # Audio dài -> nén cho vừa khung (fit 2.5) nhưng chặn ở trần chất lượng 2.0.
-    assert total_speed_ratio(5.0, 2.0, base_speed=1.3, max_speed=2.5) == 2.0
+    """Audio dài -> nén cho vừa khung, chặn ở TRẦN NGƯỜI DÙNG đặt.
+
+    [v3.23.464] Trần chất lượng 2.0 không còn kẹp cứng: đặt ``max_speed=2.5`` mà chạy
+    2.0 là "set một đường chạy một nẻo". Nay 2.0 chỉ là khuyến nghị ở tooltip.
+    """
+    assert total_speed_ratio(5.0, 2.0, base_speed=1.3, max_speed=2.5) == 2.5
+    # Trần thấp hơn vẫn được tôn trọng y hệt.
+    assert total_speed_ratio(5.0, 2.0, base_speed=1.3, max_speed=2.0) == 2.0
 
 
 def test_max_speed_caps_base() -> None:
@@ -122,5 +128,11 @@ def test_gemini_uses_shared_helper() -> None:
     source = pathlib.Path(
         "src/subtitles_extractor/infrastructure/tts/gemini_tts_adapter.py"
     ).read_text(encoding="utf-8")
-    assert source.count("total_speed_ratio(") >= 2  # standard + batch
-    assert "request.base_speed, request.max_speed" in source
+    # [v3.23.596] Cả hai đường (standard + native) gọi hàm đặt câu dùng chung, nơi tốc độ
+    # tổng được tính bằng total_speed_ratio từ base_speed/max_speed của yêu cầu.
+    assert source.count("place_line(") >= 2
+    assert source.count("base_speed=float(request.base_speed)") >= 2
+    assert source.count("max_speed=float(request.max_speed)") >= 2
+    assert "total_speed_ratio(" in pathlib.Path(
+        "src/subtitles_extractor/infrastructure/tts/line_placement.py"
+    ).read_text(encoding="utf-8")

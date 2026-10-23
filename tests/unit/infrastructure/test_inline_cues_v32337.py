@@ -32,8 +32,10 @@ class TestSchemaSelection:
         assert "cues" not in _CONTEXT_ANALYSIS_SCHEMA["properties"]
 
     def test_both_schemas_require_core_fields(self) -> None:
-        for sch in (_CONTEXT_WITH_CUES_SCHEMA, _CONTEXT_ANALYSIS_SCHEMA):
-            assert set(sch["required"]) == {"source_lang", "characters", "overview"}
+        core = {"source_lang", "characters", "overview"}
+        assert set(_CONTEXT_ANALYSIS_SCHEMA["required"]) == core
+        # [v3.23.622] Schema có cues bắt buộc thêm chính ``cues``.
+        assert set(_CONTEXT_WITH_CUES_SCHEMA["required"]) == core | {"cues"}
 
 
 class TestUseCaseInlineFlow:

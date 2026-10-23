@@ -26,7 +26,12 @@ class OcrSettings(BaseSettings):
     language: str = Field(default="ch")
     detection_model: str = Field(default="PP-OCRv6_medium_det")
     recognition_model: str = Field(default="PP-OCRv6_medium_rec")
-    score_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    # [v3.23.619] 0.75 → 0.5. Ngưỡng này lọc ô chữ NGAY trong PaddleOCR, trước bước gộp
+    # câu; các quy tắc tin cậy của bước gộp câu (0.55 cho câu hai chữ đứng yên ≥ 0.4s,
+    # 0.65 cho mảnh chớp…) vì thế không bao giờ chạy với mặc định 0.75. Phim mẫu tập 1:
+    # câu "瑶瑶" thứ hai hiện 14 khung (0.53-0.81) chỉ còn 5 khung ≥ 0.75 → bị loại. Ở 0.5:
+    # lấy lại đúng câu đó, 93 câu còn lại giống hệt chữ + thời gian, không thêm câu rác.
+    score_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
 
     limit_side_len: int = Field(default=0, ge=0, le=4096)
     limit_type: str = Field(default="min", pattern="^(max|min)$")
@@ -34,7 +39,9 @@ class OcrSettings(BaseSettings):
     det_box_thresh: float = Field(default=0.6, ge=0.0, le=1.0)
     det_unclip_ratio: float = Field(default=1.5, ge=0.5, le=3.0)
 
-    use_textline_orientation: bool = Field(default=True)
+    # [v3.23.643] Mặc định TẮT: phụ đề cứng gần như luôn nằm ngang; bộ phân loại hướng chạy thêm một
+    # lần mô hình cho MỖI khung (đo: 24 khung cho cùng chữ khi bật/tắt, bộ phân loại tốn ~6% thời gian).
+    use_textline_orientation: bool = Field(default=False)
     use_doc_orientation_classify: bool = Field(default=False)
     use_doc_unwarping: bool = Field(default=False)
 
@@ -44,6 +51,9 @@ class HardwareSettings(BaseSettings):
     device: DeviceKind = DeviceKind.GPU
     batch_size_ocr: int = Field(default=128, ge=1, le=512)
     batch_size_roi: int = Field(default=32, ge=1, le=128)
+    # [v3.23.644] Số khung bộ DÒ CHỮ của PaddleOCR xử lý trong MỘT lần chạy GPU (mặc định 1 = như cũ; PaddleOCR
+    # chỉ gọi det từng ảnh một dù ``batch_size_ocr`` lớn). Đo bằng tools/bench_ocr.py rồi mới tăng.
+    det_batch_size: int = Field(default=1, ge=1, le=64)
     workers: int = Field(default=8, ge=1, le=16)
     enable_mkldnn: bool = False
     auto_tune_batch: bool = False
@@ -99,6 +109,9 @@ class FrameSamplingSettings(BaseSettings):
     pixel_diff_ratio: float = Field(default=0.01, ge=0.0, le=1.0)
     skip_intro_sec: float = Field(default=0.0, ge=0.0, le=600.0)
     skip_outro_sec: float = Field(default=0.0, ge=0.0, le=600.0)
+    # [v3.23.644] Lọc khung theo CHỮ TRẮNG/SÁNG (xem ``frame_dedupe``): mặc định TẮT vì giả định phụ đề sáng.
+    white_text_gate: bool = Field(default=False)
+    white_text_luma: int = Field(default=200, ge=100, le=250)
 
 class PostProcessSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SE_POST_", extra="ignore")
@@ -169,7 +182,12 @@ class VideoContextSettings(BaseSettings):
 
     # Nén video ngữ cảnh trước khi upload.
     resolution_height: int = Field(default=360, ge=144, le=1080)
-    fps: float = Field(default=1.0, ge=0.2, le=5.0)
+    # [v3.23.473] Trần fps nâng 5→30 để giữ nguyên fps gốc nếu muốn (Gemini phân tích ~1fps nên
+    # cao hơn chủ yếu tăng dung lượng — nhưng tôn trọng lựa chọn người dùng).
+    fps: float = Field(default=1.0, ge=0.2, le=24.0)
+    # [v3.23.479] Bỏ cache cloud/DB: buộc cắt+nén+tải lại video ngữ cảnh từ đầu (dùng khi ĐÃ XOÁ
+    # file trên cloud hoặc muốn làm mới). Mặc định False (tái dùng cache cho nhanh).
+    ignore_cloud_cache: bool = Field(default=False)
     nvenc_cq: int = Field(default=32, ge=18, le=45)
     cpu_crf: int = Field(default=30, ge=18, le=45)
 
@@ -215,6 +233,32 @@ class TranslationSettings(BaseSettings):
     # chỗ trước theo từng request nên tổng RPM/TPM vẫn được điều tiết chính xác. Lịch sử
     # dịch (history) neo theo ĐỢT đã chốt để giữ mạch xưng hô/giọng điệu.
     translation_parallel_batches: int = Field(default=1, ge=1, le=4)
+    # [v3.23.439] Dịch CPS-aware: siết độ dài bản dịch theo tốc độ MẮT ĐỌC (ký tự/giây) để
+    # phụ đề CJK→Việt (vốn dài hơn nguồn) đọc kịp. 0 = TẮT (giữ ngân sách TTS cũ). 21 = bật
+    # ở mức bảo toàn (đo 19 tập: 51% dòng vượt 20 CPS khó đọc; siết về ~21 vẫn giữ đủ nghĩa
+    # nhờ rule 'KHÔNG bỏ từ mang nghĩa'). Khuyến nghị 17-22.
+    reading_cps_budget: float = Field(default=21.0, ge=0.0, le=50.0)
+    # [v3.23.440] Giãn thời gian HIỂN THỊ phụ đề đọc-không-kịp vào khoảng lặng phía sau (mượn
+    # gap, chừa 0.1s trước câu kế, trần 7s). 0 rủi ro mất nghĩa (chỉ chỉnh timing). Đo 19 tập:
+    # giảm ~16% dòng >20 CPS chỉ bằng timing. True = bật, False = tắt.
+    extend_display_for_reading: bool = Field(default=True)
+    # [v3.23.448] Cho model sinh tag cảm xúc [cười]/[thở dài]/[hắng giọng] TỪ NGỮ CẢNH VIDEO
+    # (hình + âm thanh) khi dịch → giọng đọc TTS biểu cảm. CHỈ tác dụng khi đính video ngữ cảnh.
+    # Mặc định TẮT (thử nghiệm; tag tự lọc khỏi phụ đề, chỉ vào TTS).
+    translation_emotion_cues: bool = Field(default=False)
+    # [v3.23.612] Xưng hô THUẦN VIỆT cho phim hiện đại/đời thường: tiếng gọi tên kèm vai
+    # vế viết "anh Kiếm", "chị Hồng", "ông Chân" thay cho "Kiếm ca", "Hồng đại tẩu", "Chân
+    # tiên sinh" — ở cả khâu phân tích ngữ cảnh lẫn khâu dịch. Mặc định TẮT (giữ kiểu
+    # Hán-Việt, hợp phim cổ trang/kiếm hiệp).
+    native_address: bool = Field(default=False)
+    # [v3.23.648] Dịch có đính video: chỉ gửi khoảng video của lô (± lề) thay vì cả đoạn dài (đo: 91,6 → 18,1 nghìn
+    # token prompt/request trên 30 phút đầu phim thật). Mặc định BẬT.
+    clip_video_to_batch: bool = Field(default=True)
+    # [v3.23.608] Bộ nhớ đệm TỪNG GIAI ĐOẠN dịch được giữ sau khi dịch xong (để sửa tay và
+    # dùng lại: đổi một giai đoạn thì các giai đoạn khác không phải dịch lại). Dọn theo số
+    # bộ phụ đề giữ lại và tuổi (ngày, tính từ lần ghi cuối).
+    stage_cache_max_files: int = Field(default=60, ge=1, le=1000)
+    stage_cache_max_age_days: int = Field(default=180, ge=1, le=3650)
 
 class ApplicationSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")

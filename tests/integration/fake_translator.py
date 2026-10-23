@@ -60,6 +60,7 @@ class FakeSubtitleTranslator:
         cancel_cb: CancellationCallback | None = None,
         video_refs: list[Any] | None = None,
         attach_video: bool = False,
+        **_extra,
     ) -> list[TranslationLine]:
         """Trả về danh sách dòng đã 'dịch' tất định, giữ nguyên index và độ dài."""
         self.translate_stage_calls.append(stage.kind.value)

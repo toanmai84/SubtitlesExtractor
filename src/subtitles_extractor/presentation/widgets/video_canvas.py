@@ -154,6 +154,8 @@ class VideoCanvas(QWidget):
 
     def send_mpv_command(self, *args: object) -> bool: return False
     def player(self) -> Any | None: return None
+    def peek_player(self) -> Any | None: return None  # [v3.23.650] API chung với MpvVideoWidget
+    def rebind_if_window_changed(self) -> bool: return False  # [v3.23.650] không có lõi mpv để nạp lại
     def release_player(self) -> None: self.pause()
 
     def set_playback_speed(self, speed: float) -> None:
@@ -174,6 +176,10 @@ class VideoCanvas(QWidget):
 
     def set_video_size(self, width: int, height: int) -> None:
         self._video_size = (width, height)
+        self.update()
+
+    def schedule_overlay_refresh(self) -> None:
+        """[v3.23.619] API chung với MpvVideoWidget: vẽ lại khung + lớp phủ."""
         self.update()
 
     def enable_roi_drawing(self, enabled: bool) -> None:

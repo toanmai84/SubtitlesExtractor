@@ -21,15 +21,23 @@ import logging
 import os
 import shutil
 import subprocess
-from subtitles_extractor.infrastructure.process.hidden_process import no_window_kwargs
+from subtitles_extractor.infrastructure.process.hidden_process import (
+    no_window_kwargs,
+    run_ffmpeg_hardened,
+)
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from subtitles_extractor.infrastructure.media.ffmpeg_locator import (
     find_ffmpeg,
     missing_ffmpeg_message,
+)
+from subtitles_extractor.infrastructure.translation.context_audio import (
+    AudioStreamInfo,
+    context_audio_args,
+    select_context_audio,
 )
 from subtitles_extractor.domain.ports.video_context_port import (
     RemoteVideoRef,
@@ -40,6 +48,9 @@ from subtitles_extractor.infrastructure.translation.chunk_cache_cleanup import (
     ChunkFileInfo,
     plan_chunk_cache_cleanup,
 )
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +67,7 @@ _TOKENS_PER_SECOND = 100
 _VIDEO_TOKENS_PER_SEC_BY_RES: dict[str, int] = {"low": 100, "medium": 300, "high": 400}
 
 
-def _vf_gpu_full(height: int, fps_str: str) -> str:
+def _vf_gpu_full(height: int, fps_str: str, width: int = -2) -> str:
     """[v3.23.159] Chuỗi filter tầng GPU HOÀN TOÀN (frame ở CUDA suốt pipeline).
 
     ``fps`` đặt ĐẦU chuỗi: vứt khung thừa NGAY sau giải mã (fps đích thường 1fps,
@@ -75,16 +86,20 @@ def _vf_gpu_full(height: int, fps_str: str) -> str:
     scale_cuda nên hwdownload gặp p010 -> gãy trên nội dung 10-bit).
 
     Args:
-        height: Chiều cao đích (px), width tự tính giữ tỉ lệ và ép chẵn (-2).
+        height: Chiều cao đích (px).
         fps_str: Số khung/giây đích dạng chuỗi (vd "1").
+        width: Chiều rộng đích (px); ``-2`` = tự tính giữ tỉ lệ và ép chẵn. [v3.23.622]
+            Video DỌC phải truyền cả hai (xem :func:`target_frame_size`).
 
     Returns:
         Chuỗi cho tham số ``-vf`` của ffmpeg.
     """
-    return f"fps={fps_str},scale_cuda=w=-2:h={height}:format=nv12,hwdownload,format=nv12"
+    return (
+        f"fps={fps_str},scale_cuda=w={width}:h={height}:format=nv12,hwdownload,format=nv12"
+    )
 
 
-def _vf_gpu_upload(height: int, fps_str: str) -> str:
+def _vf_gpu_upload(height: int, fps_str: str, width: int = -2) -> str:
     """[v3.23.159] Chuỗi filter tầng GPU-QUA-UPLOAD (frame software -> GPU scale -> RAM).
 
     Dùng khi đường thuần-GPU gãy (một số stream h264 khiến giữ frame trên CUDA thất
@@ -98,14 +113,15 @@ def _vf_gpu_upload(height: int, fps_str: str) -> str:
     VRAM khi encoder cần RAM. hwdownload là mắt xích bắc cầu VRAM->RAM còn thiếu.
 
     Args:
-        height: Chiều cao đích (px), width tự tính giữ tỉ lệ và ép chẵn (-2).
+        height: Chiều cao đích (px).
         fps_str: Số khung/giây đích dạng chuỗi.
+        width: Chiều rộng đích (px); ``-2`` = tự tính (xem :func:`_vf_gpu_full`).
 
     Returns:
         Chuỗi cho tham số ``-vf`` của ffmpeg.
     """
     return (
-        f"fps={fps_str},hwupload_cuda,scale_cuda=w=-2:h={height}:format=nv12,"
+        f"fps={fps_str},hwupload_cuda,scale_cuda=w={width}:h={height}:format=nv12,"
         f"hwdownload,format=nv12"
     )
 
@@ -130,7 +146,7 @@ def _is_nvenc_driver_too_old(ffmpeg_stderr: str) -> bool:
     )
 
 
-def _vf_cpu_scale(height: int, fps_str: str) -> str:
+def _vf_cpu_scale(height: int, fps_str: str, width: int = -2) -> str:
     """[v3.23.157] Chuỗi filter scale CPU (các tầng fallback) — ``fps`` đặt ĐẦU.
 
     Trước đây ``fps`` nằm CUỐI chuỗi nên CPU scale toàn bộ ~24fps rồi mới vứt còn
@@ -138,13 +154,52 @@ def _vf_cpu_scale(height: int, fps_str: str) -> str:
     chuỗi cho kết quả GIỐNG HỆT nhưng chỉ scale số khung thật sự cần.
 
     Args:
-        height: Chiều cao đích (px), width tự tính giữ tỉ lệ và ép chẵn (-2).
+        height: Chiều cao đích (px).
         fps_str: Số khung/giây đích dạng chuỗi.
+        width: Chiều rộng đích (px); ``-2`` = tự tính giữ tỉ lệ và ép chẵn.
 
     Returns:
         Chuỗi cho tham số ``-vf`` của ffmpeg.
     """
-    return f"fps={fps_str},scale=-2:{height},format=yuv420p"
+    return f"fps={fps_str},scale={width}:{height},format=yuv420p"
+
+
+#: [v3.23.622] Cạnh NGẮN tối thiểu khi nén video DỌC (9:16). Thăm dò thật trên tập 720x1280:
+#: nén 540x960 đọc đúng từng dòng phụ đề cứng kèm mốc MM:SS, còn 202x360 (360 là chiều CAO)
+#: trả dòng bị gộp/thiếu ngay cả ở media_resolution HIGH. Token KHÔNG phụ thuộc số điểm ảnh
+#: (HIGH = 51.151 token cho cả 202x360, 540x960 lẫn 720x1280), nên độ phân giải cao hơn chỉ
+#: tốn thêm dung lượng tải lên, không tốn quota.
+PORTRAIT_MIN_SHORT_SIDE = 540
+
+
+def _even(value: float) -> int:
+    return max(2, int(round(value / 2.0)) * 2)
+
+
+def target_frame_size(src_width: int, src_height: int, setting: int) -> tuple[int, int]:
+    """Kích thước ``(rộng, cao)`` khi nén video ngữ cảnh (hàm thuần, luôn chẵn).
+
+    Cài đặt ``resolution_height`` (mặc định 360) là chiều cao của video NGANG, tức cạnh ngắn.
+    Trước đây áp thẳng ``scale=-2:360`` cho mọi video nên 720x1280 thành 202x360 — chữ phụ
+    đề cứng bé tí. Nay: video ngang giữ nguyên hành vi (cạnh ngắn = cài đặt); video dọc lấy
+    cạnh ngắn = max(cài đặt, :data:`PORTRAIT_MIN_SHORT_SIDE`); không bao giờ phóng to quá nguồn.
+
+    Args:
+        src_width: Rộng nguồn (px), ``<= 0`` nếu không đọc được.
+        src_height: Cao nguồn (px), ``<= 0`` nếu không đọc được.
+        setting: Cài đặt ``resolution_height``.
+
+    Returns:
+        ``(-2, setting)`` khi không biết kích thước nguồn (hành vi cũ); ngược lại kích thước
+        cụ thể.
+    """
+    if src_width <= 0 or src_height <= 0:
+        return -2, setting
+    if src_height > src_width:  # dọc
+        short = min(max(setting, PORTRAIT_MIN_SHORT_SIDE), src_width)
+        return _even(short), _even(src_height * short / src_width)
+    short = min(setting, src_height)
+    return _even(src_width * short / src_height), _even(short)
 
 
 def video_tokens_per_sec(media_resolution: str) -> int:
@@ -154,8 +209,72 @@ def video_tokens_per_sec(media_resolution: str) -> int:
     )
 
 
+CLIENT_TIMEOUT_SEC = 180.0
+"""[v3.23.535] Thời hạn cho mọi lời gọi HTTP của bộ cung cấp video.
+
+Đủ rộng cho việc TẢI LÊN một đoạn video vài chục MB trên mạng chậm, nhưng hữu hạn — không lời gọi
+nào được phép treo vô hạn, vì worker treo là giao diện khoá vĩnh viễn."""
+
+
 class VideoContextError(Exception):
     """Lỗi khi chuẩn bị/tải ngữ cảnh video."""
+
+
+GEMINI_FILE_LIFETIME_HOURS = 47.0
+"""Files API tự xoá file sau 48 giờ; chừa 1 giờ an toàn để khỏi dùng file sắp bị xoá."""
+
+
+def _upload_error_types() -> tuple[type[BaseException], ...]:
+    """[v3.23.615] Các loại lỗi mạng/máy chủ có thể nổ khi tải file lên Gemini.
+
+    Nạp trễ ``httpx``/``google.genai`` để module vẫn import được khi chưa cài SDK.
+    """
+    types: list[type[BaseException]] = [OSError]
+    try:
+        import httpx
+
+        types.append(httpx.HTTPError)
+    except ImportError:
+        pass
+    try:
+        from google.genai import errors as genai_errors
+
+        types.append(genai_errors.APIError)
+    except ImportError:
+        pass
+    return tuple(types)
+
+
+def is_upload_expired(
+    created_at_iso: str | None,
+    now: datetime | None = None,
+    lifetime_hours: float = GEMINI_FILE_LIFETIME_HOURS,
+) -> bool:
+    """[v3.23.550] True nếu mục cache upload đã quá hạn sống của file Gemini.
+
+    Mục không có (hoặc hỏng) dấu thời gian được coi là CÒN HẠN — giữ hành vi cũ (thử rồi tự
+    chữa khi lỗi), không tải lại oan các mục ghi từ bản cũ.
+
+    Args:
+        created_at_iso: Thời điểm tải lên, định dạng ISO 8601.
+        now: Thời điểm hiện tại (để kiểm thử); mặc định lấy giờ UTC hiện tại.
+        lifetime_hours: Hạn sống tính bằng giờ.
+
+    Returns:
+        True nếu đã quá hạn.
+    """
+    from datetime import datetime, timezone
+
+    if not created_at_iso:
+        return False
+    try:
+        created = datetime.fromisoformat(str(created_at_iso))
+    except ValueError:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return (current - created).total_seconds() > lifetime_hours * 3600.0
 
 
 class GeminiVideoContextProvider:
@@ -179,11 +298,18 @@ class GeminiVideoContextProvider:
         Tải video chỉ dùng một key nên ta tách & lấy key đầu tiên không rỗng. Tránh
         đưa nguyên chuỗi (có '\\n') vào header HTTP → LocalProtocolError.
         """
+        keys = GeminiVideoContextProvider._split_api_keys(raw)
+        return keys[0] if keys else (raw or "").strip()
+
+    @staticmethod
+    def _split_api_keys(raw: str) -> list[str]:
+        """[v3.23.609] Tách chuỗi nhiều key (mỗi dòng/dấu phẩy một key), bỏ trùng."""
+        keys: list[str] = []
         for piece in (raw or "").replace(",", "\n").splitlines():
             key = piece.strip()
-            if key:
-                return key
-        return (raw or "").strip()
+            if key and key not in keys:
+                keys.append(key)
+        return keys
 
     def __init__(
         self,
@@ -200,11 +326,15 @@ class GeminiVideoContextProvider:
         tokens_per_second: int = _TOKENS_PER_SECOND,
         chunk_cache_max_total_mb: int = 4096,
         chunk_cache_max_age_hours: int = 72,
+        ignore_cloud_cache: bool = False,
     ) -> None:
         # [v3.23.130] Hỗ trợ chuỗi NHIỀU key (mỗi dòng/phẩy một key) từ giao diện: tải
         # video chỉ cần MỘT key → lấy key ĐẦU TIÊN hợp lệ. Nếu để nguyên chuỗi gộp, nó
         # lọt vào header 'x-goog-api-key' kèm '\n' → LocalProtocolError (crash khi tải).
         self._api_key = self._first_api_key(api_key)
+        # [v3.23.609] Mọi key người dùng nhập (và mọi key từng dùng để tải): file Gemini
+        # thuộc dự án của key đã tải nó, nên xoá phải thử đúng key đó.
+        self._known_api_keys: list[str] = self._split_api_keys(api_key)
         self._cache_db_path = cache_db_path
         self._max_tokens_per_chunk = max_tokens_per_chunk
         self._max_chunk_seconds = max_chunk_minutes * 60.0
@@ -219,6 +349,9 @@ class GeminiVideoContextProvider:
         # tránh lỗi 400 Bad Request khi phim quá dài (vd 80 tập). Vượt trần →
         # chỉ giữ các đoạn đại diện Đầu/Giữa/Cuối (Smart Video Truncation).
         self._max_total_tokens = max(max_tokens_per_chunk, max_total_tokens)
+        # [v3.23.479] Buộc cắt+tải lại (bỏ mọi cache cloud/DB) — dùng khi người dùng ĐÃ XOÁ file
+        # trên cloud và muốn ép chuẩn bị mới, thay vì tái dùng ref cache.
+        self._ignore_cloud_cache = bool(ignore_cloud_cache)
         self._client: Any = None
         # [v3.23.14] Cache refs trong phiên: tránh cắt+upload lặp khi analyze rồi
         # translate cùng một video. Khoá = chữ ký file (đường dẫn+mtime+size).
@@ -226,6 +359,18 @@ class GeminiVideoContextProvider:
         # [v3.23.21] Cache kết quả dò NVENC (None=chưa dò, True/False=đã biết). Dùng
         # để ưu tiên GPU khi nén video ngữ cảnh; tự tắt nếu GPU lỗi giữa chừng.
         self._nvenc_available: bool | None = None
+        # [v3.23.460] NHỚ NVENC treo giữa các phiên: nén GPU treo (driver NVIDIA lỗi) là tình
+        # trạng CỦA MÁY, không đổi giữa các lần chạy. Trước đây ``_nvenc_available`` reset mỗi
+        # phiên → NGƯỜI DÙNG PHẢI CHỜ 90s cho GPU treo MỖI LẦN phân tích video (app_log: treo
+        # đoạn 0 lặp lại). Nay ghi marker khi phát hiện treo; phiên sau đọc marker → BỎ GPU luôn.
+        if self._nvenc_marker_path_exists():
+            self._nvenc_available = False
+        # [v3.23.468/471] Nhớ các hwaccel GIẢI MÃ hỏng giữa các phiên (khỏi chờ treo lại). Theo
+        # DÕI RIÊNG từng loại (d3d11va, cuda…) — d3d11va hỏng không có nghĩa cuda hỏng và ngược lại.
+        self._hwdec_broken: set[str] = self._load_broken_hwdecs()
+        # [v3.23.473] Mặc định KÈM audio; bật True khi file kẹt xen kẽ audio/video (tự học sau khi
+        # thử có audio thất bại) → các đoạn sau đọc thẳng video.
+        self._drop_audio = False
         # [v3.23.155] Đếm số lần tầng scale_cuda (GPU hoàn toàn) lỗi: lần ĐẦU coi là
         # NHẤT THỜI (NVDEC surface/session bận do trình phát mpv đang hwdec) — vẫn thử
         # lại ở đoạn kế; chỉ khi lỗi lần 2 mới bỏ hẳn tầng này cho các đoạn còn lại.
@@ -243,6 +388,36 @@ class GeminiVideoContextProvider:
         self._chunk_cache_max_age_seconds = max(0, int(chunk_cache_max_age_hours)) * 3600.0
 
     # ── Lập kế hoạch cắt (thuần, không phụ thuộc mạng) ───────────────────────
+    def _read_frame_size(self, video_path: Path) -> tuple[int, int]:
+        """[v3.23.622] Rộng x cao khung hình của video (PyAV); ``(0, 0)`` nếu không đọc được."""
+        cache = getattr(self, "_frame_size_cache", None)
+        if cache is None:
+            cache = {}
+            self._frame_size_cache = cache
+        key = str(video_path)
+        if key in cache:
+            return cache[key]
+        size = (0, 0)
+        try:
+            import av
+
+            with av.open(str(video_path)) as container:
+                if container.streams.video:
+                    stream = container.streams.video[0]
+                    # Xoay hiển thị 90/270 độ (điện thoại quay dọc) làm đổi chiều rộng/cao.
+                    width = int(stream.codec_context.width or 0)
+                    height = int(stream.codec_context.height or 0)
+                    rotation = 0
+                    try:
+                        rotation = abs(int(float(stream.metadata.get("rotate", 0)))) % 360
+                    except (TypeError, ValueError):
+                        rotation = 0
+                    size = (height, width) if rotation in (90, 270) else (width, height)
+        except Exception as exc:  # noqa: BLE001 — PyAV ném nhiều loại lỗi; không chặn nén
+            logger.debug("Không đọc được kích thước khung hình %s: %s", video_path.name, exc)
+        cache[key] = size
+        return size
+
     @staticmethod
     def _read_duration_sec(video_path: Path) -> float:
         """Đọc thời lượng video (giây) bằng PyAV; raise nếu không xác định được.
@@ -297,6 +472,8 @@ class GeminiVideoContextProvider:
         bằng key mới) và buộc dựng lại client.
         """
         new_key = self._first_api_key(api_key)
+        if new_key and new_key not in self._known_api_keys:
+            self._known_api_keys.append(new_key)
         if new_key and new_key != self._api_key:
             self._api_key = new_key
             self._client = None
@@ -379,7 +556,7 @@ class GeminiVideoContextProvider:
             # đổi cấu hình thì tên đổi -> không tái dùng nhầm bản cũ.
             part = out_dir / (
                 f"{video_path.stem}.ctxpart{original_index:02d}"
-                f".h{self._resolution_height}f{self._fps:g}.mp4"
+                f".h{self._resolution_height}f{self._fps:g}.v2.mp4"
             )
             chunks.append(VideoChunk(new_index, part, start, end, is_full_video=False))
 
@@ -440,10 +617,90 @@ class GeminiVideoContextProvider:
                     feature="Ngữ cảnh video khi dịch (cắt đoạn gửi Gemini)"
                 )
             )
-        for chunk in plan.chunks:
+        # [v3.23.472] CHỊU LỖI TỪNG ĐOẠN: một đoạn nén lỗi (vd file HỎNG ở ~6s như app_log —
+        # mọi decoder kẹt cùng chỗ) KHÔNG được làm hỏng cả ngữ cảnh. Bỏ đoạn lỗi, DÙNG các đoạn
+        # còn lại (đoạn 1-15 thường vẫn tốt vì hỏng chỉ ở đầu phim). Chỉ thất bại HẲN nếu MỌI
+        # đoạn đều lỗi.
+        failed = self._encode_missing_chunks(ffmpeg, plan.source_path, plan.chunks)
+
+        if failed:
+            good = [c for c in plan.chunks if c.is_full_video or c.path.exists()]
+            if not good:
+                raise VideoContextError(
+                    f"TẤT CẢ {len(plan.chunks)} đoạn video đều nén thất bại — file gần như CHẮC "
+                    "CHẮN HỎNG (mọi decoder kẹt cùng chỗ). Hãy TẢI LẠI hoặc REMUX video "
+                    "(ffmpeg -i input.mp4 -c copy clean.mp4), hoặc bỏ đính video."
+                )
+            logger.warning(
+                "Nén ngữ cảnh: %d/%d đoạn lỗi (bỏ qua), DÙNG %d đoạn còn lại. Đoạn lỗi: %s",
+                len(failed), len(plan.chunks), len(good), failed,
+            )
+            plan.chunks[:] = good  # lọc TẠI CHỖ (list mutable dù dataclass frozen)
+
+    def _encode_missing_chunks(
+        self, ffmpeg: str, source_path: Path, chunks: list[VideoChunk]
+    ) -> list[int]:
+        """Nén các đoạn CHƯA có file cục bộ; trả chỉ số các đoạn nén lỗi (không ném lỗi).
+
+        Tách khỏi :meth:`materialize_chunks` để :meth:`upload_chunks_for_ranges` nén được đúng
+        MỘT đoạn — ``materialize_chunks`` bỏ qua hẳn khi kế hoạch chỉ có một đoạn.
+        """
+        failed: list[int] = []
+        for chunk in list(chunks):
             if chunk.is_full_video or chunk.path.exists():
                 continue
-            self._encode_low_res_chunk(ffmpeg, plan.source_path, chunk)
+            try:
+                self._encode_low_res_chunk(ffmpeg, source_path, chunk)
+            except VideoContextError as exc:
+                failed.append(chunk.index)
+                logger.warning("Bỏ qua đoạn %d (nén lỗi, dùng các đoạn còn lại): %s",
+                               chunk.index, exc)
+        return failed
+
+    @staticmethod
+    def _output_has_video_frames(ffmpeg: str, path: Path) -> bool:
+        """[v3.23.462] True nếu file output có ÍT NHẤT 1 KHUNG VIDEO thật (không chỉ audio).
+
+        Dùng để phát hiện tier CPU-nhanh (-skip_frame nokey) ra file chỉ-có-audio trên video
+        keyframe thưa. Đếm khung bằng ffprobe (đi kèm ffmpeg). Nếu KHÔNG kiểm được (thiếu ffprobe/
+        lỗi) → trả True (chấp nhận, không chặn nhầm — đường full-decode vẫn là lưới cuối).
+        """
+        import os
+
+        ffprobe = ffmpeg
+        base = os.path.basename(ffmpeg).lower()
+        if "ffmpeg" in base:
+            ffprobe = os.path.join(
+                os.path.dirname(ffmpeg), os.path.basename(ffmpeg).replace("ffmpeg", "ffprobe")
+            )
+        try:
+            result = run_ffmpeg_hardened(
+                [
+                    ffprobe, "-v", "error", "-select_streams", "v:0",
+                    "-count_packets", "-show_entries", "stream=nb_read_packets",
+                    "-of", "csv=p=0", str(path),
+                ],
+                timeout=30.0,
+                check=False,
+            )
+            text = (result.stdout or b"").decode("utf-8", "ignore").strip()
+            return text.isdigit() and int(text) > 0
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return True  # không kiểm được → không chặn
+
+    @staticmethod
+    def _ffmpeg_progress_tail(exc: "subprocess.SubprocessError") -> str:
+        """[v3.23.470] Trích dòng tiến độ CUỐI của ffmpeg (frame=/time=) từ stderr của exception
+        timeout → để phân biệt KẸT (frame=0/không có) vs CHẬM (frame tăng dần)."""
+        raw = getattr(exc, "stderr", None) or b""
+        text = raw.decode("utf-8", "ignore") if isinstance(raw, bytes) else str(raw)
+        # ffmpeg -stats dùng '\r' để cập nhật cùng dòng → tách theo cả \r lẫn \n, lấy dòng
+        # cuối có 'frame='.
+        parts = text.replace("\r", "\n").split("\n")
+        for line in reversed(parts):
+            if "frame=" in line:
+                return " ".join(line.split())[:120]
+        return "không có tiến độ (kẹt ngay từ đầu — nghi đọc/seek file)"
 
     def _encode_low_res_chunk(self, ffmpeg: str, source_path: Path, chunk: VideoChunk) -> None:
         """Cắt + nén MỘT đoạn về 360p/1fps, ghi qua file tạm ASCII rồi đổi tên.
@@ -467,8 +724,11 @@ class GeminiVideoContextProvider:
         # [v3.23.359] Hạ GPU timeout 180→90s: encode 360p/1fps chạy được chỉ mất vài
         # giây; 90s vẫn quá dư nhưng phát hiện TREO (driver NVENC lỗi) nhanh gấp đôi →
         # tắt NVENC + rơi sang CPU sớm hơn, đỡ bắt người dùng chờ vô ích.
-        gpu_timeout = 90.0
-        cpu_timeout = max(300.0, chunk.duration_sec * 0.5)
+        gpu_timeout = 45.0
+        # [v3.23.462] Có tier CPU-nhanh (skip_frame, chỉ I-frame) → nén thường xong trong
+        # vài–vài chục giây. Hạ timeout 300→120s: đủ dư mà nếu VẪN kẹt thì bỏ SỚM, rơi sang
+        # phân tích văn bản, không bắt người dùng chờ 5 phút.
+        cpu_timeout = max(120.0, chunk.duration_sec * 0.25)
         succeeded_with_gpu: bool | None = None  # None = chưa lệnh nào thành công
         scale_cuda_failed_this_chunk = False
         succeeded_cmd_used_scale_cuda = False
@@ -476,10 +736,29 @@ class GeminiVideoContextProvider:
             # Bỏ qua các lệnh GPU nếu phiên này đã xác định GPU không dùng được.
             if use_gpu and self._nvenc_available is False:
                 continue
-            timeout_s = gpu_timeout if use_gpu else cpu_timeout
+            # [v3.23.467] Tier HYBRID NVDEC-giải-mã (use_gpu=False nhưng có -hwaccel cuda).
+            is_nvdec = (not use_gpu) and ("-hwaccel" in cmd)
+            # NVDEC giải mã cả chunk (hardware) mất ~vài chục giây → timeout riêng rộng hơn
+            # gpu_timeout (vốn để bắt NVENC treo NHANH), vẫn ngắn hơn CPU để bắt treo NVDEC sớm.
+            nvdec_timeout = max(90.0, chunk.duration_sec * 0.15)
+            timeout_s = (
+                nvdec_timeout if is_nvdec
+                else (gpu_timeout if use_gpu else cpu_timeout)
+            )
             try:
-                subprocess.run(cmd, check=True, capture_output=True, timeout=timeout_s, **no_window_kwargs())
-                if tmp_out.exists() and tmp_out.stat().st_size >= 1024:
+                # [v3.23.461] Runner chống treo: stdin=DEVNULL + kill CỨNG (taskkill /F /T) khi
+                # quá hạn → ffmpeg kẹt trong driver GPU CHẮC CHẮN bị kết liễu, app không treo,
+                # người dùng KHÔNG phải tự kill ffmpeg.exe.
+                run_ffmpeg_hardened(cmd, timeout=timeout_s, check=True)
+                # [v3.23.462] Không chỉ kiểm SIZE: tier CPU-nhanh (-skip_frame nokey) trên video
+                # keyframe THƯA có thể ra file CHỈ CÓ AUDIO (0 khung video) — size vẫn ≥1KB nhưng
+                # VÔ DỤNG cho ngữ cảnh. Phải xác nhận có KHUNG VIDEO thật; nếu không → rơi tier kế
+                # (CPU-full sẽ giải mã đủ khung).
+                if (
+                    tmp_out.exists()
+                    and tmp_out.stat().st_size >= 1024
+                    and self._output_has_video_frames(ffmpeg, tmp_out)
+                ):
                     mode = self._encode_mode_label(cmd)
                     logger.info("Nén đoạn %d bằng %s.", chunk.index, mode)
                     succeeded_with_gpu = use_gpu
@@ -488,16 +767,28 @@ class GeminiVideoContextProvider:
                     )
                     break
                 tmp_out.unlink(missing_ok=True)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as timeout_exc:
                 last_exc = None
                 tmp_out.unlink(missing_ok=True)
-                if use_gpu:
+                # [v3.23.470] Trích tiến độ ffmpeg (frame=/time=) từ stderr để biết KẸT hay CHẬM.
+                progress = self._ffmpeg_progress_tail(timeout_exc)
+                if is_nvdec:
+                    # [v3.23.471] hwdec treo → nhớ RIÊNG hwaccel đó cho phiên sau, thử hwaccel/CPU kế.
+                    hw = self._hwaccel_of(cmd)
+                    self._persist_broken_hwdec(hw)
+                    logger.warning(
+                        "Giải mã GPU '%s' đoạn %d treo quá %.0fs [%s] — bỏ '%s' (nhớ cho phiên "
+                        "sau), thử cách kế.",
+                        hw, chunk.index, timeout_s, progress, hw,
+                    )
+                elif use_gpu:
                     # [v3.23.358] Tier GPU TREO tới timeout là tín hiệu MẠNH cho thấy đường
                     # mã hoá GPU hỏng trên máy này (driver/hw). Tắt NVENC cho CẢ PHIÊN để
                     # BỎ các cấp GPU còn lại (nhảy thẳng CPU), tránh treo thêm 180s/tier và
                     # tránh làm hỏng cả tác vụ phân tích ngữ cảnh.
                     if self._nvenc_available is not False:
                         self._nvenc_available = False
+                        self._persist_nvenc_broken()  # [v3.23.460] nhớ cho phiên sau
                         logger.warning(
                             "Nén GPU đoạn %d (%s) TREO quá %.0fs — TẮT mã hoá GPU cho cả "
                             "phiên, chuyển hẳn sang CPU (libx264). (Kiểm tra driver NVIDIA "
@@ -511,11 +802,21 @@ class GeminiVideoContextProvider:
                         )
                 else:
                     logger.warning(
-                        "Nén CPU đoạn %d treo quá %.0fs — huỷ.", chunk.index, cpu_timeout,
+                        "Nén CPU đoạn %d treo quá %.0fs [%s] — huỷ.",
+                        chunk.index, cpu_timeout, progress,
                     )
             except subprocess.SubprocessError as exc:
                 last_exc = exc
                 tmp_out.unlink(missing_ok=True)
+                if is_nvdec:
+                    # [v3.23.471] hwdec lỗi (không hỗ trợ codec / driver) → nhớ RIÊNG hwaccel đó.
+                    hw = self._hwaccel_of(cmd)
+                    self._persist_broken_hwdec(hw)
+                    logger.warning(
+                        "Giải mã GPU '%s' đoạn %d lỗi → bỏ '%s' (nhớ cho phiên sau), thử cách kế.",
+                        hw, chunk.index, hw,
+                    )
+                    continue
                 if use_gpu:
                     # [v3.23.128] In KÈM stderr của ffmpeg để biết LÝ DO thật (trước đây
                     # chỉ thấy 'exit status -40' vô nghĩa). Giúp chẩn đoán scale_cuda /
@@ -532,6 +833,7 @@ class GeminiVideoContextProvider:
                     if _is_nvenc_driver_too_old(err_txt):
                         if self._nvenc_available is not False:
                             self._nvenc_available = False
+                            self._persist_nvenc_broken()  # [v3.23.460] driver cũ = hỏng vĩnh viễn
                             logger.warning(
                                 "NVENC (mã hoá video GPU) KHÔNG dùng được: driver NVIDIA "
                                 "thiếu NVENC API 13.1 mà ffmpeg đóng gói yêu cầu (máy "
@@ -596,9 +898,35 @@ class GeminiVideoContextProvider:
             if last_exc is not None:
                 stderr = getattr(last_exc, "stderr", b"")
                 detail = stderr.decode("utf-8", "ignore")[:200] if isinstance(stderr, bytes) else ""
+            # [v3.23.473] TỰ ĐỘNG BỎ AUDIO rồi thử lại: nếu đang KÈM audio mà mọi tier thất bại,
+            # nghi kẹt xen kẽ audio/video (app_log: file này). Chuyển video-only (-an) + thử lại
+            # NGAY đoạn này; nhớ ``_drop_audio`` cho các đoạn sau (đặc tính file không đổi). Nhờ vậy
+            # video THƯỜNG giữ được tiếng, chỉ file lỗi mới rơi video-only.
+            if not getattr(self, "_drop_audio", False):
+                self._drop_audio = True
+                logger.warning(
+                    "Nén đoạn %d thất bại khi KÈM audio → thử lại KHÔNG audio (video-only) cho "
+                    "cả phim (nghi kẹt xen kẽ audio/video).",
+                    chunk.index,
+                )
+                self._encode_low_res_chunk(ffmpeg, source_path, chunk)
+                return
+            if last_exc is None:  # last_exc None ở nhánh timeout
+                logger.warning(
+                    "Nén đoạn %d thất bại do TIMEOUT ở mọi tier (kể cả video-only). Máy này chậm "
+                    "bất thường HOẶC file hỏng. Thử: chép video sang SSD/ổ C:, tải lại/remux "
+                    "video, hoặc bỏ đính video (phân tích văn bản vẫn tốt).",
+                    chunk.index,
+                )
             raise VideoContextError(
                 f"Nén đoạn {chunk.index} thất bại (cả GPU lẫn CPU). {detail}"
             )
+
+        # [v3.23.474] File kẹt xen kẽ a/v (đã rơi video-only) → THỬ ghép audio bằng cách trích
+        # RIÊNG luồng audio (không xen kẽ với video thưa nên thường KHÔNG kẹt). Nếu được → chunk
+        # có tiếng; nếu không → giữ video-only.
+        if getattr(self, "_drop_audio", False):
+            tmp_out = self._try_attach_audio(ffmpeg, source_path, chunk, tmp_out)
 
         # Đưa file về vị trí đích (tên có thể chứa CJK — dùng Python, KHÔNG qua ffmpeg).
         try:
@@ -610,6 +938,106 @@ class GeminiVideoContextProvider:
                 f"Không di chuyển đoạn {chunk.index} về đích: {exc}"
             ) from exc
 
+    def _context_audio(self, source_path: Path) -> AudioStreamInfo | None:
+        """[v3.23.610] Luồng âm thanh dùng làm ngữ cảnh (đọc một lần cho mỗi video)."""
+        cache = getattr(self, "_audio_probe_cache", None)
+        if cache is None:
+            cache = {}
+            self._audio_probe_cache = cache
+        key = str(source_path)
+        if key not in cache:
+            cache[key] = select_context_audio(self._probe_audio_streams(source_path))
+        return cache[key]
+
+    @staticmethod
+    def _probe_audio_streams(source_path: Path) -> list[AudioStreamInfo]:
+        """Các luồng âm thanh của video (PyAV); lỗi đọc thì trả rỗng."""
+        try:
+            import av
+        except ImportError:
+            return []
+        av_errors: tuple[type[BaseException], ...] = (OSError, ValueError, IndexError)
+        ffmpeg_error = getattr(getattr(av, "error", None), "FFmpegError", None)
+        if ffmpeg_error is not None:
+            av_errors = (*av_errors, ffmpeg_error)
+        default_flag = getattr(getattr(av, "stream", None), "Disposition", None)
+        default_flag = getattr(default_flag, "default", 1)
+        try:
+            with av.open(str(source_path)) as container:
+                streams: list[AudioStreamInfo] = []
+                for position, stream in enumerate(container.streams.audio):
+                    layout = getattr(stream, "layout", None)
+                    names = tuple(
+                        str(getattr(channel, "name", ""))
+                        for channel in getattr(layout, "channels", ()) or ()
+                    )
+                    channels = int(getattr(stream, "channels", 0) or len(names))
+                    disposition = getattr(stream, "disposition", 0) or 0
+                    streams.append(
+                        AudioStreamInfo(
+                            position=position,
+                            channels=channels,
+                            channel_names=names,
+                            is_default=bool(int(disposition) & int(default_flag)),
+                        )
+                    )
+                return streams
+        except av_errors as exc:
+            logger.debug("Không đọc được luồng âm thanh của %s: %s", source_path.name, exc)
+            return []
+
+    def _try_attach_audio(
+        self, ffmpeg: str, source_path: Path, chunk: VideoChunk, video_only: Path
+    ) -> Path:
+        """[v3.23.474] Trích RIÊNG luồng audio của đoạn (không kèm video → tránh kẹt xen kẽ) rồi
+        GHÉP vào file video-only. Trả về file có tiếng nếu được; nếu trích/ghép lỗi → trả file
+        video-only cũ (giữ nguyên hành vi an toàn)."""
+        tmp_audio = video_only.with_name(video_only.stem + ".aud.m4a")
+        muxed = video_only.with_name(video_only.stem + ".av.mp4")
+        # Trích audio-only: -vn (bỏ video) → demuxer không phải xen kẽ với video 1fps.
+        audio_cmd = [
+            ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+            "-err_detect", "ignore_err",
+            "-ss", f"{chunk.start_sec:.3f}", "-t", f"{chunk.duration_sec:.3f}",
+            "-i", str(source_path),
+            "-vn", *context_audio_args(self._context_audio(source_path)),
+            "-avoid_negative_ts", "make_zero",
+            str(tmp_audio),
+        ]
+        try:
+            run_ffmpeg_hardened(audio_cmd, timeout=90.0, check=True)
+        except (subprocess.SubprocessError, OSError) as exc:
+            logger.info("Đoạn %d: trích audio riêng KHÔNG được (%s) → giữ video-only.",
+                        chunk.index, type(exc).__name__)
+            tmp_audio.unlink(missing_ok=True)
+            return video_only
+        if not tmp_audio.exists() or tmp_audio.stat().st_size < 256:
+            tmp_audio.unlink(missing_ok=True)
+            return video_only
+        # Ghép video (video_only) + audio (tmp_audio), copy stream (nhanh, không encode lại).
+        mux_cmd = [
+            ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(video_only), "-i", str(tmp_audio),
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c", "copy", "-shortest",
+            str(muxed),
+        ]
+        try:
+            run_ffmpeg_hardened(mux_cmd, timeout=60.0, check=True)
+        except (subprocess.SubprocessError, OSError) as exc:
+            logger.info("Đoạn %d: ghép audio lỗi (%s) → giữ video-only.",
+                        chunk.index, type(exc).__name__)
+            tmp_audio.unlink(missing_ok=True)
+            muxed.unlink(missing_ok=True)
+            return video_only
+        tmp_audio.unlink(missing_ok=True)
+        if muxed.exists() and muxed.stat().st_size >= 1024:
+            video_only.unlink(missing_ok=True)
+            logger.info("Đoạn %d: đã GHÉP audio riêng vào video-only (có tiếng).", chunk.index)
+            return muxed
+        muxed.unlink(missing_ok=True)
+        return video_only
+
     def _build_encode_commands(
         self, ffmpeg: str, source_path: Path, chunk: VideoChunk, tmp_out: Path
     ) -> list[tuple[bool, list[str]]]:
@@ -619,7 +1047,10 @@ class GeminiVideoContextProvider:
         """
         # [v3.23.29] Tối ưu theo đề xuất người dùng + tài liệu NVIDIA/ffmpeg:
         # - -threads 0: tối đa luồng CPU khi giải mã HEVC/VP9 nặng (cấp CPU/NVENC-only).
-        # - -max_muxing_queue_size 1024: chống lỗi "Too many packets buffered" khi hạ
+        # - [v3.23.472] BỎ AUDIO (-an): file lỗi làm demuxer kẹt khi đọc xen kẽ audio/video
+        #   (app_log: audio tới 6.13s rồi mọi decoder đứng frame=0). Đọc thẳng video tránh kẹt +
+        #   nhanh hơn (khỏi decode/resample audio). Lời thoại đã có trong phụ đề nên mất tiếng
+        #   ngữ cảnh không đáng kể.
         #   fps mạnh (60→1) trên đoạn dài — đây là nguyên nhân chính gây TREO.
         # - -ss/-t TRƯỚC -i: fast seek (nhanh hơn nhiều với đoạn xa).
         # - -fflags +genpts: sinh lại PTS cho luồng giải mã phần cứng (NVDEC) vốn có thể
@@ -629,24 +1060,75 @@ class GeminiVideoContextProvider:
         #   max_muxing_queue_size đã đủ chống treo.)
         # - format=nv12/yuv420p ép pixel format rõ ràng (chống lỗi 10-bit).
         # - colorspace/primaries/trc=1 (BT.709) + profile main: chuẩn hoá SDR.
-        base_flags = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-threads", "0"]
+        # [v3.23.461] -nostdin: CHỐNG TREO quan trọng nhất. Không có nó, ffmpeg đọc stdin thừa
+        # hưởng từ app GUI (không console) → có thể KẸT CHỜ stdin vô hạn (vd tưởng có lệnh nhập,
+        # hoặc handle stdin lạ). App GUI phải luôn chạy ffmpeg với -nostdin + stdin=DEVNULL.
+        # [v3.23.470] -stats: ffmpeg in tiến độ (frame=/time=) ra stderr → khi bị kill vì timeout
+        # ta biết nó ĐANG kẹt (frame=0) hay chỉ CHẬM (frame tăng) → chẩn đoán đúng bệnh.
+        base_flags = [
+            ffmpeg, "-nostdin", "-y", "-hide_banner",
+            "-loglevel", "error", "-stats", "-threads", "0",
+        ]
+        # [v3.23.469] -ignore_editlist 1: file MP4/MOV từ YouTube/Google THƯỜNG có EDIT LIST
+        # (elst) → -ss/-t đọc lệch/treo. Bỏ qua edit list để đọc thẳng. CHỈ áp cho mov/mp4
+        # (option riêng của demuxer mov — thêm cho webm/mkv sẽ LỖI "Option not found").
+        mov_input_flags: list[str] = []
+        if source_path.suffix.lower() in {".mp4", ".mov", ".m4v", ".m4a", ".mp4v"}:
+            mov_input_flags = ["-ignore_editlist", "1"]
         input_args = [
+            *mov_input_flags,
+            # [v3.23.472] -err_detect ignore_err: bỏ qua lỗi giải mã, cố đọc tiếp thay vì KẸT khi
+            # gặp khung hỏng (file tải dở/muxing lỗi — app_log: mọi decoder kẹt ở ~6s). Kèm tolerance
+            # từng đoạn ở materialize_chunks (bỏ đoạn hỏng, dùng đoạn tốt).
+            "-err_detect", "ignore_err",
+            # [v3.23.471] -skip_loop_filter all: bỏ deblocking khi giải mã → nhanh hơn đáng kể
+            # trên CPU (thumbnail 360p cho ngữ cảnh không cần deblocking). Giúp giảm tải cho các
+            # file H264 giải mã chậm bất thường.
+            "-skip_loop_filter", "all",
             "-ss", f"{chunk.start_sec:.3f}",
             "-t", f"{chunk.duration_sec:.3f}",
             "-i", str(source_path),
         ]
-        av_map_and_standard_args = [
-            "-map", "0:v:0", "-map", "0:a:0?",
-            "-c:a", "aac", "-ac", "1", "-ar", "16000", "-b:a", "64k",
-            "-avoid_negative_ts", "make_zero",
-            "-colorspace", "1", "-color_primaries", "1", "-color_trc", "1",
-            "-max_muxing_queue_size", "1024",
+        # [v3.23.462] Biến thể input NHANH: chỉ giải mã KHUNG KHÓA (I-frame) → nhanh gấp 10-30
+        # lần khi lấy ~1fps cho ngữ cảnh. RỦI RO: video keyframe THƯA (GOP dài) ra quá ít/0 khung
+        # → dùng làm tier THỬ TRƯỚC; output rỗng (size <1KB) thì rơi xuống tier full-decode bên
+        # dưới. Vừa nhanh vừa AN TOÀN mọi định dạng/mã hoá.
+        input_args_fast = [
+            *mov_input_flags,
+            "-err_detect", "ignore_err",
+            "-skip_loop_filter", "all",
+            "-ss", f"{chunk.start_sec:.3f}",
+            "-t", f"{chunk.duration_sec:.3f}",
+            "-skip_frame", "nokey",
+            "-i", str(source_path),
         ]
+        # [v3.23.473] Mặc định KÈM AUDIO (Gemini nghe được ngữ điệu/nhạc nền). Chỉ bỏ audio khi
+        # file bị KẸT xen kẽ audio/video (app_log: audio tới 6.13s, video đứng frame=0) — khi đó
+        # ``_drop_audio`` bật (tự động sau khi thử có audio thất bại) → đọc thẳng video.
+        if getattr(self, "_drop_audio", False):
+            av_map_and_standard_args = [
+                "-map", "0:v:0", "-an",
+                "-avoid_negative_ts", "make_zero",
+                "-colorspace", "1", "-color_primaries", "1", "-color_trc", "1",
+            ]
+        else:
+            # [v3.23.610] Luồng tiếng mặc định, đồng bộ theo mốc thời gian, ưu tiên kênh
+            # thoại khi nguồn nhiều kênh — xem context_audio.
+            av_map_and_standard_args = [
+                "-map", "0:v:0",
+                *context_audio_args(self._context_audio(source_path)),
+                "-avoid_negative_ts", "make_zero",
+                "-colorspace", "1", "-color_primaries", "1", "-color_trc", "1",
+                # Chống treo muxing khi hạ fps mạnh (video thưa so audio): flush ngay + queue lớn.
+                "-max_muxing_queue_size", "9999",
+                "-max_interleave_delta", "0",
+            ]
 
         commands: list[tuple[bool, list[str]]] = []
 
         # [v3.23.39] Tham số nén từ Cài đặt (thay cho hardcode 360p/1fps/cq32/crf30).
-        h = self._resolution_height
+        src_w, src_h = self._read_frame_size(source_path)
+        w, h = target_frame_size(src_w, src_h, self._resolution_height)
         r = self._fps
         r_str = f"{r:g}"
         cq_str = str(self._nvenc_cq)
@@ -671,7 +1153,7 @@ class GeminiVideoContextProvider:
                 + input_args
                 + av_map_and_standard_args
                 + [
-                    "-vf", _vf_gpu_full(h, r_str),
+                    "-vf", _vf_gpu_full(h, r_str, w),
                     "-c:v", "h264_nvenc", "-preset", "p4", "-cq", cq_str,
                     "-profile:v", "main",
                     "-pix_fmt", "nv12",  # [v3.23.167] nhận nv12 từ RAM sau hwdownload
@@ -697,7 +1179,7 @@ class GeminiVideoContextProvider:
                 + input_args
                 + av_map_and_standard_args
                 + [
-                    "-vf", _vf_gpu_upload(h, r_str),
+                    "-vf", _vf_gpu_upload(h, r_str, w),
                     "-c:v", "h264_nvenc", "-preset", "p4", "-cq", cq_str,
                     "-profile:v", "main",
                     "-pix_fmt", "nv12",  # [v3.23.167] nhận nv12 từ RAM sau hwdownload
@@ -723,7 +1205,7 @@ class GeminiVideoContextProvider:
                 + input_args
                 + av_map_and_standard_args
                 + [
-                    "-vf", _vf_cpu_scale(h, r_str),
+                    "-vf", _vf_cpu_scale(h, r_str, w),
                     "-c:v", "h264_nvenc", "-preset", "p4", "-cq", cq_str,
                     "-profile:v", "main",
                     str(tmp_out),
@@ -738,7 +1220,7 @@ class GeminiVideoContextProvider:
                 + input_args
                 + av_map_and_standard_args
                 + [
-                    "-vf", _vf_cpu_scale(h, r_str),
+                    "-vf", _vf_cpu_scale(h, r_str, w),
                     "-c:v", "h264_nvenc", "-preset", "p4", "-cq", cq_str,
                     "-profile:v", "main",
                     str(tmp_out),
@@ -746,15 +1228,72 @@ class GeminiVideoContextProvider:
             )
             commands.append((True, gpu_encode_cmd))
 
+        # [v3.23.467] CẤP 2.4 — NVDEC GIẢI MÃ + CPU libx264 encode (HYBRID né NVENC hỏng).
+        # Video YouTube (VP9/AV1) giải mã CPU RẤT chậm (VP9 ~7×, AV1 ~10× so H264) → timeout.
+        # NVDEC (giải mã phần cứng) nhanh gấp bội cho VP9/AV1, và ĐỘC LẬP với NVENC (encode) —
+        # máy có thể NVENC hỏng nhưng NVDEC vẫn tốt. Tier này KHÔNG bị nvenc-marker chặn (dùng
+        # libx264 để encode, không đụng NVENC). Nếu NVDEC cũng treo/lỗi → đánh dấu bỏ trong phiên.
+        # [v3.23.467/471] CẤP 2.4 — GIẢI MÃ PHẦN CỨNG (hwaccel) + CPU libx264 encode (HYBRID né
+        # NVENC hỏng). File H264/VP9/AV1 giải mã CPU có thể CỰC chậm (app_log: 0.04× realtime với
+        # một file YouTube → 4 giờ/đoạn!). Giải mã phần cứng nhanh gấp bội. Thử NHIỀU hwaccel:
+        #   - d3d11va (Windows): CHÍNH LÀ hwdec mpv dùng (auto-safe) — tương thích rộng nhất, chạy
+        #     được cả khi cuda/NVDEC hỏng.
+        #   - cuda (NVDEC): NVIDIA.
+        # Mỗi hwaccel theo dõi hỏng RIÊNG. KHÔNG bị nvenc-marker chặn (encode libx264, không NVENC).
+        hwdec_candidates: list[str] = []
+        if os.name == "nt":
+            hwdec_candidates.append("d3d11va")
+        hwdec_candidates.append("cuda")
+        for hw in hwdec_candidates:
+            if hw in self._hwdec_broken:
+                continue
+            hwdec_cmd = (
+                base_flags
+                + ["-fflags", "+genpts", "-hwaccel", hw]
+                + input_args
+                + av_map_and_standard_args
+                + [
+                    "-vf", _vf_cpu_scale(h, r_str, w),
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", crf_str,
+                    "-profile:v", "main", "-pix_fmt", "yuv420p",
+                    str(tmp_out),
+                ]
+            )
+            commands.append((False, hwdec_cmd))
+
+        # [v3.23.462] CẤP 2.5 — CPU NHANH (chỉ giải mã I-frame): thử TRƯỚC CPU thường. Output
+        # rỗng (video keyframe thưa) → tự rơi xuống CPU-đầy-đủ (vòng thử kiểm size ≥1KB). Đa số
+        # video (keyframe ~2-4s) → nén 1 đoạn vài–vài chục giây thay vì >5 phút.
+        cpu_fast_cmd = (
+            base_flags
+            + input_args_fast
+            + av_map_and_standard_args
+            + [
+                "-vf", _vf_cpu_scale(h, r_str, w),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", crf_str,
+                # [v3.23.466] ÉP 4:2:0 8-bit: video YouTube (VP9/AV1) hay 4:4:4/4:2:2/10-bit mà
+                # libx264 profile 'main' KHÔNG hỗ trợ → "main profile doesn't support 4:4:4",
+                # encode THẤT BẠI, không cắt được. -pix_fmt yuv420p quy đổi mọi chroma/độ sâu về
+                # 4:2:0 8-bit (main chấp nhận) — decode+cắt được MỌI codec/định dạng.
+                "-profile:v", "main", "-pix_fmt", "yuv420p",
+                str(tmp_out),
+            ]
+        )
+        commands.append((False, cpu_fast_cmd))
+
         # CẤP 3 — CPU THUẦN (LUÔN có, kể cả khi không NVENC — đây là fallback cuối).
         cpu_cmd = (
             base_flags
             + input_args
             + av_map_and_standard_args
             + [
-                "-vf", _vf_cpu_scale(h, r_str),
+                "-vf", _vf_cpu_scale(h, r_str, w),
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", crf_str,
-                "-profile:v", "main",
+                # [v3.23.466] ÉP 4:2:0 8-bit: video YouTube (VP9/AV1) hay 4:4:4/4:2:2/10-bit mà
+                # libx264 profile 'main' KHÔNG hỗ trợ → "main profile doesn't support 4:4:4",
+                # encode THẤT BẠI, không cắt được. -pix_fmt yuv420p quy đổi mọi chroma/độ sâu về
+                # 4:2:0 8-bit (main chấp nhận) — decode+cắt được MỌI codec/định dạng.
+                "-profile:v", "main", "-pix_fmt", "yuv420p",
                 str(tmp_out),
             ]
         )
@@ -778,6 +1317,86 @@ class GeminiVideoContextProvider:
         if has_nvenc:
             return "GPU một phần (chỉ mã hóa NVENC, giải mã+scale trên CPU)"
         return "CPU (libx264)"
+
+    def _gpu_marker_path(self, kind: str) -> "Path | None":
+        """[v3.23.468] Đường dẫn marker 'GPU <kind> hỏng trên máy này' (cạnh cache DB)."""
+        if not self._cache_db_path:
+            return None
+        return Path(self._cache_db_path).parent / f"{kind}_runtime_broken.marker"
+
+    def _gpu_marker_valid(self, kind: str) -> bool:
+        """True nếu marker còn hiệu lực (< 7 ngày); cũ hơn → xoá + thử lại (phòng cập nhật driver)."""
+        marker = self._gpu_marker_path(kind)
+        if not marker or not marker.exists():
+            return False
+        try:
+            import time
+
+            if (time.time() - marker.stat().st_mtime) / 86400.0 > 7.0:
+                marker.unlink(missing_ok=True)
+                return False
+        except OSError:
+            return False
+        return True
+
+    def _persist_gpu_broken(self, kind: str, note: str) -> None:
+        """Ghi marker để phiên sau bỏ GPU <kind> luôn (không chờ treo lại). Lỗi ghi → bỏ qua."""
+        marker = self._gpu_marker_path(kind)
+        if marker is None:
+            return
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(note, encoding="utf-8")
+        except OSError:
+            pass
+
+    def _nvenc_marker_path(self) -> "Path | None":
+        return self._gpu_marker_path("nvenc")
+
+    def _nvenc_marker_path_exists(self) -> bool:
+        return self._gpu_marker_valid("nvenc")
+
+    def _persist_nvenc_broken(self) -> None:
+        self._persist_gpu_broken(
+            "nvenc",
+            "NVENC treo khi nén video ngữ cảnh — bỏ GPU. Xoá file này để thử lại NVENC "
+            "sau khi cập nhật driver NVIDIA.",
+        )
+
+    def _load_broken_hwdecs(self) -> set[str]:
+        """[v3.23.471] Đọc tập hwaccel giải mã đã hỏng (marker, hết hạn 7 ngày qua _gpu_marker_valid)."""
+        marker = self._gpu_marker_path("hwdec")
+        if marker is None or not self._gpu_marker_valid("hwdec"):
+            return set()
+        try:
+            return {x.strip() for x in marker.read_text(encoding="utf-8").split(",") if x.strip()}
+        except OSError:
+            return set()
+
+    def _persist_broken_hwdec(self, hwaccel: str) -> None:
+        """[v3.23.471] Ghi nhớ một hwaccel giải mã hỏng → phiên sau bỏ luôn (khỏi chờ treo lại)."""
+        self._hwdec_broken.add(hwaccel)
+        marker = self._gpu_marker_path("hwdec")
+        if marker is None:
+            return
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(",".join(sorted(self._hwdec_broken)), encoding="utf-8")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _hwaccel_of(cmd: list[str]) -> str:
+        """Lấy tên hwaccel trong lệnh (sau '-hwaccel'), rỗng nếu không có."""
+        if "-hwaccel" in cmd:
+            i = cmd.index("-hwaccel")
+            if i + 1 < len(cmd):
+                return cmd[i + 1]
+        return ""
+
+    def _persist_nvdec_broken(self) -> None:
+        """[v3.23.468] Giữ tương thích: nhớ 'cuda' hỏng."""
+        self._persist_broken_hwdec("cuda")
 
     def _detect_nvenc(self, ffmpeg: str) -> bool:
         """Dò xem ffmpeg có hỗ trợ encoder h264_nvenc không (cache kết quả)."""
@@ -820,16 +1439,47 @@ class GeminiVideoContextProvider:
             return self._client
         if not self._api_key:
             raise VideoContextError("Chưa cấu hình khoá API Gemini để tải video.")
+        self._client = self._make_client(self._api_key)
+        return self._client
+
+    @staticmethod
+    def _make_client(api_key: str) -> Any:
+        """Tạo client Gemini cho ``api_key`` (có thời hạn cho mọi lời gọi HTTP).
+
+        Raises:
+            VideoContextError: Chưa cài google-genai.
+        """
         try:
             from google import genai  # type: ignore
         except ImportError as exc:
             raise VideoContextError(
                 "Chưa cài google-genai. Cài: pip install google-genai"
             ) from exc
-        self._client = genai.Client(api_key=self._api_key)
-        return self._client
+        # [v3.23.535] ĐẶT THỜI HẠN cho mọi lời gọi HTTP. Trước đây client này KHÔNG có timeout
+        # (khác với client của adapter dịch, vốn đã có), nên một lời gọi Files API treo là treo
+        # VĨNH VIỄN. Hậu quả dây chuyền: ``run()`` của worker không bao giờ trả về → tín hiệu
+        # ``finished`` không phát → giao diện không được mở khoá → người dùng không bấm được gì,
+        # phải End Task. Nhật ký thật dừng đột ngột giữa chuỗi kiểm file trên cloud, đúng với
+        # kịch bản này.
+        timeout_ms = int(CLIENT_TIMEOUT_SEC * 1000)
+        try:
+            return genai.Client(api_key=api_key, http_options={"timeout": timeout_ms})
+        except TypeError:
+            # SDK cũ không nhận http_options — vẫn dùng được, chỉ là không có thời hạn.
+            logger.warning(
+                "SDK google-genai không hỗ trợ http_options.timeout — lời gọi tải video sẽ "
+                "không có thời hạn. Nên cập nhật google-genai để tránh treo ứng dụng."
+            )
+            return genai.Client(api_key=api_key)
 
     def _cache_lookup(self, file_hash: str) -> str | None:
+        """Tra tên file cloud đã tải cho một đoạn; bỏ qua mục đã quá hạn sống của Gemini.
+
+        [v3.23.550] Files API tự XOÁ file sau 48 giờ, và với file không còn tồn tại Gemini trả
+        **403** (không phải 404). Trước đây cột ``created_at`` có lưu nhưng không bao giờ được
+        đọc, nên mọi mục cũ đều bị đem ra thử: app_log thật có 22 lượt "403 PERMISSION_DENIED"
+        liên tiếp trước khi tải lại từng đoạn. Mục quá hạn nay bị coi là không có và xoá luôn.
+        """
         if not self._cache_db_path:
             return None
         import sqlite3
@@ -840,15 +1490,32 @@ class GeminiVideoContextProvider:
                     "file_hash TEXT PRIMARY KEY, remote_name TEXT, created_at TEXT)"
                 )
                 row = conn.execute(
-                    "SELECT remote_name FROM video_context_uploads WHERE file_hash=?",
+                    "SELECT remote_name, created_at FROM video_context_uploads "
+                    "WHERE file_hash=?",
                     (file_hash,),
                 ).fetchone()
-                return row[0] if row else None
+                if not row:
+                    return None
+                if is_upload_expired(row[1]):
+                    conn.execute(
+                        "DELETE FROM video_context_uploads WHERE file_hash=?", (file_hash,)
+                    )
+                    conn.commit()
+                    logger.debug("Bỏ mục cache upload đã quá hạn sống: %s", row[0])
+                    return None
+                return str(row[0])
         except sqlite3.Error as exc:
             logger.warning("Lỗi tra cache upload video: %s", exc)
             return None
 
     def _cache_store(self, file_hash: str, remote_name: str) -> None:
+        """Ghi ánh xạ khoá → file cloud; GIỮ mốc tải lên cũ khi vẫn là file đó.
+
+        [v3.23.615] Mục theo khoá NGUỒN được ghi lại sau MỖI lần chuẩn bị video, kể cả khi
+        đoạn chỉ được tái dùng. Ghi đè ``created_at`` bằng giờ hiện tại làm mục sống quá
+        48 giờ thật của file: lần chuẩn bị sau đem tên file đã bị Gemini xoá ra dò (403)
+        rồi mới làm lại. Mốc chỉ đổi khi tên file đổi (đã tải lên bản mới).
+        """
         if not self._cache_db_path:
             return
         import sqlite3
@@ -860,7 +1527,13 @@ class GeminiVideoContextProvider:
                     "file_hash TEXT PRIMARY KEY, remote_name TEXT, created_at TEXT)"
                 )
                 conn.execute(
-                    "INSERT OR REPLACE INTO video_context_uploads VALUES (?,?,?)",
+                    "INSERT INTO video_context_uploads VALUES (?,?,?) "
+                    "ON CONFLICT(file_hash) DO UPDATE SET "
+                    "created_at = CASE WHEN video_context_uploads.remote_name = "
+                    "excluded.remote_name THEN COALESCE("
+                    "video_context_uploads.created_at, excluded.created_at) "
+                    "ELSE excluded.created_at END, "
+                    "remote_name = excluded.remote_name",
                     (file_hash, remote_name, datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
@@ -900,7 +1573,7 @@ class GeminiVideoContextProvider:
         params = (
             f"{sig}|{chunk.index}|{chunk.start_sec:.3f}|{chunk.end_sec:.3f}"
             f"|h{self._resolution_height}|f{self._fps:.3f}"
-            f"|cq{self._nvenc_cq}|crf{self._cpu_crf}"
+            f"|cq{self._nvenc_cq}|crf{self._cpu_crf}|v2portrait"
         )
         mixer.update(params.encode("utf-8"))
         return mixer.hexdigest()
@@ -1011,8 +1684,10 @@ class GeminiVideoContextProvider:
                 else:
                     logger.warning("Lỗi không lường khi tra cloud (%s), thử tải lại.", exc)
 
+        # [v3.23.596] Đánh số từ 1 như nhật ký phân tích ("đoạn 2/17"): bản cũ ghi
+        # "đoạn 1" cho đúng đoạn mà khâu phân tích gọi là "đoạn 2".
         logger.info("Đang tải đoạn %d (%.0f–%.0fs) lên Gemini…",
-                    chunk.index, chunk.start_sec, chunk.end_sec)
+                    chunk.index + 1, chunk.start_sec, chunk.end_sec)
         # [1.1] Upload qua tên ASCII an toàn để tránh sập do header Unicode.
         safe_path, is_temporary = self._make_ascii_safe_source(
             chunk.path, cache_key, chunk.index
@@ -1025,6 +1700,15 @@ class GeminiVideoContextProvider:
                     raise VideoContextError(f"Quá hạn xử lý đoạn {chunk.index} trên cloud.")
                 time.sleep(poll_interval_s)
                 remote = client.files.get(name=remote.name)
+        except _upload_error_types() as exc:
+            # [v3.23.615] Lỗi mạng/máy chủ khi tải phải là VideoContextError — loại lỗi mà
+            # khâu phân tích biết lùi về "phân tích từ phụ đề" và khâu dịch báo rõ ràng.
+            # Trước đây httpx.ConnectError/ProxyError lọt thẳng ra ngoài: khâu dịch ghi
+            # "Lỗi không lường trước khi dịch phụ đề" kèm traceback (bấm thử toàn ứng dụng
+            # với video thật, mạng bị chặn), khâu phân tích hỏng hẳn thay vì bỏ video.
+            raise VideoContextError(
+                f"Không tải được đoạn {chunk.index + 1} lên Gemini: {exc}"
+            ) from exc
         finally:
             if is_temporary and safe_path != chunk.path:
                 try:
@@ -1067,13 +1751,13 @@ class GeminiVideoContextProvider:
         part_path = out_dir / f"{source_path.stem}.heal{index:02d}.mp4"
         duration = max(0.1, end_sec - start_sec)
         command = [
-            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
             "-ss", f"{start_sec:.3f}", "-i", str(source_path),
             "-t", f"{duration:.3f}", "-c", "copy",
             "-avoid_negative_ts", "make_zero", str(part_path),
         ]
         try:
-            subprocess.run(command, check=True, capture_output=True, timeout=600, **no_window_kwargs())
+            subprocess.run(command, check=True, capture_output=True, timeout=600, stdin=subprocess.DEVNULL, **no_window_kwargs())
         except subprocess.SubprocessError as exc:
             raise VideoContextError(f"Cắt đoạn tải lại thất bại: {exc}") from exc
         chunk = VideoChunk(index, part_path, start_sec, end_sec, is_full_video=False)
@@ -1166,40 +1850,70 @@ class GeminiVideoContextProvider:
         bộ để lần sau không "tái dùng" file đã biến mất. Không ném lỗi nếu file đã
         không còn (coi như đã xoá).
 
+        [v3.23.609] Thử LẦN LƯỢT mọi key đã biết (key đang dùng trước). File Gemini thuộc
+        dự án của key đã tải nó; key khác nhận 403 — mà 403 cũng là mã Gemini trả cho file
+        đã hết hạn, nên trước đây file tải bằng key thứ hai bị báo "đã xoá" dù vẫn còn.
+
         Args:
             remote_names: Danh sách tên file cloud (vd 'files/abc123').
 
         Returns:
-            Ánh xạ ``{remote_name: đã_xoá_thành_công}``.
+            Ánh xạ ``{remote_name: đã_xoá_hoặc_không_còn}``; ``False`` = còn lỗi khác
+            (mạng, máy chủ) với mọi key, nên thử lại sau.
         """
         if not remote_names:
             return {}
-        results: dict[str, bool] = {}
-        client: Any
-        try:
-            client = self._ensure_client()
-        except VideoContextError as exc:
-            logger.warning("Không khởi tạo được client để xoá file cloud: %s", exc)
+        clients = self._deletion_clients()
+        if not clients:
             return {name: False for name in remote_names}
-
-        for name in remote_names:
-            try:
-                client.files.delete(name=name)
-                results[name] = True
-                logger.info("Đã xoá file cloud: %s", name)
-            except Exception as exc:  # noqa: BLE001 — coi 404/đã xoá là thành công
-                if self._is_recoverable_remote_error(exc):
-                    results[name] = True  # đã không còn → xem như đã xoá
-                    logger.info("File cloud %s đã không còn (xem như đã xoá).", name)
-                else:
-                    results[name] = False
-                    logger.warning("Không xoá được file cloud %s: %s", name, exc)
-            self._cache_forget_remote(name)
-        # Xoá khỏi cache refs trong-bộ-nhớ nếu có.
+        results = {
+            name: self._delete_with_any_key(name, clients) for name in remote_names
+        }
+        for name, gone in results.items():
+            # File còn trên cloud (xoá lỗi) vẫn dùng lại được → giữ bản ghi cache.
+            if gone:
+                self._cache_forget_remote(name)
+        gone_names = {name for name, gone in results.items() if gone}
         for sig, refs in list(self._inmem_refs.items()):
-            if any(r.remote_name in remote_names for r in refs):
+            if any(r.remote_name in gone_names for r in refs):
                 del self._inmem_refs[sig]
         return results
+
+    def _deletion_clients(self) -> list[tuple[str, Any]]:
+        """``(key, client)`` cho mọi key đã biết, key đang dùng đứng đầu."""
+        clients: list[tuple[str, Any]] = []
+        try:
+            clients.append((self._api_key, self._ensure_client()))
+        except VideoContextError as exc:
+            logger.warning("Không khởi tạo được client để xoá file cloud: %s", exc)
+        for key in self._known_api_keys:
+            if key == self._api_key:
+                continue
+            try:
+                clients.append((key, self._make_client(key)))
+            except VideoContextError as exc:
+                logger.warning("Không khởi tạo được client cho key phụ: %s", exc)
+        return clients
+
+    def _delete_with_any_key(self, name: str, clients: list[tuple[str, Any]]) -> bool:
+        """Xoá ``name`` bằng key đầu tiên có quyền; ``True`` nếu đã xoá hoặc không còn."""
+        failed_otherwise = False
+        for position, (_key, client) in enumerate(clients, start=1):
+            try:
+                client.files.delete(name=name)
+            except Exception as exc:  # noqa: BLE001 — SDK ném nhiều loại lỗi HTTP khác nhau
+                if not self._is_recoverable_remote_error(exc):
+                    failed_otherwise = True
+                    logger.warning(
+                        "Không xoá được file cloud %s (key %d): %s", name, position, exc
+                    )
+                continue
+            logger.info("Đã xoá file cloud: %s (key %d).", name, position)
+            return True
+        if failed_otherwise:
+            return False
+        logger.info("File cloud %s đã không còn (xem như đã xoá).", name)
+        return True
 
     def _cache_forget_remote(self, remote_name: str) -> None:
         """Xoá bản ghi cache theo remote_name (sau khi file cloud đã bị xoá)."""
@@ -1234,7 +1948,12 @@ class GeminiVideoContextProvider:
         # [v3.23.14] CHỐNG LẶP trong RAM (cùng phiên app): nếu vừa chuẩn bị xong cho
         # đúng file này, trả lại refs đã có — bỏ qua cả materialize lẫn upload.
         cache_signature = self._video_signature(video_path)
-        cached_refs = self._inmem_refs.get(cache_signature)
+        # [v3.23.479] Người dùng bật "bỏ cache cloud" (vd đã xoá file trên cloud) → BỎ QUA mọi
+        # tái dùng (RAM/DB/khoá nguồn), buộc cắt+nén+tải lại từ đầu.
+        skip_cache = self._ignore_cloud_cache
+        if skip_cache and progress_cb:
+            progress_cb("Bỏ cache — chuẩn bị lại video ngữ cảnh từ đầu…")
+        cached_refs = None if skip_cache else self._inmem_refs.get(cache_signature)
         if cached_refs and self._refs_still_active(cached_refs):
             if progress_cb:
                 progress_cb("Tái dùng ngữ cảnh video đã chuẩn bị (không cắt/tải lại).")
@@ -1251,7 +1970,9 @@ class GeminiVideoContextProvider:
         # đủ refs cho mọi đoạn VÀ cloud còn ACTIVE → bỏ qua HOÀN TOÀN cắt+nén+upload.
         # Đây là sửa lỗi: trước đây cache cloud chỉ tra SAU khi đã cắt (materialize),
         # nên dù không upload lại thì vẫn cắt+nén lại mỗi lần — rất chậm.
-        persisted = self._plan_cache_lookup(cache_signature, len(plan.chunks))
+        persisted = None if skip_cache else self._plan_cache_lookup(
+            cache_signature, len(plan.chunks)
+        )
         if persisted and self._refs_still_active(persisted):
             if progress_cb:
                 progress_cb("Tái dùng ngữ cảnh video đã lưu (không cắt/tải lại).")
@@ -1266,7 +1987,9 @@ class GeminiVideoContextProvider:
         # đúng trường hợp đoạn đã từng nén+upload ở phiên trước (cloud còn sống) nhưng
         # plan-cache theo chữ ký lại miss (vd phiên trước upload xong nhưng chưa kịp lưu
         # plan-cache do thoát giữa chừng). Tránh nén lại rồi mới phát hiện "đã có sẵn".
-        from_source = self._resolve_chunks_from_source_cache(plan, video_path)
+        from_source = None if skip_cache else self._resolve_chunks_from_source_cache(
+            plan, video_path
+        )
         if from_source:
             if progress_cb:
                 progress_cb("Tái dùng đoạn video đã có trên cloud (bỏ qua cắt+nén).")
@@ -1323,6 +2046,68 @@ class GeminiVideoContextProvider:
             self.sweep_chunk_cache(protected_paths=protected)
         except OSError as exc:
             logger.warning("Dọn cache đoạn sau chuẩn bị gặp lỗi (bỏ qua): %s", exc)
+        return refs
+
+    def upload_chunks_for_ranges(
+        self,
+        video_path: Path,
+        ranges: list[tuple[float, float]],
+        cancel_cb: "Callable[[], bool] | None" = None,
+    ) -> list[RemoteVideoRef]:
+        """[v3.23.550] Tải lên (bằng key HIỆN TẠI) CHỈ các đoạn có khoảng thời gian cần dùng.
+
+        Vì sao cần: khi xoay key giữa chừng, file của key cũ không truy cập được. Trước đây
+        cách chữa là gọi :meth:`prepare_and_upload` — tải lại TOÀN BỘ phim. App_log thật: key #1
+        hết quota đúng ở yêu cầu CUỐI (đoạn 22/22), ứng dụng tải lại cả 22 đoạn mất 5 phút 45
+        giây chỉ để gửi đúng một yêu cầu cần đúng một đoạn. Nay tải lười từng đoạn: đoạn nào
+        được dùng tới mới tải, đoạn không bao giờ dùng lại thì không tốn gì.
+
+        Không ghi đè cache kế hoạch trọn bộ (kết quả ở đây chỉ là một phần của phim).
+
+        Args:
+            video_path: Video gốc.
+            ranges: Các khoảng ``(start_sec, end_sec)`` đúng như trong ``RemoteVideoRef`` cũ.
+            cancel_cb: Callback huỷ hợp tác.
+
+        Returns:
+            Refs mới cho các đoạn khớp khoảng, theo thứ tự thời gian. Rỗng nếu không khớp.
+        """
+        plan = self.plan_chunks(video_path)
+        wanted = [
+            chunk for chunk in plan.chunks
+            if any(
+                abs(chunk.start_sec - start) < 0.5 and abs(chunk.end_sec - end) < 0.5
+                for start, end in ranges
+            )
+        ]
+        if not wanted:
+            return []
+        if plan.needs_split:
+            ffmpeg = find_ffmpeg()
+            if not ffmpeg:
+                raise VideoContextError(
+                    missing_ffmpeg_message(
+                        feature="Ngữ cảnh video khi dịch (cắt đoạn gửi Gemini)"
+                    )
+                )
+            self._encode_missing_chunks(ffmpeg, plan.source_path, wanted)
+        refs: list[RemoteVideoRef] = []
+        for chunk in wanted:
+            if cancel_cb is not None and cancel_cb():
+                raise VideoContextError("Người dùng đã huỷ khi đang tải video.")
+            if not (chunk.is_full_video or chunk.path.exists()):
+                continue
+            refs.append(self.upload_chunk(chunk))
+            try:
+                self._cache_store(
+                    self._chunk_source_key(video_path, chunk), refs[-1].remote_name
+                )
+            except (OSError, ValueError):
+                pass
+        logger.info(
+            "Tải lại %d/%d đoạn video CẦN DÙNG bằng key hiện tại (bỏ qua %d đoạn còn lại).",
+            len(refs), len(plan.chunks), len(plan.chunks) - len(refs),
+        )
         return refs
 
     def _plan_cache_lookup(

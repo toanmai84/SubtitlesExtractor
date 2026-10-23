@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import threading
+
+import pytest
 from datetime import datetime, timezone
 
+from tests.unit.infrastructure.gemini_call_harness import install_fake_clock
 from subtitles_extractor.infrastructure.translation.gemini_quota_manager import (
     GeminiQuotaManager,
     QuotaExhaustedError,
@@ -55,18 +58,28 @@ class TestPacificReset:
 
 
 class TestThrottle:
-    def test_rpm_fills_then_remaining_zero(self) -> None:
+    def test_rpm_fills_then_remaining_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # [v3.23.643] Đồng hồ giả: lần acquire thứ 6 phải chờ cửa sổ 60 s — trước đây ngủ THẬT 60 s
+        # (14% thời gian cả bộ test).
+        install_fake_clock(monkeypatch)
         qm = GeminiQuotaManager()
-        for _ in range(10):  # flash rpm=10
+        for _ in range(10):
             assert qm.acquire("gemini-3.5-flash", 100) is not None
         assert qm.get_remaining("gemini-3.5-flash")["rpm_remaining"] == 0
 
     def test_rpd_exhausted_raises(self) -> None:
+        """[v3.23.526] Chỉ chặn cứng khi CHÍNH SERVER đã từ chối.
+
+        Bộ đếm nội bộ là ƯỚC LƯỢNG và lệch xa thực tế (nhật ký thật: ứng dụng báo chạm 50
+        request/ngày trong khi bảng điều khiển Google ghi mới dùng 0/20 và 1/20 ở hai dự án). Chặn
+        cứng theo con số đó là tự khoá mình dù còn quota, nên nay phải có xác nhận từ server.
+        """
         qm = GeminiQuotaManager(
             rate_limits={"m": RateLimit(rpm=1000, tpm=1_000_000, rpd=3)}
         )
         for _ in range(3):
             qm.acquire("m", 10)
+        qm.mark_daily_exhausted("m")  # server xác nhận hết hạn mức ngày
         try:
             qm.acquire("m", 10)
             raise AssertionError("phải raise QuotaExhaustedError")
@@ -107,3 +120,23 @@ class TestThrottle:
             t.join()
         assert sum(ok) == 30
         assert qm.get_remaining("m")["rpm_used"] == 30
+
+
+class TestFlashLiteGenerations:
+    """[v3.23.635] Mọi flash-lite đời 3.x có RPD cao (500); 2.5 vẫn thấp (20)."""
+
+    def test_35_flash_lite_gets_the_high_daily_limit(self) -> None:
+        assert _match_free_tier_limit("gemini-3.5-flash-lite").rpd == 500
+        assert _match_free_tier_limit("gemini-3.1-flash-lite").rpd == 500
+
+    def test_future_lite_generations_and_dashed_names(self) -> None:
+        assert _match_free_tier_limit("gemini-4-flash-lite").rpd == 500
+        assert _match_free_tier_limit("gemini-3-1-flash-lite-preview").rpd == 500
+
+    def test_old_and_unversioned_lite_stay_conservative(self) -> None:
+        assert _match_free_tier_limit("gemini-2.5-flash-lite").rpd == 20
+        assert _match_free_tier_limit("gemini-flash-lite-latest").rpd == 20
+
+    def test_full_flash_models_unchanged(self) -> None:
+        for name in ("gemini-3.6-flash", "gemini-3.8-flash"):
+            assert _match_free_tier_limit(name).rpd == 20

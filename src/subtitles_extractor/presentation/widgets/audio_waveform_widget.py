@@ -10,6 +10,7 @@ BẢN CẬP NHẬT ĐỘT PHÁ (V3.44 - Dynamic Center Playhead):
 from __future__ import annotations
 
 import bisect
+import contextlib
 import enum
 import functools
 import hashlib
@@ -18,11 +19,15 @@ import math
 import os
 import queue
 import subprocess
+
+from subtitles_extractor.infrastructure.process.hidden_process import no_window_kwargs
+from subtitles_extractor.presentation.qt_compat import is_deleted
 import sys
 import tempfile
 import threading
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +59,10 @@ def _cached_clean_text(raw_text: str) -> str:
     return clean_subtitle_text_for_display(raw_text).replace('\n', ' ').strip()
 
 
+# [v3.23.650] Quá ngưỡng này số dòng nằm trong khung nhìn thì vẽ gộp theo cột điểm ảnh.
+_DENSE_BLOCKS_THRESHOLD = 60
+
+
 class DragMode(enum.Enum):
     NONE = enum.auto()
     START = enum.auto()
@@ -61,6 +70,38 @@ class DragMode(enum.Enum):
     BODY = enum.auto()
     MOVE = enum.auto()
     SCRUB = enum.auto()
+
+
+class _OwnedThreads:
+    """[v3.23.619] Dừng các QThread của widget sóng âm khi widget bị huỷ.
+
+    Trước đây chỉ ``MainWindow.closeEvent`` → ``close_widget()`` dừng luồng. Widget bị huỷ
+    theo đường khác (trang Biên tập bị xoá, dọn dẹp lúc thoát) thì QThread con bị huỷ khi
+    còn chạy → Qt in "QThread: Destroyed while thread is still running" rồi ``abort()``
+    cả tiến trình. ``destroyed`` phát ra TRƯỚC khi Qt xoá các con, nên dừng ở đây kịp.
+    Là đối tượng Python thường (không phải QObject) để slot vẫn gọi được lúc widget đang
+    huỷ.
+    """
+
+    def __init__(self) -> None:
+        self._threads: list[QThread] = []
+
+    def add(self, thread: QThread) -> None:
+        self._threads = [t for t in self._threads if not is_deleted(t)]
+        self._threads.append(thread)
+
+    def stop_all(self, *_args: object) -> None:
+        for thread in self._threads:
+            if is_deleted(thread) or not thread.isRunning():
+                continue
+            for name in ("request_stop", "stop"):
+                stopper = getattr(thread, name, None)
+                if callable(stopper):
+                    stopper()
+            thread.quit()
+            if not thread.wait(6000):
+                logger.warning("Luồng sóng âm không dừng kịp khi huỷ widget.")
+        self._threads = []
 
 
 class WaveformRenderWorker(QThread):
@@ -106,9 +147,13 @@ class WaveformRenderWorker(QThread):
 
             start_idx, end_idx, canvas_width, canvas_height, zoom_level, cache_key = payload
 
+            # [v3.23.650] Chụp lock/mảng MỘT lần: GUI có thể gọi clear()/set_samples_reference(None, None) giữa lúc
+            # kiểm `is None` và `with lock` → TypeError thoát khỏi run(), worker chết, sóng âm không bao giờ vẽ lại.
+            shared_lock = self._shared_audio_lock
+            samples_reference = self._audio_samples_reference
             if (
-                self._audio_samples_reference is None
-                or self._shared_audio_lock is None
+                samples_reference is None
+                or shared_lock is None
                 or canvas_width <= 0
                 or canvas_height <= 0
             ):
@@ -117,10 +162,10 @@ class WaveformRenderWorker(QThread):
             if end_idx <= start_idx:
                 calculated_peaks_array = np.zeros(canvas_width, dtype=np.float32)
             else:
-                with self._shared_audio_lock:
+                with shared_lock:
                     try:
-                        if self._audio_samples_reference is not None and len(self._audio_samples_reference) > start_idx:
-                            visible_slice_of_samples = self._audio_samples_reference[start_idx:end_idx].copy()
+                        if len(samples_reference) > start_idx:
+                            visible_slice_of_samples = samples_reference[start_idx:end_idx].copy()
                         else:
                             visible_slice_of_samples = np.array([], dtype=np.float32)
                     except (IndexError, TypeError):
@@ -230,8 +275,12 @@ class _AudioExtractThread(QThread):
                     loaded_cached_array = np.load(cache_file_destination)
                     self.finished_sig.emit(loaded_cached_array.astype(np.float32), downsampled_envelope_rate)
                     return
-                except OSError:
-                    pass
+                except (OSError, ValueError, EOFError):
+                    # [v3.23.650] Cache cụt/hỏng (app sập giữa lúc ghi): trước đây ValueError/EOFError thoát khỏi
+                    # run() → luồng chết, finished_sig không bao giờ phát, sóng âm "đang phân tích" mãi. Xoá rồi trích lại.
+                    logger.warning("Cache sóng âm hỏng — xoá và trích xuất lại: %s", cache_file_destination)
+                    with contextlib.suppress(OSError):
+                        os.remove(cache_file_destination)
         except OSError:
             pass
 
@@ -250,11 +299,24 @@ class _AudioExtractThread(QThread):
                     "%s", missing_ffmpeg_message(feature="Sóng âm trong Trình sửa")
                 )
                 return
-            ffmpeg_subprocess_kwargs: dict[str, int | object] = {}
+            # [v3.23.544] Dùng helper CHUNG thay vì tự dựng cờ ẩn cửa sổ, rồi bổ sung phần
+            # riêng của widget này: nhóm tiến trình riêng để huỷ được cả cây tiến trình ffmpeg.
+            # Tên biến chứa "no_window_kwargs" để NHÌN NGAY TẠI LỜI GỌI là biết cửa sổ đã được
+            # ẩn — đúng điều bộ kiểm quy ước đòi hỏi (trước đây tên chung chung nên bị bỏ sót).
+            no_window_kwargs_with_group: dict[str, Any] = dict(no_window_kwargs())
             if sys.platform == 'win32':
-                ffmpeg_subprocess_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+                no_window_kwargs_with_group['creationflags'] = (
+                    int(no_window_kwargs_with_group.get('creationflags', 0))
+                    | subprocess.CREATE_NEW_PROCESS_GROUP
+                )
             else:
-                ffmpeg_subprocess_kwargs['preexec_fn'] = os.setsid
+                # [v3.23.618] ``start_new_session=True`` thay ``preexec_fn=os.setsid``: cùng
+                # tách tiến trình con sang phiên riêng nhưng làm trong mã C ngay sau fork.
+                # ``preexec_fn`` chạy mã Python trong tiến trình con của một tiến trình
+                # NHIỀU LUỒNG (Qt, loguru…) — nếu lúc fork luồng khác đang giữ khoá (GIL
+                # import, malloc, logging) thì tiến trình con kẹt vĩnh viễn và luồng sóng âm
+                # treo trong Popen (đã gặp thật: cả bộ test đứng ở dòng này, 0% CPU).
+                no_window_kwargs_with_group['start_new_session'] = True
 
             self._active_ffmpeg_process = subprocess.Popen([
                     ffmpeg_executable, '-y', '-hide_banner', '-loglevel', 'error',
@@ -272,12 +334,12 @@ class _AudioExtractThread(QThread):
                 stdin=subprocess.DEVNULL,
                 # [v3.23.350] ``ffmpeg_subprocess_kwargs`` ĐÃ chứa ``creationflags``
                 # (CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP) trên Windows và
-                # ``preexec_fn=os.setsid`` trên POSIX. Trước đây còn nối thêm
+                # ``start_new_session=True`` trên POSIX. Trước đây còn nối thêm
                 # ``**no_window_kwargs()`` (cũng đặt ``creationflags``) → Python báo
                 # "got multiple values for keyword argument 'creationflags'". Giữ MỘT
                 # nguồn duy nhất — bản đầy đủ có NEW_PROCESS_GROUP để _cleanup_process
                 # kill được cả nhóm tiến trình.
-                **ffmpeg_subprocess_kwargs,
+                **no_window_kwargs_with_group,
             )
 
             accumulated_peaks_list: list[np.ndarray] = []
@@ -433,6 +495,12 @@ class AudioWaveformWidget(QWidget):
 
         self._active_render_worker = WaveformRenderWorker(self)
         self._active_render_worker.result_ready.connect(self._on_worker_render_result_ready)
+        self._owned_threads = _OwnedThreads()
+        self._owned_threads.add(self._active_render_worker)
+        self.destroyed.connect(self._owned_threads.stop_all)
+        # [v3.23.650] `destroyed` KHÔNG phát khi wrapper Python bị GC giải phóng widget không parent (QThread còn
+        # chạy → "Destroyed while thread is still running" → abort). weakref.finalize chạy trước khi C++ bị huỷ.
+        weakref.finalize(self, self._owned_threads.stop_all)
         self._active_render_worker.start()
 
     def _init_variables(self) -> None:
@@ -761,6 +829,7 @@ class AudioWaveformWidget(QWidget):
         self._active_audio_extract_thread.chunk_ready.connect(self._on_audio_chunk_data_received)
         self._active_audio_extract_thread.finished_sig.connect(self._on_audio_extract_thread_finished)
         self._active_audio_extract_thread.ffmpeg_error_sig.connect(self.ffmpeg_error)
+        self._owned_threads.add(self._active_audio_extract_thread)
         self._active_audio_extract_thread.start()
 
     def set_duration(self, duration_sec: float) -> None:
@@ -773,6 +842,7 @@ class AudioWaveformWidget(QWidget):
     def set_events(self, events: list[SubtitleEvent]) -> None:
         self._loaded_subtitle_events = events
         self._cached_event_start_times = [event.start_sec for event in events]
+        self._dense_arrays = None
         self.update()
 
     def set_active_row(self, idx: int) -> None:
@@ -924,6 +994,59 @@ class AudioWaveformWidget(QWidget):
             # [BUG FIX v2.9+]: Tăng từ 500ms lên 2000ms để render worker kịp thoát
             # vòng lặp 50ms check + flush queue còn lại.
             self._active_render_worker.wait(2000)
+
+    def _dense_event_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(start, end, mức cảnh báo 0/1/2) của mọi dòng — dựng một lần cho mỗi lần ``set_events``."""
+        cached = getattr(self, "_dense_arrays", None)
+        if cached is None:
+            events = self._loaded_subtitle_events
+            starts = np.fromiter((e.start_sec for e in events), dtype=np.float64, count=len(events))
+            ends = np.fromiter((e.end_sec for e in events), dtype=np.float64, count=len(events))
+            lengths = np.fromiter((len(e.text) for e in events), dtype=np.float64, count=len(events))
+            duration = ends - starts
+            with np.errstate(divide="ignore", invalid="ignore"):
+                cps = np.where(duration > 0, lengths / duration, 0.0)
+            severity = np.where(cps > 25, 2, np.where(cps > 18, 1, 0)).astype(np.int8)
+            cached = (starts, ends, severity)
+            self._dense_arrays = cached
+        return cached
+
+    def _paint_dense_blocks(
+        self, painter: QPainter, first_idx: int, last_idx: int, view_start: float, view_duration: float,
+        canvas_width: float, canvas_height: float,
+    ) -> None:
+        """Vẽ khối phụ đề dạng cột điểm ảnh (không viền/chữ) khi quá nhiều dòng nằm trong khung nhìn."""
+        starts, ends, severity = self._dense_event_arrays()
+        width = max(1, int(canvas_width))
+        scale = width / view_duration
+        col0 = np.clip(np.floor((starts[first_idx:last_idx] - view_start) * scale), 0, width - 1).astype(np.int64)
+        col1 = np.clip(np.floor((ends[first_idx:last_idx] - view_start) * scale), 0, width - 1).astype(np.int64) + 1
+        sev = severity[first_idx:last_idx]
+        level = np.full(width + 1, -1, dtype=np.int8)
+        for lvl in (0, 1, 2):
+            mask = sev == lvl
+            if not mask.any():
+                continue
+            diff = np.zeros(width + 2, dtype=np.int32)
+            np.add.at(diff, col0[mask], 1)
+            np.add.at(diff, col1[mask], -1)
+            covered = np.cumsum(diff)[: width + 1] > 0
+            level[covered] = lvl
+        colors = (self._color_safe_box, self._color_warn_box, self._color_danger_box)
+        margin_y = 6.0
+        height = canvas_height - margin_y * 2
+        change = np.flatnonzero(np.diff(level, prepend=np.int8(-2)) != 0)
+        for i, begin in enumerate(change):
+            lvl = int(level[begin])
+            if lvl < 0:
+                continue
+            end = int(change[i + 1]) if i + 1 < len(change) else width + 1
+            painter.fillRect(QRectF(float(begin), margin_y, float(end - begin), height), colors[lvl])
+        active = self._highlighted_active_row_idx
+        if first_idx <= active < last_idx:
+            x0 = max(0.0, (starts[active] - view_start) * scale)
+            x1 = min(canvas_width, (ends[active] - view_start) * scale)
+            painter.fillRect(QRectF(x0, margin_y, max(2.0, x1 - x0), height), self._color_active_box)
 
     def _get_visible_event_range(self, time_start: float, time_end: float) -> tuple[int, int]:
         if not self._loaded_subtitle_events:
@@ -1157,6 +1280,18 @@ class AudioWaveformWidget(QWidget):
         # --- 3. RENDER SUBTITLE BLOCKS ---
         painter.save()
         start_visible_idx, end_visible_idx = self._get_visible_event_range(view_start_time, view_start_time + view_duration_time)
+
+        # [v3.23.650] Hàng nghìn dòng trong khung nhìn (zoom xa): vẽ từng dòng bằng Python mất 150–550 ms/khung với
+        # 3649 dòng (giao diện gần như đứng khi phát). Quá ngưỡng thì gộp theo cột điểm ảnh bằng numpy.
+        if (
+            end_visible_idx - start_visible_idx > _DENSE_BLOCKS_THRESHOLD
+            and self._mouse_drag_mode == DragMode.NONE
+        ):
+            self._paint_dense_blocks(
+                painter, start_visible_idx, end_visible_idx, view_start_time, view_duration_time,
+                canvas_width, canvas_height,
+            )
+            start_visible_idx = end_visible_idx = 0
 
         for draw_idx in range(start_visible_idx, end_visible_idx):
             event_object = self._loaded_subtitle_events[draw_idx]

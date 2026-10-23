@@ -127,13 +127,49 @@ class SettingsService:
             logger.info("Chưa có cấu hình lưu trữ — dùng mặc định.")
             return ApplicationSettings()
         try:
-            return ApplicationSettings.model_validate(raw)
+            stored = ApplicationSettings.model_validate(raw)
         except ValidationError as exc:
             logger.warning(
                 "Cấu hình lưu trữ không hợp lệ — quay về mặc định. Chi tiết: %s",
                 exc,
             )
             return ApplicationSettings()
+        return self._apply_env_overrides(stored)
+
+    @staticmethod
+    def _apply_env_overrides(stored: ApplicationSettings) -> ApplicationSettings:
+        """[v3.23.619] Biến môi trường ``SE_*`` ghi đè cấu hình đã lưu.
+
+        README hướng dẫn ``export SE_HW_DEVICE=cpu`` / ``SE_OCR_SCORE_THRESHOLD=...``,
+        nhưng trước đây giá trị trong ``config.json`` luôn thắng (biến môi trường chỉ có
+        tác dụng ở lần chạy đầu, khi chưa có tệp). Nay đọc biến môi trường của từng nhóm
+        (theo ``env_prefix``) và đè lên; giá trị sai kiểu bị bỏ qua kèm cảnh báo.
+        """
+        from pydantic_settings import EnvSettingsSource
+
+        data = stored.model_dump(mode="python")
+        changed = False
+        for group_name, field in ApplicationSettings.model_fields.items():
+            group_cls = field.annotation
+            try:
+                env_values = EnvSettingsSource(group_cls)()
+            except (ValueError, TypeError) as exc:
+                logger.warning("Bỏ qua biến môi trường nhóm %s: %s", group_name, exc)
+                continue
+            for key, value in env_values.items():
+                trial = {**data[group_name], key: value}
+                try:
+                    group_cls.model_validate(trial)
+                except ValidationError:
+                    logger.warning(
+                        "Bỏ qua biến môi trường %s.%s=%r (giá trị không hợp lệ).",
+                        group_name, key, value,
+                    )
+                    continue
+                data[group_name] = trial
+                changed = True
+                logger.info("Biến môi trường ghi đè cấu hình: %s.%s.", group_name, key)
+        return ApplicationSettings.model_validate(data) if changed else stored
 
     def _schedule_persist(self) -> None:
         """Lên lịch ghi đĩa sau ``_DEBOUNCE_INTERVAL_SEC`` giây.

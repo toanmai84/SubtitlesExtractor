@@ -17,6 +17,7 @@ from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler, Levenshtein
 
 from subtitles_extractor.application.services.cjk_utils import contains_cjk
+from subtitles_extractor.application.services.han_variants import fold_han_variants
 from subtitles_extractor.infrastructure.nlp.fastembed_adapter import FastEmbedAdapter
 
 __all__ = [
@@ -116,6 +117,12 @@ def _builder_similarity_cached(text_a: str, text_b: str) -> float:
         return 1.0
     if not text_a or not text_b:
         return 0.0
+
+    # [v3.23.616] PaddleOCR đọc cùng một chữ lúc giản lúc phồn giữa các khung liền nhau
+    # (OCR thật 14/10: "瑶瑶" có khung đọc "瑤瑤", "瑤瑶", "瑶瑤"). So nguyên văn thì hai
+    # biến thể khác HẲN nhau (similarity 0) → câu bị cắt vụn, mảnh conf thấp bị loại và
+    # câu bắt đầu trễ 200ms. Biến thể chữ không phải khác câu: so trên dạng đã gộp.
+    text_a, text_b = fold_han_variants(text_a), fold_han_variants(text_b)
 
     clean_a = _PUNCTUATION_REGEX.sub('', text_a).replace(' ', '').lower()
     clean_b = _PUNCTUATION_REGEX.sub('', text_b).replace(' ', '').lower()

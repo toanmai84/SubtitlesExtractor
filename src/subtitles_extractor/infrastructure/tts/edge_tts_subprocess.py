@@ -8,11 +8,11 @@ là "công cụ ngoài" gọi qua ranh giới tiến trình, không liên kết 
 Xem docs/LICENSE_ANALYSIS.md.
 
 Cách chạy (do edge_tts_adapter gọi, không chạy tay):
-    python edge_tts_subprocess.py --text "..." --voice vi-VN-... --rate "+0%" \\
-        --output /tmp/out.wav
+    python edge_tts_subprocess.py --text="..." --voice=vi-VN-... --rate="-10%" \\
+        --pitch="+0Hz" --output=/tmp/out.wav
 
 Giao thức:
-- Đầu vào: tham số dòng lệnh (text, voice, rate, output path).
+- Đầu vào: tham số dòng lệnh (text, voice, rate, pitch, output path).
 - Đầu ra: file WAV tại ``--output``; mã thoát 0 nếu OK, khác 0 nếu lỗi.
 - Thông báo tiến độ/lỗi in ra stderr (tiến trình chính đọc để log).
 """
@@ -41,8 +41,13 @@ def _eprint(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-async def _synthesize(text: str, voice: str, rate: str, output_path: str) -> int:
-    """Gọi edge-tts sinh audio, ghi WAV ra ``output_path``. Trả mã thoát."""
+async def _synthesize(
+    text: str, voice: str, rate: str, output_path: str, pitch: str = "+0Hz"
+) -> int:
+    """Gọi edge-tts sinh audio, ghi WAV ra ``output_path``. Trả mã thoát.
+
+    ``pitch`` [v3.23.593]: cao độ tương đối — biến thể giọng khi lồng tiếng nhiều vai.
+    """
     try:
         import edge_tts
     except ImportError:
@@ -56,7 +61,7 @@ async def _synthesize(text: str, voice: str, rate: str, output_path: str) -> int
 
     os.close(mp3_fd)
     try:
-        communicate = edge_tts.Communicate(text, voice, rate=rate)
+        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
         try:
             # Timeout cứng: WebSocket tới Microsoft có thể treo vô hạn khi mạng lỗi.
             await asyncio.wait_for(communicate.save(mp3_path), timeout=30.0)
@@ -113,15 +118,27 @@ def _mp3_to_wav(mp3_path: str, wav_path: str) -> bool:
     return True
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Bộ đọc tham số dòng lệnh của worker (dùng chung cho test giao thức với adapter).
+
+    Adapter truyền mọi giá trị dạng ``--khoá=giá_trị`` vì giá trị có thể bắt đầu bằng "-"
+    (tốc độ ``-10%``, cao độ ``-12Hz``, câu thoại ``-Đi!``).
+    """
     parser = argparse.ArgumentParser(description="Edge TTS subprocess worker")
     parser.add_argument("--text", required=True)
     parser.add_argument("--voice", required=True)
     parser.add_argument("--rate", default="+0%")
+    parser.add_argument("--pitch", default="+0Hz")
     parser.add_argument("--output", required=True)
-    args = parser.parse_args()
+    return parser
 
-    return asyncio.run(_synthesize(args.text, args.voice, args.rate, args.output))
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    return asyncio.run(
+        _synthesize(args.text, args.voice, args.rate, args.output, args.pitch)
+    )
 
 
 if __name__ == "__main__":

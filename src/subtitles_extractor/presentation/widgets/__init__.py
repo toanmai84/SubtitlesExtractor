@@ -16,6 +16,8 @@ signal names (``roi_changed``, ``roi_preview``, ``video_clicked``,
 
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -46,13 +48,26 @@ def _is_mpv_available() -> bool:
             * libmpv shared library (DLL/SO) load được không lỗi ``OSError``.
         Ngược lại ``False``.
     """
+    if os.environ.get("SUBTITLES_EXTRACTOR_NO_MPV"):
+        logger.warning("SUBTITLES_EXTRACTOR_NO_MPV được đặt — dùng VideoCanvas thay mpv.")
+        return False
     try:
-        import mpv
+        from subtitles_extractor.infrastructure.logging.crash_hooks import mpv_disabled_by_crash
 
-        # Thử tạo instance MPV không cần WID — chỉ để probe DLL load.
-        # Nếu DLL thiếu, sẽ raise OSError ngay ở constructor.
-        probe_instance = mpv.MPV()
-        probe_instance.terminate()
+        if mpv_disabled_by_crash():
+            logger.warning(
+                "Lần chạy trước crash trong mpv (access violation) — tạm dùng VideoCanvas. "
+                "Xoá tệp mpv_disabled.flag trong thư mục logs (hoặc đặt SUBTITLES_EXTRACTOR_FORCE_MPV=1) để bật lại mpv."
+            )
+            return False
+    except Exception:  # noqa: BLE001 - lớp bảo vệ không được làm hỏng việc dựng trang
+        pass
+    try:
+        # [v3.23.651] Chỉ `import mpv` (python-mpv nạp libmpv ngay lúc import, thiếu DLL → OSError). KHÔNG dựng thử
+        # `mpv.MPV()` rồi terminate() nữa: log crash thật cho thấy `access violation` trong `terminate()`/`_loop` của
+        # lần dò này ngay lúc khởi động.
+        import mpv  # noqa: F401
+
         return True
     except ImportError as exc:
         logger.warning(
@@ -60,9 +75,11 @@ def _is_mpv_available() -> bool:
             exc,
         )
         return False
-    except OSError as exc:
+    except (OSError, RuntimeError, AttributeError) as exc:
+        # [v3.23.619] + RuntimeError/AttributeError: libmpv nạp được nhưng khởi tạo lỗi hoặc
+        # lệch phiên bản với python-mpv — trước đây lọt ra ngoài làm hỏng việc dựng trang.
         logger.warning(
-            "libmpv DLL/SO không load được ({}) — chuyển sang VideoCanvas fallback.",
+            "libmpv DLL/SO không dùng được ({}) — chuyển sang VideoCanvas fallback.",
             exc,
         )
         return False

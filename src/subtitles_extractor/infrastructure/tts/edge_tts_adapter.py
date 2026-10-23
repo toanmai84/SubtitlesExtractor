@@ -22,21 +22,34 @@ import logging
 import math
 import os
 import random
+from subtitles_extractor.infrastructure.torch_import_blocker import without_torch_block
 from subtitles_extractor.infrastructure.process.hidden_process import no_window_kwargs
 import tempfile
 import time
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 import numpy as np
 
 from subtitles_extractor.domain.ports.subtitle_tts_port import (
+    LineNeighbors,
     SubtitleTTSPort, TTSCancelledError, TTSGenerationError,
     TTSProgressCallback, TTSCancellationCallback, TTSRequest,
     TTSSegmentResult, TTSUnavailableError,
 )
+from subtitles_extractor.domain.value_objects.voice_profile import VoiceProfile
+from subtitles_extractor.infrastructure.tts.edge_voice_variants import (
+    NEUTRAL_PITCH,
+    edge_voice_catalog,
+    split_voice_variant,
+)
 from subtitles_extractor.infrastructure.tts.adaptive_limiter import (
     AdaptiveConcurrencyLimiter,
 )
-from subtitles_extractor.infrastructure.tts.audio_utils import is_effectively_silent
+from subtitles_extractor.infrastructure.tts.audio_utils import (
+    is_effectively_silent,
+    speech_span,
+)
 from subtitles_extractor.infrastructure.tts.dsp_primitives import (
     clamp_smoothed_gain as _clamp_smoothed_gain,
 )
@@ -268,6 +281,7 @@ def _voiced_bounds_from_rms(
     floor_multiplier: float = 3.5,
     peak_ratio_db: float = -45.0,
     dynamic_guard_db: float = -42.0,
+    frame_s: float = 0.0,
 ) -> tuple[int, int] | None:
     """[v3.23.171] Tìm biên [đầu, cuối] vùng có tiếng trong chuỗi RMS (an toàn động học).
 
@@ -285,6 +299,9 @@ def _voiced_bounds_from_rms(
         floor_multiplier: Hệ số nhân sàn nhiễu cho ngưỡng.
         peak_ratio_db: Ngưỡng tương đối so đỉnh (dB, giá trị âm).
         dynamic_guard_db: CHẶN TRÊN ngưỡng so đỉnh (dB, âm) — bảo vệ đuôi/đầu nhỏ.
+        frame_s: [v3.23.615] Khoảng cách giữa hai phần tử ``rms`` (giây). Lớn hơn 0
+            thì bỏ đảo tạp âm lẻ ở hai đầu như VieNeu/Gemini (xem
+            ``audio_utils.speech_span``); 0 giữ cách cũ (khung có tiếng đầu/cuối).
 
     Returns:
         Cặp ``(chỉ_số_đầu, chỉ_số_cuối)`` trong ``rms`` (bao gồm), hoặc None nếu toàn
@@ -307,6 +324,9 @@ def _voiced_bounds_from_rms(
     mask = rms > threshold
     if not np.any(mask):
         return None
+    if frame_s > 0:
+        # [v3.23.616] Đo đảo trên lõi của nó, như VieNeu/Gemini (``audio_utils``).
+        return speech_span(mask, frame_s, levels=rms)
     voiced = np.nonzero(mask)[0]
     return (int(voiced[0]), int(voiced[-1]))
 
@@ -454,6 +474,29 @@ def _rate_from_speed(speed: float) -> str:
     return f"+{pct}%" if pct >= 0 else f"{pct}%"
 
 
+def completed_task_results(outcomes: Iterable[object], stage: str) -> list[Any]:
+    """Kết quả các tác vụ của ``asyncio.gather(..., return_exceptions=True)`` chạy xong.
+
+    Tác vụ lỗi bị bỏ qua và ghi log. Lọc theo ``BaseException`` chứ không phải
+    ``Exception``: từ Python 3.8 ``CancelledError`` không còn là ``Exception``, nên một
+    dòng bị huỷ riêng lẻ lọt qua bộ lọc cũ, bị đem đi tách tuple và làm hỏng cả lượt.
+
+    Args:
+        outcomes: Kết quả ``gather`` (giá trị trả về hoặc ngoại lệ của từng tác vụ).
+        stage: Tên lượt, ghi vào log ("Pass 1", "Pass 2.5"…).
+
+    Returns:
+        Các giá trị trả về của tác vụ thành công, giữ nguyên thứ tự.
+    """
+    completed: list[Any] = []
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            logger.error("%s: một dòng lỗi, bỏ qua (%r).", stage, outcome)
+            continue
+        completed.append(outcome)
+    return completed
+
+
 class EdgeTTSAdapter(SubtitleTTSPort):
     def __init__(self) -> None:
         # [SỬA] Bỏ ThreadPoolExecutor tạo ở __init__ (leak threads mỗi lần khởi tạo
@@ -475,14 +518,27 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         events: list,
         gap_guard_s: float = _GAP_GUARD_S,
         last_extend_s: float = 0.0,
+        neighbors: tuple[LineNeighbors, ...] = (),
     ) -> dict[int, float]:
+        """Khung mở rộng của từng câu: tới sát mốc câu kế (trừ khe hở).
+
+        [v3.23.596] ``neighbors`` (TTS lại tập con dòng): câu kế là dòng kề THẬT trong cả
+        phim, không phải dòng chọn kế tiếp — trước đây dòng TTS lại được khung tới tận
+        dòng chọn sau và đọc chậm đè lên câu không được chọn.
+        """
         n = len(events)
         windows: dict[int, float] = {}
         order = sorted(range(n), key=lambda i: events[i].start_sec)
         for pos, idx in enumerate(order):
             ev = events[idx]
             strict = ev.end_sec - ev.start_sec
-            if pos + 1 < n:
+            context = neighbors[idx] if idx < len(neighbors) else None
+            if context is not None:
+                if context.next_start_sec is None:
+                    extended = strict + max(0.0, last_extend_s)
+                else:
+                    extended = context.next_start_sec - ev.start_sec - gap_guard_s
+            elif pos + 1 < n:
                 next_start = events[order[pos + 1]].start_sec
                 extended = next_start - ev.start_sec - gap_guard_s
             else:
@@ -941,8 +997,13 @@ class EdgeTTSAdapter(SubtitleTTSPort):
     def list_speakers(self, language: str) -> list[str]:
         return _EDGE_VOICE_MAP.get(language, [])
 
+    def list_voice_catalog(self, language: str) -> list[VoiceProfile]:
+        """[v3.23.593] Giọng gốc + biến thể trầm/cao để đủ giọng lồng tiếng nhiều vai."""
+        return edge_voice_catalog(_EDGE_VOICE_MAP.get(language, []))
+
     # ── Public generate ───────────────────────────────────────────────────────
 
+    @without_torch_block
     def generate(
         self, request: TTSRequest, output_path: Path,
         progress_cb: TTSProgressCallback | None = None,
@@ -1005,6 +1066,12 @@ class EdgeTTSAdapter(SubtitleTTSPort):
             "Edge TTS [%s]: voice=%s events=%d concurrency=%d",
             mode, voice, n_valid, getattr(request, "edge_concurrency", _EDGE_CONCURRENCY),
         )
+        if request.line_voices:
+            logger.info(
+                "Edge TTS lồng tiếng: %d giọng khác nhau cho %d dòng.",
+                len({request.voice_at(i, voice) for i in range(len(request.events))}),
+                len(request.events),
+            )
 
         self._ts_heavy_count = 0
         self._has_librosa = self._check_librosa()
@@ -1289,7 +1356,8 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         p1_done = 0
 
         extended_windows = self._compute_extended_windows(
-            events, last_extend_s=request.last_line_max_extend_s
+            events, last_extend_s=request.last_line_max_extend_s,
+            neighbors=tuple(getattr(request, "neighbors", ()) or ()),
         )
 
         async def _p1(idx: int) -> tuple[int, tuple[np.ndarray, int] | None]:
@@ -1302,7 +1370,9 @@ class EdgeTTSAdapter(SubtitleTTSPort):
             async with semaphore:
                 if cancel_cb and cancel_cb():
                     return idx, None
-                result = await self._async_gen_with_retry(text, voice, request.base_speed, request)
+                result = await self._async_gen_with_retry(
+                    text, request.voice_at(idx, voice), request.base_speed, request
+                )
                 if result[0] is not None and len(result[0]) > 0:
                     semaphore.report_success()
                     trimmed = await asyncio.to_thread(self._trim_silence, result[0], result[1])
@@ -1321,11 +1391,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
 
         p1_raw = await asyncio.gather(*[_p1(i) for i in to_process], return_exceptions=True)
         p1_results: dict[int, tuple[np.ndarray, int] | None] = {}
-        for _item in p1_raw:
-            if isinstance(_item, Exception):
-                logger.error("Pass 1 task exception (bỏ qua): %s", _item)
-                continue
-            _idx, _res = _item
+        for _idx, _res in completed_task_results(p1_raw, "Pass 1"):
             p1_results[_idx] = _res
 
         if not request.double_pass:
@@ -1409,7 +1475,9 @@ class EdgeTTSAdapter(SubtitleTTSPort):
             async with semaphore:
                 if cancel_cb and cancel_cb():
                     return idx, None
-                result = await self._async_gen_with_retry(text, voice, api_speed, request)
+                result = await self._async_gen_with_retry(
+                    text, request.voice_at(idx, voice), api_speed, request
+                )
                 if result[0] is not None and len(result[0]) > 0:
                     trimmed = await asyncio.to_thread(self._trim_silence, result[0], result[1])
                     result = (trimmed, result[1])
@@ -1425,11 +1493,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
                 *[_p2(i, t, s) for i, t, s, _tgt in p2_needed], return_exceptions=True
             )
             p2_results: dict[int, tuple[np.ndarray, int] | None] = {}
-            for _item in p2_raw:
-                if isinstance(_item, Exception):
-                    logger.error("Pass 2 task exception (bỏ qua): %s", _item)
-                    continue
-                _idx, _res = _item
+            for _idx, _res in completed_task_results(p2_raw, "Pass 2"):
                 p2_results[_idx] = _res
         else:
             p2_results = {}
@@ -1474,7 +1538,9 @@ class EdgeTTSAdapter(SubtitleTTSPort):
                 async with semaphore:
                     if cancel_cb and cancel_cb():
                         return idx, rate, None
-                    result = await self._async_gen_with_retry(text, voice, rate, request)
+                    result = await self._async_gen_with_retry(
+                        text, request.voice_at(idx, voice), rate, request
+                    )
                     if result[0] is not None and len(result[0]) > 0:
                         trimmed = await asyncio.to_thread(
                             self._trim_silence, result[0], result[1]
@@ -1498,11 +1564,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
                     return float("inf")
                 return abs(audio_len / sr / target - 1.0)
 
-            for _item in p25_raw:
-                if isinstance(_item, Exception):
-                    logger.error("Pass 2.5 task exception (bỏ qua): %s", _item)
-                    continue
-                _idx, _rate, _res = _item
+            for _idx, _rate, _res in completed_task_results(p25_raw, "Pass 2.5"):
                 if _res is None or len(_res[0]) == 0:
                     continue
                 _old = p2_results.get(_idx)
@@ -1535,11 +1597,9 @@ class EdgeTTSAdapter(SubtitleTTSPort):
                 r2_raw = await asyncio.gather(
                     *[_p25(i, t, r) for i, t, r in round2], return_exceptions=True
                 )
-                for _item in r2_raw:
-                    if isinstance(_item, Exception):
-                        logger.error("Pass 2.5 vòng 2 exception (bỏ qua): %s", _item)
-                        continue
-                    _idx, _rate, _res = _item
+                for _idx, _rate, _res in completed_task_results(
+                    r2_raw, "Pass 2.5 vòng 2"
+                ):
                     if _res is None or len(_res[0]) == 0:
                         continue
                     _old = p2_results.get(_idx)
@@ -1562,6 +1622,10 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         request: TTSRequest,
     ) -> dict[int, tuple[float, float, float]] | None:
         if not request.elastic_timing:
+            return None
+        # [v3.23.596] TTS lại tập con dòng: các dòng chọn rời rạc, không lập cụm/dời mốc
+        # giữa chúng — mỗi dòng chỉ nén cho vừa khung tới dòng kề thật.
+        if getattr(request, "neighbors", ()):
             return None
         p1_speech_durs: dict[int, float] = {}
         for idx, p1 in p1_results.items():
@@ -1958,7 +2022,8 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         # dynamic guard để không cắt nhầm phụ âm cuối nhẹ ở câu động học lớn.
         noise_floor = float(np.percentile(rms, 5))
         peak_rms = float(np.max(rms))
-        bounds = _voiced_bounds_from_rms(rms, noise_floor, peak_rms)
+        # [v3.23.615] Đồng bộ VieNeu/Gemini: bỏ đảo tạp âm lẻ ở hai đầu (rms theo mẫu).
+        bounds = _voiced_bounds_from_rms(rms, noise_floor, peak_rms, frame_s=1.0 / sr)
         if bounds is None:
             return audio
         first_voiced, last_voiced = bounds
@@ -2343,7 +2408,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
 
     @staticmethod
     async def _run_edge_in_process(
-        text: str, voice: str, rate: str, output_path: str
+        text: str, voice: str, rate: str, output_path: str, pitch: str = NEUTRAL_PITCH
     ) -> bool:
         """Chạy edge-tts NGAY trong tiến trình này (dự phòng khi không có Python ngoài).
 
@@ -2356,6 +2421,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
             voice: Mã giọng (vd ``vi-VN-NamMinhNeural``).
             rate: Tốc độ dạng ``"+0%"``.
             output_path: Tệp WAV đích.
+            pitch: Cao độ tương đối (``"+0Hz"``) — biến thể giọng lồng tiếng.
 
         Returns:
             ``True`` nếu tổng hợp thành công.
@@ -2377,7 +2443,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         try:
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
                 mp3_path = handle.name
-            communicate = edge_tts.Communicate(text, voice, rate=rate)
+            communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
             # Giới hạn thời gian giống worker: mạng chậm không được treo vô hạn.
             await asyncio.wait_for(communicate.save(mp3_path), timeout=30.0)
             # Tái dùng CHÍNH hàm chuyển đổi của worker để hai đường chạy cho kết quả
@@ -2430,10 +2496,15 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         # KHÔNG import edge_tts — chỉ chạy worker + đọc WAV kết quả. Xem docs/LICENSE_ANALYSIS.
         import soundfile as sf
 
+        # [v3.23.593] ID giọng lồng tiếng có thể kèm cao độ ("…Neural@-12Hz"): tách ra
+        # trước khi gọi dịch vụ — Edge từ chối tên giọng lạ.
+        base_voice, pitch = split_voice_variant(voice)
         fd, tmp_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         try:
-            ok = await EdgeTTSAdapter._run_edge_subprocess(text, voice, rate, tmp_path)
+            ok = await EdgeTTSAdapter._run_edge_subprocess(
+                text, base_voice, rate, tmp_path, pitch=pitch
+            )
             if not ok:
                 return np.array([], dtype=np.float32), 24000
             try:
@@ -2452,7 +2523,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
 
     @staticmethod
     async def _run_edge_subprocess(
-        text: str, voice: str, rate: str, output_path: str
+        text: str, voice: str, rate: str, output_path: str, pitch: str = NEUTRAL_PITCH
     ) -> bool:
         """Chạy worker edge-tts trong tiến trình riêng. True nếu tạo được WAV.
 
@@ -2467,7 +2538,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
             # Lần trước đã xác định Python ngoài thiếu edge-tts — đi thẳng đường trong
             # tiến trình, khỏi tốn ~2 giây/câu cho một subprocess chắc chắn thất bại.
             return await EdgeTTSAdapter._run_edge_in_process(
-                text, voice, rate, output_path
+                text, voice, rate, output_path, pitch
             )
         if python_exe is None or not worker.is_file():
             # [v3.23.328] Trước đây tới đây là THẤT BẠI: thiết kế cũ cố ý KHÔNG đóng gói
@@ -2476,14 +2547,19 @@ class EdgeTTSAdapter(SubtitleTTSPort):
             # Vẫn ưu tiên subprocess khi có Python ngoài, vì cách ly giúp edge-tts treo
             # hoặc lỗi mạng không làm sập ứng dụng chính.
             return await EdgeTTSAdapter._run_edge_in_process(
-                text, voice, rate, output_path
+                text, voice, rate, output_path, pitch
             )
+        # [v3.23.593] Dạng ``--khoá=giá_trị``: argparse coi giá trị bắt đầu bằng "-" là
+        # một tuỳ chọn khác — "--rate -10%" (đọc chậm, Pass 2.5 vi chỉnh), "--pitch
+        # -12Hz" (giọng trầm) hay câu "-Đi!" đều làm worker thoát mã 2 mà không tổng hợp
+        # gì.
         args = [
             python_exe, str(worker),
-            "--text", text,
-            "--voice", voice,
-            "--rate", rate,
-            "--output", output_path,
+            f"--text={text}",
+            f"--voice={voice}",
+            f"--rate={rate}",
+            f"--pitch={pitch}",
+            f"--output={output_path}",
         ]
         try:
             # [v3.23.350] Trước đây dict ``flags`` cục bộ đặt ``creationflags`` RỒI
@@ -2519,7 +2595,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
                     )
                     EdgeTTSAdapter._prefer_in_process = True
                     return await EdgeTTSAdapter._run_edge_in_process(
-                        text, voice, rate, output_path
+                        text, voice, rate, output_path, pitch
                     )
                 return False
             return Path(output_path).exists() and Path(output_path).stat().st_size > 0
@@ -2562,4 +2638,4 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         return None
 
 
-__all__ = ["EdgeTTSAdapter"]
+__all__ = ["EdgeTTSAdapter", "completed_task_results"]

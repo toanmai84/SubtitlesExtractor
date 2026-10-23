@@ -40,6 +40,7 @@ from subtitles_extractor.domain.ports.progress_reporter_port import (
     NullProgressReporter,
     ProgressReporterPort,
 )
+from subtitles_extractor.domain.value_objects.time_interval import TimeInterval
 
 if TYPE_CHECKING:
     pass
@@ -51,6 +52,31 @@ _MIN_RANGE_DURATION_SEC: float = 0.12
 
 # Padding 2 đầu cho mỗi range — bù trừ cho lỗi timestamp do giải mã VFR.
 _RANGE_PADDING_SEC: float = 0.00
+
+
+def _clip_events_to_range(
+    events: list[SubtitleEvent], range_end_sec: float
+) -> list[SubtitleEvent]:
+    """[v3.23.615] Không để câu Re-OCR kéo quá cuối khoảng đã quét (hàm sửa tại chỗ).
+
+    Bộ dựng câu nay đặt mốc kết thúc = lúc chữ biến mất (khung cuối + một khung). Ở cuối
+    khoảng quét, khung kế tiếp nằm ngoài khoảng — chưa ai biết chữ còn hay không — nên mốc
+    được giữ ở cuối khoảng, không lấn sang câu kế tiếp đang có trong bảng.
+
+    Args:
+        events: Câu dựng được từ một khoảng quét.
+        range_end_sec: Mốc cuối của khoảng quét.
+
+    Returns:
+        Chính danh sách ``events``.
+    """
+    for event in events:
+        if event.end_sec > range_end_sec:
+            event.interval = TimeInterval(
+                start_sec=event.start_sec,
+                end_sec=max(event.start_sec + 0.001, range_end_sec),
+            )
+    return events
 
 
 class _SubTaskProgressProxy(ProgressReporterPort):
@@ -186,7 +212,9 @@ class ReOcrUseCase:
                 )
                 continue
 
-            all_new_events.extend(sub_response.events)
+            all_new_events.extend(
+                _clip_events_to_range(sub_response.events, time_range.end_sec)
+            )
             total_frames_processed += sub_response.frames_processed
 
         all_new_events.sort(key=lambda event: (event.start_sec, event.end_sec))
@@ -241,6 +269,8 @@ class ReOcrUseCase:
             pixel_diff_threshold=request.sampling.pixel_diff_threshold,
             skip_intro_sec=skip_intro,
             skip_outro_sec=skip_outro,
+            white_text_gate=getattr(request.sampling, "white_text_gate", False),
+            white_text_luma=getattr(request.sampling, "white_text_luma", 200),
             apply_median_blend=request.sampling.apply_median_blend,
             median_blend_frames=request.sampling.median_blend_frames,
             # Bổ sung kế thừa các tham số tối ưu hóa VRAM của PyNvVideoCodec

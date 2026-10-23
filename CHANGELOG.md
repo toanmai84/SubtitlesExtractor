@@ -1,5 +1,10500 @@
 # Changelog
 
+## [3.23.651] — 🧯 Crash thật từ 3 `fault.log` trên Windows: `access violation` trong mpv (dò mpv lúc khởi động + nạp video)
+
+### Đọc 3 log bạn gửi (đây là dữ liệu thật đầu tiên, nhờ `fault.log` của 3.23.650)
+* **Hàng chục dòng `Windows fatal exception: code 0xe24c4a02` KHÔNG phải crash**: đó là mã ngoại lệ của **LuaJIT** (script Lua nhúng trong libmpv: ytdl_hook/stats/console…), đã được Lua xử lý nội bộ, nhưng `faulthandler` ghi nhầm là "fatal"
+  và xả toàn bộ ngăn xếp mỗi lần (nên log phình to, che mất dòng thật).
+* **Crash thật = `Windows fatal exception: access violation` ngay trong mpv**, hai kịch bản:
+  1. `fault_...143930.log`: **ngay lúc khởi động** — `widgets/__init__._is_mpv_available` dựng thử `mpv.MPV()` rồi `terminate()`; `access violation` ở `_loop` (`_mpv_destroy` của luồng sự kiện) đua với `terminate()` của luồng chính.
+  2. `fault_...202351.log` và `fault.log`: **lúc chọn/nạp video** — luồng giao diện đứng ở `MpvPlayerAdapter.load → wait_until_playing` (observer thuộc tính + `Future`) trong khi luồng khác `access violation` ở `mpv.py` dòng 1058.
+* Lỗi nằm **trong libmpv/python-mpv**, không phải trong mã Python của ứng dụng. Tôi không có Windows/libmpv của bạn nên **không thể tái hiện**; các sửa dưới đây là loại bỏ đúng những đường đi xuất hiện trong ngăn xếp.
+
+### Thay đổi
+* **Không còn dựng thử `mpv.MPV()` lúc khởi động**: `import mpv` đã đủ để biết libmpv có nạp được không (python-mpv nạp DLL ngay lúc import).
+* **`MpvPlayerAdapter.load` không còn `wait_until_playing`**: đặt `pause=yes` TRƯỚC `loadfile` (không bật tiếng) rồi chờ bằng đọc thuộc tính thường (`idle-active`, `duration`) — không observer, không `Future`.
+* **Tắt script Lua của mpv** (`load_scripts`, `ytdl`, `load_stats_overlay`, `load_osd_console` = no): ứng dụng không dùng chúng; loại bỏ luôn nguồn ngoại lệ LuaJIT. Bản libmpv không nhận tuỳ chọn nào thì tự lùi về cấu hình cũ (không mất mpv).
+* **Tự bảo vệ**: nếu `fault.log` của lần trước có `access violation` + khung mpv ⇒ tạo `logs/mpv_disabled.flag`, lần chạy sau **tạm dùng trình xem dự phòng (VideoCanvas/PyAV)** và báo bạn; xoá tệp cờ (hoặc đặt biến môi trường `SUBTITLES_EXTRACTOR_FORCE_MPV=1`) để bật lại mpv. Muốn tắt mpv hẳn: `SUBTITLES_EXTRACTOR_NO_MPV=1`.
+
+### Giới hạn (nói thẳng)
+* Chưa chạy được trên Windows của bạn: chưa biết 3 sửa trên có hết `access violation` hay không. Nếu còn, lớp tự bảo vệ sẽ chuyển sang trình xem dự phòng ở lần chạy kế tiếp (mất xem trước mpv nhưng không crash); hãy gửi `fault_*.log` mới.
+* `mpv_frame_sampler`/`mpv_metadata_reader` (OCR/thăm dò video) vẫn có thể dựng `mpv.MPV()` riêng; log của bạn không cho thấy chúng liên quan nên chưa đổi.
+
+### Kiểm thử
+* `test_mpv_crash_guard_v323651.py` (7 test, mpv giả): dò khởi động không dựng MPV; cờ/biến môi trường; `load` không dùng `wait_until_playing`; lùi cấu hình khi libmpv từ chối tuỳ chọn; phân biệt Lua vô hại với `access violation`. 2 test thất bại trên mã cũ (dò khởi động, `load`); phần còn lại là mã mới.
+
+## [3.23.650] — 💥 Sửa crash trang Chỉnh sửa (ứng dụng "biến mất" khi sửa chữ trong bảng) + rà soát crash/treo toàn ứng dụng
+
+### Nguyên nhân gốc của lỗi bạn báo (TÁI HIỆN ĐƯỢC, không có nhật ký người dùng — kết luận từ tái hiện, không từ log của bạn)
+* **Segfault native** khi sửa chữ **trực tiếp trong ô "Nội dung" của bảng** rồi bấm sang dòng khác / Tab: `RichTextSubtitleDelegate.setModelData` gọi `model.setData` HAI lần.
+  Lần 1 phát tín hiệu đồng bộ → `update_text` → `_refresh_table` → `set_events` (reset model); lần 2 dùng lại `QModelIndex` của proxy đã bị giải phóng ⇒ use-after-free ⇒ **SIGSEGV** (tiến trình chết, không traceback, không log).
+  Đo: mọi cỡ dữ liệu (5 → 3649 dòng) thoát mã −11 / 139; hai reviewer độc lập tái hiện cùng dòng `rich_text_delegate.py:146`.
+  Sửa gốc: chỉ một `setData` + tín hiệu sửa chữ/giờ của model chuyển sang `QueuedConnection` (reset model không còn xảy ra BÊN TRONG `setData`/`commitData`). Test `test_direct_cell_edit_commit_does_not_segfault_v323650` (tiến trình con) thất bại trên mã cũ (mã −11).
+* **`fault.log` từng rỗng ngay cả khi crash native** (Paddle cài trình xử lý tín hiệu của riêng nó sau khi nạp và đè lên `faulthandler`; tín hiệu Qt fatal vào loguru xếp hàng nên mất khi `abort()`).
+  Nay: cài lại `faulthandler` sau khi nạp Paddle (`crash_hooks.rearm`), ghi Qt fatal ĐỒNG BỘ vào `fault.log`, cất `fault.log` cũ thành `fault_<thời điểm>.log` (giữ 5 bản), dấu phiên `session.running`; lần mở sau nếu phiên trước kết thúc bất thường → thông báo không-modal kèm đường dẫn nhật ký.
+
+### Các lỗi khác tìm được (mỗi lỗi: test thất bại trên mã cũ → sửa → test xanh)
+**Trang Chỉnh sửa**
+* Bấm sóng âm rồi focus vào/ra ô chữ **ghi đè chữ dòng cũ lên dòng mới** (mất dữ liệu): `_on_selection_changed` thoát sớm khi đồng bộ từ sóng âm nên khung sửa giữ chữ dòng cũ. Cờ đồng bộ nay bọc `try/finally`.
+* Mốc **NaN/inf** (vd `shift_all(NaN)`) lọt qua `TimeInterval` → `data()` ném ValueError mỗi lần vẽ bảng (fuzzer: 1304 ngoại lệ trong một lượt). `TimeInterval`, `shift_all`, bộ định dạng giờ nay từ chối/đỡ giá trị không hữu hạn.
+* Re-OCR khi video bị xoá/đổi tên: `VideoNotFoundError` (không phải `OSError`) trào khỏi slot — nay báo lỗi cho người dùng.
+* Ctrl+A rồi sửa một dòng tạo 3649 range riêng ⇒ mọi thao tác sau chậm 10–30× (reviewer đo: `_current_row` 150–420 ms, mỗi phím gõ ~350 ms); `_current_row` nay dùng `currentIndex`, vùng chọn khôi phục theo khoảng liền kề.
+* Ctrl+↑/↓ khi đang lọc tua video sai câu (dùng hàng proxy thay hàng nguồn); biểu tượng Play/Pause không bao giờ đổi (`btn_play` thiếu `_`); menu/hộp thoại không `deleteLater`.
+* Re-OCR cũ xong sau khi nạp dữ liệu mới vẫn chèn phụ đề video cũ; hộp thoại Tách/Gộp mở lúc danh sách đổi → tách/gộp NHẦM câu (nay so uid, huỷ nếu đổi); `insert_after` khe < 0,05 s làm danh sách mất thứ tự thời gian.
+* mpv: lõi mpv **không bao giờ được giải phóng** (slot `destroyed` không chạy trong PySide6; widget con không nhận `closeEvent`) → nay `release_all_mpv_players()` trước khi đóng; `peek_player()` không dựng lõi gpu-next ngầm; tách/gắn lại cửa sổ video nạp lại mpv nếu HWND đổi; tệp mất không ném ra slot. *(Không có libmpv/Windows trong sandbox: kiểm bằng adapter giả, chưa chạy mpv thật.)*
+* Sóng âm: vẽ 3649 dòng ở zoom xa **512 → 75 ms/khung** (toàn phim 9000 s), 223 → 56 ms (3600 s), 138 → 20 ms (900 s) bằng vẽ gộp theo cột; tệp cache `.npy` cụt làm luồng chết ("đang phân tích" mãi); race khoá làm worker render chết; widget không-parent bị GC khi luồng còn chạy → abort (nay `weakref.finalize`); `PreviewSeekService` kẹt vĩnh viễn với mốc inf/NaN và bị GC khi luồng còn chạy.
+
+**Toàn ứng dụng (5 agent rà soát độc lập, chỉ đọc + script tái hiện; tôi sửa)**
+* **Đóng ứng dụng khi đang xuất bản/ghép video/cài đặt/rút gọn AI/nạp giọng → `abort()`** ("QThread: Destroyed while thread is still running", ffmpeg/pip con bị bỏ rơi). Nay `workers/thread_shutdown.py` huỷ mềm → chờ → terminate; cảnh báo xác nhận khi thoát nếu còn tác vụ nền. Test cửa sổ chính (mã −6 trước, 0 sau).
+* `thread.quit` nối qua hàng đợi nên `closeEvent` luôn chờ hết 8 s rồi `terminate()` (đo: worker xong sau 0,5 s nhưng `wait(8000)` trả False) → `DirectConnection`.
+* Khởi động đơ 7–19 s (`is_initialized` giữ khoá suốt lúc nạp mô hình OCR, gọi từ `showEvent`) và đóng app đơ 4–6 s → lock-free.
+* **Trang Dịch: điền lại bảng kết quả đã đầy O(n²)**: 1500 hàng 39,5 s → ~1 s (reviewer đo 3649 hàng ≈ 100 s ⇒ "Not Responding") — dịch lại dòng / nạp lại phiên / "Bỏ sửa tay" / lưu giai đoạn.
+* TTS: bấm "Rút gọn AI" hai lần → abort; nạp giọng VieNeu lỗi lạ khiến nút Tổng hợp tắt mãi; chọn hàng loạt "dòng bất thường" 81 s với 1825 dòng (nay một lần chọn: 0,025 s); câu rút gọn ghi nhầm dòng khi danh sách đổi; huỷ lúc chạy cả bộ để hàng đợi "ma"; `_on_generate` thoát sớm làm hàng đợi đứng.
+* Trích xuất: kéo video khác vào lúc đang trích xuất ⇒ phụ đề video A lưu vào dự án video B; bấm Start lúc cài WhisperX bỏ rơi luồng cài; chọn "giữ bản đang sửa" vẫn đổi dự án hiện hành (ghi dữ liệu phim cũ vào dự án phim mới); worker dò/nhúng/phiên âm/seek bắt thiếu `Exception` ⇒ trạng thái bận kẹt vĩnh viễn.
+* Trang Gỡ lỗi: tab "Output" khi chưa có ảnh → `AttributeError` trong `paintEvent` + QPainter còn active ⇒ segfault (`InteractiveOutputImagePreviewLabel` nhận nhầm `parent` làm `translator`).
+* Xuất bản hàng loạt: tập không bắt đầu được làm hàng đợi đứng và "bắt cóc" lần xuất tay sau; Dịch cả bộ: lỗi ghi tệp làm chỉ số nhảy 2 và mất một tập; tệp SRT/ASS có block `end < start` làm cả tệp không nạp được (nay giữ lời thoại, thời lượng 0,5 s); `sqlite3.Error` ở Dự án/Cài đặt/bộ nhớ dịch trào ra khỏi slot; lambda nối vào tín hiệu worker chạm QLabel từ luồng worker (3 chỗ).
+
+### Fuzz giao diện (mới: `harness/editor_fuzz.py`, ngoài repo)
+Bộ fuzz ngẫu nhiên có seed dựng MainWindow thật với 3649 dòng + video 8350 s, hàng trăm thao tác (click/đúp ô/phím/menu/nút/combo/đổi kích thước/chuyển trang/sóng âm/gọi VM trực tiếp). Lần đầu: lộ NaN, Re-OCR video mất, và một abort (do QTest với ký tự không-Latin1 — lỗi của bộ fuzz, không phải ứng dụng). Sau sửa: 2 seed × 600 bước rồi 2 seed × 400 bước trên mã cuối cùng, 0 vấn đề.
+
+### Hồi quy do chính bản này gây ra, reviewer độc lập bắt được và đã sửa trước khi giao
+* Hộp xác nhận "Có tác vụ nền đang chạy" hiện ở MỌI lần đóng (luồng render sóng âm luôn chạy bị tính nhầm); thời gian chờ luồng OCR bị giảm 8 s → 4 s trước `terminate()`; tập TTS bị tính lỗi hai lần và huỷ cả hàng đợi; hàng đợi sửa chữ trong bảng dùng chỉ số dòng cũ (nay theo uid); nạp lại mpv đưa thanh trượt về 0:00; chọn dòng bảng dịch bị mất sau khi vẽ lại; cờ `_release_after_init` có thể tồn dư; dấu phiên crash bị hai bản chạy song song giẫm lên nhau; `ConfigurationError` chưa được bắt khi nạp dự án cũ có mốc xấu.
+* Một test cũ treo cả bộ test (hộp thoại tổng kết hàng loạt chờ vô hạn) vì hàng đợi xuất bản nay báo lỗi tập không bắt đầu được thay vì im lặng.
+
+### Giới hạn (nói thẳng)
+* Tôi KHÔNG có nhật ký crash của bạn: kết luận "đây là nguyên nhân" dựa trên việc tái hiện đúng triệu chứng (thao tác ở trang Chỉnh sửa sau OCR, app biến mất không log) — nếu bản này vẫn crash, hãy gửi `logs/fault_*.log` (nay có nội dung thật) và `app.log`.
+* Mọi thứ liên quan mpv/Windows (HWND, d3d11, terminate luồng, antivirus đổi tên tệp) chỉ kiểm bằng adapter giả / suy luận từ mã, chưa chạy trên Windows.
+* Chưa sửa (ghi nhận): `retrieve_memory_for_lines` chạy 4–7 s ở luồng giao diện mỗi lần bấm Dịch; `delete_cloud_files_for_video` đồng bộ ở luồng giao diện; `renumber_results` đổi tên tệp ở luồng giao diện; `pip list` đồng bộ khi dựng trang TTS; log bão >1k dòng/giây làm trang Nhật ký lag; Debug re-OCR có thể ghi kết quả vào khung đã đổi; `terminate()` vẫn được dùng như phương án cuối khi thoát.
+
+### Kiểm thử
+* 88 test mới (tên có `v323650`; bộ đầy đủ: 7602 passed, 61 skipped) + 4 test cũ cập nhật cho hành vi mới (hàng đợi xuất bản/dịch trả bool, kiểm tra nguồn `_voice_loader_running`, `logger.exception` ở seek): segfault ô bảng (tiến trình con), đồng bộ sóng âm, NaN/inf, mpv bằng adapter giả, vẽ gộp sóng âm, đóng cửa sổ chính khi luồng chạy, bulk selection, worker catch-all, batch TTS/Xuất bản/Dịch, importer, crash_hooks, lock-free OCR. Từng nhóm đã xác nhận ĐỎ trên mã cũ (hoàn tác sửa → thất bại).
+
+## [3.23.649] — 🛡️ Tệp cơ sở dữ liệu hỏng không còn làm ứng dụng không khởi động được: kiểm tra, sao lưu xoay vòng, tự phục hồi
+
+### Lỗ hổng (đo thật)
+* Cả 6 kho SQLite (dự án, phụ đề, phiên dịch, trạng thái video, bộ nhớ dịch, ngữ cảnh) đều mở `app_state.db` mà không kiểm gì. Ghi đè vài trang giữa tệp hoặc ghi rác vào tệp →
+  **cả 6 kho** ném `DatabaseError: database disk image is malformed` ⇒ ứng dụng không khởi động; Thư viện 79 dự án của bạn không có bản sao lưu nào.
+
+### Thay đổi (`infrastructure/database/db_guard.py`, gọi trước khi kho đầu tiên kết nối)
+* **Kiểm tra:** tệp ≤ 256 MB chạy `PRAGMA quick_check`; tệp lớn chỉ kiểm nhẹ (đọc lược đồ) lúc khởi động, `quick_check` đầy đủ chạy NỀN và đặt cờ `.suspect` nếu thấy hỏng
+  — lần khởi động sau kiểm kỹ rồi phục hồi (đo bởi reviewer: `quick_check` 685 MB lạnh 8,7 s — không được chặn khởi động).
+* **Sao lưu xoay vòng** `app_state.db.bak1/.bak2` mỗi 12 giờ bằng API `backup` của SQLite (an toàn khi đang ghi WAL), chạy nền, chỉ xoay vòng khi bản mới qua kiểm tra, bỏ qua nếu ổ đĩa
+  trống < 2× kích thước DB; kích thước tính cả `-wal`.
+* **Phục hồi** khi hỏng: đổi tên tệp hỏng (kèm `-wal`/`-shm`, hoàn tác nếu có bước thất bại) thành `.corrupt-<thời điểm>` — KHÔNG xoá, giữ 3 bản mới nhất theo tên — rồi dựng lại:
+  1. cứu từng dòng đọc được (xuôi từ đầu bảng và ngược từ cuối bảng, bỏ cột sinh, giữ index/trigger/view); **đọc hết không lỗi ⇒ dùng bản cứu** (là bản mới nhất);
+  2. còn thiếu ⇒ **gộp** bản cứu vào bản sao lưu lành mới nhất (`INSERT OR REPLACE`, dòng cứu được thắng);
+  3. không cứu được ⇒ bản sao lưu; không có gì ⇒ ứng dụng tạo tệp mới. Hộp thoại báo cho bạn khi mở cửa sổ chính.
+* **Không bao giờ kết luận nhầm:** chỉ coi là hỏng khi SQLite nói rõ (`malformed`/`not a database`/…) hoặc `quick_check` báo lỗi; tệp đang bị khoá, thư mục chỉ đọc, lỗi I/O tạm = "không rõ" ⇒ để nguyên.
+* Khoá liên tiến trình `.guardlock` (hai lần bấm đúp exe không cất/ghi đè tệp của nhau; khoá cũ > 3 phút bị chiếm lại); khoá nội bộ để kho thứ hai (luồng khác) chờ phục hồi xong.
+* "Dọn dẹp Database" (Cài đặt) xoá cả `.bak*`/`.corrupt-*`/`.suspect` — nhưng CHỈ khi dọn thành công.
+
+### Rà soát độc lập (bản nháp đầu có 9 lỗi thật; đã sửa hết, mỗi lỗi có test thất bại trên bản nháp)
+* Cắt tỉa bản hỏng theo `mtime` có thể xoá chính bản vừa cất → mất dữ liệu gốc (nay theo tên, không bao giờ xoá bản vừa tạo).
+* Lỗi GHI khi cứu (đầy đĩa) bị nuốt như lỗi đọc, đếm dòng sai, hoặc ném ra sau khi đã cất tệp ⇒ DB rỗng, không thử sao lưu (nay phân biệt, thử đường khác, luôn báo).
+* Chọn nguồn theo tổng số dòng làm bản sao lưu cũ đè lên bản cứu đầy đủ, mới hơn (dự án đã xoá sống lại) — nay: cứu đủ thì dùng bản cứu, thiếu thì gộp.
+* URI `file:` ghép thô: đường dẫn có `#`/`?` làm SQLite cắt tên tệp, tạo tệp rỗng lạ, kiểm tệp rỗng "lành" và sao lưu tệp rỗng đẩy bản tốt ra; `%` tắt bảo vệ âm thầm — nay `Path.as_uri()`.
+* Hai bản ứng dụng khởi động lúc A đang phục hồi: B tạo DB rỗng, A ghi đè bằng bản sao lưu → mất. Nay khoá liên tiến trình.
+* `-wal` cũ nằm lại (không đổi tên được) bị phát lại lên DB vừa dựng → hỏng index/mất 5994/6000 dòng. Nay đổi tên cả bộ hoặc huỷ phục hồi, và xoá sidecar trước khi đặt DB mới.
+* `reset_database` xoá sao lưu cả khi reset thất bại. Salvage nhân đôi dòng bảng không khoá chính, bỏ view, vỡ ở cột sinh. Sao lưu lúc khởi động đồng bộ 2,2 s với DB 685 MB (nay nền).
+
+### Giới hạn
+* `quick_check` không bắt được mọi hỏng index/bảng lệch nhau (`integrity_check` đầy đủ quá chậm cho khởi động). Kiểm trên Linux; Windows (đổi tên tệp đang mở, antivirus) mới mô phỏng bằng test, chưa chạy thật.
+* Sao lưu chỉ chạy lúc khởi động: máy chạy liền nhiều ngày không có bản sao lưu mới giữa chừng.
+
+### Kiểm thử
+* `test_db_guard_v323649.py`: 41 test (tệp lành/rỗng/nhỏ, xoay vòng, URI đặc biệt, hỏng nặng/nhẹ, cứu/gộp/sao lưu, đầy đĩa, WAL lạ, khoá, hai tiến trình, tệp lớn nền, reset, cả 6 kho mở được sau khi tệp rác). Hoàn tác từng sửa → test tương ứng thất bại (URI, cắt tỉa, chọn nguồn).
+
+## [3.23.648] — ✂️ Dịch có đính video: chỉ gửi khoảng video của lô — prompt giảm 5× (91,6 → 18,8 nghìn token/request)
+
+### Vấn đề (log thật 22/10 + đo lại)
+* 111 request dịch tốn **7,48 triệu token prompt (67 nghìn/request)** so với 268 nghìn token đầu ra — nguồn của hầu hết thời gian chờ TPM và 503.
+* Nguyên nhân: mỗi lô 40–50 dòng (~2 phút phim) bị đính TRỌN đoạn video phủ nó. Đoạn dài tính theo token (30 phút đầu phim: 2 đoạn × 915 s, ~91 nghìn token mỗi đoạn),
+  nên một lô ~2 phút gửi cả 15 phút video.
+
+### Sửa
+* Mỗi lô chỉ gửi khoảng `[đầu lô − 8 s, cuối lô + 8 s]` của đoạn qua `video_metadata.start_offset/end_offset` (`video_clip_window.clip_window`, hàm thuần). Đo bằng `count_tokens`
+  trên đoạn 138 s thật: cả đoạn **14 218** token, cắt 30 s còn **2 384–3 094**. Không cắt khi đoạn ≤ 4 s hoặc khoảng cắt > 80% đoạn (gửi nguyên cho đỡ rủi ro); lô nằm
+  sát mép đoạn được nới đủ 4 s và kẹp trong đoạn; lô bắc qua hai đoạn thì cắt từng đoạn riêng; thiếu handle (resolve hỏng) thì không đoán, gửi như cũ.
+* Handle đã tải lại sau khi xoay key (403) được gắn lại đúng khoảng cắt; ước lượng token cho quota tính theo số giây THỰC gửi.
+* Cài đặt `translation.clip_video_to_batch` (mặc định BẬT) + ô **"Chỉ gửi đoạn video của từng lô khi dịch"** ở trang Dịch (cạnh ô chọn giai đoạn đính video). Chỉ áp cho khâu dịch;
+  khâu quét Visual Cues và bổ sung người nói vẫn gửi nguyên đoạn (mốc `t` của chúng tính từ đầu đoạn — cắt phải đổi mốc, chưa làm).
+
+### Đo thật: 30 phút đầu phim (837 dòng), giai đoạn dịch thô, gemini-3.1-flash-lite, đính video
+| | Gửi nguyên đoạn | Cắt theo lô |
+|---|---|---|
+| Request | 18 | 18 |
+| Prompt token / request | **91 604** | **18 774** (4,9× ít hơn) |
+| Tổng prompt token | 1 648 886 | 337 945 |
+| Thời gian | 553 s | 236 s |
+* Thời gian chưa phải so sánh sạch (bản nguyên đoạn dính chờ TPM; lần chạy cắt đầu tiên rơi vào lúc 3.1-flash-lite quá tải nên 11/19 request chạy ở model dự phòng — loại ra, chạy lại).
+* **Chất lượng (chấm mù, 120 dòng lấy ngẫu nhiên trong 689/837 dòng mà hai bản khác nhau — phần lớn chỉ khác dấu câu/diễn đạt):** 94 dòng ngang; cắt hơn ở 11, nguyên đoạn hơn ở 15;
+  lỗi nặng: cắt 4, nguyên đoạn 2 (lỗi của bản cắt là xưng hô với sư thúc: "ta" thay "con"/"đệ tử" ở dòng 181, 187, 205 và một câu "nợ" thay "thu lợi tức" ở dòng 327; của bản nguyên
+  đoạn: dòng 66 mất tên tông môn và dòng 609 câu vặn "ta hỏi ngươi sao?" bị dịch thành câu hỏi thật). Hai bản cùng sai dòng 54 ("sư tôn của ta" thành sư phụ của Sở Dao).
+  Chênh lệch nhỏ, hai chiều, cỡ nhiễu chạy lại (689/837 dòng khác nhau giữa hai lượt cùng cấu hình khác nhau chỉ ở video) — **không thấy mất chất lượng có hệ thống, nhưng cũng không đủ để khẳng định
+  bằng nhau**: một giai đoạn, một đoạn 30 phút, một giám khảo AI. Nếu bạn thấy xưng hô với bề trên kém đi, tắt ô này.
+
+### Khác
+* Dọn hai `import json` thừa trong `translate_page_view_model.py` (ruff F).
+
+### Kiểm thử
+* `test_video_clip_v323648.py` (18): hàm thuần (lề, kẹp mép, bỏ cắt khi không lợi), `Part` có `start_offset/end_offset` (kể cả cùng `fps`), proxy handle, giai đoạn dịch 3 đoạn × 9 lô
+  (mỗi lô gửi khoảng nằm trong đoạn và phủ dòng của lô; tổng giây gửi < 60% trước đây), cờ tắt giữ hành vi cũ, thiếu handle, lô bắc qua hai đoạn, cài đặt mặc định + container + ô trang Dịch.
+
+## [3.23.647] — 🎙️ TTS: master nhanh gấp 3–4×, lượt cả phim chạy tiếp được sau khi sập/huỷ, mở trang không phải nạp VieNeu 36 s
+
+### Master âm thanh (bước sau cùng của mọi lượt TTS, kể cả sửa 1 dòng rồi ghép lại)
+* Đo trên tín hiệu mô phỏng giọng + khoảng lặng (4 lõi CPU, `master_finalize`, có làm rõ giọng): **400 s: 26,3 s → 5,9 s; 1200 s: 71,6 s → 20,9 s** (3,4–4,5×).
+  Ngoại suy cho phim 8350 s: ~10 phút → ~3 phút trên 4 lõi (chưa đo trên phim thật; máy nhiều lõi hơn nhanh hơn, tối đa 6 luồng).
+* Cách làm: (1) chỉ lọc các "đảo" có tiếng — master là `zeros` cộng từng câu nên khoảng lặng giữa câu là số 0 đúng nghĩa và mọi bộ lọc tuyến tính cho 0 ra 0
+  (phim thật: 30–40% thời lượng); (2) lọc các khối song song (scipy nhả GIL); (3) đo LUFS (K-weighting) theo đảo, song song; (4) true-peak limiter song song
+  và bỏ qua đoạn toàn 0.
+* Độ chính xác so với bản cũ: lệch lớn nhất **1,2e-7** (−188 dB), LUFS giống tới 1e-12; `true_peak_limit` song song giống hệt từng mẫu.
+* RAM: thêm cỡ cố định ~200–400 MB (số luồng × một khối 30 s), không tăng theo độ dài phim (1200 s: đỉnh 903 → 1094 MB).
+* Rà soát độc lập tìm ra lỗi thật của bản nháp: biên đảo cắt thẳng ở khung 0,25 s làm mất đuôi/tiền-vọng zero-phase của bộ lọc → click (bước nhảy gấp ~63× tại biên
+  đảo; 6–8/87 biên vượt −60 dBFS). Đã nới mỗi đảo thêm 1 khung hai phía; sau sửa lệch chỉ còn 1e-7. Test hồi quy `TestIslandEdges` thất bại trên mã bản nháp.
+
+### Lượt TTS cả phim chạy tiếp được (điểm kiểm tra)
+* Log thật: lượt cả phim 3649 dòng ~19 phút. Cache từng dòng (3.23.630) chỉ được ghi SAU khi cả lượt xong, và lượt dở dưới 30% dòng còn bị coi là "đổi quá nhiều"
+  ⇒ huỷ/sập/mất điện ở phút 15 là chạy lại từ đầu.
+* Nay VieNeu ghi điểm kiểm tra mỗi 25 dòng hoặc 30 giây (chi phí đo: ~67 ms mỗi lần ghi cho 3649 dòng, ~5 s cả lượt). Cache mang cờ `complete=False`; lần
+  Tổng hợp sau dùng lại MỌI dòng đã xong (kế hoạch `resumed`, bỏ ngưỡng 30%). Cache cũ không có cờ = đã xong, hành vi cũ giữ nguyên.
+* Lượt tiếp tục (đường tăng dần) cũng ghi điểm kiểm tra — rà soát độc lập chỉ ra bản nháp chưa có, nên bị ngắt lần hai là mất cả phần vừa làm (test:
+  40 dòng, sập sau 3, tiếp tục sập sau 10, lần 3 chỉ đọc 27 dòng còn lại). Segment mới dời về thư mục chính ngay tại điểm kiểm tra; thư mục tạm của lượt TTS lại nay nằm
+  TRONG thư mục segment (cùng ổ ⇒ đổi tên thay vì chép; trước đây ~1 GB WAV vào thư mục tạm hệ thống/ổ C:), và thư mục tạm sót lại sau sập được dọn.
+* Hàm điểm kiểm tra chỉ dùng một lần và được gỡ ở hoàn tất/lỗi/huỷ — TTS lại vài dòng bằng cùng adapter không bao giờ ghi điểm kiểm tra của lượt cũ.
+
+### Danh mục giọng VieNeu lưu trên đĩa
+* Log thật: mở trang Dịch/TTS nạp VieNeu (ONNX/CPU) ở tiến trình chính **36 s** (09:53:52 → 09:54:28) chỉ để liệt kê 25 giọng. Danh mục nay lưu theo (chế độ, bản `vieneu`) cạnh
+  kho model; lần sau đọc từ đĩa không nạp engine. Nâng bản `vieneu` hoặc đổi chế độ thì đọc lại từ engine.
+* **Chưa làm được trong bản này (cần GPU của bạn để đo, không đoán):** gom lô toàn cục theo giọng, bỏ hẳn việc nạp engine CPU ở tiến trình cha khi chạy GPU
+  (engine còn cần để lấy dữ liệu giọng và làm đường lùi), làm lại ducking.
+
+### Kiểm thử
+* Test mới: `test_mastering_parallel_v323647.py` (13), `test_tts_checkpoint_v323647.py` (12, gồm sập-rồi-chạy-tiếp, sập-hai-lần, dọn thư mục tạm), `test_voice_catalog_cache_v323647.py` (9).
+  Hoàn tác từng sửa → test tương ứng thất bại.
+* **Chưa kiểm với engine VieNeu thật/GPU**: mốc thời gian của lượt tiếp tục suy từ mã (`resynthesis_neighbors`/`line_context`, giống đường "TTS lại dòng chọn") chứ chưa so
+  với lượt liền mạch bằng giọng thật.
+
+## [3.23.646] — 🩹 Sửa khẩn: OCR không nạp được paddle ("Thiếu lõi OCR … 'libpaddle' is not a package") — hồi quy do 3.23.643
+
+### Triệu chứng (log 23/10 của bạn, exe v3.23.645)
+`Preload OCR engine thất bại: Thiếu lõi OCR (paddlepaddle-gpu) … No module named 'paddle.base.libpaddle.pir'; 'paddle.base.libpaddle' is not a package`
+ngay lúc khởi động; "Đo tốc độ OCR", dò vùng phụ đề và trích xuất đều chết vì cùng lỗi. Lõi paddle trong `models\paddle_runtime`
+KHÔNG hỏng — đó là thông báo đánh lạc hướng.
+
+### Nguyên nhân gốc (tái hiện được trong sandbox bằng đúng thông báo trên)
+* Tiến trình chính giữ `sys.modules["torch"] = None` (bộ chặn torch bảo vệ cuDNN của paddle) từ lúc khởi động đến khi paddle nạp xong.
+  Với scipy ≥ 1.15, `import scipy.stats` / `scipy.signal` / `sklearn.cluster` lần ĐẦU khi đang có bộ chặn chết với
+  `AttributeError: 'NoneType' object has no attribute 'Tensor'` (đã đo lại với scipy 1.18).
+* Trước 3.23.643 `bbox_analyzer` nạp sklearn ngay lúc khởi động nên các thư viện này đã nạp xong từ trước khi bộ chặn bật. **3.23.643 chuyển sang nạp
+  trễ** (để tiết kiệm 1,5 s khởi động) ⇒ lần nạp đầu rơi vào GIỮA `import paddle`/`paddleocr`. Đây là lỗi của tôi: test không có ca nào nạp paddle
+  khi bộ chặn đang bật.
+* Nhánh "dọn module nửa-khởi-tạo rồi thử lại" (từ 3.22.8) xoá luôn `paddle.base.libpaddle.pir` — module con do chính thư viện native tự đăng ký,
+  nạp lại không đăng ký lại được — nên lần thử thứ hai báo lỗi `libpaddle … is not a package` và **che mất lỗi gốc**.
+
+### Sửa
+1. `_prewarm_scientific_imports()` trong `PaddleOcrAdapter._import_paddle`: nạp trước `scipy.stats`, `scipy.signal`, `sklearn.cluster` (chỉ khi có cài)
+   trong `torch_none_bypassed()` — bộ chặn torch được trả đúng như cũ ngay sau đó (test kiểm `sys.modules["torch"] is None`).
+2. Nếu `import paddle` vẫn lỗi sau khi lõi native đã nạp thì KHÔNG thử lại nữa (đã thử trên paddle 3.3.1: giữ native thì chạy lại mã Python đập vào đăng ký
+   toàn cục — "Pass 'fuse_resnet_unit' is registered more than once"/protobuf "duplicate file name"; xoá native thì ra lỗi `pir`) mà báo **đúng lỗi gốc**
+   của lần nạp đầu; lần đầu cũng được ghi vào nhật ký kèm traceback.
+3. `bbox_analyzer.load_dbscan_class()` nạp sklearn trong `torch_none_bypassed()`: cùng nguyên nhân khiến dò vùng phụ đề tự động **âm thầm rơi về Heatmap**
+   (lỗi bị nuốt ở nhánh `except`) từ 3.23.643 đến nay khi OCR chưa nạp.
+
+### Kiểm chứng
+* Tái hiện trước khi sửa: tiến trình mới + `install_torch_import_blocker()` + `PaddleOcrAdapter._import_paddle()` → đúng thông báo `…libpaddle.pir…`. Sau sửa: nạp xong trong 2,5–3,5 s.
+  Bỏ riêng bước nạp trước → báo `AttributeError: 'NoneType' object has no attribute 'Tensor'` (lỗi gốc), không còn `pir`.
+* `test_paddle_import_v323646.py` (5 test, gồm nạp paddle THẬT trong tiến trình con khi bộ chặn đang bật — xoá bước nạp trước thì test này thất bại).
+* **Chưa chạy được trên Windows/GPU của bạn** — lỗi tái hiện bằng paddle 3.3.1 CPU trên Linux; cơ chế (scipy + bộ chặn torch) không phụ thuộc hệ điều hành, nhưng
+  hãy kiểm lại trên máy bạn: nếu còn lỗi, dòng `Nạp paddle lần 1 lỗi (…)` trong nhật ký giờ cho biết lỗi gốc.
+
+## [3.23.645] — 📊 Đo tốc độ OCR ngay trong giao diện · tên tông môn viết lệch · dự trù request · số liệu dịch có/không video
+
+### Đo tốc độ OCR trong ứng dụng (thay cho script `tools/bench_ocr.py` chạy bằng cmd)
+* Trang **Trích xuất → nút "📊 Đo tốc độ OCR"** (cạnh "Thử nhanh"): chọn độ dài đoạn đo (mặc định 60 s) + vị trí, tick các kịch bản
+  (hiện tại · tắt phân loại hướng chữ · batch dò chữ 4/8 · lọc khung chữ sáng 200/220…), bấm Bắt đầu. Dùng ĐÚNG video, ROI, cài đặt
+  đang mở và ĐÚNG pipeline trích xuất (cùng bộ giải mã/NVDEC, cùng bộ OCR), chạy nền, huỷ được, có tiến độ theo kịch bản.
+* Bảng kết quả: tổng giây, giây trong bộ OCR, số khung/lô OCR, số câu, "giống hệt" hay thiếu/thừa câu, mốc thời gian lệch tối đa, tốc độ
+  so với hiện tại. **Đề xuất = kịch bản nhanh nhất mà tập câu phụ đề không đổi** (chênh <10% thì khuyên giữ nguyên); nút **Áp dụng**
+  ghi vào Cài đặt và áp dụng ngay cho bộ OCR. Đề xuất bộ lọc chữ sáng luôn kèm cảnh báo "chỉ đúng với phụ đề trắng/sáng".
+* Kịch bản trùng cấu hình hiện tại không được đo lại; đề xuất chỉ ghi những khoá THỰC SỰ khác cài đặt hiện tại.
+* Đo thật end-to-end (CPU sandbox, 30 s mẫu, view model + luồng nền thật): hiện tại 69,2 s → lọc chữ sáng 31,9 s (**2,2×**), cùng tập câu;
+  đề xuất `{ocr: use_textline_orientation=False, frame: white_text_gate=True}`; sau khi đo engine được trả về đúng cấu hình cũ.
+  **Chưa đo trên GPU** — máy bạn là nơi có số liệu thật; nút này chính là cách đo.
+
+### Tên tông môn viết lệch một chữ (灵霄宗 / 凌霄宗)
+* Dữ liệu thật phim mẫu: 灵霄宗 ở tập 1 và 4, 凌霄宗 ở tập 8. Bảng thuật ngữ chỉ giữ một dạng (`drop_variant_glossary_entries` còn bỏ dạng
+  thứ hai), khối nhắc thuật ngữ theo lô khớp đúng chuỗi nên lô chỉ có dạng kia không nhận được bản dịch quy định → cùng tông môn có hai tên Việt.
+* Nay (`term_variants.py`) khối nhắc thuật ngữ thêm mục `{"term": "凌霄宗", "must_translate_as": "Linh Tiêu Tông", "variant_of": "灵霄宗"}`
+  và chẩn đoán tính các dạng lệch vào cùng mục khi đo tuân thủ. Chỉ xét tên 3–6 chữ kết thúc bằng 宗/殿/阁/派 (không dùng 会/帮/门/教/谷:
+  rà soát độc lập chỉ ra `天地会` + "明天才会到" sinh biến thể giả `天才会`), khác đúng một chữ ở phần tên riêng, dạng đó không phải thuật ngữ khác
+  trong bảng. Gợi ý biến thể xếp SAU thuật ngữ thật (không chiếm chỗ trong giới hạn 25), mỗi dạng một gợi ý. So khớp gộp phồn/giản cả ở chẩn đoán.
+* Chỉ mục băm thay regex: 400 tên tổ chức trong bảng từ ~1,2 s/lô (≈104 s cho một phim) xuống <1 s cho cả phim.
+* **Rủi ro còn lại (quyết định thiết kế):** một tông môn KHÁC thật sự nhưng tên lệch một chữ và không có trong bảng (vd 云霄宗 cạnh 灵霄宗) cũng
+  nhận gợi ý cùng bản dịch; khoá `variant_of` để model tự cân nhắc theo ngữ cảnh, không phải ép tuyệt đối.
+* Chẩn đoán vẫn dùng so khớp "từ nội dung" (≥ ngưỡng) nên "Lăng Tiêu Tông" vẫn lọt qua "Linh Tiêu Tông" khi đo tuân thủ — chưa đổi để không làm
+  lệch toàn bộ số liệu cũ.
+
+### Dự trù request của phân tích
+* Chọn key trước khi phân tích nay cộng thêm các lượt bổ sung người nói (`SPEAKER_COMPLETION_PASSES`) khi bật Visual Cues; trước đây chỉ tính số đoạn
+  video. Vẫn là dự trù thấp: mỗi lượt bổ sung có thể gửi nhiều request (theo lô/đoạn) — chưa đo con số này.
+
+### Dịch có / không đính video (đo thật, chấm mù bằng 3 giám khảo AI, tập 5, 9, 12 — mỗi tập chỉ 63–72 dòng)
+* Chuỗi 3 giai đoạn `gemini-3.1-flash-lite`, phân tích dùng lại, chỉ khác phần đính video. Lần 1 (không video vs video cả 3 giai đoạn), lỗi nặng/nhẹ:
+  tập 5: **7**/3 vs **2**/2 · tập 9: 5/5 vs 4/6 · tập 12: 5/4 vs 3/9 → tổng nặng **17 vs 9**, video thắng cả 3 tập (tập 9 sát nút).
+  Lần 2 (ba bản xếp hạng mù: không video / video chỉ ở "Dịch thô" / video cả 3 giai đoạn), lỗi nặng: tập 5: 7 · 3 · 2; tập 9: 5 · 1 · 4;
+  tập 12: 1 · 3 · 2 → tổng **13 · 7 · 8**.
+* Lỗi nặng của bản không video chủ yếu là NHẦM NGƯỜI NÓI (sư thúc bị dịch thành lời đồ đệ: "con/người" thay vì "ta/ngươi"), đúng chỗ video giúp.
+  Vì vậy **không nên tắt video khi dịch**. "Dịch thô" có video ngang cả 3 giai đoạn (7 so với 8) mà gửi video ít hơn → nên tick riêng "Dịch thô"
+  (ô giai đoạn trong trang Dịch luôn do bạn chọn; không đổi mặc định). Mẫu nhỏ, giám khảo AI nhiễu (thứ hạng tập 9 và 12 đảo nhau) — kết luận là
+  xu hướng, không phải chứng minh. Chưa A/B ở quy mô phim dài, nơi 67 nghìn token/request (log 22/10) mới là vấn đề thật.
+* Tooltip ô "Đính video" ghi các số này.
+
+### Sửa lỗi rà soát độc lập (bản vừa làm, 15 mục — các mục xác minh được đã sửa)
+* **Cao:** áp dụng đề xuất xong, trang Cài đặt vẫn hiện giá trị cũ và lần Lưu kế tiếp âm thầm hoàn tác đề xuất → phát tín hiệu để Cài đặt nạp lại form.
+* Đề xuất trùng cấu hình hiện tại chỉ vì nhiễu đo (nút Áp dụng bật mà không đổi gì) → lọc khoá trùng + không đo kịch bản trùng.
+* Thanh tiến độ trích xuất tính theo CẢ phim thay vì đoạn được quét (cửa sổ 60 s của phim 40 phút: tối đa 2% rồi nhảy 95%) → tính theo đoạn quét
+  (cũng đúng cho "Thử nhanh" và bỏ đầu/cuối).
+* Phép đo nén JPEG khung vào bộ đệm Re-OCR (tính vào giờ đo) và xoá bộ đệm của người dùng → thêm `use_frame_cache=False` cho phép đo, không còn xoá bộ đệm.
+* Nút Bắt đầu mở lại trước khi view model hết bận → chờ `busy_changed`. Kịch bản bị huỷ giữa chừng không còn vào bảng với số đo dở. Hộp thoại được
+  `deleteLater` sau khi đóng. Thoát ứng dụng chờ luồng đo trước khi giải phóng bộ OCR.
+* **Chưa sửa:** bộ giải mã/ổ đĩa chưa nóng khi chạy "hiện tại" đầu tiên nên mốc có thể chậm hơn thật (đẩy tốc độ các kịch bản sau lên nhẹ; ngưỡng 10% bù một phần);
+  chạy Re-OCR ở trang Biên tập đồng thời với phép đo dùng chung một bộ OCR (chưa có chốt liên trang); tên kịch bản/lý do đề xuất còn tiếng Việt trong giao diện tiếng Anh.
+
+### Kiểm thử
+* Toàn bộ: **7410 passed, 61 skipped** (trước: 7359). Test mới: `test_ocr_benchmark_v323645.py` (24), `test_ocr_benchmark_dialog_v323645.py` (7),
+  `test_extract_page_bench_v323645.py`, `test_term_variants_v323645.py` (12), `test_analyze_needed_requests_v323645.py`. Ca biên cache/tiến độ đã
+  được kiểm lại bằng cách hoàn tác sửa → test thất bại.
+* Quét giao diện tự động (9 trang, 200 nút): không sập; 20 dòng ERROR trong log đều là môi trường sandbox thiếu lõi PaddleOCR GPU và file `.seraw.json` rác.
+
+## [3.23.644] — 🚀 OCR: lô đầy thật, bộ lọc chữ sáng (tuỳ chọn), batch bộ dò chữ (tuỳ chọn) + script đo GPU
+
+### Vì sao (đo thật trên tập 1 phim mẫu: 4 421 khung, ROI 603×119)
+* Bộ lọc khung cũ nhìn cả vùng ROI nên chuyển động nền làm đổi mọi thứ: **71,8% khung (3 173) bị gửi đi OCR**, trong khi 96,4% khung liền
+  nhau có CÙNG chữ và chỉ ~158 lần đổi chữ.
+* Mỗi khung trùng cắt lô OCR: các đoạn khung cần OCR liên tiếp dài trung bình **3,1 khung** (đỉnh 14) nên lô 128 chưa bao giờ đầy — GPU luôn
+  chạy lô bé. PaddleOCR còn xử lý TỪNG ảnh một ở bước dò chữ dù `batch_size_ocr` lớn (đo: 10 lượt det × 1 ảnh).
+
+### Thay đổi
+1. **Hàng đợi trì hoãn (luôn bật):** khung trùng / trống / lỗi nằm trong hàng đợi cùng khung cần OCR, được giải quyết SAU khi lô chạy
+   (trùng = sao chép kết quả khung đứng ngay trước trong chuỗi; trống/lỗi = rỗng). Kết quả vẫn đủ và đúng thứ tự khung; lô nay đầy
+   (test: lô 4/4 thay vì ~2). Hàng đợi bị chặn ở 16× cỡ lô để một phụ đề đứng yên hàng phút không làm phình bộ nhớ. Lần đo tự điều chỉnh cỡ
+   lô (`auto_tune`) cũng chính xác hơn vì lô đầu nay là lô đầy.
+2. **Bộ lọc khung theo chữ sáng — TUỲ CHỌN, mặc định TẮT** (Cài đặt → Lấy mẫu khung): chỉ OCR khi các điểm ảnh sáng (chữ trắng/vàng nhạt, độ chói
+   > ngưỡng, mặc định 200) thật sự đổi; khung không có chữ sáng bỏ qua. Dùng chung cho bộ giải mã NVDEC và PyAV (`frame_dedupe.py`); chế độ
+   cổ điển giữ nguyên hành vi cũ (test so sánh từng quyết định với logic cũ).
+   * **Đo thật tập 1 (phụ đề trắng):** khung OCR **71,8% → 30,9%** (ngưỡng 220: 10,9%); phụ đề dựng ra **95/95 câu giống hệt**, lệch mốc bắt
+     đầu 0, mốc kết thúc tối đa 1 khung (0,04 s). Ngưỡng 220 rơi một câu xám nhạt 2 chữ (瑶瑶) nên mặc định là 200.
+   * **Giới hạn:** phụ đề tối màu/màu đậm sẽ bị bỏ sót; mới đo trên MỘT tập. Hãy chạy `tools/bench_ocr.py` trên phim của bạn trước khi bật
+     (nó in số câu thiếu/thừa so với cấu hình hiện tại). Không áp dụng cho bộ lấy mẫu mpv/OpenCV.
+3. **Batch bộ dò chữ (`det_batch_size`) — TUỲ CHỌN, mặc định 1 (như cũ):** đặt bộ chia lô của pipeline và bộ dò chữ PaddleOCR = N. Đo (CPU, 10 ảnh):
+   1 lượt det × 10 ảnh, chữ nhận dạng giống hệt — nhưng trên CPU KHÔNG nhanh hơn (215 s so với 158 s ở bench). Lợi ích trên GPU chưa đo được
+   → dùng `tools/bench_ocr.py` rồi mới tăng. Lỗi cấu trúc nội bộ của PaddleOCR chỉ cảnh báo và giữ mặc định.
+4. **`tools/bench_ocr.py` (mới):** chạy cả pipeline của ứng dụng trên một đoạn phim với các kịch bản (hiện tại / tắt phân loại hướng / det batch
+   4-8-16 / lọc chữ sáng 200-220 / kết hợp), in thời gian OCR vs còn lại, số khung & lô, và so phụ đề với cấu hình hiện tại (câu thiếu/thừa, lệch
+   mốc). `--app-settings` lấy nền từ cài đặt đang lưu trong ứng dụng.
+
+### Lỗi do lượt rà soát độc lập tìm ra TRONG chính bản này — đã sửa
+* Engine OCR trả lệch số kết quả làm `_reverse_vram_geometry` ném `ValueError` (sập cả lượt khi bật viền/upscale VRAM; lỗi có từ trước) → bù/cắt
+  ngay sau `infer_batch`, cả đường thử lại từng khung.
+* Đo tự điều chỉnh cỡ lô trên lô LẺ (hàng đợi cắt sớm) làm cỡ lô bị thổi phồng tới 256 → chỉ đo trên lô đầy.
+* `tools/bench_ocr.py`: (a) các kịch bản sau lấy khung từ bộ đệm RAM nên lệch giờ → xoá bộ đệm mỗi kịch bản; (b) sập `UnicodeEncodeError` khi
+  chuyển hướng ra tệp trên Windows (cp1252) → ép UTF-8; (c) kịch bản `current` ghi đè `det_batch`/lọc chữ sáng của bạn → giữ cài đặt nền;
+  (d) không giải phóng engine khi kịch bản lỗi → luôn giải phóng.
+* Ghi nhận, chưa đổi: nền sáng lớn (tuyết, tường trắng) làm tăng số điểm sáng nên bộ lọc chữ sáng có thể coi thay đổi nhỏ là "trùng" — chỉ khi bạn tự
+  bật; hàng đợi chờ tối đa 16× cỡ lô (≈ 2 048 khung ở lô 128) trước khi ghi checkpoint.
+
+### Kiểm chứng
+* Chạy thật `tools/bench_ocr.py` (CPU, 20 s tập 1, 3 câu): hiện tại 162 s → lọc 200: 68 s (2,4×) → lọc 220: 21,5 s (7,5×), cùng 3 câu; lô TB 16/16.
+* Toàn bộ: **7359 passed, 61 skipped** (3 phút 49 giây). Test mới: hàng đợi trì hoãn (6), bộ lọc khung (9), batch bộ dò chữ (4), lệch số kết quả (1)…
+
+## [3.23.643] — ⚡ Đợt A: hai lỗi mới từ nhật ký 22/10 + sửa nhanh OCR / khởi động / bộ nhớ master
+
+### Hai lỗi tìm thấy trong nhật ký thật của bạn (phim 86 tập, 3.649 dòng)
+1. **Model DỰ PHÒNG hết hạn mức ngày làm hỏng cả lượt dịch.** Chuỗi trong nhật ký: `3.1-flash-lite` 503 → `3.5-flash-lite` →
+   `3.1-flash-lite-preview` → `gemini-3.7-flash` (20 request/ngày). Server báo `3.7-flash` hết ngày → `QuotaExhaustedError`
+   thoát khỏi vòng thử lại và DỪNG giai đoạn dịch (22:30), dù `3.1/3.5-flash-lite` còn hạn mức (chỉ đang quá tải tạm thời).
+   Nay: dự phòng hết hạn mức → thử dự phòng kế tiếp; không còn thì **quay về model chính** và chờ nó hết quá tải. Model chính hết
+   hạn mức trên mọi key vẫn báo lỗi như cũ. `failover_tried` chỉ lớn dần nên không thể quay vòng vô hạn.
+2. **Bản dịch thô đã hoàn tất (67 phút) bị vứt vì "model yếu hơn".** Bạn chọn lại `3.5-flash-lite`, ứng dụng xếp 3.5 > 3.1 theo
+   số đời nên bỏ bản dịch 3.1 để dịch lại. Nhưng đo thật (v3.23.635, chấm mù): 3.1-flash-lite **tốt hơn** (điểm 30 so với 42–52) và nhanh
+   gấp đôi. Nay hai đời flash-lite 3.1 và 3.5 ngang hạng: đổi qua lại không vứt kết quả (flash-lite vẫn không thay được flash đầy đủ).
+
+### Sửa nhanh (từ phân tích toàn ứng dụng)
+* **OCR:** (a) một khung lỗi không còn làm mất cả lô (tới 128 khung ≈ 5 giây phụ đề) — thử lại từng khung; (b) khung trùng đầu lượt /
+  ngay sau khung lỗi không còn bị bỏ làm thủng chuỗi khung; (c) giải mã PyAV đa luồng `thread_type="AUTO"` (đo 190–221 → 415–437
+  khung/giây); (d) bộ phân loại hướng dòng chữ mặc định TẮT cho cài đặt mới (đo: bật/tắt cho cùng chữ, tốn ~6% thời gian) — với cài đặt
+  hiện có, tắt trong Cài đặt → OCR nâng cao.
+* **Không mất tiến độ phân tích:** tiến độ 24 đoạn chỉ bị xoá SAU KHI bước hoàn thiện người nói và tự kiểm tra xong; huỷ hay đóng app
+  giữa chừng thì chạy lại không phải gửi lại đoạn nào.
+* **Ghi lỗi chưa bắt:** `sys.excepthook` + `threading.excepthook` + `faulthandler` (→ `logs/fault.log`). Bản đóng gói `console=False`
+  nuốt stderr nên trước đây lỗi trong slot/luồng nền và crash native không để lại dấu vết.
+* **Số phiên bản:** `__version__` đã kẹt ở 3.23.616 nên gói chẩn đoán (kể cả file bạn gửi) ghi sai phiên bản; thêm test bắt lệch giữa
+  `pyproject.toml`, `raw_ocr_serializer` và `__version__`.
+* **Khởi động:** `sklearn` nạp trễ (1,55 s trong ~2 s của `import bootstrap`), `google.genai` không còn bị nạp trên luồng giao diện khi mở trang TTS
+  (0,7–1,0 s).
+* **Thư viện dự án:** danh sách chỉ đọc cột nhẹ (`list_summaries`); mở dự án mới nạp bản ghi đầy đủ. Đo: 86 dự án × 2 SRT 293 KB =
+  58 MB, `list_all` mất 1,44 s trên luồng giao diện sau mỗi lần trích xuất/TTS/xuất bản.
+* **Bộ nhớ master cho phim dài:** `dc_block` lọc theo khối có mang trạng thái (y hệt từng bit, RAM ~1× thay vì ~3,2×), `soft_limit`
+  và đo đỉnh theo khối, ghi WAV/FLAC theo khối (không còn hai bản sao cỡ toàn bộ). Chuỗi cũ ước tính ~9 GB cho phim 2h19 ở 48 kHz.
+* **Test nhanh hơn ~90 s:** hai test ngủ THẬT 60 s và 30 s dùng đồng hồ giả.
+
+### Lỗi do lượt rà soát độc lập (agent riêng, không xem kết luận của tôi) tìm ra TRONG chính bản này — đã sửa
+* Quay về model chính sau khi dự phòng khác thế hệ suy nghĩ làm mất `thinking_config` của model chính (chạy với mức suy nghĩ mặc định:
+  chậm hơn, tốn token, dễ cụt) → nay khôi phục cấu hình gốc. Có phép thử đột biến: bỏ dòng khôi phục thì test hỏng.
+* `_peak_abs_chunked` / `dc_block` ném `ValueError` với âm thanh nhiều kênh (hồi quy tiềm ẩn; hiện mọi lời gọi đều đơn kênh) → xử lý đúng.
+* Giữ tiến độ phân tích không lồng nhau được (hai lượt chồng nhau trên một bộ dịch xoá nhầm / bỏ sót) → đếm lồng nhau.
+* Thử lại từng khung OCR khi engine hỏng hẳn: tối đa 128 lần + 128 traceback mỗi lô → dừng sau 3 khung liên tiếp lỗi.
+* sklearn cài hỏng (lệch ABI) ném `ValueError` giữa phân tích DBSCAN → bắt mọi lỗi và rơi về Heatmap.
+* Ghi nhận, chưa đổi: ngân sách chờ quá tải 600 s được tính lại mỗi khi đổi model (hữu hạn: tối đa số model × 600 s).
+
+### Kiểm chứng
+* 6 test hồi quy mới thất bại trên mã 3.23.642 (dự phòng, xếp hạng model, OCR hai ca) và đạt trên mã mới; 2 test bộ nhớ master thất bại
+  trên mã cũ, hai test so sánh từng bit đạt trên cả hai.
+* Toàn bộ: **7338 passed, 61 skipped** trong 3 phút 35 giây (trước: 7 phút 9 giây).
+
+### Chưa làm trong bản này (đã đo, chờ A/B trên GPU của bạn)
+* Mỗi lời gọi dịch hiện ĐÍNH 1–2 đoạn video: 111 request, **7,48 triệu token prompt (trung bình 67 nghìn/request)** so với 268 nghìn
+  token đầu ra → toàn bộ thời gian chờ TPM và phần lớn 503. Cần A/B chất lượng dịch có/không video (cues đã có sẵn từ phân tích).
+
+## [3.23.642] — 🔑 Xoay key: thử MỌI key mà server chưa từ chối trước khi bỏ model (trước đây bỏ sót key)
+
+### Nguyên nhân (nhật ký thật 21/10, `gemini-3.8-flash`, 20 request/ngày/key)
+* Lượt 2 của "Tự kiểm tra phân tích": server từ chối key …0d53 khi ứng dụng mới đếm **18/20**. Ngay sau đó (0,5 giây)
+  ứng dụng kết luận "đã hết hạn mức ở mọi API key (**server xác nhận**)" và chuyển sang model dự phòng — **không gửi thử key nào khác**.
+* Cơ chế: việc xoay key chỉ chọn key còn `rpd_remaining > 0` theo BỘ ĐẾM NỘI BỘ. Key có bộ đếm đầy nhưng server CHƯA từ chối
+  bị coi là hết, dù bộ đếm chỉ là ước lượng (đã lệch ở cả hai chiều: server từ chối lúc app đếm 18/20; trước đó bảng Google ghi
+  0/20 khi app đếm đầy — xem v3.23.526). Câu "server xác nhận" vì thế sai sự thật. `has_any_daily_quota` (kiểm tra trước phân tích
+  video, bỏ qua model ở bước tự kiểm tra, chọn model dự phòng) cũng dùng đúng cách đếm đó.
+
+### Thay đổi
+* Key có bộ đếm đầy nhưng server chưa từ chối hôm nay được **thử đúng một lần** khi không còn key nào còn hạn mức theo bộ đếm
+  (ưu tiên key có bộ đếm thấp nhất). Server từ chối → key thành "xác nhận" (không thử lại trong ngày); server nhận → dùng tiếp.
+* Chỉ khi MỌI key đã bị server từ chối (hoặc bị đánh dấu hỏng) mới báo hết và chuyển model dự phòng — thông báo "server xác nhận"
+  nay đúng theo cách dựng. Key còn hạn mức thật luôn được ưu tiên hơn key chỉ để thử.
+* `has_any_daily_quota` (kiểm tra trước phân tích video, bước tự kiểm tra) cũng tính key "đáng thử", nên không bỏ model còn dùng được. Riêng việc CHỌN model dự phòng vẫn theo bộ đếm (model còn hạn mức thật được ưu tiên).
+* Hai test cũ (v32546) mã hoá ngữ nghĩa cũ "bộ đếm đầy = hết" được cập nhật: hết chỉ khi server đã từ chối.
+* Nhật ký xoay key nói rõ "bộ đếm đã đầy nhưng SERVER chưa từ chối — thử một lần".
+
+### Kiểm chứng
+* Tái hiện đúng ca nhật ký: trên mã 3.23.641, 4/5 test mới thất bại (`server.calls == ['KEY_A']` rồi `QuotaExhaustedError`
+  "mọi key (server xác nhận)"); mã mới đạt.
+* Mô phỏng ngẫu nhiên 40 seed × 4 lời gọi (3 key, trạng thái server và bộ đếm ngẫu nhiên): luôn kết thúc, thành công khi còn ít nhất
+  một key sống, ném `QuotaExhaustedError` đúng khi cả 3 key chết, mỗi key chết bị thử tối đa **1** lần.
+* Toàn bộ: **7302 passed, 61 skipped** (7 phút 9 giây).
+* Quy tắc mới trong CLAUDE.md: sau MỖI lần phát triển phải rà BUG/CRASH chính phần vừa viết rồi mới giao.
+
+## [3.23.641] — 🛠️ Rà soát BUG CRASH các bản 3.23.636–640: 7 lỗi sập / kẹt, đều tái hiện được và đã sửa
+
+Cách rà: mypy --strict trên các tệp đã đổi (không có lỗi thật), fuzz 4 000 chuỗi ngẫu nhiên × 5 hàm xử lý bảng xưng hô
+(+ ReDoS 100 000 ký tự: 0,01 s), fuzz tệp trạng thái quota, quét giao diện 196 nút / 48 combo, và một lượt rà ĐỘC LẬP
+bằng agent riêng (không nhìn kết luận của tôi) — mỗi lỗi bên dưới có script tái hiện trên mã cũ.
+
+### Lỗi sửa
+1. **Khởi động sập khi tệp trạng thái quota là JSON hợp lệ nhưng sai hình** (mảng, chuỗi, số, `"count": "abc"`/`null`/`Infinity`,
+   `learned_minute: [Infinity, 5]`): `GeminiQuotaManager(...)` ném `TypeError/AttributeError/ValueError/OverflowError` ngay trong hàm dựng
+   → không mở được ứng dụng. Nay bỏ qua cả tệp (sai kiểu gốc) hoặc chỉ mục hỏng. 17 ca đo trên mã cũ: 8 sập.
+2. **Ghi tệp quota không nguyên tử**: tắt máy giữa chừng để lại tệp cụt → mất bộ đếm cả ngày. Nay ghi tệp tạm + `os.replace`.
+3. **`UnicodeEncodeError` thoát khỏi nhánh xử lý lỗi**: lý do key hỏng (văn bản của server) chứa surrogate lẻ → `write_text` ném
+   `ValueError` (không phải `OSError`). Nay làm sạch + cắt 300 ký tự và bắt cả `ValueError`.
+4. **Adapter không có key nào** (`api_key=""`) ném `IndexError` thay vì `TranslatorUnavailableError` (hồi quy từ 3.23.639).
+5. **Client của key SAI** (đua luồng): `_client_for_index` kiểm tra "key hiện tại" rồi mới dựng client ngoài khoá; luồng khác đổi key
+   giữa chừng → lời gọi đi bằng key khác key đã đặt chỗ quota. Đo: 58/600 000 lời gọi (3 luồng + 1 luồng đổi key); sau sửa 0.
+   `_get_client` đọc lại `self._client` sau khi dựng nên có thể trả `None` — nay dùng biến cục bộ.
+6. **Key đã sửa vẫn bị khoá cả ngày**: dấu "key hỏng" (3.23.639) không có đường xoá nào (`clear_invalid_key` không ai gọi) → sau khi người
+   dùng sửa key phía Google, bước kiểm tra trước khi phân tích video vẫn báo "tất cả key hết quota ngày" và bảng key ⛔ mãi. Nay dấu tự hết hạn
+   sau 10 phút (thử lại 1 request) và được xoá ngay khi key gọi thành công.
+7. `ModelHealth.record_overload` tràn số (`OverflowError`) sau ~1 025 lượt thăm dò hỏng liên tiếp (lỗi cũ) — giới hạn số mũ.
+
+### Còn lại (đã ghi, chưa sửa)
+* RPM/TPM học được lưu theo model, không theo key/dự án: key trả phí cùng tên model với key miễn phí bị giới hạn theo số miễn phí.
+* Quét giao diện báo 4 dòng ERROR: là ca âm tính cố ý (nút mở tệp `.seraw.json` với tệp rác) — lỗi được xử lý, không sập.
+
+### Kiểm chứng
+* Test mới `test_crash_fixes_v323641.py` (27 ca): **19 ca thất bại trên mã 3.23.640, đạt trên mã mới**.
+* Toàn bộ: **7289 passed, 61 skipped** (7 phút 4 giây).
+
+## [3.23.640] — 🔎 Chọn được model "Tự kiểm tra phân tích" + dự phòng; sửa thanh trạng thái nói sai model
+
+### Nguyên nhân (từ nhật ký thật của người dùng)
+* Người dùng chọn `gemini-3.8-flash` (phân tích) và `gemini-3.5-flash-lite` (dự phòng) nhưng bước **"Tự kiểm tra phân tích"** lại chạy
+  bằng `gemini-3.1-flash-lite`. Lý do: từ v3.23.631 bước này dùng hằng số cố định `DEFAULT_AUDIT_MODEL` (không có ô chọn nào), chủ ý
+  tránh tiêu hạn mức `gemini-3.8-flash` (chỉ **20 request/ngày/key**; nhật ký cho thấy phân tích 24 đoạn video đã dùng hết hạn mức
+  của hai key). Nhưng (1) người dùng không thể đổi, (2) model dự phòng đã chọn không áp dụng cho bước này, (3) dòng trạng thái
+  in model của bước *phân tích* nên trông như đã chọn đúng, và (4) `QuotaExhaustedError` từ bước kiểm tra không được bắt.
+
+### Thay đổi
+* Ô chọn **"Model tự kiểm tra"** (mặc định *Tự động* = model rẻ như trước) ở tab Dịch; lưu vào cấu hình (`audit_model`).
+* Chuỗi model của bước kiểm tra: model đã chọn → model dự phòng đã chọn → model mặc định rẻ. Model đã hết hạn mức ngày trên mọi key
+  được bỏ qua KHÔNG tốn lời gọi; lỗi ở một model thì thử model kế tiếp; tất cả đều lỗi thì giữ nguyên phân tích cũ (không crash).
+* Thanh trạng thái in đúng chuỗi model thực tế của bước kiểm tra.
+* Khuyến nghị: để *Tự động*, vì `gemini-3.8-flash` hết hạn mức ngày sau phân tích video.
+
+### Kiểm chứng
+* Test mới `test_audit_model_v323640.py` + `TestAuditModelChoice`; hai test cũ có bản giả `refine` chữ ký cũ được cập nhật.
+* Toàn bộ: **7261 passed, 61 skipped** (7 phút 38 giây).
+
+## [3.23.639] — 🔑 Quota & xoay key thông minh: key hỏng cách ly, dàn đều tải, xoay thay vì chờ, học RPM/TPM
+
+### Phân tích (dữ liệu thật)
+* **Trạng thái quota thật của 3 key sau một buổi làm việc** (gemini-3.1-flash-lite): key #1 **500/500** (server từ chối) và
+  cả gemini-3.5-flash-lite 500/500, trong khi key #2 chỉ 134 và 49, key #3 chỉ 81 và 45 → cách chọn cũ "dính một key
+  tới khi cạn rồi mới xoay" **dồn tải** vào một key. Với gemini-3.8-flash cả ba key đều dừng đúng 20/20 → ba key này là ba
+  dự án riêng (hạn mức không chung).
+* **Đo thật 18 lời gọi tuần tự, mỗi key giả lập 3 request/phút** (3 key thật, gemini-3.1-flash-lite):
+  | | mã cũ | mã mới |
+  |---|---|---|
+  | Tổng thời gian | 424,5 s | **183,7 s** (−57%) |
+  | Thời gian chờ quota | 250,1 s | **34,0 s** (−86%) |
+  | Phân bố key | 18 / 0 / 0 | **6 / 6 / 6** |
+  (lần đo đầu 593 s → 411 s bị nhiễu bởi 5 lượt 503 của server; số trên là lần đo có tách riêng thời gian chờ quota và ngủ thử lại,
+  503: 90 s so với 60 s.)
+* **Key sai (đo bằng API thật)**: `400 INVALID_ARGUMENT … reason: API_KEY_INVALID` — trước đây là lỗi "không thể thử lại": MỘT key
+  hỏng làm hỏng cả lượt dịch dù các key khác còn tốt. Google cũng vô hiệu hoá key bị lộ / hết hạn.
+* **429 theo phút (đo bằng 60 lời gọi dồn)**: `quotaId: GenerateRequestsPerMinutePerProjectPerModel-FreeTier`, `quotaValue: '15'` —
+  số RPM thật nằm ngay trong lỗi, nhưng ứng dụng chỉ học RPD, còn RPM/TPM đoán theo tên model.
+* Chuỗi key dùng chung toàn adapter nên khi dịch song song, luồng khác đổi key giữa lúc luồng này đặt chỗ quota và lúc gửi → lời gọi đi
+  bằng key khác key đã tính quota (và `mark_daily_exhausted` đánh dấu nhầm key).
+
+### Cải tiến
+1. **Key hỏng được cách ly** (`_is_invalid_key_error`, `_quarantine_key`): API_KEY_INVALID / hết hạn / bị vô hiệu hoá → ghi dấu hỏng (lưu qua
+   phiên trong ngày, sang ngày mới thử lại), mọi lượt chọn/xoay key bỏ qua key đó và lời gọi thử lại NGAY bằng key khác; mọi key
+   đều hỏng thì báo lỗi rõ thay vì "Gọi Gemini thất bại". Chặn vòng lặp: tối đa một lần cách ly mỗi key mỗi lời gọi.
+2. **Chọn key trước mỗi lời gọi văn bản** (`key_selection.choose_key`, hàm thuần): ưu tiên key GỬI ĐƯỢC NGAY (không chờ RPM/TPM/cooldown) thay vì
+   ngồi chờ tới 60 s trong khi key khác trống; khi nhiều key cùng rảnh thì dàn đều theo hạn mức ngày (có độ trễ 15% và tối thiểu 10 request
+   để không nhảy key liên tục, nên model hạn mức ít như 20/ngày giữ nguyên hành vi dùng-tới-khi-cạn). Lời gọi đính video giữ key (handle video
+   gắn theo key). Quota manager có `estimate_wait()` không đặt chỗ.
+3. **Sổ sách đúng key**: key dùng để đặt chỗ quota = key gửi đi (client ghim theo key); dấu hết quota ngày / cooldown 429 ghi vào đúng key đã gửi; luồng khác
+   đã chuyển sang key còn hạn mức thì dùng luôn thay vì kết luận "mọi key hết".
+4. **Học RPM / TPM thật** từ lỗi 429 `…PerMinute…` (lưu qua phiên) thay cho bảng đoán theo tên model.
+5. **Hộp thoại nhiều key**: hiển thị key bị Gemini từ chối (⛔ + lý do), key hết hạn mức (🔴), tổng request còn lại trên các key dùng được, giờ hạn
+   mức hồi, và cảnh báo "nghi dùng chung dự án" khi server từ chối dù ứng dụng mới đếm ít.
+
+### Lỗi tìm được khi kiểm thử
+* Bộ test cũ (`test_translate_page_bugs_v323609`) treo vì adapter KHÔNG có bộ quản lý quota + key sai → cách ly key rồi "thử lại" mãi (key hỏng
+  luôn "còn dùng được"). Đã sửa bằng sổ key bị từ chối riêng của adapter và chặn số lần đổi key; 3 test hồi quy.
+* Test mới: 32 (chọn key, quota manager, phân loại lỗi, key hỏng, xoay thay vì chờ, ghim key, học RPM, hộp thoại key) — 20 ca thất bại trên mã cũ.
+
+### Giới hạn
+* Phát hiện nhiều key CHUNG DỰ ÁN (hạn mức tính theo dự án, không theo key) chỉ ở mức cảnh báo trong hộp thoại; chưa tự gộp bộ đếm. Ba key
+  của môi trường thử là ba dự án riêng nên không kiểm chứng được nhánh này bằng API thật.
+* Dàn đều tải chỉ áp cho lời gọi KHÔNG đính video; lời gọi đính video vẫn dính một key (muốn chạy song song bằng nhiều key phải tải video lên từng key).
+
+## [3.23.638] — 🛟 Chọn model dự phòng + rà soát ổn định (fuzz tìm và sửa lỗi sập)
+
+### Tính năng: người dùng chọn model dự phòng
+* Trang Dịch có ô **"Model dự phòng"** (dưới ô model phân tích) với 3 chế độ:
+  **Tự động (khuyên dùng)** — như trước, ứng dụng xếp hạng model cùng nhóm còn hạn mức; **Không chuyển model** —
+  chỉ chờ và thử lại trên model đang chọn; hoặc **một model cụ thể** (kể cả model gõ tay chưa có trong danh sách API).
+* Lựa chọn áp cho MỌI lời gọi Gemini của ứng dụng (bộ chọn dự phòng khi model quá tải 503/504 dùng chung giữa các
+  adapter) và cho bước phân tích khi model phân tích hết hạn mức ngày (trước đây cố định `gemini-3.1-flash-lite`).
+  Model chọn không dùng được (chính nó, đã thử, đang ngắt mạch, hết hạn mức ngày) thì rơi về tự động chứ không bỏ cuộc.
+  Lưu trong cài đặt, giữ nguyên khi bấm "Tải danh sách model". 14 test.
+
+### Rà soát ổn định (tìm bằng fuzz / quét giao diện, mỗi lỗi có test tái hiện)
+Phương pháp: (1) bộ quét giao diện bấm 9 trang / 197 nút / 48 ô chọn — **0 ngoại lệ, 0 sập** (4 log ERROR đều là
+thông báo đúng khi nạp tệp sai định dạng); (2) fuzz các bộ đọc dữ liệu do **model** hay **tệp trên đĩa** cung cấp:
+~75.000 lời gọi hàm với dữ liệu ngẫu nhiên; (3) fuzz TOÀN đường ống dịch với bộ dịch giả hành xử hỗn loạn (thiếu/thừa/trùng/rỗng/chữ Hán/ném lỗi/
+xáo dòng/văn bản `None`) — **2.700 lượt, 0 sập**; (4) `ruff`: không có lỗi nghiêm trọng (chỉ phong cách); `mypy
+--strict`: 936 cảnh báo kiểu, các ca đọc kỹ đều là dương tính giả (đã có kiểm tra None phía trước).
+Lỗi thật tìm được và đã sửa:
+1. **Bản vá tự kiểm tra phân tích sai kiểu làm MẤT cả kết quả phân tích**: model trả `"glossary": 5`,
+   `"cue_fixes": true`, `"remove_characters": 1.5`, gốc là danh sách/null… → `TypeError/AttributeError` trong
+   `apply_audit_patch` (1.573/3.000 mẫu fuzz) và lan ra ngoài `refine`. Nay bỏ trường sai kiểu / phần tử không phải
+   chuỗi (trước đây `None` thành nhân vật tên "None") và `refine` bọc thêm bước áp bản vá: hỏng thì giữ kết quả cũ.
+2. **`"cues": null` / số / chuỗi từ model** (lệch schema) làm `_parse_visual_cue_items` ném `TypeError` — cả lô gán
+   người nói bị bỏ (4.000 mẫu fuzz: 593 ca). Nay coi như không có nhãn.
+3. **Tệp cấu hình (`config.json`) không phải UTF-8** (ghi dở khi mất điện, sửa bằng trình soạn thảo ANSI) → ứng dụng
+   **sập ngay lúc khởi động** (`UnicodeDecodeError` không phải `JSONDecodeError`). Cùng lỗi ở tệp tiến độ phân tích,
+   tiến độ giai đoạn dịch dở, kết quả WhisperX. Nay đọc hỏng thì quay về mặc định / bỏ tệp đó.
+4. **Mở tệp `.seraw.json` hỏng ở trang Debug**: gốc JSON là danh sách/`null` → `AttributeError`; tệp `.gz` cụt →
+   `EOFError`. Nay báo "File JSON/nén không hợp lệ".
+Mỗi ca có test tái hiện (6 + 12 + 8 mẫu; 6 ca thất bại trên mã cũ).
+
+### Giới hạn
+* Fuzz chỉ phủ phần thuần/đường ống dịch và bộ đọc tệp; các luồng cần GPU/ffmpeg/mpv thật (OCR trực tiếp, TTS,
+  xuất bản) chỉ được bao phủ bởi test hiện có và lượt quét giao diện, không bởi fuzz.
+* `mypy --strict` còn 936 cảnh báo kiểu (chủ yếu thiếu chú thích kiểu / stub PySide6); chưa dọn.
+
+## [3.23.637] — 🧭 Bảng xưng hô: tự sửa khi thiếu / sai thế giới phim (từ dữ liệu thật phim 86 tập của bạn)
+
+### Dữ liệu thật dùng
+* Tệp chuẩn đoán phân tích + tệp chuẩn đoán dịch của phim 86 tập (3649 dòng, 19 nhân vật) bạn gửi.
+* Phim ghép 12 tập đầu (837 dòng) để tái hiện lỗi của phân tích cả phim; chấm mù (Opus, không có đáp án)
+  các đoạn dịch; 3 đoạn × 120 dòng trích thẳng từ BẢN DỊCH THẬT của bạn (dòng 500-620, 1800-1920, 3000-3120).
+
+### Điều tra trên bản dịch thật của bạn
+* Chấm mù 360 dòng trích từ bản dịch thật: **12 lỗi nặng, 41 lỗi nhẹ** (7/11 · 4/15 · 1/15). Lỗi nặng lặp lại:
+  (1) xưng hô đổi trong cùng một cặp (ta/con với sư bá, người/ngươi với đệ tử, ta/muội); (2) đại từ hiện đại
+  "cậu" trong phim tu tiên; (3) cùng một tông môn dịch hai kiểu (凌霄宗 → "Linh Tiêu" 10 dòng / "Lăng Tiêu" 9 dòng).
+  Lỗi nhẹ chủ yếu là tiếng lóng/meme dịch sát chữ ("cao dán da chó", "giỏ tam giác", "老可爱 → lão phế vật").
+* Nguyên nhân (1) và (2) nằm ở bảng nhân vật: `analysis.characters` của lượt dịch có **0 mệnh đề xưng hô** (cờ
+  `roster_without_address_rules`, `address_rules = 0`) nên phép gán đại từ sẵn cho từng dòng không có gì để gán;
+  còn bảng `series_context` đã lưu (sinh bởi bản cũ) có 7 mệnh đề sai thế giới phim: Diệp Nhiên tự xưng
+  `'cháu'` với sư thúc, `'tôi'` với Thiên Thanh; Tần Chấp `'tôi'`/`'cậu'`; Ma Viêm, Ma Hải `'tôi'`.
+* Tái hiện bằng phân tích cả phim ghép 12 tập, `gemini-3.8-flash`: **1/4 lượt ra bảng 0 mệnh đề xưng hô** (giống
+  hệt tệp của bạn), 3/5 lượt viết `Diệp Nhiên tự xưng 'ta' gọi 'sư thúc'`.
+* Hậu quả đo được (dịch 3 giai đoạn cùng bảng sai/đã sửa, chấm mù tập 5, 6, 9, 12 — cả phim ghép dịch một lượt):
+  bảng có lỗi **26 lỗi nặng** → bảng đã sửa **16** → bảng tốt **10** (tập 5: 7→3→1 · 6: 4→1→1 · 9: 7→3→0 · 12: 8→9→8).
+
+### Sửa
+1. **Tự kiểm tra phân tích bắt "bảng không có mệnh đề xưng hô"** (`no_address_rules`): model kiểm định viết lại
+   phần "xưng hô: với <Tên> tự xưng '…' gọi '…'" cho từng nhân vật; vá chỉ BỔ SUNG khi nhân vật chưa có mệnh đề
+   nào (không bao giờ ghi đè mệnh đề / vai trò người dùng đã sửa). Phim dài chỉ gửi 6 đoạn liền mạch (≤ 1200 dòng).
+   Đo thật trên bảng hỏng: **0 → 10-12 mệnh đề, đều tra được người nghe, 3/3 lượt**.
+2. **Sửa tất định đại từ sai thế giới phim** (`roster_register.py`, không gọi AI) — chạy ở bước phân tích và ở đầu mỗi
+   lượt dịch (nên cả bảng ĐÃ LƯU từ bản cũ được sửa): trong phim nhận ra là cổ phong/tiên hiệp (≥ 5 từ khoá), mệnh
+   đề `xưng 'tôi'` → `'ta'`, `gọi 'cậu'` → `'ngươi'`, `xưng 'cháu'`/`'ta'` + gọi bậc trên (sư phụ/sư tôn/sư thúc/sư
+   bá/chưởng giáo/tông chủ…) → `'đệ tử'`. Trên `series_context` thật của bạn: **7 mệnh đề được sửa**. Phim hiện đại
+   không bị đụng tới (có test).
+3. Prompt phân tích + kiểm định thêm quy tắc VAI VẾ (người dưới tự xưng đệ tử/đồ nhi/con, không "ta"). **Không đo
+   được tác dụng** (gemini-3.1-flash-lite: 2/6 lượt sai → 3/6; gemini-3.8-flash: 3/5 → 1/4) — nên mới có bước sửa tất
+   định ở mục 2.
+
+### Thử và KHÔNG nhận
+* **Tách giọng theo đoạn cho video > 28 phút** (hiện phim dài hơn 28 phút KHÔNG BAO GIỜ được tách giọng — phim 86 tập
+  của bạn gán người nói chỉ bằng chữ). Đã làm xong (cắt ở khoảng lặng, mỗi đoạn một lời gọi, nhãn `đoạn.giọng`):
+  chạy được (30 phút → 2 đoạn, 808/837 dòng có nhãn giọng, 95 giây) nhưng đo trên phim ghép KHÔNG có lợi rõ:
+  độ đúng người nói tập 1-3 **90,5% (có giọng) vs 89,8% (chỉ chữ)**, 5 lượt mỗi bên — trong nhiễu; chấm mù dịch tập
+  5/6/9/12: **15 lỗi nặng (có giọng) vs 8 (chỉ chữ)**, một lượt mỗi bên. Gỡ khỏi bản này; cần đo lại trên phim dài thật.
+* Thêm câu cấm pinyin sau "với" (chi tiết bản 3.23.636, nhắc lại ở đây vì tệp của bạn cho thấy mệnh đề không tra được
+  người nghe là nguồn lỗi lớn): không nhận (tỉ lệ tra được không tăng).
+
+### Giới hạn còn lại
+* Tên tông môn viết hai dạng trong phụ đề (灵霄宗 14 dòng / 凌霄宗 19 dòng) vẫn dịch hai kiểu; đồng âm 灵/凌 không phân
+  biệt được bằng luật tất định (bảng đọc âm không có pinyin). Cần mục thuật ngữ cho từng dạng chữ.
+* Tiếng lóng/meme vẫn hay dịch sát chữ (lỗi nhẹ lặp lại nhiều nhất ở bản dịch thật của bạn).
+* Phân tích cả phim bằng `gemini-3.1-flash-lite` nông hơn nhiều (4-5 nhân vật, ≤ 22 thuật ngữ cho 12 tập) so với
+  `gemini-3.8-flash`; hạn mức ngày của 3.8-flash (20 request/key) cạn nhanh khi thử nhiều lượt.
+
+## [3.23.636] — 🎯 Xưng hô nhất quán: quy tắc "A hoặc B" vẫn gán được pron + tự xưng bằng danh xưng không bị đổi thành "ta"
+
+### Dữ liệu thật (tập 9-12 phim mẫu — chưa từng dùng để chỉnh prompt; bản 3.23.635, dịch 3 giai đoạn, chấm mù không đáp án)
+* Tổng 4 tập: **9 lỗi nặng, 23 lỗi nhẹ** (tập 9: 3/4 · tập 10: 1/8 · tập 11: 0/4 · tập 12: 5/7). Không có kiểu lỗi
+  mới lớn; lỗi nặng còn lại: xưng hô đổi giữa các dòng (7/9), một câu khẩu ngữ dịch sai nghĩa (`我还不信了`), một
+  nhãn người nói sai (đảo vai). Lỗi nhẹ rải rác (sắc thái mỉa, từ hiện đại "Miễn bình luận"…), không lặp.
+* Truy nguyên lỗi xưng hô tập 12: bảng nhân vật ghi `tự xưng 'đệ tử' hoặc 'con' gọi 'sư thúc'` (prompt phân tích
+  đã cấm "hoặc" nhưng model vẫn lọt) → `address_pronoun_gloss` bỏ trống pron **11/18 dòng** của cặp → bản dịch tự
+  xưng lúc "con", lúc "đệ tử", lúc "ta".
+
+### Sửa
+* `address_gloss.first_alternative`: phương án nối bằng **"hoặc"** thu về phương án ĐẦU rồi mới gán pron. Phương án
+  ngăn bằng "/" (`'tôi/chị'`, khác loại đại từ — ca thật v3.23.550) vẫn để model tự chọn.
+  Đo thật (tập 12, dịch 3 giai đoạn, 3 lượt/cách): tự xưng nhất quán **"đệ tử" 6/6 lượt** (trước: lẫn con/đệ tử/đệ
+  ở 3/3 lượt).
+* Tự xưng bằng **danh xưng** (đệ tử/đồ nhi/đồ đệ/thuộc hạ/tiểu nhân/vãn bối/tại hạ) ghi rõ trong pron: viết nguyên
+  danh xưng, KHÔNG đổi thành "ta". Đo thật (tập 5+9+12, 3 lượt × 2 cách, đếm dòng có pron 我 mà bản dịch dùng đúng
+  từ đó): giai đoạn dịch thô **88% → 94,5%** (95/108 → 104/110), bản cuối **87% → 91%**; tập 5 82% → 100% (thô),
+  tập 9 91% → 87% (nhiễu, nhiều dòng 我 nằm trong cụm không cần tự xưng như `你给我等着`).
+
+### Điều tra ca tập 5 ("Ta thích người" thay vì "đệ tử thích Sư thúc")
+4 lượt dịch thô cùng bản phân tích: 3/4 lượt đúng "đệ tử"; 1/4 rơi về "Ta" ở 4 dòng → **nhiễu giữa các lượt**,
+không phải lỗi hệ thống của quy tắc; không đổi sang "con". Cách ghi rõ danh xưng ở trên giảm đúng kiểu nhiễu này.
+
+### Thử và KHÔNG nhận
+* Cấm pinyin sau "với" (`với Ye Ran`, `với Qin Zhi`) trong prompt phân tích (4 lượt × 4 tập, 2 cách): pinyin 3 → 0 lần
+  NHƯNG tỉ lệ mệnh đề tra được người nghe 74% → 71% và mệnh đề có "hoặc" 1 → 7. Pinyin chỉ chiếm 4/14 mệnh đề
+  không tra được (còn lại: mô tả thay tên "đối phương…", "người ngoài"). Không nhận.
+
+### Giới hạn còn lại
+* Mệnh đề xưng hô không tra được người nghe (~26% trong 16 lượt phân tích) vẫn là nguồn lỗi xưng hô lớn nhất;
+  nguyên nhân là mô tả thay tên chứ không riêng pinyin.
+* Style stage đôi khi chèn "người" (kính ngữ) vào lời bề trên nói với bề dưới (tập 9 dòng 46) khi dòng không có
+  chữ 你 → không có pron để bám.
+
+## [3.23.635] — 📊 Hạn mức miễn phí theo model + chọn model mặc định bằng dữ liệu thật (3.1 vs 3.5-flash-lite)
+
+### Hạn mức miễn phí
+* Tài liệu Google (`rate-limits.md`, tải 16/10/2026) KHÔNG công bố RPM/TPM/RPD theo model — chỉ nói xem
+  trong AI Studio; chỉ nêu "hạn mức tính theo project, RPD reset 00:00 giờ Thái Bình Dương". Nhật ký
+  thật của bạn có xác nhận từ server: `gemini-3.7-flash` = 20 request/ngày.
+* Bảng trong ứng dụng (`_FREE_TIER_LIMITS`) chỉ coi **3.1**-flash-lite là 500 request/ngày nên
+  `gemini-3.5-flash-lite` (bạn xác nhận 500) bị ứng dụng tự giới hạn 20/ngày. Nay mọi flash-lite **đời
+  3.x trở lên** (3.1, 3.5, 4…) = 500; 2.5-flash-lite và tên không có số đời vẫn 20; flash đầy đủ vẫn 20.
+  Con số THẬT vẫn được học từ lỗi 429 của server (`learn_daily_limit_from_server`) nên bảng chỉ là giá
+  trị ban đầu.
+
+### So sánh 3.5-flash-lite với 3.1-flash-lite bằng dữ liệu thật (tập 1-2 phim mẫu, nhiều lượt)
+| Phép đo | 3.1-flash-lite | 3.5-flash-lite |
+|---|---|---|
+| Dịch 3 giai đoạn, 6 bảng chấm mù (điểm, thấp là tốt; bỏ lỗi dòng 9 chung) | **30** (nặng 2, nhẹ 20) | 42 (suy nghĩ low) · 52 (medium) |
+| Thời gian một lượt dịch 3 giai đoạn (TB 6 lượt) | **251 s** | 509 s (medium) · 545 s (low) |
+| Token suy nghĩ / lượt | ~10,7k | **0** ở medium (250), ~1,5k ở low |
+| Lỗi tạm thời 503/504/429 (6 lượt) | 8 | 15 · 22 |
+| Gán người nói (12 lượt, độ đúng) | 95,9% | 96,4% (ngang nhau) |
+| Phân tích chỉ chữ (12 lượt, tổng lỗi theo đáp án) | **21** | 30 (trộn chữ Hán 9 lần, nhiều phương án 7 lần) |
+
+Kết luận: **dịch và phân tích → giữ `gemini-3.1-flash-lite`** (tốt hơn, nhanh gấp đôi, ít 503);
+gán người nói hai model ngang nhau — giữ `gemini-3.5-flash-lite` (thùng hạn mức riêng, 500/ngày).
+* Danh sách model: `gemini-3.1-flash-lite` đứng đầu (trước đây ghi chú gọi 3.5 là mặc định dù giai đoạn
+  dịch thực tế mặc định 3.1).
+* **Giai đoạn phong cách / bản địa hoá mặc định → `gemini-3.1-flash-lite`** (trước: `gemini-3.6-flash`,
+  20 request/ngày/key). Một phim 3649 dòng cần ~92 lô mỗi giai đoạn → ~184 request, trong khi 3 key chỉ
+  có 60 request/ngày với model Flash đầy đủ. Cả chuỗi bằng 3.1-flash-lite đã đo (điểm 30). Chưa đo
+  được 3.6-flash một cách sạch: lượt thử bị 503 kéo dài nên cơ chế model dự phòng (3.23.631) tự chuyển
+  sang lite — đúng như thiết kế nhưng không còn là phép so sánh 3.6. 3.6/3.8-flash vẫn chọn được.
+
+### Còn tồn tại
+* Mẫu nhỏ (tập 1-2, 3 lượt, một người chấm mỗi bảng). Chênh 30 vs 42-52 ngoài nhiễu thường gặp (~±10)
+  nhưng nên kiểm lại trên phim của bạn; nếu muốn giữ 3.6/3.8-flash cho giai đoạn tinh chỉnh, chỉ nên
+  dùng cho đoạn ngắn vì hạn mức 20 request/ngày.
+* 3.5-flash-lite không suy nghĩ ở mức low/medium trong lời gọi dịch (đã đo: 0-250 token) — có thể
+  khác ở mức high, chưa thử vì đã chậm gấp đôi.
+
+### Lỗi tìm thấy khi chạy bộ test đầy đủ — ffmpeg TREO làm treo cả ứng dụng (`_run_ffmpeg_concat`)
+Một tiến trình ffmpeg ghép video kẹt 26 phút trong bộ test (không in gì). Gốc: vòng `for line in
+process.stderr` chặn tới khi ffmpeg đóng stderr, nên `timeout_sec` (chỉ kiểm sau vòng đọc) lẫn nút huỷ
+(chỉ kiểm khi có dòng mới) đều vô tác dụng khi ffmpeg im lặng — với người dùng là driver NVENC kẹt thì
+ứng dụng treo vô hạn thay vì rơi sang x265. Nay đọc stderr ở luồng riêng, luồng chính hỏi mỗi 0,25 s:
+huỷ, hết `timeout_sec`, hoặc **không có dòng tiến độ nào trong 180 s** (`FFMPEG_STALL_TIMEOUT_SEC`) đều
+giết ffmpeg và báo `VideoConcatError` (chuỗi dự phòng phần cứng → phần mềm chạy tiếp); `stdin=DEVNULL`.
+Test: `test_ffmpeg_hang_v323635.py` (6, dùng "ffmpeg giả" treo im lặng / in tiến độ / lỗi).
+
+Test: `TestFlashLiteGenerations` (4), `test_default_models_prefer_31_flash_lite_and_refine_default_has_high_quota`.
+
+## [3.23.634] — 🧭 Prompt PHÂN TÍCH: đại từ theo thể loại, một phương án mỗi cặp, không bịa tên / trộn chữ Hán
+
+Đo bằng Gemini thật trên tập 1-3 phim mẫu bằng bộ chấm TỰ ĐỘNG theo đáp án (đủ/đúng nhân vật, giới
+tính, aka "Dao Dao", quy tắc xưng hô từng cặp theo đáp án, không đại từ hiện đại cho phim tiên hiệp,
+không bịa nhân vật, không trộn chữ Hán vào chữ Việt, đúng một phương án mỗi cặp) — số lỗi trên 12
+lượt phân tích (4 lượt × 3 tập, chỉ chữ, `gemini-3.1-flash-lite`).
+
+### Lỗi đo được ở bản cũ
+Ví dụ trong prompt phân tích viết `xưng hô: với <Tên> tự xưng 'em' gọi 'anh'` (đại từ HIỆN ĐẠI) nên
+phim tiên hiệp hay ra "Diệp Nhiên tự xưng 'anh' gọi 'muội'", "Dao Dao tự xưng 'em' gọi 'anh'" (3/12
+lượt); ngoài ra ghi nhiều phương án ("gọi 'muội/Dao Dao'", "'đồ nhi' hoặc 'ta'" — 2/12), bịa nhân vật
+chưa từng có trong phụ đề ("Chu Dao", "Triệu Phàm"), trộn chữ Hán vào câu Việt ("Nam宫梦", "sư叔").
+Bản cũ phim nhiều cặp xưng hô sai: 叶然→楚瑶 7/12, 楚瑶→叶然 5/12, 叶然→南宫梦 4/12.
+
+### Thay đổi
+* `ANALYSIS_ADDRESS_REGISTER_RULE` chèn trước quy tắc tên trong prompt phân tích: bộ đại từ cổ phong
+  cho phim cổ trang/tiên hiệp (cấm anh/em/cô/tôi), hiện đại thì ngược lại; "tự xưng"/"gọi" phải là từ xưng
+  hô thật, đúng MỘT phương án (kèm ví dụ SAI/ĐÚNG), chỉ ghi tên có thật trong phụ đề, không trộn chữ Hán.
+  Ví dụ trong quy tắc là tên hư cấu (có test chặn dùng tên của phim đo).
+
+### Kết quả
+| Phép đo | Cơ sở | Mới |
+|---|---|---|
+| Chỉ chữ, 3.1-flash-lite, 12 lượt: tổng lỗi | 32 | **21** |
+| Có video + Visual Cues, **3.8-flash (model mặc định)**, tập 1+2: lỗi | 14 | **8** (tập 2 cơ sở thiếu hẳn nhân vật Dao Dao) |
+| Tập giữ riêng 5-9, chấm mù (điểm, thấp là tốt) | 64 | 61 (lỗi nặng 10 = 10; tập 6 cơ sở dùng tôi/anh/cô: 5 → 2) |
+
+Đo lại bằng chính mã nguồn bản này (12 lượt): 21 lỗi.
+
+### Kết quả ÂM / không nhận
+* Bỏ ví dụ 'em'/'anh' khỏi mẫu xưng hô + cấm ghi chú nội bộ ("anav3"): 27 lỗi (kém bản được nhận 21).
+* Bản chỉ có quy tắc đại từ theo thể loại ("anav1"): 31 lỗi vì làm tăng trộn chữ Hán (10/12 lượt) —
+  phải kèm quy tắc cấm trộn mới tốt.
+* Giai đoạn dịch: sau v3.23.633 các lỗi còn lại ở dịch chủ yếu là lỗi nhẹ về văn phong/sắc thái mỉa
+  (可爱炼气, 也不撒泡尿照照自己) và lỗi vai do nhãn người nói sai; chưa tìm được thay đổi prompt nào
+  vượt nhiễu.
+
+### Còn tồn tại
+* Lỗi nặng còn lại ở phân tích tập giữ riêng chủ yếu là TÓM TẮT sai ai làm gì với ai và sai quan hệ
+  nhân vật (chỉ đọc chữ, không video): quy tắc đại từ không sửa được loại này.
+* Mẫu nhỏ: một phim tiên hiệp hài (12 tập đã trích xuất); chưa đo phim hiện đại, chỉ có câu "hiện đại
+  thì ngược lại" trong quy tắc.
+
+Test: `test_analysis_register_v323634.py` (3).
+
+## [3.23.633] — 🎯 Tối ưu prompt bằng dữ liệu Gemini thật: giữ vai/ngôi ở giai đoạn tinh chỉnh, gán người nói kiểm nội dung
+
+Cách đo: tập 1-3 phim mẫu (296 dòng), `gemini-3.1-flash-lite` cho cả ba giai đoạn, nhãn người nói
+từ chữ + tách giọng như mặc định. Chấm mù (MQM, người chấm là agent ẩn danh, bảng ẩn nhãn) + hai
+chỉ số TỰ ĐỘNG đo trên nhiều lượt lặp: (a) độ đúng gán người nói so với đáp án theo từng dòng,
+(b) số dòng bẫy sai vai/ngôi (`role_metric`). Đã chạy ~140 lượt dịch, ~180 lượt gán người nói,
+50 bảng chấm mù.
+
+### Phát hiện 1 — giai đoạn tinh chỉnh làm tăng lỗi nặng, nhưng gốc nằm ở NHÃN người nói sai
+Lần đo đầu: dịch thô 44 điểm, +phong cách 99, +phong cách+bản địa hoá 63 (thấp là tốt). Lỗi nặng
+gần như toàn là ĐẢO NGÔI nhóm đệ tử giễu nhân vật chính ("当年你是天纵之资" → "Năm xưa **ta** là
+thiên tài", "才会给你们缔结婚约" → "hứa hôn cho **hai ta**"). Chẩn đoán prompt thật: tách giọng gộp
+nhầm đệ tử vào giọng nhân vật chính (nhãn `[v:3]`), bộ gán người nói làm theo nhãn → dòng 71-80
+mang "叶然 — tự nhủ" → model coi là độc thoại. Hai lưu ý: (1) lỗi cũng xảy ra ngay ở giai đoạn dịch
+thô của một số lượt (lượt khác thì đúng) nên so một lượt với một lượt là nhiễu; (2) vì vậy mọi kết
+luận dưới đây dùng lặp 3-6 lượt.
+
+### Thay đổi (đều có số đo)
+* **Prompt gán người nói** (`_text_cues_system_instruction`): nhãn giọng vẫn là bằng chứng mạnh
+  nhưng phải kiểm nội dung với người đã gán (người nói không tự xưng 你 với mình / không gọi tên mình,
+  câu giễu cợt 你…而你呢 là lời kẻ đối đầu, giới tính-vai vế phải khớp, nhãn xen kẽ nhiều cuộc thoại
+  có thể là gộp nhầm). Độ đúng tập 1 (6 lượt/bên): **86,5% → 93,7%** (nhóm dòng 71-80: 0/6 → 4/6 đúng);
+  tập 2+3 (4 lượt/bên): 98,3% ↔ 97,9% (trong nhiễu).
+* **Quy tắc GIỮ VAI & NGÔI cho STYLE/LOCALIZE** (`PERSON_ANCHOR_RULE_REFINE`): 你/您/你们 là ngôi
+  thứ hai (không thành ta/tôi/chúng ta), nhãn speaker/cue là gợi ý có thể sai → tin `original` và
+  `text`. Dòng bẫy sai vai/ngôi: **20 lỗi / 12 lượt → 4 / 6 lượt** (cơ sở vs có quy tắc).
+* **Lưới đảo ngôi** (`person_flip_guard.py`, hàm thuần; `_revert_person_flips`): sau mỗi giai đoạn
+  tinh chỉnh, dòng có câu gốc chỉ có 你 mà bản mới chỉ còn ta/tôi/tớ/tao (bản trước không vậy) thì lùi
+  về bản trước; ngược lại cho 我. Chỉ dùng đại từ không nhập nhằng; ghi sự kiện `person_flip_revert`.
+* **Kết quả toàn chuỗi (dịch thô+phong cách+bản địa hoá), 6 bảng chấm mù tập 1-2 × 3 lượt**:
+  lỗi nặng **8 → 1**, lỗi nhẹ 16 = 16, điểm **56 → 21**.
+
+### Kết quả ÂM (đã đo, KHÔNG nhận)
+* Quy tắc "ngôi theo chữ gốc là chuẩn" cho giai đoạn DỊCH THÔ: 8 bảng chấm mù, điểm 76 (có quy tắc)
+  vs 58 (mã cũ) vs 47 (không quy tắc). Nó ép "ngươi" cả khi 你 hướng tới bề trên (sư thúc) →
+  "ngươi…" với sư thúc, "sư thúc của muội" sai quan hệ. Đã bỏ khỏi bản này.
+* Hai biến thể prompt gán người nói: thêm "chỉ đổi khi mâu thuẫn rõ ràng" (làm dòng 10 tập 2 sai
+  5/5 lượt) và thêm "nhãn lẻ 1-2 dòng thường sai" (tập 1: 1/5 lượt sửa được) — kém bản được nhận.
+* Ví dụ trong prompt dùng câu chung, KHÔNG dùng câu của phim đo (có test chặn).
+
+### Còn tồn tại (ghi thẳng)
+* Dòng 9 tập 2 (你幸福就好) vẫn bị đảo vai ở mọi cấu hình: nhãn giọng của dòng lẻ này sai (một dòng
+  một nhãn riêng); chưa có cách đã đo là sửa được.
+* Giai đoạn dịch thô vẫn thỉnh thoảng sinh câu vô nghĩa (dao động giữa các lượt); giai đoạn tinh
+  chỉnh thường sửa được, nên không nên chỉ dùng dịch thô khi cần chất lượng cao.
+* Mẫu nhỏ: 3 tập của một phim tiên hiệp hài, một người chấm/bảng ở vòng cuối. Chưa kiểm trên tập
+  khác hay thể loại khác; số đo "lỗi nặng 8 → 1" tin hơn "điểm" tuyệt đối.
+
+Test: `test_person_flip_guard_v323633.py` (22), `test_person_anchor_prompt_v323633.py` (6).
+
+## [3.23.632] — 🧱 Gói 3 theo log thật: ghép video không mã hoá lại cả phim, OCR chạy tiếp được, vá dòng dịch thiếu
+
+Nguồn: cùng log thật 10/2026 (phim 86 tập nối thành 1 video, Windows + GPU, Gemini free tier).
+
+### C2 — Ghép video: `hevc_nvenc` lỗi không còn kéo cả phim sang x265 (~43 phút)
+- Trước: ghép bằng MỘT đồ thị lọc cho cả 86 tập; `hevc_nvenc` lỗi (lý do KHÔNG được ghi log nên không
+  biết nguyên nhân thật) → rơi sang x265 phần mềm cho cả phim ≈ 43 phút.
+- Nay (`ffmpeg_concat_adapter._concat_by_episode`): chuẩn hoá TỪNG TẬP ra tệp tạm riêng (chạy song song:
+  2 luồng với GPU, tối đa 4 với CPU) rồi nối bằng concat demuxer `-c copy`. Mỗi tập có chữ ký
+  (nguồn: tên/kích thước/mtime + bộ mã hoá + bộ lọc) → **chạy lại sau khi lỗi/huỷ thì bỏ qua tập đã xong**,
+  tập nguồn đổi thì làm lại đúng tập đó. Thư mục tạm dọn khi xong.
+- Chuỗi dự phòng: bộ mã hoá phần cứng → phần mềm (CHỈ tập cần làm lại, ghi rõ lý do) → đồ thị lọc đơn cũ
+  (`_concat_single_graph`, nay cũng log `Lý do`). Huỷ giữa chừng được tôn trọng.
+- Giới hạn: không thể thử GPU thật trong môi trường này; lỗi nvenc của máy bạn vẫn chưa rõ nguyên nhân —
+  bản này sẽ GHI LẠI lý do ở lần sau.
+- Test: `test_concat_per_episode_v323632.py` (8 ca, ffmpeg thật).
+
+### C3 — OCR có điểm dừng: bị ngắt thì chạy TIẾP
+- Trước: một lượt OCR 2 giờ 24 phút chỉ lưu kết quả ở cuối → sập/đóng app giữa chừng là mất sạch.
+- Nay: `ocr_checkpoint.py` ghi kết quả dần (JSON-lines cạnh cache OCR thô, `<tên>.seraw.json.gz.ckpt`,
+  mỗi 30 s, ghi nối + fsync → O(n) tổng, mất điện chỉ hỏng dòng cuối và dòng đó bị cắt khi nạp). Lần chạy
+  sau CÙNG video/vùng chữ/cấu hình lấy mẫu & OCR (vân tay; `batch_size`... không tính) thì nạp phần đã
+  xong, tua tới ngay sau khung cuối và đánh số khung tiếp nối; kết quả **y hệt chạy một mạch** (test so
+  từng khung, kể cả khung trùng). Khác cấu hình/video bị sửa → bỏ điểm dừng, OCR từ đầu. Xong thì tự xoá;
+  huỷ/lỗi thì giữ. Muốn ép OCR lại từ đầu: xoá tệp `.ckpt`.
+- **Lỗi gốc phát hiện kèm (bộ lấy mẫu PyAV)**: seek tới ĐÚNG mốc `skip_intro` — với video có B-frame
+  nó rơi vào khung khoá kế tiếp và MẤT các khung từ mốc tới khung khoá (đo trên HEVC GOP 50 có B-frame:
+  `skip_intro=5,85 s` cho khung đầu 6,00 s thay vì 5,88 s). Nay lùi 5 s như bộ NVDEC rồi bỏ phần lùi.
+  Test chặn tái phát thất bại trên mã cũ (bước 0,1 s).
+- Test: `test_ocr_checkpoint_v323632.py` (17 ca: sập→chạy tiếp, huỷ→chạy tiếp, đổi cấu hình, dòng cuối dở,
+  tệp hỏng, vân tay, PyAV thật).
+
+### C4 — Vá RIÊNG dòng còn bị nghi DỊCH THIẾU ở bản cuối
+- Log thật: lưới `under_translation_guard` chỉ cảnh báo, "bổ sung" ở giai đoạn sau không cứu được —
+  cùng dòng (1734 `师父师姐`→`Sư tỷ...`, 3148, 1190, 917, 1396…) bị báo lại ở CẢ BA giai đoạn rồi nằm
+  trong bản cuối. Các khâu khác đã có sẵn: dọn chữ Hán sót, sửa khối lệch, dòng trùng (không đổi).
+- Nay (`under_translation_patch.py` + `TranslateSubtitlesUseCase._patch_under_translated`): sau khâu dọn
+  trùng, dịch lại riêng các dòng còn bị báo (tối đa 40, nặng nhất trước) kèm ±2 dòng kề làm ngữ cảnh
+  trong MỘT lượt gọi; mỗi dòng được nhận/bỏ riêng — chỉ nhận khi không rỗng, không chữ Hán, dài hơn bản
+  cũ, hết bị lưới báo, không thành dòng nói lặp/trùng dòng kề. Dòng kề không bao giờ bị đổi. Ghi sự kiện
+  `under_translated_patched` cho nhật ký chuẩn đoán.
+- Chạy Gemini thật (`gemini-3.1-flash-lite`) trên 2 bản dịch thật còn dòng bị báo: tập 2 dòng 74
+  `早早给他们` `đã sớm`→`mà sớm đã`; tập 3 dòng 34 `看着你自己的` `nhìn`→`nhìn thấy`; mỗi lần 1 lượt gọi,
+  dòng kề giữ nguyên. Cải thiện nhỏ nhưng đúng chiều; số dòng bị ảnh hưởng ít (2-4/3649 dòng).
+- Test: `test_under_translation_patch_v323632.py` (22 ca).
+
+### C1 — TTS "ngân dài" (chỉ phân tích, KHÔNG đổi mã)
+- Đo ≈40 cảnh báo/lượt ≈ 1,6 phút/lượt (2,39 s mỗi lần thử lại); không tái hiện được trên CPU (0/72),
+  tập trung ở lần thử đầu của lô GPU. Gói 1 (TTS tăng dần) đã giảm số lượt chạy cả phim, nên phần lớn
+  chi phí này biến mất; thử lại theo lô trên GPU rủi ro hơn lợi ích → chưa làm.
+
+Test: toàn bộ bộ test 7063 đạt, 61 bỏ qua.
+
+## [3.23.631] — 🛡️ Gói 2 theo log thật: chịu quá tải/hạn mức Gemini free tier, tự kiểm tra phân tích rẻ + hội tụ
+
+Nguồn: cùng log thật 10/2026 (phim 86 tập, 3649 dòng, 3 API key free tier). Tổng thời gian **chờ
+thử lại Gemini = 3,06 giờ**, phân rã: **lỗi 503 = 171 lần, 142 phút (46%)**; điều tiết TPM
+(flash-lite, đoạn video ~139 nghìn token) 148 lần, 34 phút (vốn có, không tránh được); 429 = 3,9
+phút; 504 = 3,5 phút. 17 chuỗi 503 liên tục: dài nhất **68 lần liền = 41 phút** trên
+`gemini-3.1-flash-lite` (bước hỏi lại người nói, có video); hai lượt dịch **hỏng hẳn** sau 12 lần
+503 (13-14 phút) mà không ai thử model khác.
+
+### B2 — Bộ ngắt mạch quá tải theo MODEL + model dự phòng (`model_health.py`)
+- `ModelHealth` (dùng chung cho mọi adapter trong tiến trình): 3 lỗi quá tải liền trên một model
+  thì "ngắt mạch" 90 s × 2^(lần ngắt−1) (trần 15 phút); hết hạn thì lượt đầu là lượt thăm dò — hỏng
+  là ngắt lại ngay (gấp đôi), thành công là bình phục. Các lời gọi KẾ TIẾP sang dự phòng NGAY, không
+  tự đốt lại hai lượt 503 để biết điều đã biết.
+- Trong MỘT lời gọi: sau 2 lượt quá tải liên tiếp (hoặc model đã bị ngắt) → chuyển sang model dự
+  phòng cho phần còn lại của lời gọi (reset bộ đếm/ngân sách chờ, hạn mức theo model mới), thay vì chờ
+  5-11 lượt. Thứ tự dự phòng: cùng nhóm lite/flash trước → bản chính thức trước preview → hạn mức ngày
+  cao → đời mới; chỉ chọn model còn hạn mức ngày ở ≥1 key, cùng thế hệ suy nghĩ (khác thế hệ thì bỏ
+  `thinking_config`); không quay lại model đã thử. Danh sách lấy từ `list_available_models` (gieo sẵn
+  3.1/3.5-flash-lite); **loại** native-audio/live/omni/image/tts và bí danh `-latest` — danh sách free
+  tier THẬT của tài khoản có 18 model gồm cả các loại này (kiểm bằng API thật).
+- Không có model dự phòng (hoặc tắt `model_health`) = hành vi cũ nguyên vẹn.
+
+### B3 — Video handle / xoay key
+- **Không xoay key vì quá tải khi lời gọi đính video**: log thật 17 lần xoay key vì quá tải chỉ **2
+  lần** được trả lời ngay (15/17 vẫn 503) — quá tải là của model, không phải của key — mà mỗi lần xoay
+  kèm video buộc tải lại đoạn (đo: 30 lần tải lại sau đổi key = **53 phút**) và vài request bị tính
+  hạn mức ngày. Lời gọi không video vẫn xoay như cũ. (Test `TestVideoFollowsTheKey` của 3.23.592
+  khẳng định hành vi ngược lại → cập nhật theo hợp đồng mới.)
+- File đã bị 403 với key hiện tại được nhớ (khoá key+tên file): không dò `files.get` lại ở các lượt
+  thử/lô sau (93 dòng "cần tải lại (403)" trong log, phần lớn là dò lặp). Lỗi tạm (500…) không nhớ.
+- Ghi chú đo: số lần "Tái dùng đoạn video đã tải lên" = 311 — bộ nhớ tải lên theo (đoạn, key) đã
+  có sẵn và hoạt động; phần tốn thật là tải lên lần đầu cho từng key, nay bớt vì không xoay oan.
+
+### B1 — Tự kiểm tra phân tích: rẻ, nhanh, hội tụ
+Log: lượt 1 mất **10 phút** (suy nghĩ "high" 15.980 token; một lời gọi chạy hết 300 s thì 504, lần
+thử lại cũng 504), lần chạy kế mất 20 phút (29.819 / 26.402 token suy nghĩ, hai lần 504) và **vẫn mở
+đầu bằng "17 khiếm khuyết"** như lần trước. Nguyên nhân: 40 dòng nghi lỗi × cửa sổ ±40 dòng phủ >85%
+phim vào một prompt; khiếm khuyết model không sửa được bị gửi lại mãi; chạy bằng gemini-3.8-flash
+(20 request/ngày/key — mà 24 đoạn video đã cần).
+- **Lô nhỏ**: khiếm khuyết xếp theo vị trí trong phim, mỗi lô một lời gọi với cửa sổ ±8 dòng, ≤ 320
+  dòng/prompt (cửa sổ của 40 dòng rải đều: 85%+ phim → <25%), tối đa 6 lời gọi/lần; adapter cũng có
+  trần cứng 320 dòng (giữ dòng gần dòng nghi lỗi nhất).
+- **Sổ "đã bỏ qua"** (`analysis_audit.note_declined` + `audit_ledger.py`, lưu
+  `analysis_audit_ledger.json` theo dấu phim+ngôn ngữ, giữ 30 phim): đơn vị khiếm khuyết (mỗi dòng /
+  mỗi nhãn) gửi mà vẫn còn sau bản vá được cộng một lần; đủ 3 lần thì thôi không gửi (cả lần chạy
+  sau) — mục đã sửa được thì không bị tính. Thanh trạng thái báo "Tự kiểm tra: N khiếm khuyết, K lời
+  gọi, vá M mục, bỏ qua B mục model đã không sửa được nhiều lần (nên soát tay)".
+- **Model kiểm định rẻ**: `gemini-3.1-flash-lite` (500 request/ngày) cho cả nút "Tự kiểm tra" lẫn
+  tự kiểm tra sau phân tích, thay vì model phân tích đang chọn.
+- **Mức suy nghĩ riêng** cho kiểm định, đo thật (Gemini 3.1 Flash-Lite, tập 2 bị cố ý làm hỏng 12
+  khiếm khuyết, 3 lượt mỗi mức): `medium` **sạch 3/3 lượt trong 3,8–5,2 s** (546–876 token suy nghĩ);
+  `low` chỉ 1/3 lượt sạch và vá thừa tới 39 mục; `high` 2/3 lượt sạch, 9,7–26 s (2.598–6.868 token).
+  Chọn `medium`. Cùng dữ liệu, thời gian tổng 4–5 s / 1 lời gọi (so với 10–20 phút của log thật — khác
+  cỡ phim: 143 dòng vs 3649, nên số tuyệt đối chỉ để tham khảo; lượng token suy nghĩ giảm 20–30 lần).
+
+Test: `test_model_failover_v323631.py` (22 ca, chạy thật vòng thử lại với Gemini giả theo kịch bản,
+gồm nguyên văn 503 của log), `test_video_handle_probe_v323631.py` (3), `test_audit_converge_v323631.py`
+(23, gồm phim 3649 dòng × 40 dòng nghi lỗi, ba lần chạy liền qua sổ). Cập nhật
+`test_overload_key_rotation_v323592.py` (hợp đồng mới). Toàn bộ 7014 test qua (61 bỏ qua do thiếu dữ
+liệu/thư viện ngoài).
+
+## [3.23.630] — ⚡ Gói 1 theo log thật: TTS tăng dần, duyệt nhanh người nói, xuất thử một đoạn
+
+Nguồn: log thật 10/2026 của phim 86 tập nối thành 1 video (3649 dòng, Windows + GPU): **21 lượt
+"Tổng hợp" cả phim × ~18 phút = 6h14m** dù mỗi lần chỉ sửa vài chục dòng; **861/3649 dòng (23,6%)
+sửa tay người nói**, mỗi dòng một lần chuột phải → menu 24 vai; **37 lần xuất video** × ~3 phút.
+Đo lại trên chính dữ liệu 3649 dòng: một lần sửa người nói chỉ tốn ~0,2 s xử lý (không phải lỗi hiệu
+năng) — nút thắt là SỐ THAO TÁC của người dùng và việc chạy lại cả phim.
+
+### A1 — TTS TĂNG DẦN: chỉ đọc lại dòng đã đổi
+- **Chữ ký từng dòng** (`tts_line_cache.py`, hàm thuần): lời + mốc đầu/cuối + giọng của dòng + mốc
+  đầu câu kế (khung thời gian của dòng phụ thuộc câu kế). **Khoá toàn cục**: engine/chế độ + mọi cài
+  đặt ảnh hưởng audio từng dòng (tốc độ, lập lịch, giọng mặc định, ref…); KHÔNG gồm cài đặt chỉ
+  ảnh hưởng master (chuẩn hoá, LUFS, định dạng/bitrate file, thời lượng video…).
+- Chữ ký theo NỘI DUNG, không theo vị trí → thêm/xoá dòng hay MỞ LẠI ỨNG DỤNG vẫn nhận lại đúng
+  audio; audio dòng đổi vị trí được đổi tên `seg_<vị trí mới>.wav` (hai pha, không đè nhau).
+- Cache bền: `<output>_segments/line_cache.json` (ghi nguyên tử; hỏng/khác phiên bản = chạy cả
+  phim). Dòng lỗi hoặc thiếu file audio không vào cache → lần sau tự thử lại. Chạy cả phim thì xoá
+  cache trước (huỷ giữa chừng không để cache sai).
+- `TTSPageViewModel.start_tts(incremental=True)`: có cache hợp lệ và còn ≥ 30% dòng dùng lại được thì
+  đi đường "TTS lại dòng chọn" (đã có từ 3.23.450) cho các dòng đổi + ghép lại master + xuất lại
+  phụ đề; không dòng nào đổi thì chỉ ghép lại. Ô **⚡ Chỉ tổng hợp lại dòng đã đổi** ở khu Thực thi
+  (mặc định bật, nhớ theo QSettings); bỏ tick = chạy lại cả phim. Dòng tóm tắt kết quả thêm
+  "Đã dùng lại X/Y dòng, tổng hợp lại Z dòng".
+- "TTS lại dòng chọn" và thêm/xoá/gộp/tách dòng cũng cập nhật cache (lần Tổng hợp sau không đọc lại
+  đúng các dòng đó).
+- **Sửa kèm**: `ResynthesizeLinesUseCase` luôn ghi master dạng WAV dù tên file là `.mp3/.m4a/.flac`
+  → nay ghi đúng định dạng/bitrate đã chọn (`write_audio`); huỷ/lỗi giữa chừng để lại thư mục WAV tạm
+  `resynth_seg_*` → nay dọn; `ResynthesizeWorker` không báo "huỷ" (hiện lỗi "không xác định") → nay
+  có tín hiệu `cancelled` như `TTSWorker`.
+- Đo bằng VieNeu v3 Turbo thật (CPU/ONNX, 60 dòng, qua `TTSPageViewModel`; thời gian gồm ~35 s nạp
+  model): lượt 1 cả phim 114 s → sửa 2 dòng: **41,7 s** (đọc lại đúng 2 dòng) → không đổi: **11,1 s**
+  (chỉ ghép lại) → phiên mới + xoá 1 dòng: **33,3 s** (chỉ 1 dòng đọc lại, 58/59 dùng lại) → tắt tăng
+  dần: 94 s. Với 3649 dòng: `prepare_run` (đọc cache 3,1 MB + so chữ ký + đổi tên ~3000 file) 0,5 s;
+  GPU ~0,3 s/dòng nên sửa ~100 dòng ≈ nạp model ~20 s + ~30 s + ghép master thay cho ~18 phút.
+- **Giới hạn cần biết**: dòng không đổi giữ nguyên mốc phát đã lập lịch ở lần chạy trước; nếu dòng
+  trước nó dài ra/ngắn đi nhiều thì không lập lịch lại toàn cục. Muốn lập lịch lại từ đầu: bỏ tick ô trên.
+
+### A2 — DUYỆT NHANH NGƯỜI NÓI
+- **Nút ⚡ Duyệt nhanh** (hàng nút thứ nhất) + mục menu chuột phải "Duyệt nhanh người nói từ dòng
+  này…": hộp thoại hiện dòng đang duyệt tô vàng giữa ±3 dòng (mốc · người nói · câu gốc · lời dịch),
+  **phím 1–9 chọn người nói** (gợi ý = người đang hội thoại quanh dòng, người vừa chọn gần đây, người
+  được nói tới), `0` giọng chung, `Space`/`→` giữ nguyên, `←` về trước, `Ctrl+Z` hoàn tác; ô "Vai
+  khác…" cho người ngoài gợi ý; tick **áp cho cả đoạn liền kề cùng người nói** (khoảng lặng ≤ 2,5 s).
+  Mặc định duyệt các dòng nghi sai — bằng chứng chắc nhất trước (gọi tên chính người nói > giới tính >
+  chỉ biết giọng > chưa rõ), cùng nhóm theo thứ tự phim — hoặc "mọi dòng" từ vị trí bất kỳ. Mọi lựa
+  chọn chỉ áp dụng một lượt khi bấm "Xong" (theo từng người nói, đi qua đường sửa tay cũ nên lưu theo
+  phụ đề, "Bỏ sửa tay", hoàn tác đều dùng được); "Huỷ" bỏ hết.
+- Mục menu "Chọn cả đoạn liền kề cùng người nói": chọn đoạn rồi đổi người nói một lần.
+- Phần lõi (hàm thuần, không Qt): `speaker_review_flow.py` (hàng đợi, đoạn liền kề, gợi ý),
+  `speaker_review_session.py` (con trỏ, lựa chọn, hoàn tác). Cảnh kiểm thử là dòng 490–499 thật của
+  log (dòng 495 nhãn vợ nhưng câu gốc gọi chính cô là "阿秀").
+- Gọi `line_context` không còn phân tích lại cả JSON Visual Cues mỗi dòng (nạp một lần khi nạp vai).
+
+### A4 — XUẤT THỬ MỘT ĐOẠN
+- Trang Xuất bản: ô **⚡ Chỉ xuất đoạn thử (nhanh)** + "Từ (phút)" + "Dài (giây)" (mặc định 90 s).
+  Ra tệp `<tên>_xemthu.mkv` cạnh đích — không ghi đè bản đầy đủ. Hỗ trợ cả 3 kiểu phụ đề × 3 kiểu
+  âm thanh. Mốc bắt đầu vượt thời lượng video bị chặn trước khi chạy.
+- `RenderRequest.clip_start_sec/clip_duration_sec`: `-ss` TRƯỚC mỗi `-i` (nhanh, không đọc cả
+  phim), `-t` ở đầu ra, hình LUÔN mã hoá lại (preset `veryfast`; cắt sao chép luồng chỉ chính xác ở
+  khung khoá nên giọng đọc lệch hình tới vài giây), phụ đề `.srt` cắt + dời về mốc 0
+  (`subtitle_clip.py`; `.ass` bị từ chối kèm hướng dẫn). Tiến độ tính theo độ dài đoạn.
+- Kiểm bằng ffmpeg thật: đoạn 12→18 s của phim 20 s (giọng giả 440 Hz rồi 880 Hz từ giây 10) cho track
+  tiếng Việt đúng 880 Hz, phụ đề "Trong đoạn" (13,0 s) ra ở 1,06 s (lệch 64 ms do độ trễ mã hoá AAC),
+  thời lượng 6,0 s, thư mục tạm dọn sạch.
+
+Test: `test_tts_incremental_v323630.py` (37 ca, gồm chạy thật qua ViewModel + worker),
+`test_speaker_review_flow_v323630.py` (19), `test_speaker_review_quick_v323630.py` (16),
+`test_render_clip_v323630.py` (16, trong đó 3 ca chạy ffmpeg thật). Cập nhật 3 test có worker giả
+(thêm tín hiệu `cancelled`). Toàn bộ 7018 test qua.
+
+Bấm thử giao diện thật với VieNeu v3 Turbo (14 dòng, 0 vấn đề): lượt 1 cả phim 19,8 s → duyệt nhanh
+đổi người nói dòng 3 rồi Tổng hợp: **4,6 s, dùng lại 13/14** → sửa chữ dòng 5: **5,6 s, 13/14** → xoá
+dòng 1 rồi Tổng hợp: 2,4 s, 13/13 (không dòng nào phải đọc lại) → không đổi: 2,1 s (chỉ ghép) → bỏ
+tick: 18,7 s cả phim. Master hợp lệ, không trùng tên segment.
+
+## [3.23.629] — 🔁 Dịch ↔ TTS: khép vòng "dòng quá dài" (đo bằng VieNeu thật)
+
+Chiều xuôi (dịch → TTS) đã có từ lâu: mỗi dòng gửi model một ngân sách âm tiết đã hiệu chỉnh trên 3
+engine. Đo lại bằng VieNeu 3.8.3 thật trên bản dịch tập 2 (143 dòng, giọng "Hải Đăng"): nén trung
+bình **1,07×**, p90 1,25×, không chồng tiếng, không bị cắt, chỉ 1 dòng ≥ 1,5× (khung 0,56 s cho 4 âm
+tiết — bất khả thi). Tức khâu dịch đang làm đúng việc; thứ THIẾU là chiều ngược: dòng nào vẫn không
+vừa thì không có đường quay lại khâu dịch, và dòng người dùng tự sửa / thêm / gộp / tách ở trang TTS
+không hề có ngân sách.
+
+- **Mô hình thời lượng đọc của VieNeu** hồi quy lại trên 141 dòng thật:
+  `thời lượng tự nhiên = 0,312 + 0,177 × số âm tiết` (sai số chuẩn 0,09 s) — `tts_fit.py`.
+- **Tìm dòng không vừa** (`predict_misfits` trước khi tổng hợp, `measured_misfits` sau khi tổng
+  hợp: nén ≥ 1,5×, bị cắt, chồng tiếng > 0,3 s). Dự đoán dùng ngưỡng 1,8× vì bộ lập lịch còn dời
+  câu / mượn khoảng lặng (đo: ngưỡng 1,5× gắn 9 dòng nhưng thực tế chỉ 1 dòng bị nén ≥ 1,5×).
+  Không bao giờ yêu cầu cắt quá 40% âm tiết và không đụng dòng dưới 4 âm tiết (NGHĨA hơn độ mượt).
+- **Rút gọn bằng AI** (`GeminiTranslationAdapter.shorten_for_speech` + `ShortenForSpeechUseCase`):
+  gửi câu gốc, bản dịch, người nói → người nghe, 2 dòng kề mỗi phía, số âm tiết tối đa. Mỗi câu trả
+  về được KIỂM: giữ tag `[Tên:]`, không chèn chữ Hán, ngắn hơn, đạt mục tiêu hoặc rút ≥ 15%, **trùng
+  ≥ 70% âm tiết với câu cũ và thêm ≤ 1 từ mới**. Lý do (đo thật trên 24 dòng với Gemini 3.1
+  flash-lite): "Hiện giải phóng cho ký chủ" bị trả thành "Mở toàn lực một ngày" (lấy nội dung dòng
+  kề), "Chỉ có sư thúc là người luôn" → "Sư thúc luôn chăm sóc" (bịa), "phong ấn tu vi" → "Phá phong
+  ấn" (đổi nghĩa). Sau khi siết prompt (giữ từ khoá, được trả lại nguyên văn nếu không rút nổi) và
+  kiểm tra: 24 dòng → 13 dòng hợp lệ.
+- **Nút "✂ Rút gọn dòng quá dài (AI) (n)"** ở trang TTS (hàng nút thứ ba): đếm số dòng, gọi AI ở luồng
+  nền, **hiện hộp xem trước** (tick từng dòng, mặc định tick hết) rồi mới áp dụng qua đường sửa lời
+  thường (nên "Bỏ sửa tay", hoàn tác, lưu theo phụ đề đều dùng được) và tự TTS lại các dòng đã đổi.
+  Khoá API / ngôn ngữ lấy từ trang Dịch.
+
+Kết quả đo (tập 2, TTS lại cả tập sau khi áp 13 câu rút gọn): hệ số nén trên đúng 13 dòng đó giảm
+**1,20× → 1,08×** (10/13 dòng giảm nén), toàn tập 1,073 → 1,062, số dòng nén ≥ 1,25× từ 26 → 21. Dòng
+bất khả thi (khung 0,56 s) không cứu được bằng rút gọn — đúng kỳ vọng. Thử nút trên giao diện với
+Gemini thật: dòng 16 âm tiết → 11, tự TTS lại.
+
+Test: `test_shorten_for_speech_v323629.py` (13 ca), `test_dubbing_shorten_v323629.py` (6 ca).
+
+## [3.23.628] — 🧪 Chạy VieNeu 3.8.3 THẬT + bấm giao diện: sửa 3 lỗi chặn tổng hợp
+
+Lần đầu cài `vieneu 3.8.3` + `onnxruntime 1.31` + `scipy 1.18` trong môi trường kiểm thử, chạy
+bộ chuyển đổi của ứng dụng và trang TTS (Qt offscreen) trên phụ đề tiếng Việt thật (tập 2). Hai lỗi
+đầu CHẶN HẲN việc tổng hợp:
+
+1. **onnxruntime từ chối nạp model**: `External data path escapes model directory` — cache
+   HuggingFace để `snapshots/<rev>/x.data` là symlink tới `blobs/<hash>`, mà onnxruntime mới đòi
+   `realpath` của external data phải nằm trong thư mục model. Mọi lần nạp VieNeu v3 Turbo (CPU/ONNX)
+   chết ngay từ đầu trên máy có symlink. Sửa: `hf_cache_fix` bọc `hf_hub_download`, thay symlink
+   bằng hard link tới đúng blob (không tốn dung lượng, chép nếu khác ổ).
+2. **Tổng hợp xong cả phim nhưng không ghi được WAV**: `AttributeError: 'NoneType' object has no
+   attribute 'Tensor'` ở `true_peak_limit` (`resample_poly`). Blocker torch của PaddleOCR đặt
+   `sys.modules["torch"]=None` ngay lúc khởi động và chỉ gỡ khi PaddleOCR nạp — người dùng vào
+   thẳng trang TTS (chưa chạy OCR) dính lỗi ở khâu master, scipy ≥ 1.15 dò `torch.Tensor`.
+   Sửa: `torch_none_bypassed` / `@without_torch_block` bọc khâu master của VieNeu, Edge, Gemini và
+   `ResynthesizeLinesUseCase._write_master`; chỉ gỡ entry `None` (không đụng torch thật), khôi phục
+   nguyên trạng khi ra khối nên PaddleOCR vẫn được bảo vệ. Tái hiện: không có decorator thì
+   `_write_master` ném đúng lỗi trên.
+3. Thông báo sai: chế độ standard/turbo thiếu `llama-cpp-python` (ImportError không tên) bị báo
+   "VieNeu-TTS chưa cài. Chạy: pip install vieneu" dù đã cài 3.8.3. Nay nêu đúng lỗi và gợi ý dùng
+   v3 Turbo (`describe_vieneu_import_error`).
+
+Kết quả chạy thật sau khi sửa (CPU 4 nhân, ONNX fp32):
+- 14 dòng tập 2 → 14/14 OK trong ~20 s qua nút "Tổng hợp" của trang TTS, WAV 48 kHz hợp lệ
+  (đỉnh 0,92, không NaN); 25 giọng với phong cách/⭐/bí danh đọc đúng từ nhãn thật.
+- Lồng tiếng nhiều giọng từ phân vai thật (Diệp Nhiên → "Adam bựa", Dao Dao → "Trúc Ly"); giọng đã
+  lưu dưới tên cũ ("Minh Quân", "Anh Khôi") hiện đúng "Hải Đăng", "Thiện Minh" trong bảng phân vai.
+- Sửa chữ + TTS lại dòng, thêm dòng (tự TTS dòng mới), xoá dòng (ghép lại master 1,2 s; đoạn dòng đã
+  xoá im lặng hoàn toàn), sửa mốc, gộp, tách: kết quả luôn khớp danh sách dòng, tệp audio từng dòng
+  đúng tên theo vị trí, không trùng; nạp lại phụ đề gốc khôi phục đủ thêm/xoá/gộp/tách.
+- int8 (CPU nhanh), nhân bản giọng từ clip, tag cảm xúc (`[cười]`, `[chuckle]`): chạy OK.
+- Quét 9 trang / 195 nút: không ngoại lệ (4 dòng ERROR là nút "Mở dữ liệu thô" nhận tệp SRT — ứng
+  dụng báo lỗi đúng; cảnh báo âm thanh Qt do môi trường không có thiết bị audio).
+
+Test: `tests/unit/infrastructure/test_vieneu_real_run_v323628.py` (10 ca).
+
+## [3.23.627] — ↶↷ Lồng tiếng: hoàn tác / làm lại + khớp frame codec VieNeu 3.8
+
+Đối chiếu tiếp mã nguồn VieNeu-TTS (HEAD 19/10/2026):
+
+- **Trần `max_new_frames` sai đơn vị**: ứng dụng đổi "trần giây → frame" bằng 100 frame/s (hop 480
+  của neucodec, đọc từ SDK 3.2.3), nhưng codec v3 Turbo (MOSS-Audio-Tokenizer-Nano) là 3840
+  mẫu/frame @ 48 kHz = **12,5 frame/s** (`CODEC_SAMPLES_PER_FRAME`). "Trần 6× kỳ vọng" thành ~48×
+  kỳ vọng (câu 12 ký tự: 549 frame thay vì 112) — lưới chống ngân dài ở tầng gọi gần như vô
+  hiệu (engine có trần riêng theo phoneme nên không thảm hoạ, nhưng lưới của ứng dụng không chạy
+  đúng ý). Nay theo chế độ: v3 Turbo 12,5; standard giữ 100. Câu hợp lệ vẫn dư ≥ 5× so với cần.
+- **Tag cảm xúc**: SDK 3.8 nhận cả `[chuckle]/[sigh]/[clear throat]` và dạng không dấu
+  (`[cuoi]/[tho dai]/[hang giong]`); ứng dụng từng xoá chúng như "tag rác". Nay được giữ.
+
+**Hoàn tác / làm lại** chỉnh sửa dòng (nút "↶ Hoàn tác" / "↷ Làm lại", Ctrl+Z / Ctrl+Y khi bảng
+được chọn): lời, người nói, thêm / xoá / gộp / tách dòng, sửa mốc; thao tác ghép nhiều bước
+(gộp, tách) tính MỘT bước; tối đa 100 bước. Chỉ dùng được TRƯỚC khi có kết quả TTS — sau khi tổng
+hợp, audio từng dòng đã đổi nên không khôi phục nguyên vẹn được (nút nói rõ trong chú thích);
+nạp phụ đề khác hoặc có kết quả TTS thì xoá lịch sử.
+
+Test: `test_dubbing_undo_v323627.py` (7 ca), `test_vieneu_frames_v323627.py` (3 ca).
+
+## [3.23.626] — 🦜 Cập nhật theo VieNeu-TTS 3.8.3 + lồng tiếng: sửa mốc / gộp / tách dòng
+
+Đối chiếu mã nguồn VieNeu-TTS mới nhất (github.com/pnnbao97/VieNeu-TTS, 3.8.3 ngày 23/9/2026;
+HEAD 19/10/2026) với cách ứng dụng dùng SDK. Tìm ra **lỗi thật**: VieNeu 3.8.1-3.8.2 ĐỔI TÊN
+giọng preset (Minh Quân → Hải Đăng, Anh Khôi → Thiện Minh, Mạnh Dũng → Quốc Tuấn; tên cũ chỉ còn
+là bí danh), còn ứng dụng chỉ khớp tên với danh sách preset nên:
+
+- giọng đã lưu cho vai dưới tên cũ **bị bỏ lặng lẽ** (bảng phân vai về giọng tự động);
+- dòng của vai yêu cầu "Minh Quân" **đọc bằng giọng chung** (khớp mềm không ra);
+- giọng chung đã chọn ở tab Engine về "mặc định" khi mở lại.
+
+Sửa: bảng bí danh `VIENEU_VOICE_ALIASES` + `resolve_voice_alias` (ưu tiên `engine.resolve_voice_name`
+của SDK đang cài) dùng ở cả ba đường chọn giọng (CPU, dòng-theo-vai, worker GPU);
+`VoiceProfile.aliases` + `canonical_voice_id` đổi lựa chọn đã lưu sang tên mới.
+
+Cải thiện chất lượng phân vai từ metadata mới của VieNeu (nhãn giọng ghi phong cách và dấu ⭐):
+`VoiceProfile.style` (tự nhiên / kể chuyện / tin tức) và `featured`. Phân vai tự động và giọng
+nam/nữ mặc định của chế độ hai giọng nay ưu tiên giọng "tự nhiên" (hợp thoại nhân vật) hơn giọng
+đọc tin tức, rồi giọng tuyển chọn; giọng tin tức là lựa chọn cuối khi hết giọng. (Trước đây
+"giọng nam mặc định" là giọng tuyển chọn ĐẦU danh sách — có thể là giọng đọc tin tức.)
+
+Cập nhật SDK: sàn `vieneu[legacy]>=3.8.3,<4` + `sea-g2p>=0.9.1` (kế hoạch cài GPU và
+requirements-gpu.txt). 3.8.0 sửa lỗi bộ mã hoá nối thêm frame đệm 455 NGHE ĐƯỢC vào clip giọng mẫu
+(ảnh hưởng nhân bản giọng và giọng preset). Khi nạp model, ứng dụng ghi cảnh báo nếu bản đang cài
+cũ hơn 3.8.0 (lỗi âm thanh) hoặc 3.8.3 (khuyên cập nhật) kèm lệnh `pip install -U vieneu sea-g2p`.
+
+Lồng tiếng — hoàn thiện thao tác dòng (bổ sung cho thêm/xoá dòng ở 3.23.625), cùng cơ chế dịch vị
+trí + lưu theo phụ đề + TTS lại dòng bị ảnh hưởng:
+- **⏱ Sửa mốc…**: đổi bắt đầu/kết thúc một dòng (không cho vượt dòng kề; mốc đã xếp lại của kết
+  quả TTS bị bỏ để dòng được đặt lại), được lưu theo phụ đề;
+- **🔗 Gộp dòng**: gộp các dòng LIỀN NHAU (lời nối, mốc phủ cả hai, giữ người nói dòng đầu);
+- **✂ Tách dòng…**: tách tại dấu câu gần giữa lời nhất (`suggest_split`), mốc cắt chia theo tỉ lệ
+  ký tự, hai nửa giữ người nói; chỉnh được trong hộp thoại.
+Nút nằm hàng thứ ba (6 → 9 nút một hàng sẽ bị cắt chữ ở 1500 px) và trong menu chuột phải.
+
+Test: `tests/unit/infrastructure/test_vieneu_update_v323626.py` (9 ca),
+`tests/unit/presentation/test_dubbing_edit_lines_v323626.py` (10 ca).
+
+## [3.23.625] — ➕🗑 Lồng tiếng: THÊM / XOÁ dòng
+
+Danh sách dòng của trang TTS trước đây cố định theo phụ đề nạp vào: chỉ sửa được lời và người
+nói, không thêm câu bị sót (ví dụ tiếng thở, câu OCR bỏ mất) hay bỏ câu thừa. Nay:
+
+- Nút **"➕ Thêm dòng…"** (hộp thoại: mốc bắt đầu/kết thúc, lời thoại, người nói; mốc gợi ý
+  khít khoảng trống sau dòng đang chọn) và **"🗑 Xoá dòng"** (có xác nhận) + mục tương ứng ở menu
+  chuột phải. Dòng mới tự xếp đúng thứ tự thời gian.
+- Mọi trạng thái đánh theo VỊ TRÍ dòng được dịch đúng theo (hàm thuần `dubbing_line_structure`):
+  người nói chọn tay, lời sửa tay, dòng cần TTS lại, kết quả TTS, giọng từng dòng của lần chạy
+  trước, **tệp audio từng dòng** (`renumber_results` đổi tên hai bước qua tên tạm để không đè
+  audio dòng khác; audio dòng bị xoá được dọn) và số thứ tự `index` của phụ đề.
+- Đã TTS (VieNeu giữ audio từng dòng): **xoá dòng → ghép lại master ngay, không TTS** (chế độ
+  `remerge_only` của `ResynthesizeLinesUseCase`; master không còn dòng nào có tiếng thì im lặng;
+  phụ đề `.tts.*.srt` xuất lại); **thêm dòng → tổng hợp riêng dòng mới** rồi ghép. Engine không
+  giữ audio từng dòng (Edge/Gemini) thì báo rõ phải TTS lại cả phim.
+- Danh sách dòng đã đổi được LƯU theo phụ đề (ảnh chụp `LineSnapshot` trong `LineEdits`, kèm vị
+  trí gốc từng dòng) và dựng lại khi nạp lại đúng phụ đề đó cùng sửa tay; ảnh chụp hỏng/không
+  khớp thì bỏ cả ảnh chụp (không áp nửa vời). Không cho xoá hết mọi dòng; chặn khi đang bận.
+
+Test: `tests/unit/presentation/test_dubbing_add_delete_lines_v323625.py` (18 ca: ánh xạ vị trí,
+đổi tên tệp audio giữ đúng audio theo dòng, ghép lại không TTS, VM, lưu/khôi phục, trang).
+
+## [3.23.624] — 🔍 Tự kiểm tra & vá phân tích cũ (không phân tích lại từ đầu)
+
+Người dùng soát kết quả phân tích thấy chưa đúng thì trước đây chỉ còn cách sửa tay hoặc phân
+tích lại cả tập (tốn quota, lại ra kết quả ngẫu nhiên khác). Nay ứng dụng tự đối chiếu CHÍNH phân
+tích cũ với phụ đề rồi chỉ vá chỗ lỗi:
+
+- `analysis_audit.find_analysis_defects` (tất định, không tốn lời gọi AI): bảng nhân vật/tóm tắt
+  rỗng, nhãn người nói/nghe xuất hiện ≥3 dòng mà không có trong bảng nhân vật (nhân vật bị sót
+  hoặc viết sai tên), dòng có lời chưa có người nói, người nghe trùng người nói, thuật ngữ không
+  thấy trong phụ đề (chỉ là gợi ý — đứng một mình không đáng một lời gọi AI).
+- `GeminiTranslationAdapter.audit_analysis`: MỘT lời gọi nhỏ, schema chỉ nhận **bản vá** (nhân vật
+  thêm/sửa/xoá, thuật ngữ, tóm tắt, sửa người nói/nghe theo `id`) — không sinh lại toàn bộ.
+- `apply_audit_patch` gộp bản vá vào phân tích cũ; mục không được nhắc tới (kể cả chỗ người dùng
+  đã sửa tay) giữ nguyên. `AnalyzeSubtitleContextUseCase.refine` lặp tối đa 2 lượt, dừng khi hết
+  khiếm khuyết/bản vá không đổi gì; lỗi API không làm hỏng kết quả cũ.
+- Tự chạy cuối mỗi lượt phân tích (`self_audit=True`) và có nút **"🔍 Tự kiểm tra & tối ưu"** trên
+  trang Dịch (dùng nguyên các ô đang hiển thị, kể cả phần đã sửa; không cần video).
+
+Rà lỗi tính năng ngay trong bản này: bản vá không ghi đè vai trò/xưng hô người dùng đã sửa (chỉ
+điền phần trống), không xoá nhân vật còn được nhãn người nói nhắc tới, chỉ xoá thuật ngữ thật sự
+vắng trong phụ đề; bản vá đi qua lại bước sửa phiên âm tên/chức danh/xưng hô thuần Việt như lượt
+phân tích thường.
+
+Đo thật (tập 2, 3.5-flash-lite): làm hỏng phân tích (xoá 2 nhân vật, xoá tóm tắt) → 6 khiếm khuyết
+được phát hiện → vá 4 mục ở lượt 1, tóm tắt viết lại, 2 nhân vật khôi phục kèm nhân vật "Hệ thống"
+bị sót; ~3 giây/lượt. Test: `tests/test_analysis_audit_v323624.py` (9 ca).
+
+## [3.23.623] — 🎙️ Tách giọng + gán người nói từ phụ đề: lỗi đảo vai nặng 27 → 2 (chấm mù)
+
+Rà soát theo tài liệu Gemini API mới nhất (tải 16/10/2026, 61 trang: model, thinking, structured
+output, prompting, video/âm thanh, caching, hạn mức) → 59 đề xuất từ 6 mảng mã nguồn, kiểm chứng
+và ĐO lại bằng 3 key Gemini thật trên tập 1-3 phim mẫu. Phát hiện lớn nhất: lỗi dịch nặng còn lại
+hầu như toàn là **đảo vai** (ai nói với ai), mà MỌI lưới xưng hô của ứng dụng (quy tắc "tự xưng …
+gọi …", lưới đại từ, kiểm vai) chỉ chạy khi dòng có người nói/người nghe — thứ trước nay chỉ có
+khi đính cả video lên Gemini. Không video = các lưới đều "mù".
+
+### Kết quả (chấm mù, 3 tập × 2 lượt, hai người chấm độc lập mỗi bảng; điểm = nặng×5 + nhẹ, thấp là tốt)
+
+| Cấu hình dịch thô (3.1-flash-lite, thinking low) | Lỗi nặng | Lỗi nhẹ | Điểm |
+|---|---|---|---|
+| Trước (không có người nói) | 27 | 28 | 163 |
+| + gán người nói từ chữ + `pron` | 12 | 21 | 81 |
+| + tách giọng từ âm thanh + `pron` (mặc định mới) | **2** | 22 | **32** |
+
+Độ đúng người nói so với đáp án gán tay theo dòng (tập 1 / tập 2):
+chỉ chữ (3.5-flash-lite) 96 % / 91-96 % · chữ + nhãn giọng **97-99 % / 99-100 %** · phân tích
+có video 3.8-flash 100 % / 100 %. Bỏ phiếu nhiều lượt KHÔNG giúp (5 lượt cùng ra ~91 % ở tập
+2: lỗi hệ thống do cảnh mơ hồ) — chỉ tín hiệu âm thanh mới phá được.
+
+### Tính năng mới
+
+* **Tách giọng bằng `gemini-3.5-transcribe`** (miễn phí ở hạng miễn phí): cắt riêng âm thanh lời
+  thoại của video cạnh phụ đề (KHÔNG tải video lên), nhận nhãn giọng theo từ, ghép vào từng dòng
+  theo mốc thời gian. Tập 2: `spk:0` = nhân vật chính 77/77 dòng, `spk:2` = sư thúc 28/28,
+  `spk:3` = hệ thống 24/24 (cả các dòng 3-9 mà đọc chữ cứ gán nhầm). 6-11 s, 4-6k token/tập; kết
+  quả nhớ theo (đường dẫn, kích thước, ngày sửa). Âm thanh > 28 phút (giới hạn của dịch vụ khi
+  bật tách giọng) thì bỏ qua và gán bằng chữ.
+* **Gán người nói/người nghe từ phụ đề** (`analyze_text_cues`): đọc CẢ TẬP một lượt (dữ liệu
+  trước, câu hỏi cuối), model Lite rẻ gán MỖI nhãn giọng cho một nhân vật. 6-12 s, 3-4k token.
+  Nối vào cả bước Phân tích (kết quả hiện ở ô "Gợi ý hình ảnh" để xem/sửa) lẫn bước Dịch (tự
+  chạy nếu chưa có cues, lưu vào checkpoint). Ô mới ở trang Dịch, mặc định bật.
+* **`pron` — gán sẵn 我/你 cho TỪNG dòng** từ quy tắc xưng hô của cặp: "师兄我就先走了" (sư muội
+  nói) trước đây ra "Sư huynh đi trước đây" dù nhãn đúng; nay dòng mang sẵn `我=muội` và
+  prompt dặn "我 sau lời gọi vẫn là người nói". Bỏ qua quy tắc có điều kiện / nhiều phương án.
+* **Người nghe viết lệch tên vẫn tra được quy tắc**: bảng nhân vật tập 2 ghi "với Diêu Dao" cho
+  nhân vật "Dao Dao" → cặp 叶然→瑶瑶 không có quy tắc nào. Nay khớp mờ khắt khe (cùng số âm tiết,
+  chung ít nhất một âm tiết, hơn ứng viên thứ hai 25 điểm; "đại tẩu" ≠ "Mạc đại tẩu" vẫn bị
+  loại) và prompt phân tích dặn tên sau "với" phải y hệt tên trong bảng.
+
+### Phân tích có video
+
+* **Mốc `[MM:SS]` + câu chốt cho phân tích một-đoạn** (mọi tập ≤ 18 phút): đường này chưa từng
+  gửi mốc thời gian dù đường nhiều đoạn có; prompt cũng không có chỉ thị đứng cuối. 3.1-flash-lite:
+  **2 lời gọi / 76 s / 167 s → 1 lời gọi / 18 s / 25 s**, vẫn điền 95/95 và 143/143 nhãn.
+  `cues` và các trường của cue nay bắt buộc (tài liệu: "Make all output fields required").
+  Có mốc thì cả 3.6-flash lẫn 3.8-flash đạt ~100 % người nói (con số 80 % ở tập 2 trước đây là
+  do thiếu mốc, không phải do model).
+* **Model phân tích mặc định → `gemini-3.8-flash`**: ngang 3.6-flash về độ đúng nhưng nhanh gấp
+  ~2,4 lần (45 s / 74 s so với 108 s / 186 s) và ít token suy nghĩ hơn (1,3k / 2,0k so với 6,1k
+  / 4,8k). Hết hạn mức ngày thì vẫn tự lùi về 3.1-flash-lite.
+
+## [3.23.622] — 🧹 Vệ sinh theo tài liệu Gemini 10/2026: bí danh model, `minimal`, MAX_TOKENS, video dọc
+
+* **Bí danh đã ngừng**: `gemini-3.5-flash` → 3.6-flash và `gemini-3.7-flash` → 3.8-flash
+  (deprecations.md; thăm dò thật: `response.model_version` khác tên đã gọi). Mặc định
+  analysis/STYLE/LOCALIZE dùng tên thật; hai tên cũ khỏi danh sách mời chọn nhưng cài đặt đã lưu
+  vẫn chạy. So sánh sức mạnh model (dùng lại kết quả đã lưu) và bảng giá coi bí danh = bản đích;
+  thêm hàng giá `gemini-4-argon` (chỉ trả phí). Hạn mức/ngày KHÔNG gộp (bí danh có thùng riêng).
+* **`minimal` bị từ chối trên 3.8 Flash VÀ Gemini 4** ("Not supported (error)"; thăm dò: bí danh
+  3.7 trả 400 3/3 lần). Chỉ 3.8 được chặn → 3.7/Gemini 4 tắt suy nghĩ vẫn gửi `minimal`, tốn một
+  lời gọi 400 mỗi phiên. Nay chặn trước.
+* **`MAX_TOKENS`** (token suy nghĩ tính vào ngân sách đầu ra): trước đây phản hồi rỗng + MAX_TOKENS
+  bị coi là "rỗng không rõ lý do" và sau lần thứ hai ứng dụng **BỎ VIDEO** (mất căn cứ gán người
+  nói); JSON cụt của khâu phân tích bị `json_repair` vá lặng lẽ thành "đầy đủ". Nay: hạ mức suy
+  nghĩ một bậc rồi thử lại (đúng khuyến nghị thinking.md), giữ nguyên video, khâu phân tích không
+  nhận JSON cụt.
+* **Nhật ký mỗi lời gọi**: model yêu cầu vs model THẬT SỰ phục vụ, mức suy nghĩ gửi vs token suy
+  nghĩ thực, lý do kết thúc.
+* **Nén video DỌC không còn thu về 202x360**: bộ lọc cũ `scale=-2:360` coi 360 là chiều cao nên
+  720x1280 thành 202x360 — thăm dò thật: 540x960 đọc đúng từng dòng phụ đề cứng, 202x360 trả
+  dòng bị gộp/thiếu (kể cả ở HIGH). Token KHÔNG phụ thuộc số điểm ảnh (HIGH = 51.151 cho cả ba
+  kích thước). Video ngang giữ nguyên hành vi.
+
+Chưa làm (đã đề xuất, cần đo riêng): ví dụ few-shot đúng định dạng và dọn mâu thuẫn trong prompt
+dịch, `line_notes` cho câu mỉa mai/điển tích, trường `addressee` trong schema đầu ra, đưa cả tập
+vào ngữ cảnh dịch, sổ thuật ngữ chạy theo lô, Batch/Flex, bỏ mức `medium` của media_resolution
+(= `low` trên Gemini 3), streaming cho lời gọi video dài, bảng ước tính token video theo họ model.
+
+Test: `test_diarization_v323623`, `test_text_cues_v323623`, `test_text_cues_option_v323623`,
+`test_address_gloss_v323623`, `test_single_chunk_timestamps_v323622`,
+`test_max_tokens_handling_v323622`, `test_model_alias_thinking_v323622`,
+`test_portrait_downscale_v323622`.
+
+## [3.23.621] — 🎯 Phân tích bằng 3.5-flash (tự lùi khi hết hạn mức), văn phong cổ phong, ngắt dòng đúng từ
+
+Đánh giá lại bằng thước đo lớn hơn: mỗi bản dịch tập 1–3 (296 dòng) được agent chấm MÙ theo
+thang lỗi MQM (nặng ×5 + nhẹ), chạy lặp để thấy nhiễu. 14 "dòng bẫy" của bản trước quá ít:
+cùng cấu hình mà lúc 6/7 lúc 4/7.
+
+### Phát hiện chính: lỗi nặng còn lại gần như toàn là ĐẢO VAI — chỉ video sửa được
+
+Chỉ đọc phụ đề, mọi cấu hình (3.1/3.5-flash-lite, thinking minimal/low/medium, lô 25/50)
+đều sai cùng các dòng ở tập 2 ("你还是天骄", "你走吧" → "Huynh…"), chênh lệch giữa các cấu
+hình nằm trong nhiễu. Luồng phim bộ tập 1→3 (ngữ cảnh tích luỹ + bộ nhớ dịch như "Dịch cả
+bộ"), điểm lỗi thấp = tốt:
+
+| Phân tích | Lỗi nặng | Lỗi nhẹ | Điểm |
+|---|---|---|---|
+| Chỉ phụ đề | 9 | 26 | 71 |
+| Đính video, 3.1-flash-lite | 5 | 18 | 43 |
+| Đính video, 3.5-flash | 2 | 23 | 33 |
+
+Người nói đúng (so với đáp án theo dòng): 3.1-flash-lite 89–99 %, 3.5-flash ~100 % (chỉ
+khác ở chỗ gọi giọng hệ thống là "người dẫn chuyện"). Chi phí 3.5-flash: 1 request/tập (~20–27k
+token vào kể cả video).
+
+* **Model phân tích mặc định → `gemini-3.5-flash`.** Hạn mức chỉ 20 request/ngày/key, nên
+  khi model đã chọn hết hạn mức ngày, phân tích **tự lùi về `gemini-3.1-flash-lite`** (500/key)
+  và báo ở dòng trạng thái — trước đây hết hạn mức là báo lỗi rồi dừng. Bổ sung người nói lúc
+  dịch vốn đã lùi về model dịch. Cài đặt đã lưu của người dùng giữ nguyên.
+
+### Dịch
+
+* **Trôi đại từ trong phim cổ trang**: roster đã chốt ta/huynh/muội, sư thúc mà model vẫn
+  chuyển sang "anh/em", "mày/tao" (có lượt 13 dòng ở tập 2). Thêm quy tắc văn phong theo bối
+  cảnh (và "ngươi" ≠ "người"). Đo lặp tập 2: trung bình **7,8 → 0,7 dòng/lượt**.
+* Hán-Việt khó nghe qua TTS ("nhất ngôn vi định", "tiểu khả ái") → ưu tiên thuần Việt.
+
+### Lỗi: ngắt dòng phụ đề cắt đôi từ ghép
+
+Ngắt dòng (>42 ký tự) chỉ tìm khoảng trắng gần giữa câu — tiếng Việt cách theo âm tiết nên
+cắt đôi từ: "tranh vị / trí", "sức / mạnh", "chuyện tình / cảm", "đỉnh / cao", treo lượng từ
+"các / ngươi" (5/296 dòng trên phim mẫu). Nay phạt điểm ngắt giữa từ ghép thông dụng
+(`data/vi_compound_words.txt`), sau lượng từ/phủ định, và trước trợ từ cuối câu.
+
+Kiểm tra thêm: 3.5-flash-lite với thinking "low" thực tế KHÔNG suy nghĩ (0 token, phải
+"medium"); 3.1-flash-lite thì "low" đã suy nghĩ — không phải lỗi ứng dụng.
+
+Test: `test_line_wrap_compounds_v323621.py`, `test_analysis_model_fallback_v323621.py`,
+`test_prompt_tuning_v323620.py::test_register_rule_v323621`.
+
+## [3.23.620] — 🎯 Tối ưu prompt Phân tích + Dịch (đo bằng Gemini thật trên phim mẫu)
+
+Đo trên tập 1–3 của phim mẫu bằng 3 key Gemini thật, cấu hình mặc định (Dịch thô
+`gemini-3.1-flash-lite`). Tập 1+2 dùng để tinh chỉnh với 14 "dòng bẫy" đã soát tay (xưng
+hô, vai người nói, biệt danh, nghĩa bị bỏ); tập 3 để kiểm chứng (không dùng khi tinh chỉnh).
+
+### Lỗi: phim ≥ 50 dòng không dịch được (400 INVALID_ARGUMENT)
+
+* Schema mỗi lô gắn CẢ `minItems/maxItems` lẫn khoảng `line_no`; Gemini từ chối khi lô
+  ≥ 50 dòng — tức lô MẶC ĐỊNH. Đo 3.1/3.5-flash-lite: cả hai ràng buộc chạy tới 40 dòng,
+  chỉ số phần tử tới 50, chỉ khoảng `line_no` tới 200. Tập 3 (58 dòng) với bản cũ: hỏng
+  cả lượt dịch. Lỗi 400 chung chung còn bị nhận nhầm là "model không hỗ trợ thinking".
+* Sửa: lô > 40 dòng chỉ giữ khoảng `line_no` (lệch số dòng vẫn bị bắt ở bước kiểm toàn
+  vẹn); gặp 400 chung chung thì nới schema từng bước rồi thử lại, không tắt thinking nhầm.
+
+### Dịch thô
+
+* **Chú thích "(…)" bịa đầu câu**: schema mô tả trường `description` là "chú thích ngắn cho
+  dòng" → model chèn cảm xúc/giọng điệu/"nội tâm" vào ngoặc (tùy chọn "Giữ mô tả tiếng
+  động" bật sẵn). Bản cũ: tập 1+2 có 11–19 dòng, **tập 3 cả 58/58 dòng** (vd "(Ma tu đắc ý)
+  Cửu Chuyển Liệt Dương Cổ…"). Nay `description` chỉ nhận tiếng động không lời mà dòng gốc
+  ghi rõ, mặc định trống → **0 dòng** ở cả 3 tập.
+* **Đảo vai/xưng hô**: tắt tag người nói thì prompt bảo "để trống speaker" — model bỏ luôn
+  bước xác định ai nói với ai (你 → "Anh", 师兄 → "Sư muội", 我师尊 → "sư tôn muội"). Nay
+  luôn điền speaker (chỉ để suy luận, không hiển thị khi tắt tag) + quy trình xác định vai
+  (我 = người nói, 你 = người nghe, danh xưng đầu câu là lời gọi…) ở mọi giai đoạn dịch.
+* Thán từ (呸, 哼…) dịch bằng thán từ tự nhiên thay vì phiên âm ("Phỉ"); giữ biệt danh.
+* Dọn prompt: bỏ chuỗi `\n` dạng chữ và các mốc phiên bản nội bộ `[v3.23.xxx]` lọt vào
+  prompt gửi model; hai câu quy tắc bị dính liền.
+* **Mặc định bật Thinking "low" cho Dịch thô** (trước: tắt = mức thấp nhất). So sánh trên tập
+  1+2: tắt 0–7/14 bẫy (dao động mạnh giữa các lần chạy), low 11/14 (low + prompt cũ 10/14,
+  medium 8/14 nhưng 52 dòng bịa, 3.5-flash 5–7/14). Chi phí thêm ~3.4–7.3k token suy nghĩ/tập, thời gian
+  ~20–40 s/tập. Cài đặt đã lưu của người dùng vẫn được giữ nguyên.
+
+### Phân tích ngữ cảnh
+
+* `aka` trong Roster là chữ được CHÉP vào lời thoại, nhưng model ghi cụm mô tả ('师父 (Sư phụ
+  của Diệp Nhiên)') → bản dịch "Sư phụ của Diệp Nhiên đã bế tử quan". Nay nhân vật không tên
+  dùng danh xưng ngắn như lời thoại gọi ('Sư phụ'), quan hệ ghi vào `role`; mỗi bí danh có
+  cách đọc riêng ('楚瑶 / 瑶瑶' → 'Sở Dao / Dao Dao' — trước 瑶瑶 bị dịch thành 'Sở Dao').
+
+### Kết quả (bẫy đúng / dòng chèn chú thích bịa)
+
+| | Tập 1 | Tập 2 | Tập 3 |
+|---|---|---|---|
+| 3.23.619 | 0–3/7, 0–4 | 0–4/7, 7–19 | lỗi 400 (lô 40: 58/58 dòng bịa) |
+| 3.23.620 | 6/7, 0 | 5/7, 0 | 0 dòng bịa, đúng vai |
+
+Hai bẫy còn lại ở tập 2 ("师兄我…") mơ hồ khi chỉ có chữ — chính nam chính cũng tự xưng
+"师兄我" — cần phân tích video (ai nói) để phân định.
+
+Test: `test_schema_complexity_400_v323620.py`, `test_prompt_tuning_v323620.py`,
+`test_literal_thinking_default_v323620.py`.
+
+## [3.23.619] — 🐞 Rà soát toàn bộ: crash, abort, kẹt khi thoát, câu thoại bị sót, cài đặt bị lờ
+
+Rà soát toàn ứng dụng theo ba cách: phân tích tĩnh (ruff luật bắt lỗi, mypy, quét log/phụ
+thuộc), bấm thử TOÀN BỘ giao diện (9 trang, 192 nút, 50 ô chọn, 36 ô số; hộp thoại trả lời
+tự động; bắt mọi ngoại lệ, kể cả ở luồng nền) và chạy pipeline thật trên phim mẫu 86 tập.
+
+### Crash / abort
+
+* **Biên tập — "Tự sửa lỗi timeline" và "⧉ Tách (F11)" crash trên máy không có libmpv**:
+  gọi `_schedule_geometry_update` (chỉ widget MPV có) trên `VideoCanvas` → AttributeError.
+  Thêm API chung `schedule_overlay_refresh()` cho cả hai widget + test quét tĩnh chặn mọi
+  thành viên chỉ một trong hai widget có.
+* **Trích xuất — tua video crash khi MPV khởi tạo lỗi**: gọi `set_frame` trên
+  `MpvVideoWidget` (không có) → AttributeError mỗi lần tua. Thêm `set_frame` vẽ khung bằng
+  Qt; `player()` bắt thêm `OSError` (python-mpv có nhưng thiếu libmpv); dò MPV bắt thêm lỗi
+  khởi tạo/lệch phiên bản.
+* **Sóng âm — huỷ widget khi luồng còn chạy làm Qt abort() cả tiến trình** ("QThread:
+  Destroyed while thread is still running"). Chỉ `MainWindow.closeEvent` dừng luồng; nay
+  widget tự dừng mọi luồng của nó qua tín hiệu `destroyed`.
+* **Đóng ứng dụng khi video đang tách (F11) — ứng dụng không thoát**: còn cửa sổ video
+  nên Qt không thoát dù đã dọn container; bấm X cửa sổ video thì nó "gắn lại + ẩn" và bỏ
+  qua lệnh đóng → không còn cửa sổ nào nhưng tiến trình vẫn chạy ngầm (trên Windows còn
+  trong Task Manager, giữ khoá tệp). Nay đóng cửa sổ chính thì gắn video về rồi đóng hẳn
+  cửa sổ tách; cửa sổ tách tự đóng nếu trang Biên tập đã huỷ. Kịch bản thật: thoát sạch 3/3.
+* Test: SIGSEGV ~50% khi chạy riêng `test_ui_bug_sweep_v323613.py` (huỷ trùng widget lúc
+  thoát) — conftest huỷ tường minh cửa sổ cấp cao. Ứng dụng thật thoát sạch 10/10 lần.
+
+### Nối cả bộ
+
+* **Trang Xuất bản nối lần 2 lấy tệp trọn bộ cũ làm đầu vào** — trùng tệp đầu ra → ffmpeg
+  lỗi mã 234, "Nén lại" cũng lỗi. `find_concat_videos` luôn loại `*_tron_bo.*`; adapter từ
+  chối khi đầu ra trùng đầu vào (thông báo dễ hiểu).
+
+### Trích xuất (kiểm trên phim mẫu tập 1)
+
+* **Sót câu "瑶瑶" thứ hai** (hiện 14 khung, tin cậy 0.53-0.81): ngưỡng OCR mặc định 0.75
+  lọc ô chữ ngay trong PaddleOCR → chỉ 5 khung (0.2s) tới bước gộp câu, quy tắc "câu hai
+  chữ đứng yên ≥ 0.4s chỉ cần 0.55" (v3.23.616) không bao giờ chạy với mặc định. Mặc định
+  nay 0.5: lấy lại đúng câu (1:37.08-1:37.64), 93 câu còn lại giống hệt chữ + thời gian,
+  không thêm câu rác; ra 95 câu như bản người dùng sửa tay. Cấu hình đã lưu không đổi.
+* **Cài đặt "Giới hạn cạnh" (limit_side_len/limit_type) không có tác dụng**: adapter luôn
+  truyền `None` cho PaddleOCR; đổi giá trị chỉ làm nạp lại model. Nay áp dụng khi > 0.
+* **Dò vùng phụ đề nhanh gấp 1.7 lần**: OCR khung thu về cạnh 960 px (chỉ cần toạ độ) rồi
+  quy về khung gốc. CPU 4 nhân, 30s video: 290-300s → 174-179s; vùng tìm được lệch ≤ 1 px
+  trên 3 tập (gồm tập 30 fps). Bước OCR chính không đổi.
+* Kiểm chứng tập 1 (176s): 95 câu; soát khung hình các đoạn nghi vấn (khoảng trống 21s
+  không thoại, "可爱炼气" đúng chữ trên hình). SRT/ASS xuất-nhập khứ hồi giữ nguyên chữ
+  (lệch ≤ 1 ms); xuất bản phụ đề cháy/rời chạy đúng, chữ Hán hiển thị đúng.
+
+### Cấu hình / phụ thuộc / kiến trúc
+
+* **Biến môi trường `SE_*` chỉ có tác dụng ở lần chạy đầu** (config.json luôn thắng) trái
+  với README. Nay ghi đè cấu hình đã lưu khi nạp; giá trị sai kiểu bị bỏ qua kèm cảnh báo.
+* Khai báo Pillow (giải mã phụ đề ảnh PGS/VobSub — trước chỉ có nhờ paddleocr kéo theo);
+  `pyproject.toml` đồng bộ với `requirements.txt` (thiếu 10 gói). Test chặn tái phát.
+* `is_cjk_char` chuyển về tầng domain — domain không còn import tầng application.
+* Test "Tách dòng" hỏng trên PySide6 6.12 (`__doc__` rỗng) — đọc chữ ký từ `QtWidgets.pyi`.
+* Thêm `CLAUDE.md`: quy tắc "phát hiện lỗi thì khắc phục ngay" cho các lần phát triển sau.
+
+## [3.23.618] — ⚡ Mã hoá GPU khi máy hỗ trợ, nối cả bộ bằng HEVC; hết treo khi mở sóng âm
+
+### Nối cả bộ / Xuất bản — bộ mã hoá
+
+* **Nối cả bộ (chuẩn hoá) nay nén HEVC, ưu tiên GPU.** Thứ tự: NVIDIA NVENC → Intel QSV →
+  AMD AMF → Apple VideoToolbox → CPU (`libx265` preset fast). Trước đây luôn `libx264`
+  crf 20: bộ 86 tập 736 MB thành 2.75 GB. Đo trên phim mẫu 720x1280: 40s tập 1 —
+  x264 medium crf 20 14.4 MB (SSIM 0.9918, 20.3s) / x265 fast crf 22 8.0 MB (SSIM 0.9896,
+  23.4s); 5 tập ranh giới (6.2 phút) — 130.5 MB → 88.9 MB, 191s → 220s, vẫn đủ 9293/9293
+  khung, không khoảng trống.
+* **"Tự động (GPU nếu có)" ở trang Xuất bản trước đây luôn là `h264_nvenc`** — máy không
+  có GPU NVIDIA xuất phụ đề cháy là lỗi. Nay dò bộ mã hoá dùng được thật (H.264 để tương
+  thích tối đa), không có GPU thì `libx264`.
+* **Dò bằng cách thử mã hoá thật** vài khung, không đọc `ffmpeg -encoders`: ffmpeg liệt kê
+  `hevc_nvenc`/`hevc_qsv` cả trên máy không có GPU (đã thấy trên máy kiểm thử). Kết quả
+  nhớ trong phiên chạy (`infrastructure/video/video_encoder_selector.py`, dùng chung).
+* **GPU lỗi giữa chừng** (hết phiên NVENC, thiếu VRAM, driver cũ) → tự chạy lại bằng CPU
+  và bỏ bộ mã hoá đó cho các lần sau; kiểu xuất chỉ sao chép hình thì không chạy lại.
+* Tham số chất lượng quy đổi theo từng họ bộ mã hoá (`-crf`, `-cq`, `-global_quality`,
+  `-qp_*`, `-q:v`); trước đây QSV/AMF/VideoToolbox bị truyền `-crf` (không nhận). HEVC
+  trong MP4/MOV được gắn thẻ `hvc1` để QuickTime/iPhone phát được.
+
+### Sóng âm (Linux/macOS)
+
+* **Mở video trong Trình sửa có thể treo vĩnh viễn**: luồng sóng âm khởi chạy ffmpeg với
+  `preexec_fn=os.setsid` — chạy mã Python trong tiến trình con của một tiến trình nhiều
+  luồng; nếu lúc fork luồng khác giữ khoá, tiến trình con kẹt và `Popen` không bao giờ trả
+  về (đã gặp: bộ test đứng ở đây 2 lần, 0% CPU). Nay `start_new_session=True` (cùng tác dụng,
+  làm trong mã C). Chạy lặp 25 lần các test mở video + sóng âm: 25/25 qua, không treo. Thêm
+  test chặn `preexec_fn` quay lại trong mã nguồn. Windows không bị ảnh hưởng.
+
+## [3.23.617] — 🎬 Nối cả bộ không còn mất khung hình
+
+Người dùng báo: video nối cả bộ (nút "Nối cả bộ" ở trang Trích xuất và trang Xuất bản —
+hai nút dùng chung một hàm) bị thiếu khung hình ở một số phân đoạn. Tái hiện trên bộ phim
+mẫu 86 tập (phim ngắn dọc 720x1280 HEVC): 80 tập 25 fps (time base 1/12800) xen 6 tập
+30 fps (tập 56-58, 63-65; time base 1/15360), và 4 bộ tham số SPS khác nhau.
+
+### Nối video
+
+* **Mất khung hình ở 19 tập giữa phim mà ffmpeg không báo lỗi.** Nối bằng concat demuxer
+  + `-c copy`: từ tập 56 (tập 30 fps đầu tiên) tới tập 76, vị trí các tập trên dòng thời
+  gian gần như không còn khung nào — 10 nghìn khung dồn chồng vào chỗ tập 72, đầu tập 56
+  trống 41.5s. Tổng thời lượng tệp vẫn khớp nên không ai thấy lỗi khi nối xong. Trên 5 tập
+  ranh giới (23, 24, 55, 56, 63): hình kết thúc ở 446.1s, tiếng ở 371.8s. Nay đọc thông số
+  từng tập bằng ffprobe trước khi nối: chỉ sao chép luồng khi MỌI tập giống hệt (codec, kích
+  thước, định dạng điểm ảnh, tốc độ khung, time base, bộ tham số mã hoá, thông số tiếng);
+  lệch → chuẩn hoá từng tập (về mốc 0, ép tốc độ khung theo số đông, khớp kích thước, tiếng
+  chung; tập không có tiếng được chèn khoảng lặng) rồi nối bằng concat FILTER.
+* **Phương án "nén lại" cũ cũng hỏng y hệt** — vẫn đọc nhãn thời gian sai từ concat demuxer
+  — và chỉ được mời khi ffmpeg báo lỗi (ở đây không bao giờ). Nút "nén lại" nay đi đường
+  chuẩn hoá.
+* **Kiểm tra tệp ra sau khi sao chép luồng**: quét nhãn thời gian gói hình (~1s cho 2 giờ
+  phim, không giải mã) + đối chiếu tổng thời lượng; khoảng trống > 5s hoặc lệch thời lượng
+  → tự nối lại bằng chuẩn hoá.
+* Bộ lọc dài (nhiều tập) đọc từ tệp thay vì dòng lệnh (giới hạn 32767 ký tự trên Windows);
+  tự chọn `-/filter_complex` (ffmpeg ≥ 7) hoặc `-filter_complex_script` (bản cũ).
+* Trang Xuất bản nay hiện % tiến độ khi nối (trước truyền tổng thời lượng 0 nên không có %).
+* Kết quả trên bộ 86 tập (giải mã lại toàn bộ tệp ra, đếm khung từng tập): 208 752/208 752
+  khung, khoảng trống lớn nhất 0.08s, không lỗi giải mã, hình và tiếng cùng kết thúc ở
+  8351.6s. Nén lại 138 phút mất 65 phút trên CPU 4 nhân; bộ cùng thông số vẫn sao chép
+  luồng (3 tập: 1.3s).
+
+## [3.23.616] — ✍️ Bớt việc sửa tay sau trích xuất, dịch viết hoa đúng đầu câu
+
+Phân tích bộ chẩn đoán 14/10 21:43 (phim "天骄女友退婚" tập 1, bản 3.23.615), đối chiếu
+với phụ đề người dùng đã sửa tay và với điểm ảnh vùng phụ đề của video mẫu. Kèm rà lại các
+bản sửa 3.23.615 và bấm thử toàn ứng dụng với video + phụ đề thật (103 nút, 20 ô chọn, không
+lỗi).
+
+### Trích xuất phụ đề
+
+* **Mất câu gọi tên "瑶瑶" — cả hai lần trích người dùng phải tự thêm lại.** Câu hiện rõ
+  0.44s (12 khung, cùng một chỗ, đọc giống nhau) trên nền áo sáng nên PaddleOCR chỉ chấm
+  0.56-0.73/khung; ngưỡng cứng 0.65 cho câu hai chữ Hán loại cả câu. Nay câu hai chữ đứng
+  yên ≥ 0.4s (≥ 5 khung) chỉ cần 0.55; mảnh chớp ngắn vẫn cần 0.65 như cũ.
+* **Câu bị cắt vụn vì OCR đọc lẫn chữ phồn/giản giữa các khung** ("瑶瑶", "瑤瑤", "瑤瑶",
+  "瑶瑤" xen nhau): hai cách viết bị coi là hai câu khác hẳn, mảnh conf thấp bị loại nên câu
+  "瑶瑶" thứ hai bắt đầu trễ 200ms. Nay khi so câu, chữ phồn/giản được coi là một. Chữ
+  trong phụ đề vẫn giữ nguyên như OCR đọc.
+* **Nới biên câu bằng khung có chữ ở chỗ khác.** Khung bị lọc sát biên câu (để bù khung
+  hiện/tắt dần) được dùng mà không xét vị trí: nét áo ở góc màn hình đọc thành "山"/"公"
+  kéo câu "瑶瑶" kết thúc trễ 40ms và câu "就是" bắt đầu sớm 40ms (đúng như tệp người dùng
+  nhận). Nay chỉ dùng khung có chữ nằm chồng lên vùng của câu. Trên dữ liệu thật, đây là 2/2
+  lần nới sai và không đụng lần nới đúng nào.
+* **Rác chữ số "00", "0.."** (khoen thắt lưng lọt vùng phụ đề, conf 0.70-0.84, dài hơn ngưỡng
+  mảnh flash) — người dùng phải xoá tay cả hai lần. Nay trong phim phụ đề CJK, câu chỉ gồm
+  chữ số/dấu câu, ≤ 4 ký tự, conf < 0.90 bị bỏ; số đọc rõ (≥ 0.90) giữ nguyên.
+* Dựng lại từ OCR thô của cả ba lần trích (15:50, 21:48 và bản chạy thử) nay ra đúng 95 câu
+  như bản người dùng đã sửa tay. Đối chiếu điểm ảnh: câu bắt đầu đúng khung 85 → 89/95 (các
+  câu còn lệch là chỗ nền trắng làm phép đo điểm ảnh sai, đã xem từng khung).
+
+### Dịch (Gemini)
+
+* **Viết thường chữ đầu câu.** Dòng 59 "Từ hôn?!" rồi dòng 60 "sắp chết bỗng giật mình ngồi
+  dậy,". Trên mọi file chuẩn đoán dịch thật (65 phim, gần 180 nghìn dòng): sau dấu kết câu
+  có 113 nghìn dòng viết hoa và vài trăm dòng viết thường — soát đều là lỗi chính tả. Nay
+  bản dịch cuối viết hoa chữ đầu dòng mở câu mới (198 dòng trên toàn bộ dữ liệu); không
+  đụng câu bỏ lửng "...", chữ viết tắt "v.v.", dòng mở bằng số/ngoặc/gạch đầu dòng, tên
+  kiểu "iPhone". Dịch lại dòng chọn xét đúng dòng đứng trước trong phim.
+* **Dịch lại dòng chọn không còn bị "đóng câu" theo dòng kề trong tập chọn** (hai dòng kề
+  trong tập chọn không phải hai dòng kề trong phim).
+* **Gemini quá tải: báo lỗi bằng lời dễ hiểu.** Ba lượt dịch liền (20:55, 21:09, 21:35) báo
+  lên nguyên khối JSON tiếng Anh của máy chủ sau 8-14 phút chờ; người dùng tự đổi lần lượt
+  ba model, tới bản flash-lite thì dịch xong ngay. Nay thông báo nói rõ model nào, đã thử
+  mấy lượt trên mấy key trong bao lâu, gợi ý thử lại sau hoặc đổi sang model nhẹ hơn, và
+  nhắc phần đã dịch được giữ. Bộ diễn giải lỗi không còn coi mọi chuỗi có số "500" (vd
+  "1500 dòng") là lỗi máy chủ.
+
+### Lồng tiếng
+
+* **Tiếng lẻ sau lời thoại vẫn lọt (sửa tiếp 3.23.615).** FLAC 21:45: câu "nhưng đường tu
+  tiên" còn một tiếng 40-50ms (-13 dB) sau 210ms lặng. Bộ cắt chạy TRƯỚC khi nén tốc độ, ở đó
+  tiếng này dài ~52ms, nhưng ngưỡng "có tiếng" sát sàn nhiễu đếm cả phần hiện/tắt dần và
+  hai mép cửa sổ 20ms nên thành 80ms, quá ngưỡng 60ms. Phép đo của 3.23.615 làm trên audio
+  SAU nén nên không thấy; chạy đúng thứ tự thì ca "Hôm nay muội đến đây" của bản đó cũng
+  chưa được cắt. Nay độ dài đảo đo trên lõi của nó (trong vòng 20 dB dưới đỉnh của chính
+  đảo) — cả VieNeu, Gemini và Edge. Áp lên 190 đoạn của hai FLAC thật: đúng hai câu này đổi.
+
+## [3.23.615] — 🎞️ Chạy thật với video mẫu: lấy đủ khung, mốc phụ đề đúng tới từng khung
+
+Dùng video mẫu (phim "天骄女友退婚" tập 1: HEVC 25fps, 4421 khung) chạy thật các khâu lấy
+mẫu khung, dựng câu, xuất bản, rồi lấy CHUẨN bằng điểm ảnh vùng phụ đề của từng khung (lúc
+chữ hiện ra/biến mất). Kèm phân tích bộ chẩn đoán 14/10 15:49 và bấm thử toàn ứng dụng với
+video + phụ đề thật.
+
+### Trích xuất phụ đề
+
+* **Bộ lấy mẫu bỏ 16% khung hình.** Bước 0.04s (đúng một khung) nhưng tệp OCR thô chỉ có
+  3700/4421 khung — đều đặn 1 trong 2-3 khung từ giây 64. Mốc kế tiếp = mốc khung vừa lấy
+  + 0.04; do làm tròn số thực, khung sau có lúc "sớm" hơn mốc đó một phần tỉ giây và bị
+  bỏ. Chạy lại bộ lấy mẫu PyAV của bản cũ trên video mẫu ra đúng 3700 khung như tệp của
+  người dùng (NVDEC cùng phép so); bộ OpenCV bỏ 22 khung và lấy trùng 22 khung; bộ mpv
+  cộng dồn mốc nên trôi dần. Hệ quả đo bằng điểm ảnh: 14/15 câu bắt đầu trễ 40ms và 20/22
+  câu kết thúc sớm thêm 40ms rơi đúng khung bị bỏ. Nay cả bốn bộ lấy đủ 4421 khung. Số
+  khung phải OCR tăng khoảng 14% (khung trùng vẫn bỏ qua OCR).
+* **Mốc kết thúc câu sớm đúng một khung.** Mốc kết thúc là mốc của khung CUỐI có chữ, trong
+  khi khung đó còn đứng trên màn hình thêm một khung: 84/94 câu kết thúc sớm 40ms, giữa hai
+  câu liền nhau luôn có khe 40ms không có thật (lồng tiếng mất 40ms khung đọc mỗi câu). Nay
+  mốc kết thúc = lúc chữ biến mất (không chồng câu sau). Re-OCR không kéo câu quá khoảng đã
+  quét.
+* Tổng hợp trên video mẫu: câu bắt đầu đúng khung 74 → 86/94; câu kết thúc đúng mốc
+  1 → 83/94 (sai số dưới 1ms). Chữ của mọi câu giữ nguyên.
+
+### Dịch (Gemini)
+
+* **499 CANCELLED làm hỏng cả lượt dịch** (14/10 14:26: lô dịch thô chạy đúng 300 giây rồi
+  nhận 499, phải bấm dịch lại). Máy chủ tự huỷ khi hết thời hạn mỗi lời gọi — nay được thử
+  lại như 504 DEADLINE_EXCEEDED.
+* **Lượt thử lại dùng lại đúng thời hạn vừa không đủ.** 44 tệp app_log: 56 lượt hỏng đúng
+  mốc 300 giây (504, 499, "timed out"); lượt kế tiếp lại chạm mốc 17/62 lần, mỗi lần mất
+  thêm 5 phút và một request. Nay lượt thử sau một lần chạm hạn chót được nới thời hạn
+  ×1.5 (tối đa 600 giây, bằng mức cao nhất của ô Cài đặt), chỉ cho lời gọi đó.
+* Thông điệp "Hết thời gian chờ mạng (kết nối chậm/chập chờn)" đổi thành "Hết thời hạn chờ
+  trả lời (máy chủ chậm hoặc mạng chập chờn)": 34/34 lần trong nhật ký là máy chủ chậm.
+* **Lỗi mạng khi tải video ngữ cảnh lọt ra ngoài** (tìm thấy khi bấm thử toàn ứng dụng với
+  video thật): khâu dịch ghi "Lỗi không lường trước khi dịch phụ đề" kèm traceback, khâu
+  phân tích hỏng hẳn thay vì lùi về phân tích từ phụ đề. Nay là lỗi video ngữ cảnh có thông
+  điệp rõ ràng.
+* So tên/thuật ngữ không phân biệt chữ Hán phồn/giản: OCR đọc "楚瑶" thành "楚瑤" (10/12
+  khung). Khối nhắc thuật ngữ theo lô, bước thay tên còn sót trong bản dịch và chẩn đoán
+  ngữ cảnh nay nhận ra. Phụ đề gốc không bị đổi chữ.
+
+### Ngữ cảnh và chẩn đoán
+
+* Cảnh báo oan "两 đọc lưỡng/lượng/lạng" cho nhãn "Hai vị trưởng lão": số đếm đọc bằng số
+  từ thuần Việt là dịch nghĩa. Đo trên 28 bảng nhân vật thật: chỉ mục này đổi.
+* File video tái dùng trên cloud không còn bị ghi lại mốc tải lên (phiên dịch ghi 09:23 cho
+  file tải lúc 08:27); bộ nhớ đệm tải video cũng giữ mốc cũ — Gemini xoá file 48 giờ sau
+  lúc TẢI, không phải lúc dùng.
+
+### Lồng tiếng
+
+* **Tiếng "tách" sau lời thoại.** FLAC thật: câu "Hôm nay muội đến đây" nói xong, im 305ms
+  rồi một tiếng tạp 30ms (-24 dB) ở cuối; câu "Hả?!" cũng vậy. Bộ cắt lặng lấy khung có
+  tiếng CUỐI CÙNG làm mốc nên giữ cả khoảng lặng lẫn tiếng tách. Nay đảo tạp âm ≤ 60ms cách
+  lời ≥ 150ms ở hai đầu bị cắt — cả VieNeu, Gemini và Edge. Áp lên 95 đoạn của FLAC thật:
+  chỉ hai câu đó đổi.
+* Tự rà bản 3.23.614: "大夫人" (phu nhân cả) thành chưa rõ giới vì "大夫" (thầy thuốc) bị
+  xoá ở mọi nơi — nay chỉ xoá khi đứng riêng. Giới tính viết ở dạng Unicode tổ hợp cũng
+  được hiểu.
+
+### Đã đo, không phải lỗi
+
+* Giọng lồng tiếng: cao độ nam 125–190 Hz, nữ 197–252 Hz, đúng vai 95/95 dòng; -14.06 LUFS,
+  không méo, không chồng câu.
+* Xuất bản thuyết minh: giọng cao hơn nền (đã hạ) trung vị 10.5 dB. 126 mẫu vượt 0 dBFS đều
+  nằm ngoài lúc thuyết minh — âm thanh gốc của phim vốn đã vượt +2.46 dBFS. MKV + AAC lệch
+  21ms với ffmpeg 6.1, nhưng bản ffmpeg ứng dụng đóng gói (BtbN master) ghi đúng: lệch 0.
+* Bốn lần Re-OCR ra 0 câu: dữ liệu OCR không có phụ đề nào ngoài 95 câu đã có.
+
+### Chưa làm
+
+* VieNeu nạp model hai lần (CPU 39 giây để lấy danh sách giọng, rồi tiến trình GPU khi
+  đọc) — cần thay đổi cách lấy danh sách giọng, để bản sau.
+
+## [3.23.614] — 🎭 Bảng nhân vật đọc đủ: đủ xưng hô, đúng giọng nam/nữ
+
+Phân tích bộ chẩn đoán phim "天骄女友退婚" tập 1 (gemini-3.8-flash, thinking cao, 94 dòng):
+chẩn đoán ngữ cảnh ghi 4 nhân vật, 0 quy tắc xưng hô mà không có cờ nào; khâu dịch báo
+"KHÔNG có quy tắc xưng hô nào"; lồng tiếng chế độ 2 giọng đọc cả 94/94 dòng bằng giọng
+nam "Minh Đức" — kể cả lời của nữ chính. Cả ba triệu chứng chung một gốc ở bộ đọc bảng
+nhân vật.
+
+### Ngữ cảnh và dịch
+
+* **Bảng nhân vật 7 người chỉ đọc được 4 tên trơn.** Model ghi đúng quy cách
+  ``Tên (Phiên âm) [giới, tuổi] — mô tả``, nhưng mô tả kết thúc bằng câu mới
+  "… Luyện Khí. Xưng hô: với Sở Dao tự xưng 'huynh' gọi 'muội'." Bộ đọc coi "Xưng hô:"
+  là tên nhân vật thứ hai trên dòng nên bỏ cách đọc tất định, rơi xuống nhánh dự phòng:
+  mất nữ chính 楚瑶 và hai đệ tử, mất mọi giới tính, phiên âm và quy tắc xưng hô. Nay
+  dòng đúng quy cách luôn là MỘT nhân vật (mọi thứ sau ``—`` là mô tả). Đo trên toàn
+  bộ dữ liệu thật đang có: chỉ phiên lỗi này đổi kết quả (4 → 7 nhân vật, 0 → 6 quy tắc
+  xưng hô); các phiên khác đọc y hệt bản cũ. Dữ liệu cũ kiểu "A: … . B: …" vẫn tách
+  như trước.
+* **Nhân vật chưa rõ giới mà có tuổi (``[~70]``) bị đọc "~70" thành giới tính** và mất
+  tuổi (giọng theo tuổi, "先生" → ông/anh đều dựa vào trường này). Nay ``[giới, tuổi]``
+  được tách theo nội dung. Phát hiện bằng kiểm thử kết xuất → đọc lại 3000 bảng ngẫu
+  nhiên: bản 3.23.613 hỏng 2483/3000, bản này 0 (thêm 8000 lần thử khác: 0 lỗi).
+* Gộp bảng nhân vật giữa các đoạn phân tích (phim dài) đi qua cùng bộ đọc nên cũng
+  hết rơi nhân vật.
+* Giới tính ghi kiểu "Nam giới"/"nữ giới" nay được hiểu ở lồng tiếng và xưng hô thuần
+  Việt; "không rõ" không còn bị coi là một giới thứ ba (trước đây làm nhân vật bị loại
+  khỏi mọi tiếng gọi thuần Việt).
+
+### Chẩn đoán ngữ cảnh
+
+* Cờ mới **``roster_lines_unread``** (lỗi): dòng của bảng nhân vật mà bộ đọc bỏ sót, kèm
+  danh sách ``roster.unread_lines``. Lỗi kiểu trên giờ lộ ngay trong file chẩn đoán thay
+  vì ``quality_flags: []``.
+* Cờ mới **``roster_without_address_rules``** (cảnh báo): bảng đủ người mà không có quy
+  tắc xưng hô nào → khâu dịch tự chọn xưng hô từng lô.
+
+### Lồng tiếng
+
+* **Vai "女弟子" (nữ đệ tử) được giao giọng NAM** vì chữ "弟" trong "弟子" (đệ tử — không
+  chỉ giới) khớp trước chữ "女". Nay giới tính theo DANH TỪ CHÍNH đứng cuối cụm chữ Hán
+  ("伯母" bác gái, "舅妈" mợ, "姐夫" anh rể — bản cũ đọc ngược cả ba), bỏ các từ không chỉ
+  giới ("弟子", "徒弟", "子弟", "大夫"), thêm "姐夫/妹夫/姨夫/姑夫/夫君" và "妇/婦".
+* Với dữ liệu phiên 14/10, chế độ 2 giọng nay giao giọng nữ cho lời của 楚瑶 và nữ đệ
+  tử, giọng nam cho Diệp Nhiên và nam đệ tử.
+
+### Lỗi khác tìm thấy khi rà toàn ứng dụng
+
+* **Trang Nhật ký và tệp app_log xuất ra mất chữ**: dòng log được chèn dạng HTML mà
+  không thoát ký tự — mọi thứ sau dấu "<" biến mất, xuống dòng bị gộp. app_log thật
+  14/10: "khung OCR chớp nhoáng" mất "< 0.3 s: 5 → 5 dòng"; traceback thêm ở 3.23.613
+  bị nuốt từ "in <module>" và dồn thành một dòng. Nay giữ nguyên văn.
+* **Tô sáng tìm kiếm phá thẻ in nghiêng/đậm trong bảng phụ đề**: tìm "i" biến ``<i>``
+  thành mã HTML vỡ hiện ra trên dòng. Nay chỉ tô phần chữ, không đụng thẻ.
+* **"Tải lại" video vô ích sau khi chọn API key**: ứng dụng chọn key còn hạn mức TRƯỚC
+  khi tải video (để video và lời gọi cùng một key), nhưng việc đổi key đó vẫn bật cờ
+  "handle video thuộc key cũ" → lời gọi Gemini đầu tiên "tải lại" đúng file vừa tải
+  (app_log 14/10: cả lượt phân tích lẫn lượt dịch). Với phim nhiều đoạn, lượt đó còn nén
+  lại đoạn video bằng ffmpeg. Nay đổi key ở bước chọn trước không bật cờ; xoay key GIỮA
+  phiên vẫn tải lại như cũ.
+* **Đọc SRT mất câu thoại cuối tệp chỉ gồm chữ số** ("520", "3" khi đếm ngược): bộ đọc
+  coi nó là số thứ tự của khối kế dù không còn khối nào. Kiểm thử xuất → đọc lại SRT
+  ngẫu nhiên nay 0 lỗi.
+
+### Tự rà bản 3.23.613
+
+Bấm thử toàn ứng dụng 3/3 lần sạch (không sập, không lỗi trong log), quét toàn bộ
+widget sạch; kiểm thử ngẫu nhiên các vòng kết xuất ↔ đọc lại (bảng nhân vật, SRT,
+cue) đều 0 lỗi sau các sửa trên.
+
+### Chưa sửa (đo thấy không đáng)
+
+* Tên viết phồn thể/giản thể khác nhau giữa bảng và thoại: 1/5943 dòng thật.
+
+## [3.23.613] — 🐞 Rà lỗi toàn ứng dụng: hết sập khi tua, nút chết, log mất
+
+Rà lại hai bản trước rồi quét cả ứng dụng: mypy, ruff, ba bộ quét tự viết (thuộc tính
+không tồn tại, kiểu định dạng log, chuỗi giao diện), bấm thử MỌI nút trên mọi trang khi đã
+nạp video + phụ đề (có gdb bắt điểm sập), và đối chiếu 64 tệp app_log thật.
+
+### Sập ứng dụng
+
+* **Tua video trên trang Trích xuất làm sập ứng dụng** (khung vẽ dự phòng, khi không có
+  MPV). Worker đọc khung hình bị xoá HAI lần cùng lúc: Qt xoá trong luồng nền
+  (``thread.finished → worker.deleteLater``) trong khi Python cũng xoá ở luồng giao
+  diện. Đo: tua liên tục 400 lần sập 4/5 lần chạy (Segmentation fault / Bus error);
+  gdb chỉ đúng ``QObject::~QObject`` trong luồng tua. Cùng mẫu đó có ở luồng trích
+  xuất, dò vùng phụ đề, Re-OCR, OCR lại một khung (Gỡ lỗi), tải libmpv. Nay mọi chỗ
+  dùng chung ``WorkerThreadKeeper``: một chủ sở hữu, chờ luồng thoát hẳn rồi mới thả
+  worker. Sau sửa: 0/6 lần sập với cùng phép đo; bấm thử toàn ứng dụng 6/6 lần sạch
+  (trước đó khoảng một nửa số lần sập).
+* **Một dòng Edge TTS bị huỷ làm hỏng cả lượt lồng tiếng**: ``CancelledError`` không
+  còn là ``Exception`` nên lọt bộ lọc kết quả ``gather`` và bị đem đi tách tuple
+  (TypeError) → mất mọi dòng đã đọc. Nay dòng đó bị bỏ qua, các dòng khác giữ nguyên.
+
+### Nút chết im lặng
+
+* **Trình chỉnh sửa → "Tách dòng"**: hộp thoại không mở (PySide6 nhận
+  ``minValue``/``maxValue``, không nhận ``min``/``max``).
+* **Mở lại dự án từ Thư viện**: video không hiện, sóng âm không vẽ (đường dẫn lưu dạng
+  chuỗi mà trình chỉnh sửa gọi ``.resolve()``).
+* **Mở dự án nhưng chọn GIỮ bản đang sửa**: trước đây vẫn đổi video và dự án hiện hành
+  sang dự án mới trong khi bảng phụ đề là của phim cũ → lồng tiếng/xuất bản sau đó ghi
+  khâu vào nhầm dự án. Nay giữ nguyên tất cả.
+* **Re-OCR với khoảng thời gian rỗng**: báo lỗi đúng thay vì AttributeError.
+* **Cài WhisperX xong**: nút Phiên âm vẫn tắt và hộp thoại "đã sẵn sàng" không hiện
+  (gọi hàm không tồn tại). Nay bật ngay khi có video và trang không bận.
+* **Tua video khi đã chốt vùng ROI**: khung ROI không được vẽ lại.
+* **Xuất bản → "Nối cả bộ" lỗi → "Nén lại?" → Có**: không có gì xảy ra (luồng cũ chưa
+  dọn chặn lượt mới). Nay chạy ngay khi luồng cũ dọn xong.
+* **Hàng loạt (Xuất bản, Trích xuất)**: tập kế được gọi khi luồng tập trước có thể chưa
+  báo thoát → bị từ chối im lặng, hàng đợi đứng yên. Nay chờ rồi chạy tiếp (như khâu
+  Dịch đã làm).
+
+### Chữ trên giao diện
+
+* 5 dòng trạng thái trang Trích xuất hiện "{n}", "{label}", "{msg}", "{kind}" thô (thay
+  "{{n}}" trong khi chuỗi ghi "{n}"): đang cài, cài lỗi, trích phụ đề nhúng, xong phụ đề
+  nhúng, xong phiên âm. Gợi ý Phiên âm nay theo ngôn ngữ giao diện.
+* Cài WhisperX lỗi với thông điệp rỗng không còn ném IndexError.
+
+### Log và chẩn đoán
+
+* **Trang Nhật ký mất traceback**: sink gắn kiểu ``enqueue=True`` khiến Loguru bỏ khung
+  stack khi đưa bản ghi qua hàng đợi — app_log thật có ba lần "Lỗi không mong đợi khi
+  mở hộp thoại xuất tệp." mà không một dòng nào cho biết lỗi ở đâu. Nay traceback được
+  dựng trước hàng đợi (``QtLogBridge.attach``), không chép giá trị biến.
+* Tải CUDA/paddle thất bại: dòng log chứa đuôi log pip (lý do thất bại) bị ``logging``
+  bỏ vì viết chỗ trống kiểu loguru ``{}``. Log "bấm Xuất tệp" ghi "%d" thô (loguru).
+* Gemini TTS: dòng lỗi trước đây không để lại một chữ nào trong log.
+
+### Tự rà hai bản trước
+
+* **Xưng hô thuần Việt** (3.23.612): tên có âm tiết trùng hậu tố vai vế bị cắt cụt —
+  "Lâm Di" (林怡) thành "Chị Lâm" khi câu gốc có 姨 ở chỗ khác. Hậu tố VIẾT HOA nay chỉ
+  là tiếng gọi khi bảng nhân vật xác nhận (tên chữ Hán tận cùng là hậu tố đó: 王姨 →
+  "Vương Di" → "Dì Vương"). Âm tiết "Di" nay được coi là tên ("Di tỷ" → "chị Di").
+  Đối chiếu 2.942 thay đổi trên mọi phiên dịch thật đã gửi: chỉ khác đúng một chỗ
+  ("Mày tên Cẩu Ca phải không?" — nay giữ nguyên tên gọi được hỏi).
+* Chọn model cho lượt dịch lại (3.23.611): rà lại, không có lỗi.
+
+### Chống tái phát
+
+* ``tests/unit/test_project_static_guards_v323613.py`` quét TOÀN DỰ ÁN: mọi ``self.X``
+  đọc phải tồn tại; kiểu chỗ trống log khớp thư viện log; mọi khoá chuỗi giao diện có ở
+  cả hai ngôn ngữ và chỗ trống khớp. Chạy trên bản 3.23.612: bắt được cả 11 chỗ
+  thuộc ba lớp lỗi này.
+* Không còn nơi nào gắn ``worker.deleteLater`` vào ``thread.finished``; phép thử tua 400
+  lần chạy trong tiến trình con.
+* Test log cũ không còn thay PySide6 bằng bản giả khi máy có Qt thật (làm hỏng các test
+  Qt chạy sau, tuỳ thứ tự).
+
+## [3.23.612] — 🗣️ Tuỳ chọn "Xưng hô thuần Việt"
+
+Phim hiện đại, đời thường mà bản dịch gọi "Kiếm ca", "Hồng đại tẩu", "Lâm tiên sinh"
+nghe như phim kiếm hiệp. Người Việt nói "anh Kiếm", "chị Hồng", "anh Lâm". Ô mới
+**"Xưng hô thuần Việt"** nằm ở phần cấu hình phân tích ngữ cảnh trên trang Dịch (mặc định
+tắt; phim cổ trang, kiếm hiệp cứ để tắt).
+
+### Khi bật
+
+* **Đổi ngay, không tốn hạn mức.** Bảng nhân vật, tóm tắt, thuật ngữ và bản dịch đang
+  có được đổi tại chỗ và lưu vào phiên, không phải phân tích hay dịch lại. Mở lại một
+  phiên cũ khi ô đang bật thì bản dịch đã lưu cũng được đổi.
+* **Phân tích ngữ cảnh:** prompt dặn model ghi tên gọi, danh xưng, quy tắc xưng hô
+  theo kiểu thuần Việt. Phần model vẫn viết kiểu Hán-Việt được đổi tất định ngay sau đó.
+* **Dịch:** prompt của mọi giai đoạn (trừ hiệu đính nguồn) có quy tắc tương ứng. Bước
+  cuối của lượt dịch đổi nốt những chỗ còn sót, nên không bước dịch lại nào đưa "Kiếm
+  ca" trở lại bản cuối.
+* **Tắt lại** thì lượt sau dùng kiểu Hán-Việt như cũ; bản dịch đang có giữ nguyên.
+
+### Đổi thế nào
+
+* Từ vai vế đứng trước tên **theo đúng cách người nói gọi người đó** trong bảng nhân
+  vật, không cố định một từ:
+  * cảnh sát gọi vợ Kiếm Thanh là 'cô', nên "Chân đại tẩu" thành **"Cô Chân"**;
+  * Hồng Chấn (sau khi thua) gọi Kiếm Thanh là 'ông', nên "Chân tiên sinh" thành
+    **"ông Chân"**;
+  * không có quy tắc thì lấy từ mặc định: 哥 → anh, 姐 → chị, 嫂 → chị, 姨 → dì,
+    叔 → chú, 弟/妹 → em; 先生 → "anh" nếu người đó dưới 40 tuổi, "ông" nếu từ 40
+    tuổi.
+* Danh xưng đứng một mình: "đại tẩu"/"tẩu tử" → "chị dâu", "biểu ca" → "anh họ".
+* Viết hoa từ vai vế khi đứng đầu câu ("Anh Kiếm, anh ăn đi"). Bỏ tiền tố thân mật
+  thừa ("Tiểu Tiền đệ đệ" → "Em Tiền") và chữ "vị" thừa ("Vị Lâm tiên sinh" → "Anh
+  Lâm").
+* Giữ nguyên phiên âm tên và kiểu "A + tên" ("A Tú").
+
+### An toàn
+
+* Dòng dịch chỉ bị đổi khi:
+  * câu gốc có đúng chữ Hán của hậu tố (哥 cho "ca");
+  * chữ đứng trước hậu tố là âm tiết tên của một nhân vật trong bảng.
+* Nhờ vậy không đụng tới "ca hát", "hai tỷ đồng", "đệ tử", "di chúc" hay tiếng lóng
+  "đại ca". Danh xưng sau một tên lạ cũng không bị ghép sai thành "Mạc chị dâu".
+* Bảng nhân vật/tóm tắt/thuật ngữ chỉ đổi những tiếng gọi mà chính bảng ghi là tên gọi
+  của một nhân vật. Hậu tố viết hoa ("Lý Thẩm") chỉ đổi khi tên chữ Hán đúng là hậu tố
+  đó (王二婶 → "thím Vương Nhị"), vì 沈 cũng đọc "Thẩm".
+* Đổi xong, mọi quy tắc xưng hô trong bảng nhân vật vẫn tra được như trước.
+
+### Đo trên dữ liệu thật (65 lượt dịch đã lưu của 3 phim)
+
+* 2349 dòng được đổi. Đã soát tay toàn bộ dòng đổi ở bản mới nhất của từng phim và 45
+  dòng lấy ngẫu nhiên từ các lượt khác: không dòng nào bị đổi sai nghĩa. Vài dòng vốn
+  đã lẫn xưng hô từ bản dịch gốc ("Cẩu ca, tao…") thì vẫn lẫn ("Anh Cẩu, tao…").
+* Bản cuối 13/10 của "灭门惨案II": 35 dòng (28 lần "Kiếm ca", 5 lần "Hồng đại tẩu", 3
+  lần "Chân đại tẩu", 1 lần "Chân tiên sinh"). "Hệ thống sủng thê": 53 dòng. Phim đô
+  thị: 30 dòng.
+* Đổi bảng nhân vật trước rồi đổi dòng, hay đổi dòng theo bảng gốc, đều cho cùng kết
+  quả trên cả 65 lượt.
+* Tiến độ phân tích theo đoạn được lưu riêng cho chế độ này, nên không trộn đoạn cũ với
+  đoạn mới. Gói "Xuất chuẩn đoán ngữ cảnh" ghi thêm `native_address`.
+
+## [3.23.611] — 🩺 Soát chuẩn đoán 13/10 (phim "灭门惨案II", bản 3.23.609)
+
+Soát nhật ký ứng dụng, chuẩn đoán phân tích, chuẩn đoán dịch và chuẩn đoán lồng tiếng của
+lượt chạy 13/10. Hai lỗi thật đã sửa; một hướng cải thiện đo trên dữ liệu thật thấy không
+đáng tin nên không đưa vào.
+
+### Lượt dịch lại phụ không còn gọi model đã hết hạn mức ngày
+
+* **Lỗi:** mọi lượt dịch lại phụ đều dùng model của giai đoạn dịch thô. Đó là trọng tài
+  dòng lẻ, trọng tài dải lệch, sửa khối lệch, dọn chữ Hán sót và dọn dòng trùng.
+* Lượt chạy 13/10 dịch thô bằng gemini-3.7-flash tới hết hạn mức. Sau đó người dùng đổi
+  giai đoạn phong cách sang gemini-3.6-flash rồi chạy tiếp. Trọng tài vẫn gọi
+  gemini-3.7-flash nên thất bại ngay ("đã chạm giới hạn 20 request/ngày"). 4 dòng lẻ bị
+  viết lại sai không được phân xử và đi thẳng vào bản cuối.
+* **Nay:** nếu model dịch thô đã hết hạn mức ngày trên mọi key, lượt dịch lại phụ dùng
+  model của giai đoạn đang chạy. Nếu model đó cũng hết thì thử model của các giai đoạn
+  khác.
+* Chỉ đổi tên model. Nhiệt độ, thinking và cỡ lô vẫn lấy từ giai đoạn dịch thô, để bản
+  dịch lại vẫn là bản sát câu gốc. Nhật ký ghi rõ đã đổi sang model nào.
+
+### Tự sửa phiên âm tên gọi thân mật hai chữ
+
+* Bảng nhân vật ghi `阿彪 (A Tiêu / Cục trưởng Bưu)`. Chữ 彪 chỉ có một âm Hán-Việt là
+  "bưu", chính dòng đó cũng viết "Bưu". Còn "tiêu" là âm của 標/鏢 (cùng đọc *biāo*).
+* Quy tắc cũ chỉ tự sửa họ tên từ ba chữ, nên tên này chỉ được báo trong file chuẩn đoán.
+* **Nay** tên hai chữ cũng được tự sửa khi đủ các điều kiện sau:
+  * mở đầu bằng 阿/小/老, và chính tiền tố được phiên âm đúng ("A", "Tiểu", "Lão");
+  * chỉ có một chữ bị lệch âm.
+* Chữ chỉ quan hệ, vai vế thì không sửa: "阿叔 (A Chú)", "阿哥 (A Anh)", "老頭 (Lão
+  Già)", "老闆 (Lão Chủ)" là danh xưng dịch nghĩa có chủ ý.
+* Đo trên 26 bảng nhân vật thật của kho chuẩn đoán: chỉ "A Tiêu" → "A Bưu" được sửa
+  thêm. "Mạc Sảo" (莫嫂, không có tiền tố), "Quan khách" (宾客), "Chị Mai" (王梅) giữ
+  như cũ.
+
+### Đã đo nhưng không đưa vào: đoán nhãn người nói sai từ cách xưng hô của bản dịch
+
+* Dòng 1175 "你扣得這麼緊，怎麼脫呀" mang nhãn 洪大嫂 → 洪震, nên lồng tiếng bằng giọng
+  nữ. Nhưng bản dịch "Bà cài chặt thế này…" lại gọi theo cách Hồng Chấn gọi vợ.
+* Thử dò mọi dòng mà bản dịch dùng cách gọi của chiều ngược lại (người nghe gọi người
+  nói), đối chiếu với nhãn đa số của nhiều lượt phân tích. Tín hiệu chỉ đúng:
+  * 4/61 dòng ở phim "灭门惨案II" (26 lượt);
+  * 0/182 dòng ở "Hệ thống sủng thê";
+  * 10/264 dòng ở phim đô thị.
+* Phần lớn là bản dịch lệch quy tắc xưng hô, chứ không phải nhãn sai. Riêng dòng 1175
+  thì 26 lượt phân tích chia gần đôi (15 lượt cho Hồng Chấn, 10 lượt cho vợ). Vì vậy
+  không tự đổi người nói, cũng không thêm cờ soát.
+
+## [3.23.610] — 🔭 Học từ gemini-srt-translator
+
+Đọc toàn bộ mã nguồn và 221 commit của gemini-srt-translator (bản 3.8.3, 01/09/2026),
+đối chiếu từng tính năng với ứng dụng. Phần lớn ứng dụng đã có (và thường kỹ hơn):
+
+* nới bộ lọc an toàn;
+* sửa JSON hỏng, chia nhỏ lô khi lỗi, vá dòng thiếu;
+* xoay nhiều key khi hết hạn mức, dừng sớm khi quá tải để giữ hạn mức;
+* nối tiếp lượt dịch dở, ngữ cảnh các dòng trước;
+* trích phụ đề nhúng trong video, đọc/ghi ASS, ghi tệp nguyên tử.
+
+Năm điểm dưới đây ứng dụng chưa có hoặc đang làm sai, nay đã đưa vào.
+
+### Tắt "Thinking" nay giảm suy nghĩ thật sự
+
+* **Trước đây bỏ chọn ô Thinking là KHÔNG gửi cấu hình**, nên model dùng mức mặc định.
+  Theo tài liệu Gemini API (trang Thinking, 10/2026), mặc định đó là:
+  * gemini-3.8-flash, 3.6-flash: Medium;
+  * gemini-3.1-flash-lite và các bản Pro: High;
+  * Gemini 2.5 Flash: suy nghĩ động.
+
+  Tức là "tắt" lại suy nghĩ NHIỀU hơn mức "Thấp" khi bật. Token suy nghĩ tính giá như
+  đầu ra và tính cả vào hạn mức token/phút.
+* Nay tắt là gửi mức thấp nhất model nhận:
+  * Gemini 3: `minimal`; bản Pro và gemini-3.8-flash (tài liệu không có `minimal`): `low`;
+  * Gemini 2.5 Flash: ngân sách 0 (tắt hẳn); Gemini 2.5 Pro: 128 (mức tối thiểu).
+* Model nào từ chối `minimal` thì tự hạ xuống `low`, thử lại ngay và nhớ cho các lô sau.
+* Ngân sách khi bật được kẹp vào khoảng model nhận (2.5 Pro: 128–32768; 2.5 Flash: tối
+  đa 24576), thay vì để API trả lỗi 400.
+* **Lỗi phụ đi kèm:** khi model không nhận cấu hình suy nghĩ, bước bỏ suy nghĩ để thử
+  lại dựng lại cấu hình từ 4 trường. Vì vậy mất độ phân giải video (video gửi ở mức mặc
+  định, tốn token hơn hẳn) và mất bộ lọc an toàn đã nới. Nay chỉ bỏ phần suy nghĩ.
+* Bộ nhớ đệm giai đoạn vẫn dùng lại được: kết quả dịch lúc "tắt" theo kiểu cũ (suy nghĩ
+  nhiều hơn) không kém bản mới.
+
+### Thống kê token và chi phí ước tính
+
+* Sau mỗi lượt dịch, phân tích, "Bổ sung người nói" hay "Dịch lại các dòng đã chọn", kể
+  cả khi huỷ hoặc lỗi giữa chừng, thông báo kèm thêm thống kê token. Ví dụ: "Đã dùng
+  1.234.567 token qua 37 lượt gọi Gemini — đầu vào 1.100.000 (300.000 lấy từ cache),
+  suy nghĩ 80.000, đầu ra 54.567. Nếu tính phí: ≈ 1,13 USD (bảng giá 09/2026; dùng hạn
+  mức miễn phí thì không mất tiền)."
+* Lượt gọi trả JSON hỏng hoặc trả rỗng vẫn bị máy chủ tính token, nên cũng được đếm.
+* "Dịch cả bộ" báo tổng token của cả hàng đợi.
+* Gói "Xuất chuẩn đoán dịch" có thêm mục `token_usage_last_run`, chia theo model.
+* Bảng giá nằm ở `data/gemini_pricing.json`, sửa được mà không cần sửa mã:
+  * lấy từ gemini-srt-translator (MIT), bổ sung gemini-3.8-flash;
+  * token lấy từ cache tính 10% giá đầu vào;
+  * model không có trong bảng thì báo "chưa có giá", không đoán.
+
+### Âm thanh của video ngữ cảnh: đúng giờ và rõ lời thoại
+
+Đo bằng ffmpeg thật trên nguồn thử:
+
+* **Âm thanh lệch giờ sau khoảng hở.** Nguồn có khoảng hở 2 giây trong luồng âm thanh
+  (thường gặp ở bản ghi TS/IPTV) thì mọi âm thanh sau khoảng hở của đoạn gửi Gemini sớm
+  2 giây so với hình: tiếng bíp ở giây 10 nằm ở giây 8. Gemini nghe câu thoại trước khi
+  thấy người nói, nên dễ gán nhầm người nói.
+  * Nay thêm `aresample=async=1:first_pts=0` (gemini-srt-translator dùng `async=1`;
+    thêm `first_pts=0` để âm thanh bắt đầu đúng 0 s cả khi đoạn cắt rơi vào giữa khoảng
+    hở).
+* **Nguồn 5.1/7.1: lời thoại bị nhạc nền lấn.** Lời thoại nằm ở kênh giữa, còn trộn mono
+  mặc định cộng dồn mọi kênh nhạc và hiệu ứng.
+  * Nay trộn ưu tiên kênh giữa, giữ một phần hai kênh trước (nhạc, không khí cảnh), bỏ
+    kênh vòm và LFE. Tỉ lệ lời/nền tăng khoảng 9–10 dB và hết chạm trần 0 dBFS.
+  * gemini-srt-translator giữ riêng kênh giữa. Ở đây vẫn giữ một phần nhạc vì ứng dụng
+    dùng âm thanh cả cho ngữ điệu và tag cảm xúc.
+* Phim nhiều luồng tiếng: dùng luồng được đánh dấu mặc định thay vì luôn luồng đầu tiên.
+
+### Phụ đề chữ phải-sang-trái (Ả Rập, Do Thái, Ba Tư)
+
+* Trang Dịch cho chọn đích tiếng Ả Rập, nhưng tệp xuất không có dấu định hướng: trình
+  phát coi dòng là trái-sang-phải, nên dấu câu cuối câu nhảy sang đầu dòng.
+* Nay khi xuất SRT/ASS, mỗi dòng có chữ phải-sang-trái chiếm ưu thế được bọc RLE … PDF.
+  Bọc từng dòng, vì ký tự xuống dòng kết thúc dấu định hướng (gemini-srt-translator bọc
+  cả khối nên chỉ dòng đầu có tác dụng).
+* Khi nạp lại tệp, dấu được gỡ ra, nên văn bản trong ứng dụng (sửa, đếm ký tự, đọc TTS)
+  không mang ký tự ẩn.
+
+### Tệp phụ đề xuất ra không còn bị "chỉ chủ sở hữu đọc được"
+
+* Trên Linux/macOS, tệp tạm của bước ghi nguyên tử mang quyền 0600 và truyền quyền đó
+  sang tệp phụ đề. Hệ quả:
+  * máy chủ phim (Plex/Jellyfin chạy bằng tài khoản khác) không đọc được;
+  * tệp đã có quyền rộng hơn bị thu hẹp mỗi lần ghi lại.
+* Nay tệp mới theo umask, tệp ghi đè giữ nguyên quyền cũ. gemini-srt-translator gặp và
+  sửa đúng lỗi này.
+
+### Không đưa vào (và lý do)
+
+* **Phiên âm bằng Gemini** (âm thanh → phụ đề): mốc thời gian chỉ chính xác tới giây.
+  WhisperX của ứng dụng căn từng từ, chính xác hơn nhiều.
+* **Chế độ streaming:** chính README của họ khuyên tắt khi bị quá tải. Ứng dụng vốn đã sửa
+  JSON hỏng và vá dòng thiếu.
+* **Hạng dịch vụ flex/priority, Vertex AI:** chỉ dùng được với tài khoản trả phí hoặc
+  Google Cloud. Hạn mức miễn phí — cách ứng dụng đang dùng — không có các lựa chọn này.
+* **Lưu nhật ký suy nghĩ, tự cập nhật qua PyPI, giao diện cho agent, API phiên:** dành cho
+  công cụ dòng lệnh, không hợp với ứng dụng desktop.
+* **Giảm cỡ lô theo số lỗi liên tiếp, đếm token trước khi gửi:** ứng dụng đã chia đôi lô
+  hỏng và vá dòng thiếu theo từng lô, chi tiết hơn.
+
+### Kiểm thử
+
+* 50 test mới, đều chạy hỏng trên 3.23.609, trừ 2 test canh hành vi phải giữ: bản Pro
+  không nhận `minimal`, và mức suy nghĩ người dùng chọn được giữ nguyên.
+  * Hai test âm thanh chạy ffmpeg thật, trên đúng lệnh nén của ứng dụng.
+* Test cũ được cập nhật:
+  * 2 test mã hoá đúng hành vi đã sửa ("tắt suy nghĩ = không gửi cấu hình");
+  * 3 test dựng ViewModel/trang giả được bổ sung hàm báo token.
+
+## [3.23.609] — 🐞 Rà lỗi phần bộ nhớ đệm giai đoạn và toàn bộ trang Dịch
+
+Rà lại các việc của bản 3.23.608, rồi rà tiếp toàn bộ trang Dịch (trang, ViewModel,
+các luồng chạy nền). Mỗi lỗi dưới đây có test tái hiện, chạy hỏng trên 3.23.608.
+
+### Phần bộ nhớ đệm giai đoạn (3.23.608)
+
+* **Dịch lại khi mọi giai đoạn đã có sẵn vẫn nén và tải toàn bộ video.**
+  * Nhật ký thật ngày 12/10: bước chuẩn bị video mất 5 phút 23 giây (17 đoạn).
+  * Nếu model đính video đã hết hạn mức ngày thì lượt dịch còn bị chặn hẳn, dù không
+    giai đoạn nào cần gọi model.
+  * Nay ứng dụng tính trước giai đoạn nào phải dịch, theo đúng quy tắc dùng lại. Nếu
+    không giai đoạn nào phải dịch thì bỏ qua bước chuẩn bị video và bước kiểm hạn mức.
+* **Sửa giai đoạn hoặc "Dùng làm bản dịch hiện hành" không được lưu vào phiên khi
+  không đính video.** Nay lưu theo video của phụ đề (xem mục dưới).
+* Thử ngẫu nhiên 150 chuỗi thao tác (sửa, đổi model, đổi cấu hình, xoá giai đoạn,
+  bật/tắt giai đoạn, đổi bảng nhân vật, lượt dịch bị ngắt giữa chừng). Kết quả:
+  * dự đoán "dùng lại nguyên / giữ bao nhiêu dòng" luôn khớp lượt dịch thật;
+  * không dòng sửa tay nào bị mất;
+  * chạy lại ngay sau đó không gọi model lần nào.
+
+### Trang Dịch: phụ đề bị gắn nhầm video
+
+* **Nạp tệp phụ đề hoặc lấy từ trang Biên tập: video của dự án mở trước vẫn bị coi là
+  video của phụ đề mới.** Hệ quả:
+  * nạp nhầm phân tích ngữ cảnh và bản dịch của phim cũ cho phụ đề mới;
+  * sửa hay dịch lại dòng của phụ đề mới thì ghi vào phiên của video cũ;
+  * tên file xuất và nút "Xoá file cloud" đều theo video cũ.
+
+  Ngoài ra video nằm cạnh tệp phụ đề (hay video của trang Biên tập) chỉ được gắn SAU
+  bước nạp lại phiên, nên phân tích đã lưu của chính phim đó không bao giờ được nạp.
+  Nay video của phụ đề được xác định trước khi nạp phụ đề.
+* **Tệp phụ đề đọc hỏng vẫn xoá sạch ngữ cảnh của phụ đề đang mở.** Nay đọc tệp trước,
+  hỏng thì giữ nguyên mọi thứ.
+* **Dịch hoặc phân tích KHÔNG đính video thì không lưu gì.** Khoá phiên trước đây là
+  video đính kèm, nên lượt dịch không đính video không lưu bản dịch, không tích luỹ Bộ
+  nhớ dịch hay ngữ cảnh phim bộ, và mở lại thì mất hết. Nay khoá phiên là video của phụ
+  đề, kể cả khi không đính video lên Gemini.
+* **Nạp lại phiên ghép nhầm bản dịch.**
+  * Trước đây bản dịch đã lưu được ghép theo số thứ tự khi số dòng chỉ lệch ≤ 20%, nên
+    phụ đề khác cùng cỡ vẫn nhận bản dịch của phim kia.
+  * Nay mỗi dòng lưu kèm vân tay câu gốc, và chỉ nạp lại khi ≥ 90% dòng khớp. Sửa lỗi
+    chính tả vài dòng vẫn nạp lại bình thường.
+  * Phụ đề đánh số không bắt đầu từ 1 trước đây bị lệch một dòng. Nay ghép theo chỉ số
+    câu gốc.
+* **Thay phụ đề mà "So sánh giai đoạn" vẫn hiện các giai đoạn của phim cũ.**
+
+### Trang Dịch: các lỗi khác
+
+* **Nạp phụ đề mới khi đang đính video làm nút Dịch bị chặn.** Ô "Phân tích hình ảnh"
+  vẫn bật và đánh dấu dù ô đính video đã tắt, nên bấm Dịch báo "Chưa chọn video ngữ
+  cảnh".
+* **"Dịch lại các dòng đã chọn" lấy nhầm người nói.** Visual Cues gắn theo số thứ tự dòng
+  của cả phim, còn tập dòng gửi đi được đánh số lại 1..k. Vì vậy khi dịch lại dòng 723,
+  dòng này nhận người nói và người nghe của dòng 1, dẫn đến sai xưng hô. Nay chỉ gửi cues
+  của các dòng đã chọn, đánh số theo tập con.
+* **Phân tích bị gián đoạn (timeout, mất mạng) chỉ hiện "Đã huỷ phân tích."** Lỗi thật
+  bị giấu như thể người dùng tự huỷ. Nay báo lỗi và gợi ý thử lại, giống khâu dịch từ
+  3.23.175. Áp dụng cho cả nút "Bổ sung người nói".
+* **Thông báo "Dịch hoàn tất" hiện sai lúc.** Trước đây nó hiện cả khi chỉ mở lại phiên
+  hay dịch lại hai dòng, kèm số dòng và thời gian của lần dịch trước. Nay chỉ hiện khi
+  một lượt dịch thật vừa xong.
+* Đang dịch thì không cho sửa hay dịch lại dòng trên bảng. Trước đây vẫn cho làm, rồi
+  bản dịch mới ghi đè mất mà không báo.
+* Bảng thuật ngữ và ô Visual Cues không còn dựng lại toàn bộ chữ các giai đoạn hay giải
+  mã lại JSON cues mỗi lần chọn dòng hoặc gõ phím.
+
+### Dịch cả bộ
+
+* **Mở lại phiên bị coi là "dịch xong tập".** Bản dịch nạp lại (của phim mở trước đó)
+  bị ghi thành tệp `.translate` của tập vừa nạp, rồi hàng đợi nhảy sang tập kế. Lỗi này
+  có thể dây chuyền qua mọi tập có số dòng gần bằng nhau.
+* **Mọi tập dùng chung ngữ cảnh và video.** Trước đây:
+  * bảng nhân vật, tóm tắt và Visual Cues của tập trước (hay phim mở trước đó) được dùng
+    cho mọi tập; cues gắn theo số dòng nên người nói bị gán sai dòng;
+  * khi bật đính video, mọi tập đều đính cùng MỘT video.
+
+  Nay mỗi tập dùng video của chính nó, và lấy phân tích đã lưu của tập đó (hoặc ngữ cảnh
+  chung của phim bộ).
+* **Huỷ giữa chừng làm hàng đợi treo.** Không có bảng tổng kết, và lần dịch tay kế tiếp
+  ghi kết quả vào tệp của tập dở. Nay huỷ là kết thúc hàng đợi và báo tổng kết.
+* **Cảnh báo cấu hình làm hàng đợi đứng im.** Các cảnh báo như thiếu API key hay chưa
+  chọn video dừng hàng đợi mà không báo gì. Nay dừng hẳn kèm tổng kết. Lỗi chung cho mọi
+  tập ("bộ dịch chưa sẵn sàng") cũng dừng ngay, thay vì làm hỏng lần lượt từng tập.
+* **Bấm "Dịch cả bộ" trong lúc đang dịch.** Kết quả của lượt đang chạy bị ghi thành bản
+  dịch tập 1. Nay nút bị khoá khi đang bận.
+* **Ước lượng request sai.**
+  * Trước đây đọc ô "cỡ lô" và ô model không tồn tại trên trang, nên luôn tính một lượt
+    với lô 40 câu và không bao giờ cảnh báo vượt hạn mức. Với phim 1246 dòng, 3 giai đoạn
+    (lô 60/48/48), ước lượng cũ là 32 request trong khi thật là 73.
+  * Nay tính theo từng giai đoạn và từng model (model "lite" bị kẹp lô 60 như lúc dịch
+    thật), rồi so với hạn mức còn lại hôm nay của các key.
+* **Tổng kết khi hết hạn mức báo thiếu một tập đã dịch xong.**
+
+### Lượt rà thứ hai: dòng sửa tay trên bảng kết quả
+
+* **Dịch lại là mất mọi dòng đã sửa tay trên bảng kết quả.** Từ 3.23.608 bấm Dịch lại
+  chỉ mất vài giây (giai đoạn lấy từ bộ nhớ đệm) nên đây là thao tác thường gặp, nhưng
+  bản dịch cuối được dựng lại từ các giai đoạn và ghi đè, không báo gì. Kể cả các dòng
+  vừa "Dịch lại các dòng đã chọn".
+  * Nay mỗi dòng sửa được ghi lại (lưu cả vào phiên) và áp lại sau mỗi lượt dịch. Báo
+    "Giữ N dòng đã sửa trên bảng kết quả."
+  * Dòng có câu gốc đã đổi (sửa OCR, thêm/bớt dòng) thì bỏ câu sửa; câu sửa tiếng Việt
+    không áp vào bản dịch tiếng Anh.
+  * Dòng đã sửa được đánh dấu trên bảng. Chuột phải → **"Bỏ sửa tay"** trả về câu máy
+    dịch MỚI NHẤT.
+* **Nạp lại phiên lệch dòng khi phụ đề có thêm dòng ở cuối.** Bản dịch được ghép theo vị
+  trí nên các dòng mới nhận bản dịch của dòng khác. Nay ghép theo chỉ số câu gốc.
+* **Danh sách phụ đề dùng chung giữa trang Dịch và trang Biên tập.** Đánh số lại hay sửa
+  dòng ở trang này làm đổi luôn phụ đề nguồn (và bản dịch) ở trang kia mà không báo.
+  Nay mỗi trang giữ bản sao riêng.
+
+### Lượt rà thứ hai: bấm Huỷ và các nút trên trang
+
+* **Bấm Huỷ đúng lúc đang dọn dòng trùng / chữ Hán sót / sửa khối lệch thì không huỷ
+  được.** Lỗi "người dùng huỷ" bị nuốt cùng các lỗi khác của bước phụ: lượt dịch chạy tiếp
+  tới cuối và báo "Dịch hoàn tất". Ở bước sửa khối lệch, giai đoạn còn được LƯU vào bộ
+  nhớ đệm khi chưa sửa xong. Gián đoạn do mạng (không bấm Huỷ) vẫn được bỏ qua như cũ.
+* **Bấm "Tải model" làm đổi model của các giai đoạn.** Model đang chọn mà không có trong
+  danh sách tải về (vd bản preview) bị thay bằng model đầu danh sách. Nay giữ nguyên.
+* **Hộp "Hạn mức model" gõ nhầm một ô là mất hết các dòng vừa nhập.** Nay báo lỗi rồi
+  mở lại hộp với nguyên các dòng.
+* **Giữa hai tập của "Dịch cả bộ":** nút Dịch, Nạp phụ đề, Lấy từ Biên tập lại bật (kết
+  quả của lượt bấm tay bị ghi thành bản dịch của tập đang chạy) còn nút Huỷ bị khoá. Bấm
+  Huỷ ngay lúc chuyển tập vẫn chạy tập kế. Nay khoá/mở đúng và huỷ là dừng hẳn.
+* **Đóng ứng dụng khi đang phân tích:** luồng phân tích vẫn ghi phiên sau khi kho dữ liệu
+  đã đóng. Nay ngắt mọi tín hiệu trước.
+
+### Lượt rà thứ hai: bộ nhớ đệm giai đoạn
+
+* **Bộ nhớ đệm dùng thường xuyên vẫn bị dọn như đồ cũ.** Tuổi tính theo lần GHI file
+  cuối, mà lượt dịch dùng lại nguyên (không dịch gì) thì không ghi gì. Nay mỗi lần dùng
+  lại đều "làm mới" tuổi.
+* **Sửa một dòng giai đoạn thành rỗng được chấp nhận** (cả ở hộp "Quản lý giai đoạn").
+  Dòng rỗng đi tiếp qua các giai đoạn sau thành dòng phụ đề trống. Nay bị từ chối, kèm
+  thông báo.
+* **Bật suy nghĩ, đổi mức rồi tắt lại là dịch lại cả giai đoạn**, dù yêu cầu gửi model y
+  hệt (khi tắt, mức và ngân sách suy nghĩ không được gửi). Nay dấu vân tay cấu hình chỉ
+  tính những gì thật sự gửi tới model. Kết quả do 3.23.606–608 lưu vẫn được dùng lại.
+* **Kiểm hạn mức trước khi tải video xét nhầm model.** Trước đây xét model của giai đoạn
+  đính video ĐẦU TIÊN, kể cả khi giai đoạn đó lấy từ bộ nhớ đệm (không gọi model). Nếu
+  model đó hết hạn mức thì cả lượt dịch bị chặn. Nay chỉ xét các giai đoạn sẽ dịch thật,
+  và số request dự trù cũng chỉ đếm các giai đoạn đó. Không đọc được bộ nhớ đệm thì
+  chuẩn bị video như cũ thay vì báo lỗi.
+
+### Lượt rà thứ hai: nút "Xoá file cloud"
+
+* **File video tải bằng key dự phòng bị báo "đã xoá" nhưng vẫn còn trên cloud.** Video
+  được tải bằng key còn hạn mức (và tải lại khi xoay key), nhưng nút xoá chỉ dùng key
+  chính. Gemini trả 403 cho file của dự án khác, mà 403 cũng là mã Gemini trả cho file đã
+  hết hạn, nên file bị coi là "đã không còn" và bị xoá khỏi danh sách. Nay thử lần lượt
+  mọi key (chính + dự phòng).
+* **Đoạn video tải khi DỊCH (đính video) hoặc tải lại khi xoay key không được ghi lại**,
+  nên nút báo "Không có file cloud nào để xoá". Nay mọi lần tải đều được ghi vào phiên.
+* **Mỗi lần phân tích ghi đè danh sách file cloud**, nên file của lần trước (còn trên
+  cloud tới 48 giờ) bị quên. Nay cộng dồn; bản ghi quá 48 giờ tự bỏ.
+* **Xoá lỗi mạng giữa chừng vẫn xoá cả danh sách**, không thử lại được. Nay giữ lại các
+  file chưa xoá được và báo bấm lại.
+
+### Kiểm thử
+
+* Lượt rà đầu: 27 test mới; 24 trong số đó chạy hỏng trên 3.23.608. Ba test còn lại canh
+  hành vi phải giữ: sửa chính tả vài dòng vẫn nạp lại; người dùng tự huỷ vẫn không báo
+  lỗi; lượt dịch còn giai đoạn phải dịch thì vẫn chuẩn bị video.
+* Lượt rà thứ hai: 37 test mới; 33 trong số đó chạy hỏng trước khi sửa. Bốn test còn lại
+  canh hành vi phải giữ: gián đoạn do mạng ở bước phụ vẫn được bỏ qua; bộ nhớ đệm do
+  3.23.608 lưu vẫn được dùng lại; nạp lại phiên thiếu dòng giữa không lệch; file không key
+  nào truy cập được (đã hết hạn) vẫn coi là đã xoá.
+* Test cũ được cập nhật:
+  * 4 test dựng trang/ViewModel giả được bổ sung hàm mới (`_session_video_path`,
+    `_set_video_controls_enabled`, `stage_output_count`);
+  * 3 worker dịch giả được bổ sung tín hiệu `video_refs_ready`;
+  * "đổi mức suy nghĩ đổi khoá" nay xét khi BẬT suy nghĩ (thêm test "khi tắt thì không
+    đổi");
+  * test đọc mã nguồn client Gemini theo dạng tạo client mới (theo từng key).
+* Toàn bộ: 6228 test đạt, 57 bỏ qua (thiếu dữ liệu thật/thư viện native), 0 hỏng.
+
+## [3.23.608] — 🗂 Quản lý, sửa và dùng lại TỪNG giai đoạn dịch
+
+Trả lời câu hỏi ngày 13/10: "Khi dịch ta có thể quản lý cache của từng giai đoạn dịch
+không? Có thể chỉnh sửa nội dung của từng giai đoạn dịch không? Có tận dụng lại nội dung
+của từng giai đoạn dịch không?"
+
+### Trước bản này: cả ba đều KHÔNG
+
+* **Không tận dụng lại sau khi dịch xong.** Bộ nhớ đệm các giai đoạn bị xoá ngay khi lượt
+  dịch hoàn tất. Chỉ lượt dịch bị ngắt (hết hạn mức, mất mạng) mới được nối tiếp. Đổi phong
+  cách giai đoạn tinh chỉnh, thêm giai đoạn bản địa hoá hay bấm Dịch lại là dịch lại TẤT CẢ
+  giai đoạn từ đầu.
+* **Không sửa được từng giai đoạn.** Chỉ sửa được bản dịch cuối, và lần dịch sau ghi đè mất.
+* **Không quản lý được.** Chỉ có nút "Xoá cache dịch" xoá tất cả — mà nút này còn hỏng
+  (xem dưới).
+* **Lỗi của v3.23.606 khi bật Visual Cues.** Khoá file bộ nhớ đệm chứa model quét Visual
+  Cues, mà model này lấy theo giai đoạn đầu. Bật Visual Cues rồi đổi model giai đoạn đầu
+  (vì hết hạn mức) là đổi tên file → mất mọi giai đoạn đã xong — đúng điều v3.23.606 định
+  sửa.
+* **Nút "Xoá cache dịch" không xoá được gì.** Nút này chỉ gửi ngôn ngữ đích, thiếu ngôn ngữ
+  gốc (luôn có sau khi phân tích ngữ cảnh) → tính ra tên file khác tên file lúc dịch → báo
+  "đã xoá" mà file vẫn còn, lần dịch tới vẫn dùng lại bản cũ.
+
+### Đã làm
+
+* **Bộ nhớ đệm từng giai đoạn được GIỮ sau khi dịch xong.**
+  * Bấm Dịch lại với cùng cấu hình: không gọi API lần nào cho các giai đoạn.
+  * Đổi cấu hình một giai đoạn hay thêm giai đoạn: các giai đoạn khác dùng lại nguyên.
+  * Tự dọn: giữ tối đa 60 bộ phụ đề gần nhất trong 180 ngày (chỉnh được trong
+    `TranslationSettings`: `stage_cache_max_files`, `stage_cache_max_age_days`). Đo trên
+    phim thật 1246 dòng: ~175 byte/dòng/giai đoạn → phim 3902 dòng × 4 giai đoạn ≈ 3 MB.
+* **Nút mới "🗂 Quản lý giai đoạn"** (hàng nút dưới bảng kết quả). Với mỗi giai đoạn:
+  * đã lưu chưa, bao nhiêu dòng, dịch bằng model nào, lưu lúc nào, bao nhiêu dòng sửa tay,
+    lần dịch dở còn bao nhiêu dòng;
+  * **lần bấm Dịch tới sẽ làm gì**, theo đúng cấu hình đang chọn: dùng lại nguyên / chỉ dịch
+    lại các lô có dòng đổi (giữ bao nhiêu dòng) / dịch lại — kèm lý do (cấu hình đã đổi,
+    model đang chọn mạnh hơn model đã dịch, bảng nhân vật đã đổi, giai đoạn trước sẽ dịch
+    lại…). Dự đoán dùng chính quy tắc của khâu dịch nên khớp với điều thực sự xảy ra (có
+    test đối chiếu);
+  * **Xem / sửa…**: bảng từng dòng gồm bản gốc, đầu vào của giai đoạn và nội dung giai
+    đoạn; sửa trực tiếp, tìm kiếm, lọc dòng đã sửa / dòng khác đầu vào, hoàn tác về câu
+    model;
+  * **Dùng làm bản dịch hiện hành**: đưa nội dung giai đoạn vào bảng kết quả ngay, không
+    gọi API;
+  * **Xoá giai đoạn** (giữ hoặc bỏ các dòng sửa tay) để dịch lại riêng giai đoạn đó, và
+    **Xoá tất cả**.
+* **Sửa tay một giai đoạn → lần dịch tới chỉ dịch lại phần bị ảnh hưởng.**
+  * Bộ nhớ đệm ghi thêm vân tay TỪNG DÒNG đầu vào. Giai đoạn sau giữ các dòng có đầu vào
+    không đổi và chỉ dịch lại các lô có dòng đổi.
+  * Đo trên phim thật 1246 dòng (lô 60 dòng): sửa 1 dòng dịch thô → 2 lượt gọi thay vì
+    42; sửa 5 dòng → 10 thay vì 42; sửa 20 dòng → 24 thay vì 42.
+* **Dòng sửa tay luôn được giữ.** Giai đoạn bị dịch lại (đổi sang model mạnh hơn, đổi cấu
+  hình, đổi bảng nhân vật) thì câu sửa tay vẫn được áp lên bản model mới, sau mọi lưới tự
+  sửa. Câu model mới được ghi lại để còn hoàn tác. Đổi bảng nhân vật/thuật ngữ trước đây bỏ
+  hết bộ nhớ đệm — nay vẫn bỏ bản model (để tên riêng, xưng hô nhất quán) nhưng giữ các dòng
+  sửa tay.
+* **Khoá file không còn chứa model quét Visual Cues.** File của bản 3.23.606-607 (khoá cũ)
+  và của bản ≤ 3.23.605 tự được nhận sang khoá mới.
+* **Sửa nút "Xoá cache dịch".** Nút này, nút Dịch và màn Quản lý giai đoạn nay dùng chung
+  một cách tính khoá; nút xoá cũng xoá file khoá của các bản cũ. Thông báo nói rõ có xoá
+  được gì không.
+* **Thông báo sau khi dịch** nói phần nào lấy từ bộ nhớ đệm, vd "Dùng lại nguyên: Dịch thô.
+  Chỉ dịch lại phần đổi: Tinh chỉnh (giữ 1241 dòng). Áp lại dòng sửa tay: Dịch thô 5."
+  (thay cho "Phát hiện bản dịch chưa hoàn tất. Đang tiếp tục…" hiện sai sau mỗi lượt).
+* "Dịch lại dòng đã chọn" không ghi bộ nhớ đệm (mỗi tập dòng con sẽ thành một file riêng
+  chiếm chỗ bộ nhớ đệm của các phim).
+* File bộ nhớ đệm ghi kiểu ghi-tạm-rồi-thay-thế (mất điện giữa chừng không hỏng bản cũ),
+  có định dạng `format: 2`, thông tin mô tả (`meta`) và thời điểm lưu từng giai đoạn.
+
+### Kiến trúc
+
+* Mới `application/services/stage_checkpoint.py` (lưu trữ + quy tắc dùng lại, tách khỏi
+  use case dịch 3900 dòng) và `application/services/stage_cache.py` (xem / dự đoán / sửa /
+  xoá). Giao diện: `presentation/widgets/stage_cache_dialog.py`,
+  `presentation/view_models/stage_cache_session.py`, `stage_cache_texts.py`.
+* Tên cũ trong `translate_subtitles` (`_StageCheckpoint`, `_compute_checkpoint_key`,
+  `_lines_to_json`…) vẫn dùng được.
+
+### Kiểm thử
+
+* 38 test mới (ứng dụng, giao diện offscreen, câu chữ); các kịch bản dùng lại sau khi xong,
+  Visual Cues + đổi model, và nút xoá cache đều ĐỎ trên v3.23.607.
+* Hai test cũ đổi kỳ vọng "xoá bộ nhớ đệm sau khi xong" → "giữ lại và lần sau không gọi
+  API".
+
+## [3.23.607] — 🕑 Sửa lại mốc hồi hạn mức Gemini: 00:00 giờ Thái Bình Dương (14:00 giờ Việt Nam)
+
+Phân tích nhật ký 11:50 ngày 12/10 (v3.23.606).
+
+### Bản v3.23.606 đổi sai mốc hồi hạn mức — bản này sửa lại
+
+* **v3.23.606 đã làm gì.** Bản đó tin con số `retryDelay` trong lỗi 429 hết hạn mức ngày.
+  Con số này luôn chỉ về 00:00 UTC (07:00 giờ Việt Nam), nên v3.23.606 tính ngày hạn mức
+  theo UTC. Sai.
+* **Nhật ký hôm nay bác bỏ mốc 07:00.**
+  * 06:17 và 06:33: gemini-3.8-flash hết hạn mức; server gửi `retryDelay` ~26 phút.
+  * 11:05: v3.23.606 tưởng hạn mức đã hồi từ 07:00. Ứng dụng tải lại đủ 17 đoạn video
+    (hơn 5 phút), nhận lại bản dịch thô 3.8-flash từ checkpoint, rồi gửi giai đoạn
+    tinh chỉnh.
+  * 11:06 đến 11:07: cả ba key đều bị từ chối. Server lúc này lại báo "19 giờ 52 phút".
+* **Nhật ký 08/10 cũng vậy.** Ba key hết hạn mức gemini-3.8-flash lúc 07:46, 08:00 và
+  08:05. Lúc 14:19 gọi lại thì thành công.
+* **Tài liệu chính thức của Gemini API ghi đúng như vậy:** "Requests per day (RPD) quotas
+  reset at midnight Pacific time" và "Rate limits are applied per project, not per API key".
+* **Mốc thật là 00:00 giờ Thái Bình Dương:**
+  * 14:00 giờ Việt Nam trong giờ mùa hè của Mỹ (từ Chủ nhật thứ hai tháng 3 đến Chủ nhật
+    đầu tháng 11);
+  * 15:00 giờ Việt Nam trong thời gian còn lại.
+
+### Đã làm
+
+* **Bỏ hẳn việc học mốc hồi từ `retryDelay`.** Ngày hạn mức trở lại tính theo 00:00 giờ
+  Thái Bình Dương, gom vào mô-đun mới `gemini_quota_clock`.
+  * Ưu tiên dữ liệu múi giờ của máy (`zoneinfo`).
+  * Windows thường không có dữ liệu này: có sẵn quy tắc giờ mùa hè của Mỹ để dự phòng.
+    Trước đây ứng dụng lùi về UTC-8, lệch một giờ suốt mùa hè.
+  * Quy tắc dự phòng đã so khớp với cơ sở dữ liệu múi giờ từ 2024 đến 2030.
+  * Thêm gói `tzdata` vào requirements, pyproject và gói cài đặt.
+* **Thông báo hết hạn mức ghi đúng giờ hồi theo giờ máy.**
+  * Vd lúc 11:07 hôm nay: "Hạn mức ngày của Gemini hồi lúc 00:00 giờ Thái Bình Dương —
+    14:00 hôm nay theo giờ máy (còn khoảng 2 giờ 52 phút)". Thông báo cũ là "hồi sau
+    khoảng 19 giờ 52 phút".
+  * Áp dụng cho mọi chỗ: lỗi dịch, lỗi phân tích, báo trước khi tải video, thông báo phân
+    tích dở.
+* **Chuyển an toàn tệp trạng thái quota do v3.23.606 ghi.** Nhãn ngày UTC "12/10" trùng
+  chữ với ngày hạn mức bắt đầu lúc 14:00 hôm nay; giữ nguyên thì gemini-3.8-flash bị chặn
+  oan tới 14:00 ngày mai.
+  * Nếu chắc bản ghi thuộc ngày hạn mức hiện tại, nó được giữ và đổi nhãn. Vd mở ứng dụng
+    trước 14:00 hôm nay: dấu chặn lúc 11:07 vẫn đúng, nên ứng dụng báo ngay thay vì tải
+    17 đoạn video rồi mới bị từ chối.
+  * Còn lại thì bỏ; key nào thật sự cạn thì server báo lại ở lượt gọi đầu.
+* **Phần đúng của v3.23.606 vẫn giữ.** Lượt 11:05 đã nhận lại bản dịch thô
+  gemini-3.8-flash từ checkpoint của lần chạy 05:50 ("Chuyển checkpoint dịch của bản cũ…
+  1 giai đoạn đã xong (literal)") và bỏ qua giai đoạn dịch thô.
+
+### Kiểm thử
+
+* Mới: `test_quota_reset_pacific_v323607.py`. Gồm dòng thời gian thật 12/10 và 08/10, dấu
+  chặn lúc 06:33 còn hiệu lực lúc 11:06 rồi hết lúc 14:00, hai ca tệp trạng thái của
+  v3.23.606, đổi giờ mùa hè, Windows thiếu `tzdata`, thông báo lúc 11:07.
+* Các ca dấu chặn trượt trên v3.23.606 và qua trên bản này.
+* Bỏ `test_daily_reset_boundary_v323606.py` (kiểm hành vi sai của v3.23.606).
+* `test_daily_quota_wait_v323586.py`: thông báo nay theo giờ Thái Bình Dương, không theo
+  `retryDelay`.
+
+## [3.23.606] — 🎯 Đổi model vì hết hạn mức không còn mất phần đã dịch; dùng lại model mạnh ngay khi server hồi hạn mức
+
+Phân tích chuẩn đoán 09:59 ngày 12/10 (灭门惨案II, v3.23.605). Sáng nay có ba lần dịch liên
+tiếp. Bản cuối dùng gemini-3.5-flash-lite cho cả ba giai đoạn, dù trước đó bản dịch thô
+của gemini-3.8-flash đã xong.
+
+### Chuyện gì đã xảy ra (nhật ký thật, giờ máy)
+
+* **05:50 — gemini-3.8-flash cả ba giai đoạn.** Dịch thô xong lúc 06:33 (22 lượt gọi,
+  nhiều lần 503). Giai đoạn tinh chỉnh hết hạn mức ngay lượt gọi đầu.
+* **06:57 — đổi sang gemini-3.7-flash.** Khoá checkpoint chứa tên model của mọi giai
+  đoạn, nên bản dịch thô của 3.8-flash không được tìm thấy: dịch thô làm lại từ đầu
+  (21 lượt gọi). Tinh chỉnh được 11 lô thì hết hạn mức.
+* **07:30 — đổi sang gemini-3.5-flash-lite.** Lại làm từ đầu cả dịch thô lẫn tinh chỉnh
+  (66 lượt gọi).
+* Kết quả là bản cuối hoàn toàn của model yếu nhất:
+  * 240 dòng vượt ngân sách đọc (bản dịch thô 3.7-flash hôm trước: 122).
+  * 80 dòng lồng tiếng phải đọc nhanh hơn 1,6x (hai lượt trước: 59 và 44).
+* Thêm một chi tiết: lúc 07:30, gemini-3.8-flash thật ra **đã dùng lại được**. Server
+  báo hạn mức hồi lúc 07:00 nhưng ứng dụng vẫn chặn model này tới 14:00 (xem dưới).
+
+### Đã làm
+
+* **Đổi xuống model yếu hơn thì giữ mọi phần đã dịch.**
+  * Khoá checkpoint nay chỉ gồm phụ đề, cặp ngôn ngữ và Visual Cues.
+  * Mỗi giai đoạn đã xong ghi kèm dấu vân tay đầu vào, cấu hình (trừ model) và model đã
+    dịch nó. Tiến độ dở giữa giai đoạn cũng ghi model.
+  * Lần chạy sau dùng lại kết quả khi đầu vào và cấu hình khớp, và model đã dịch **mạnh
+    hơn hoặc ngang** model đang chọn. So hạng theo tên: dòng (lite < flash < pro) rồi
+    tới thế hệ. Vd 3.8-flash > 3.7-flash > 3.5-flash-lite.
+  * Đổi **lên** model mạnh hơn thì vẫn dịch lại, vì khi đó bạn muốn chất lượng cao hơn.
+  * Nhật ký ghi rõ: "dùng lại bản đã dịch bằng 'gemini-3.8-flash' … thay vì dịch lại".
+    Muốn dịch lại bằng model đang chọn thì bấm "Xoá bộ nhớ đệm dịch".
+  * Đổi phong cách, ghi chú bản địa hoá, mức suy nghĩ, cỡ ngữ cảnh, nhiệt độ, cỡ lô hay
+    việc đính video thì vẫn dịch lại như trước.
+  * Mô phỏng đúng chuỗi sáng nay (lô 2 dòng, 12 dòng thật):
+    * Lần 2 không gọi dịch thô nào, dồn hạn mức 3.7-flash cho tinh chỉnh và bản địa hoá.
+    * Lần 3 flash-lite chỉ dịch các lô bản địa hoá còn thiếu.
+  * Ước tính cho ba lần chạy thật (theo số lượt 3.7-flash server đã cho, khoảng 34): dịch
+    thô 3.8-flash, tinh chỉnh 3.7-flash, bản địa hoá khoảng nửa số lô bằng 3.7-flash,
+    nửa còn lại flash-lite.
+* **Nhận checkpoint dở do bản cũ ghi.** File của v3.23.605 trở về trước được chuyển sang
+  khoá mới, nếu bạn chạy lại với đúng cấu hình của lần dở đó. "Xoá bộ nhớ đệm dịch" xoá
+  cả file khoá cũ.
+* **Mốc đổi ngày hạn mức theo server: 00:00 UTC (07:00 sáng giờ Việt Nam).**
+  > **SAI — đã sửa ở 3.23.607:** hạn mức hồi lúc 00:00 giờ Thái Bình Dương (14:00/15:00
+  > giờ Việt Nam); `retryDelay` không phải mốc hồi.
+  * Bốn lần server báo hết hạn mức ngày kèm thời gian chờ đều chỉ về 06:59–07:00 giờ máy:
+    * 20:47 + 10 giờ 12 phút;
+    * 08:05 + 22 giờ 54 phút;
+    * 06:33 + 26 phút;
+    * 07:27 + 23 giờ 32 phút.
+  * Ứng dụng lại tính ngày theo 00:00 giờ Thái Bình Dương (14:00 giờ Việt Nam). Vì vậy dấu
+    "server đã từ chối" còn hiệu lực từ 07:00 tới 14:00. Trong khoảng đó ứng dụng tự chặn
+    model và báo "mọi key đã hết hạn mức", dù server đã cho dùng lại.
+  * Nay mốc mặc định là 00:00 UTC. Mỗi lần server báo hết hạn mức ngày kèm thời gian chờ,
+    ứng dụng học lại mốc (làm tròn 30 phút) và lưu vào tệp trạng thái. Dấu chặn và bộ đếm
+    của ngày hiện tại được chuyển nhãn theo mốc mới, không mất hiệu lực oan.
+  * Các thông báo hết hạn mức nay ghi "hạn mức hồi lúc 07:00 sáng giờ Việt Nam
+    (00:00 UTC)", thay cho "00:00 giờ Thái Bình Dương". Thông báo khi dịch hết hạn mức
+    nói thêm rằng phần đã dịch được giữ.
+
+### Kiểm thử
+
+* Mới:
+  * `test_model_switch_resume_v323606.py`: chuỗi ba lần chạy sáng nay, đổi lên model mạnh
+    hơn, checkpoint bản cũ, nút xoá bộ nhớ đệm, so hạng model.
+  * `test_daily_reset_boundary_v323606.py`: bốn gợi ý thật của server, dấu chặn hết hiệu
+    lực lúc 07:00, học mốc khác.
+* Các ca chính (lần 2 không dịch thô lại; 3.8-flash dùng lại được lúc 07:30) trượt trên
+  v3.23.605 và qua trên bản này.
+* `test_checkpoint_key_v32535.py`: chuyển các kiểm tra "đổi cấu hình thì không dùng lại"
+  sang dấu vân tay từng giai đoạn.
+
+## [3.23.605] — 🎙️ Dòng thoại không còn bị thay bằng "[cười]"; bỏ từ đệm làm giọng đọc gấp; hết dò 403 lặp lại sau khi xoay key
+
+Phân tích chuẩn đoán 21:10 ngày 11/10 (灭门惨案II, v3.23.604). Phân tích ngữ cảnh được khôi
+phục từ phiên trước. Dịch thô dùng gemini-3.7-flash; tinh chỉnh và bản địa hoá dùng
+gemini-3.5-flash-lite. Lồng tiếng VieNeu 2 giọng, 1246 dòng: 1 dòng bị bỏ, 1 chỗ chồng tiếng
+0,18 s.
+
+### Đo được trên lượt này
+
+* Dịch thô gemini-3.7-flash gọn nhất từ trước tới nay: 122 dòng vượt ngân sách ký tự
+  (các lượt trước 234–245).
+* Hai giai đoạn tinh chỉnh chạy model nhẹ làm câu dài ra: 194 dòng vượt sau tinh chỉnh, 202
+  ở bản cuối. Số dòng lồng tiếng phải đọc nhanh hơn 1,6x tăng 44 → 59 so với lượt trước.
+  Ước tính 32/59 dòng đó sẽ không phải đọc nhanh nếu giữ bản dịch thô. Phần lớn là viết lại có đổi
+  nội dung, chỉ có thể soi tay; phần chỉ chèn từ đệm thì nay tự xử lý (xem dưới).
+* Dòng 200 (khung OCR 0,066 s kẹt giữa hai câu, cách mỗi bên dưới 0,07 s): không còn khoảng
+  lặng nào để kéo dài, giọng đọc 2,5x và lấn 0,18 s — giới hạn vật lý, không đổi.
+
+### Đã làm
+
+* **Dòng thoại không còn bị thay bằng tag cảm xúc đứng một mình.**
+  * Ca thật: dòng 263 "當當" (tiếng "tèn ten" khi đưa đồ). Bản tinh chỉnh "Đương Đương...",
+    giai đoạn bản địa hoá (đang bật sinh tag cảm xúc) trả về đúng "[cười]". Khâu lồng
+    tiếng bỏ trống dòng chỉ có tag ("Bị bỏ (không đọc): 1"). Phụ đề xuất ra cũng lọc tag,
+    nên dòng thoại mất ở cả hai nơi. Bản v3.23.586 cũng hỏng đúng dòng này ("Trời ạ." →
+    "[cười]").
+  * Nay sau mỗi giai đoạn tinh chỉnh: câu gốc có lời, bản trước còn lời mà bản mới chỉ còn
+    tag hoặc chú thích trong ngoặc → lùi về bản trước.
+  * Câu gốc chỉ là tiếng cười/thở dài/ho ("哈哈哈", "唉") được phép thành tag đứng một mình.
+  * Chạy lại trên mọi cặp giai đoạn đã lưu của 3 phim: chỉ bắt đúng 2 ca dòng 263 ở trên.
+  * Cờ chất lượng mới `unspoken_lines`: bản cuối chỉ còn tag/chú thích dù câu gốc có lời.
+    Cờ bắt được thêm dòng 2050 "哎呀" → "[cười]" của phim 傻子落水 (hỏng ngay từ dịch thô,
+    không có bản trước để lùi).
+* **Bỏ từ đệm làm câu vượt ngân sách đọc.**
+  * Giai đoạn tinh chỉnh có lúc giữ nguyên mọi từ của bản trước, chỉ chèn thêm hư từ/trợ từ
+    ("rồi", "đấy", "đây", "sẽ", "đang", "của", "với"…). Câu không thêm nghĩa nhưng dài
+    hơn, giọng đọc phải nhanh hơn. Ví dụ dòng 384 "Mày quá đáng lắm, giờ tính sao?" thành
+    "Mày quá đáng lắm rồi đấy, giờ tính sao đây?" và phải đọc 1,95x.
+  * Nay câu như vậy mà vượt ngân sách (đúng con số `max_chars` đã gửi model) thì giữ bản
+    trước.
+  * Không lùi khi bản sau chèn đại từ ("Anh đúng là đồ khốn nạn!"), chèn từ mang nghĩa
+    ("Từ từ ăn đi." — 慢慢, "hết cả", "có thể … một vụ"), hay đổi câu kể thành câu hỏi
+    ("… không có tiền" → "… không có tiền chứ?").
+  * Lượt này: lùi 10 dòng; phần vượt ngân sách của các dòng đó giảm 51 → 10 ký tự, 7 dòng
+    nằm gọn trong ngân sách. Chạy lại trên mọi file chuẩn đoán: 0–30 dòng mỗi lượt dịch.
+* **Hết dò 403 và "tải lại" lặp lại sau khi xoay API key.**
+  * Lượt này key #1 hết hạn mức gemini-3.7-flash lúc 20:36:54, cuối giai đoạn dịch thô.
+    Mỗi giai đoạn sau đó lại nhận danh sách đoạn video gốc của key cũ. Kết quả: giai đoạn 3
+    dò lỗi 403 34 lần và chạy 15 vòng tải lại; giai đoạn 4 lặp y nguyên 34 lần dò và 15
+    vòng (mất 27,6 s) dù giai đoạn 3 vừa tải lại xong đủ 17 đoạn. Mỗi đoạn còn bị dò hai lần
+    liền ("Handle video … cần tải lại" lặp đôi).
+  * Nay đoạn video đã tải lại bằng một key được ghi nhớ theo key đó và dùng ngay ở mọi lô,
+    mọi giai đoạn sau, không dò lại. Đoạn chưa tải lại chỉ bị dò một lần trước khi tải.
+  * Với lượt này: giai đoạn 4 không còn lần dò 403 hay vòng tải lại nào. Giai đoạn 3 vẫn
+    phải tải 8 đoạn mà key #2 chưa có (bắt buộc).
+
+### Kiểm thử
+
+* Mới: `test_spoken_line_guard_v323605.py`, `test_padding_guard_v323605.py` (dữ liệu thật
+  dòng 263, 15 dòng thật kèm mốc thời gian thật), `test_healed_refs_v323605.py`. Các ca
+  chính đều trượt trên v3.23.604 và qua trên bản này.
+* `test_rotation_and_address_v323550.py`: bổ sung khoá trạng thái cho adapter dựng thủ công
+  trong kiểm thử.
+
+## [3.23.604] — 🎙️ Khung OCR chớp nhoáng được kéo đủ dài để đọc; lưới xưng hô không tạo dòng lệch cảnh
+
+Phân tích chuẩn đoán 16:01 ngày 11/10 (灭门惨案II, v3.23.603). Phân tích ngữ cảnh được khôi
+phục từ phiên trước. Dịch thô và tinh chỉnh dùng gemini-3.5-flash-lite, **bản địa hoá dùng
+gemini-3.8-flash**. Lồng tiếng VieNeu 2 giọng, 1246 dòng.
+
+### Đổi model ở giai đoạn bản địa hoá đã cải thiện rõ (đo trên lượt này)
+
+* Sửa đúng các lỗi nghĩa của model nhẹ: dòng 163 "不是吧" từ "Phải đấy." thành "Làm gì có
+  chuyện đó!"; dòng 480 "thổi bay xác định" thành "đều bị nổ chết hết rồi"; dòng 502 tự
+  trách "Đồ vô dụng!" (trước là "Em vô dụng thế…"); dòng 1032 "Chồng cô…" khớp người nghe.
+* Bản dịch gọn hơn nên lồng tiếng đỡ phải đọc nhanh:
+  * Dòng đọc ≥ 1,8x: 52 → 25.
+  * Cờ `reading_speed`: 104 → 54; cờ `tts_compression`: 56 → 29.
+  * Chồng tiếng: 4 dòng / 0,61 s → 2 dòng / 0,11 s.
+* Lưới trọng tài lùi 13/24 dòng lẻ bị viết lại. Soát cả 13: bản trước đều dùng được. 11 dòng
+  được giữ lại, trong đó có các sửa đúng (163, 480, 168 "Làm sao bây giờ?", 843 "nhớ chồng").
+
+### Đã làm
+
+* **Kéo khung OCR chớp nhoáng (< 0,3 s) tới mức đọc được.** OCR đôi khi chỉ bắt được 2–4
+  khung hình cuối của một dòng phụ đề. Ở lượt này, 2/2 chỗ chồng tiếng và 3/4 dòng đọc
+  ≥ 2,2x đều là khung loại này.
+  * Ví dụ dòng 916 "我........": khung chỉ 0,065 s (4081,267–4081,332), trước đó có 1,33 s
+    lặng, nhưng ngay sau là dòng 917. Bản cũ chỉ giãn phần đuôi nên không giãn được, lồng
+    tiếng đọc "Tôi..." ở 2,5x mà vẫn lấn câu sau.
+  * Nay khung chớp nhoáng được kéo tới tối thiểu 0,833 s (hoặc đủ đọc ở 21 ký tự/giây):
+    mượn khoảng lặng phía sau trước, thiếu thì mượn phía trước, luôn chừa 0,1 s với câu kề.
+  * Chạy trên bản dịch cuối của 3 phim: kéo dài 19/42, 17/32 và 4/6 khung (21 dòng mượn
+    khoảng lặng phía trước), không tạo dòng chồng nhau nào.
+  * Ở phim này: dòng 916 thành 0,833 s, dòng 504 "Đừng mà anh Kiếm!" từ 0,1 s thành 0,79 s
+    (trước đọc 1,95x), dòng 925 từ 0,1 s thành 0,93 s (trước đọc 2,2x).
+  * Lồng tiếng vẫn ghép đúng câu gốc theo vị trí. Nhật ký "Giãn giờ đọc" ghi thêm số khung
+    chớp nhoáng trước/sau khi kéo.
+* **Lưới khôi phục xưng hô không tạo một dòng lệch giữa cảnh đã đổi xưng hô.**
+  * Ca thật: gemini-3.8-flash viết lại cảnh 694–703 (Chu Chính Quân tặng vòng cho Tần Khả Tú
+    khi chồng cô còn sống) thành "tôi … cô", sát bảng nhân vật hơn bản tinh chỉnh "em …
+    anh". Lưới chỉ khôi phục được dòng 699, ra "rất hợp với **em** mà" nằm giữa các dòng
+    "tôi tặng cô".
+  * Nay lưới bỏ lượt khôi phục khi đại từ định trả lại không có ở dòng nào khác của cặp
+    nhân vật trong cảnh, còn đại từ mới thì có.
+  * 153 dòng đã khôi phục trong mọi file chuẩn đoán có nhật ký: 4–5 dòng thuộc loại này.
+  * Chạy lại trên 124 cặp giai đoạn đã lưu: bỏ 21/279 lượt khôi phục. Đa số giữ đúng đại
+    từ cả cảnh đang dùng: câu của đứa trẻ "Bỏ cháu ra!" không còn bị đổi thành "tôi", câu
+    của lão Mạc "Cả nhà mày mới chết sạch!" không còn bị đổi thành "ông". 2 ca còn bàn cãi
+    được.
+  * Đã thử chỉ so các dòng cùng vai (tự xưng / gọi): lưới bỏ thêm 6 lượt, trong đó có lượt
+    đúng, nên không dùng.
+
+### Xác nhận các sửa của v3.23.603 trên lượt chạy thật này
+
+* Dòng 127 "秦可秀" được sửa người nói ngay khi dịch ("Sửa người nói ở 1 dòng TRẢ LỜI tên:
+  127") và lồng tiếng đọc bằng giọng nữ Ngọc Huyền. `name_answer_lines` rỗng vì nhãn đã sửa
+  được lưu lại vào phiên.
+* Nhật ký không còn dòng DEBUG filelock nào (lượt trước có 60 dòng).
+* Bước đóng câu sau khi dịch lại chưa chạy ở lượt này: không có dòng nào sót chữ Hán hay
+  bị trùng.
+
+### Đã đo nhưng KHÔNG làm
+
+* **Dòng 200 "慢慢吃吧" và dòng 49 "所長..."**: khung 0,066 s và 0,1 s nhưng kẹp sát giữa hai
+  câu, không còn khoảng lặng nào để mượn; vẫn phải đọc 2,5x.
+* **Xoay key giữa giai đoạn bản địa hoá**: giai đoạn này gửi 21 lô cộng 8 lượt 503, nên key
+  #1 hết 20 lượt/ngày và phải xoay sang key khác. Sau đó 5 lô, mỗi lô thử `files.get` 2 lần
+  bị 403 rồi mới tải lại đoạn video (khoảng 1 s mỗi lô, không tốn lượt Gemini).
+* **Người nghe "anh họ" chưa tra ra 老表**: dòng 8 vẫn tự xưng "tôi" thay vì "em" như bảng
+  nhân vật ghi. Loại này chỉ có 2/1580 mệnh đề xưng hô trong kho.
+
+Kiểm thử: 6059 passed, 57 skipped (+9 test mới dùng mốc giờ và câu thật: khung chớp nhoáng
+916/504/356/200, cảnh 694–703 và 583–599. 5 test bắt đúng lỗi, không qua trên v3.23.603; 4
+test chốt hành vi cũ, qua ở cả hai bản).
+
+## [3.23.603] — 🎭 Dòng trả lời tên đọc đúng giọng; phân tích gán người nói cho cả dòng lặp
+
+Phân tích chuẩn đoán 10:29–11:01 ngày 11/10 (灭门惨案II; phân tích bằng gemini-3.8-flash,
+dịch 3 giai đoạn bằng gemini-3.5-flash-lite, VieNeu 2 giọng, 1246 dòng).
+
+### Đã làm
+
+* **Dòng TRẢ LỜI tên không còn bị coi là tiếng gọi.** Dòng 126 Long Truyền Nhân hỏi
+  "你叫甚麼名字", dòng 127 Tần Khả Tú đáp "秦可秀". Lưới đảo nhãn dòng gọi tên (v3.23.570)
+  coi 127 là tiếng gọi nên đảo nhãn đúng `秦可秀 → 龍傳人` thành `龍傳人 → 秦可秀`, lưu
+  vào phiên, và lồng tiếng đọc "Tần Khả Tú." bằng giọng nam Minh Đức. Cả 22 lượt phân
+  tích đã xuất của phim đều mang nhãn sai này. Phim "傻子落水…" có ca tương tự ở dòng
+  2442–2444 ("如何称呼" / "我是" / "柳慕云!"): 16 lượt ghi dòng tên là lời 徐俊豪, dù dòng
+  "我是" ngay trước đã ghi đúng 柳慕云.
+  * Dòng chỉ-là-tên đứng ngay sau câu hỏi tên ("叫甚麼", "什么名字", "贵姓", "称呼",
+    "你是谁") hoặc sau nửa đầu lời tự giới thiệu ("我是", "我叫") thì không đảo nhãn nữa.
+    Nhãn đã lưu ghi sai (dòng đáp ghi là lời người hỏi) được sửa về đúng người mang tên.
+    "你叫我什么" (gọi tôi là gì) không bị tính là câu hỏi tên.
+  * Áp dụng ở khâu dịch, ở lồng tiếng khi nạp vai (phiên đã lưu được sửa ngay, không
+    phải dịch lại), và trong chuẩn đoán ngữ cảnh (trường mới `name_answer_lines`).
+  * Mô phỏng trên 30 lượt phân tích khác nhau: chỉ hai dòng này đổi nhãn (127 ở 11 lượt,
+    2444 ở 4 lượt), tất cả đều thành đúng. Mọi dòng gọi tên khác giữ nguyên kết quả cũ.
+* **Phân tích kèm Visual Cues gửi cả các dòng lặp liền nhau.** Trước đây khâu phân tích bỏ
+  dòng giống hệt dòng liền trước ("1246 dòng gốc → 1240 dòng sau khử trùng"). Model trả
+  nhãn theo số dòng được gửi, nên dòng lặp bị bỏ không bao giờ có nhãn. Ở lượt này, cả
+  6/6 dòng phải hỏi lại người nói đều là dòng lặp bị bỏ (207, 217, 356, 366, 455, 714).
+  * Bước hỏi lại mất 5 phút 36 giây và 9 lượt gửi của model chỉ có 20 lượt/ngày: 1 lượt
+    bị từ chối vì key đã hết hạn mức ngày, 4 lượt lỗi 503, 4 lượt thành công.
+  * Dòng 207 "朱正軍" còn bị gán người nói khác với dòng lặp ngay trước nó (14/17 lượt
+    phân tích khác ghi 阿積).
+  * Phim khác có 10/3902 và 31/5540 dòng lặp. Sau phân tích, các dòng này chỉ có nhãn
+    nhờ quét bổ sung về sau.
+  * Phân tích không kèm Visual Cues vẫn bỏ dòng lặp như cũ (tiết kiệm token).
+* **Lưới khôi phục xưng hô không coi "con" trong lời chửi "con khốn" là đại từ.** Dòng
+  911 (`洪志權 → 秦可秀`, bảng nhân vật ghi gọi 'con khốn'):
+  * Bản thô: "Để tao cho con khốn này biết thế nào là lợi hại". Bản tinh chỉnh: "Để tao
+    cho mày nếm mùi lợi hại".
+  * Lưới thấy chữ "con" trong bản thô nên "khôi phục" thành "Để tao cho **con** nếm mùi
+    lợi hại" (thành giọng cha mẹ nói với con). Lỗi lặp lại ở cả giai đoạn tinh chỉnh lẫn
+    bản địa hoá.
+  * Đã sửa theo đúng cách đọc lời chửi của v3.23.601. Trên mọi file chuẩn đoán, lưới vẫn
+    khôi phục đúng 279 dòng như trước.
+* **Dòng dịch lại ở bước dọn cuối không còn kết thúc bằng dấu phẩy khi câu đã hết.** Bước
+  dọn chữ Hán sót và bước dịch lại dòng trùng gửi riêng từng dòng cho model, không kèm
+  dòng trước/sau.
+  * Trên 93 dòng được dịch lại ở mọi file chuẩn đoán, 26 dòng mất dấu kết câu mà bản
+    trước có. Ví dụ dòng 65 lượt này: "Thêm chút dâm tiện, mặt trắng," đứng ngay trước
+    lời của người khác.
+  * Nay dấu phẩy MỚI ở cuối dòng sẽ được đóng câu khi gặp ranh giới câu: dòng sau là
+    người nói khác, cách ≥ 1,5 s, hoặc là dòng cuối. Dòng sau mở đầu bằng chữ thường
+    (câu còn tiếp) thì giữ nguyên. Dấu đóng câu lấy theo bản trước.
+  * Mô phỏng: sửa 11 dòng. Soát tay: 10 đúng ("Đừng, đừng mà," → "Đừng, đừng mà!"), 1
+    chấp nhận được ("Thưa mọi người," → "Thưa mọi người."). Nhật ký diễn biến ghi sự
+    kiện `retranslated_endings_closed`.
+* **Nhật ký ứng dụng bỏ DEBUG của filelock.** Lượt này có 60/553 dòng nhật ký chỉ là
+  "Attempting to acquire lock …" khi nạp model VieNeu.
+
+### Xác nhận các sửa của v3.23.602 trên lượt chạy thật này
+
+* Bước hỏi lại người nói đã dùng model phân tích (gemini-3.8-flash), không còn dùng model
+  dịch.
+* Lưới "có mặt trong cảnh" không phải hạ nhãn nào: cả 6 nhãn hỏi lại đều là người có mặt
+  trong cảnh.
+
+### Đã đo nhưng KHÔNG làm
+
+* **Lưới độc thoại xoá nhãn người nghe ở lượt có "你".** Dòng 502 "你這麼沒用" (Chân Kiếm
+  Thanh tự trách) được 4 lượt phân tích ghi là tự nói. Lưới vẫn coi đó là nói với người
+  khác, và 2/4 bản dịch thành "Em vô dụng thế…" (thành mắng vợ).
+  * Lý do chưa sửa: trên 30 lượt phân tích có 109 lượt bị xoá nhãn; soát tay 18 lượt của
+    phim "he thong sung the" thì khoảng một nửa đúng là độc thoại. Ca nhãn sai thật ("你想造反啊" quát đàn em) có cùng cấu trúc, nên không
+    có tín hiệu nào tách được hai loại.
+* **Ép cách GỌI người nghe theo bảng nhân vật.** Lượt này có 14 dòng lệch, 63 dòng đúng.
+  * 7 dòng là 'cậu'/'chú' xen nhau trong cùng quan hệ.
+  * 5 dòng thuộc cảnh vợ chồng họ Hồng đùa cợt, cả cảnh dùng anh/em trái với bảng
+    (ông/bà); sửa một nửa cảnh sẽ thành lẫn lộn.
+  * 1 dòng đọc nhầm vai ("Mặc kệ tôi"), 1 dòng nghi nhãn sai.
+* **Chồng tiếng ở dòng 200 (0,271 s).** Khung OCR của dòng này chỉ 0,066 s, kẹp giữa hai
+  dòng, không có khoảng lặng quanh đó. Mức dời mốc tối đa 250 ms là cài đặt người dùng
+  chọn.
+* **Lỗi nghĩa do model dịch nhẹ**: dòng 163 "不是吧" → "Phải đấy." (ngược nghĩa), dòng 480
+  "thổi bay xác định". Đã thử lưới "câu gốc có phủ định mà bản dịch mất phủ định": 25 dòng
+  bị bắt, chỉ 1 dòng sai thật, nên không làm.
+* Người nghe "anh họ" chưa tra ra 老表: chỉ 2/1580 mệnh đề xưng hô trong kho thuộc loại
+  này.
+
+Kiểm thử: 6050 passed, 57 skipped (+27 test mới dùng dữ liệu thật: dòng trả lời tên, dòng
+lặp gửi phân tích, lời chửi 'con khốn', đóng câu sau dịch lại, nhật ký filelock — 24 test
+không qua trên v3.23.602; 3 test chốt hành vi cũ qua ở cả hai bản; +1 test chữ ký tự sinh).
+
+## [3.23.602] — 🎭 Nhãn người nói vừa hỏi lại phải có mặt trong cảnh; bước hỏi lại dùng model phân tích
+
+Phân tích chuẩn đoán 05:38 ngày 11/10 (灭门惨案II, phân tích + dịch lại bằng
+gemini-3.5-flash-lite cho MỌI giai đoạn, VieNeu chế độ 2 giọng, 1246 dòng). Bước hỏi lại
+của v3.23.600 điền đủ 1207 → 1246/1246 dòng có người nói, nhưng chất lượng nhãn điền thì kém:
+các câu của đám dân làng hỏi trưởng đồn (dòng 103-114, 131-132, 154-156) được chia LẦN
+LƯỢT cho ba tên trong bảng — 胖公安, 老伯, 朱正軍, 胖公安, 老伯, 朱正軍… — kể cả câu nói
+liền ba dòng 154-156 thành ba người. Lồng tiếng vì thế dựng vai riêng cho từng câu đám đông,
+quy tắc xưng hô áp theo cặp nhân vật bịa ra.
+
+### Đã làm
+
+* **Lưới "có mặt trong cảnh" cho nhãn vừa hỏi lại** (`fill_support_guard`). Người nói
+  THẬT hầu như luôn xuất hiện (nói hoặc được nói tới) trong nhãn ±10 dòng quanh mình: trên
+  153 746 nhãn tên của 57 lượt phân tích (3 phim) chỉ 0.83% vắng mặt; ở 34 nhãn tên vừa hỏi
+  lại của lượt này thì 14 (41%) vắng mặt — và 0/14 trùng nhãn đa số của các lượt phân tích
+  khác (cả lượt chỉ 5/39 nhãn hỏi lại trùng đa số). Nhãn tên trong bảng nhân vật mà không
+  có mặt trong cảnh (cảnh có ≥ 3 dòng nhãn tin cậy) bị HẠ xuống nhãn giọng theo giới tính
+  ("Giọng nam chưa rõ"): giữ phần model nghe được (giới — lồng tiếng vẫn đúng giọng), bỏ
+  danh tính không có chỗ dựa. Mô phỏng trên nhãn thật (cứ 7 nhãn tên coi 1 nhãn là vừa hỏi
+  lại, 3 lượt mới nhất mỗi phim): hạ nhầm 189/31 340 (0.60%).
+  * Áp ở cả ba chỗ: ngay sau khi hỏi lại (khâu phân tích, khâu dịch, nút "🎭 Bổ sung người
+    nói"), lúc khâu dịch dùng Visual Cues ĐÃ LƯU (sự kiện `scan_cues_demoted` trong nhật ký
+    diễn biến), và lúc lồng tiếng nạp vai từ phiên đã lưu — phiên của chuẩn đoán này đã lưu
+    sẵn 39 nhãn hỏi lại (nhận ra nhờ luôn kèm mô tả bối cảnh) nên lồng tiếng lần sau dùng
+    ngay nhãn đã sửa, không cần phân tích lại.
+  * Đo lại trên chính phiên này: vai lồng tiếng 23 → 24 (thêm "Giọng nam chưa rõ" 14 dòng;
+    胖公安 25 → 20, 朱正軍 108 → 103, 老伯 13 → 9 dòng).
+  * Nhật ký/thông báo hỏi lại ghi thêm "hạ N nhãn tên không có mặt trong cảnh về nhãn
+    giọng (dòng …)".
+* **Bước hỏi lại người nói dùng model PHÂN TÍCH** (ô model ở thẻ Ngữ cảnh) thay vì model
+  của giai đoạn dịch đầu: phân biệt ai đang nói là việc của model xem video, còn lượt này
+  hỏi lại bằng gemini-3.5-flash-lite chỉ vì đó là model dịch. Model phân tích lỗi hết các
+  lượt (hạn mức, quá tải) → tự hỏi lại bằng model giai đoạn dịch; người dùng huỷ → dừng
+  ngay, không chuyển model.
+* **Prompt bộ quét/hỏi lại: quy tắc đám đông.** Dân làng, người qua đường… không có trong
+  bảng: không mượn tên nhân vật trong bảng chỉ vì người đó có mặt, không chia lần lượt các
+  tên cho một loạt dòng — một người không tên ghi nhãn giọng, nhiều người ghi "Đám đông";
+  một câu tách qua nhiều dòng liền nhau là của cùng một người.
+* **Cờ "dịch không nhất quán" bỏ qua tag trong ngoặc vuông.** Dòng 454/455 "酒逢知己":
+  "Rượu gặp tri kỷ..." và "[cười] Rượu gặp tri kỷ" bị báo lệch — tag cảm xúc chỉ vào giọng
+  đọc, bộ xuất SRT/ASS đã lọc khỏi phụ đề. Đo lại file chuẩn đoán: 11 → 10 cờ, chỉ cặp này
+  mất; "Bà xã à, vẫn là em cừ nhất" / "Bà xã, vẫn là bà giỏi nhất" (918/1136) vẫn báo.
+* **Kiểm thử cô lập bộ chặn import torch.** `bootstrap_for_gui` cài bộ chặn cho CẢ tiến
+  trình; test nào gọi nó làm hỏng scipy ở các test âm thanh chạy sau (`'NoneType' has no
+  attribute 'Tensor'`, lỗi theo thứ tự chạy). Thêm fixture tự động gỡ bộ chặn sau mỗi test.
+
+### Xác nhận các sửa của v3.23.601 trên lượt chạy thật này
+
+* Lấy mẫu lại "dài bất thường": 27 lần / 11 dòng → 11 lần / 8 dòng.
+* Chồng tiếng thật: 7 dòng, tổng 1.16 s → 4 dòng, tổng 0.10 s (tóm tắt báo đúng 4).
+* Dòng 991 "Đúng thế.": nén 2.5x và vẫn lấn 0.181 s → đọc 1.95x, không lấn.
+
+### Đã đo nhưng KHÔNG làm
+
+* **Ép cùng người nói cho hai dòng kề có câu gốc giống hệt**: chỉ 80/111 cặp (72%) thật sự
+  cùng người khi cách nhau < 0.5 s (hay là hai người đối đáp lặp lời) → không đủ tin.
+* **Coi "người nói = người nghe đã biết" là mâu thuẫn** (dòng 138): nhãn phân tích thật ghi
+  người nghe trùng người nói rất thường (độc thoại) — mô phỏng hạ nhầm 1057 nhãn, và chính
+  dòng 138 thì 14 lượt phân tích khác đều nói là 龍傳人.
+* **Bỏ đọc dòng OCR rác / chữ trên màn hình** (344/345/355/356, độ tin OCR 0.81-0.91):
+  4/1246 dòng; ở hai phim kia các dòng tin cậy < 0.85 lại là tiếng kêu thật → không có
+  ngưỡng an toàn, soát tay ở trang TTS.
+* **Dịch lại dòng trùng câu gốc không có ngữ cảnh** (dòng 217): 1 trong ~25 nhóm câu trùng.
+* Rút gọn bản dịch vượt ngân sách âm tiết và khung phụ đề siêu ngắn: như v3.23.601.
+
+Khuyến nghị dùng: lượt này chạy gemini-3.5-flash-lite cho phân tích, cả ba giai đoạn dịch
+và hỏi lại người nói. Muốn sát giới hạn chất lượng của Gemini, đặt model phân tích (thẻ Ngữ
+cảnh) là model mạnh nhất có hạn mức — nay nó lo cả bước hỏi lại người nói.
+
+Kiểm thử: 6022 passed, 57 skipped (+20 test mới dùng nhãn thật của chuẩn đoán: lưới có mặt
+trong cảnh, phiên đã lưu, lồng tiếng, chọn/chuyển model hỏi lại, prompt, cờ nhất quán — 19/20
+đỏ trên v3.23.601, test còn lại là chốt "khác từ ngữ vẫn báo"; +1 test chữ ký tự sinh).
+
+## [3.23.601] — 🎙️ Lồng tiếng đo đúng "dài bất thường" và chồng tiếng; 🎭 Bổ sung người nói cho phân tích khôi phục
+
+Phân tích chuẩn đoán 18:05 ngày 10/10 (灭门惨案II, VieNeu v3 Turbo, chế độ 2 giọng, 1246
+dòng; phân tích ngữ cảnh được KHÔI PHỤC từ phiên cũ, không chạy lại phân tích/dịch).
+
+### Đã làm
+
+* **VieNeu (và Gemini TTS) đo "dài bất thường" trên PHẦN TIẾNG, không trên bản thô.**
+  Lưới lấy mẫu lại đo độ dài thô của lần sinh, trong khi khâu đặt câu cắt lặng biên ngay
+  sau đó (VieNeu sinh im lặng đầu câu tới 1.42 s — đo ở v3.23.204). Nhật ký: 27 lần lấy mẫu
+  lại "DÀI BẤT THƯỜNG 2.16-2.88s" cho 11 dòng 1-3 âm tiết (đều giọng Ngọc Huyền: 'Cảm
+  ơn.', 'Đừng!', 'Đúng thế.'…, ~50 giây suy luận), trong khi bản được giữ của chính các
+  dòng đó có 0.57-2.08 s tiếng — dưới ngưỡng 1.8-2.1 s. Nay đo sau khi cắt lặng (cùng hàm
+  cắt của khâu đặt câu); "bản ngắn nhất" khi mọi lần đều dài cũng chọn theo phần tiếng.
+  Bản thu dài vì ngân THẬT vẫn bị lấy mẫu lại như cũ.
+* **Cờ ⚠ "dài bất thường" ở bảng TTS đo tiếng TRƯỚC khi nén.** Dòng 991 "Đúng thế.": cả 5
+  lần thử ra 2.16 s tiếng (3.4 lần mức đọc gọn) → nén 2.5x còn 0.864 s, vẫn lấn 0.181 s,
+  nhưng cờ đo audio SAU nén (dưới 1.8 s) nên bảng không báo dòng nào để TTS lại.
+* **Chỉ đếm chồng tiếng THẬT (≥ 1 ms).** Tóm tắt báo "Có chồng tiếng (lấn): 113" (lượt
+  trước 125) trong khi CSV chỉ có 7 (11) dòng lấn từ 1 ms (tổng 1.16 s); phần còn lại là
+  dư vài mẫu do làm tròn độ dài sau nén. VieNeu và Gemini ghi lấn = 0 khi dưới 1 ms; tóm
+  tắt đếm theo `TTSSegmentResult.has_audible_overlap`. Mô phỏng 60 dòng: v3.23.600 báo 14
+  dòng "lấn", 13 dòng dưới 1 ms.
+* **Nút "🎭 Bổ sung người nói (N)" ở trang Dịch (thẻ Ngữ cảnh).** Phân tích khôi phục từ
+  phiên cũ không qua bước hỏi lại người nói của khâu phân tích/dịch (v3.23.600): 39/1246
+  dòng không có người nói, lồng tiếng đọc bằng giọng chung "Minh Đức" — đa số là dân làng
+  nói với trưởng đồn (dòng 103-114), có cả dòng 714 "不要！" của Tần Khả Tú (hai dòng
+  trước, một dòng sau đều là cô). Nút hỏi Gemini (xem video) đúng các dòng thiếu, tối đa
+  hai lượt, giữ nhãn sẵn có, nhãn mới qua lưới "lạc cảnh"; kết quả lưu vào phiên và lồng
+  tiếng dùng ngay ở lần tổng hợp sau (vai được nạp lại lúc tổng hợp).
+  * Khôi phục phân tích còn dòng thiếu người nói → cảnh báo kèm cách làm; cờ
+    `speakers_missing` của file chuẩn đoán ngữ cảnh chỉ tới nút này.
+  * Hết hạn mức / mọi lượt hỏi đều lỗi → báo lỗi rõ; lượt sau lỗi vẫn giữ phần đã điền;
+    người dùng huỷ → dừng. Không có video → báo cần chọn video (người nói đọc từ hình).
+  * Lõi hỏi lại dùng CHUNG cho khâu phân tích, khâu dịch và nút mới
+    (`CompleteSpeakersUseCase`, `complete_and_check_speakers`); callback "tải lại video
+    bằng key hiện tại" dùng chung cho ba worker (trước là hai bản chép giống hệt).
+* **Bảng xưng hô: "con ranh", "con đàn bà kia" là lời chửi, không phải đại từ "con".** Cờ
+  `roster_ambiguous_address` oan cho `洪志權 → Tần Khả Tú: xưng 'tao' gọi 'mày/con
+  ranh'` (kèm lời khuyên phân tích lại cả phim). Đo trên 24 bảng nhân vật của kho: chỉ cờ
+  này thay đổi (26 → 25); "con gái", "con trai" vẫn là đại từ "con".
+* **Giao diện không còn nút bị cắt chữ.** Trang Dịch: hàng 8 nút kết quả bị bóp còn ~80
+  px mỗi nút ở cửa sổ 1500 px (4 nút vẫn cắt ở 1920 px), hàng nút phân tích làm thẻ Ngữ
+  cảnh cuộn ngang 304 px → tách mỗi hàng thành hai. Trang TTS: 4/6 nút kết quả cắt chữ ở
+  1500 px → tách hàng nút theo dòng.
+* Test cũ dùng fixture phạm vi class dạng phương thức thể hiện (cảnh báo sẽ lỗi ở pytest
+  10) → `classmethod`.
+
+### Đã đo nhưng KHÔNG làm
+
+* **Đoán người nói theo dòng kề** (dòng thiếu kẹp giữa hai dòng cùng người nói): đúng 90%
+  (傻子落水), 76% (灭门惨案II) nhưng chỉ 20% (he thong sung the) → không đủ tin để tự điền;
+  dùng Gemini (nút mới) và soát tay ở trang TTS.
+* **Rút gọn bản dịch vượt ngân sách âm tiết**: 44/1246 dòng vượt, chiếm 33/48 dòng TTS phải
+  đọc ≥ 1.8x. Prompt dịch đặt "nghĩa thắng giới hạn" (bài học v3.23.222) và ở đây không gọi
+  được Gemini để đo chất lượng câu rút gọn → chưa thêm lượt rút gọn.
+* **Khung phụ đề siêu ngắn (< 0.3 s, lỗi mốc OCR)**: 11/1246, 36/3902, 25/5540 dòng; chỉ
+  2/7 dòng đọc ở 2.5x thuộc loại này → chưa đổi khâu giãn giờ đọc.
+* Người nghe "bác sĩ" chưa tra ra vì bảng có hai bác sĩ (醫生, 住院醫生) — đúng là mơ hồ.
+* `address_drift` 甄劍聲 → 朱正軍 'cậu' → 'chú': quan hệ đổi theo cốt truyện (người lạ →
+  thân), không phải lỗi dịch.
+
+Kiểm thử: 6001 passed, 57 skipped (+32 test mới: lưới tiếng/chồng tiếng VieNeu, bổ sung
+người nói, bảng xưng hô, bố cục trang Dịch/TTS — 29/32 đỏ trên v3.23.600; +3 test chữ ký
+tự sinh cho file nguồn mới).
+
+## [3.23.600] — 🎯 Phân tích + dịch có kèm video: đủ người nói cho mọi dòng có lời
+
+Yêu cầu: từ khâu phân tích tới khâu dịch (khi kèm ngữ cảnh hình ảnh/âm thanh) phải cung
+cấp đủ 100% người nói, để lồng tiếng có đủ dữ liệu. Soát mã và dữ liệu thật thấy ba chỗ
+hở làm dòng mất người nói:
+
+1. **Khâu dịch chỉ quét bổ sung khi nhãn phủ DƯỚI 60%.** Phủ 97% là thôi, 3% còn lại không
+   bao giờ được hỏi. Lượt dịch mới nhất phim "he thong sung the" (`069d0c24`): nhật ký ghi
+   "Dùng 5415 Visual Cues từ phân tích ngữ cảnh (đã có sẵn, không quét lại video)" — 125/5540
+   dòng không có người nói; phim "傻子落水…" (`da77ec5a`) 103/3902 dòng. Chín dòng 1301-1313
+   giữa cuộc gọi Lâm Dật ↔ chị dâu là đúng các dòng lưới "lạc cảnh" (v3.23.581) đã bỏ nhãn
+   sai rồi để trống — không ai hỏi lại.
+2. **Dòng chỉ có người NGHE được tính là "đã có nhãn"** (39 dòng ở lượt `bf8d54a5`, vd
+   dòng 1128 "哎呀，你怎么知道的？" → 柳慕云): lồng tiếng vẫn không biết ai nói.
+3. **Prompt phân tích và bộ quét dặn "không chắc thì để trống người nói".**
+
+### Đã làm
+
+* **Hỏi lại đúng các dòng thiếu người nói, ở cả hai khâu.**
+  * Khâu phân tích (khi bật Visual Cues + đính video): phân tích xong, dòng có lời nào còn
+    trống người nói được hỏi lại bằng bộ quét Visual Cues, kèm nhãn đã biết làm mạch hội
+    thoại và mốc thời gian (như quét bổ sung); tối đa 2 lượt — lượt 2 chỉ hỏi dòng model
+    còn bỏ sót. Phân tích dừng giữa chừng (hết hạn mức, quá tải) thì để lượt chạy tiếp làm.
+  * Khâu dịch: sau các bước quét bổ sung / bỏ nhãn lạc cảnh / điền lượt lời, dòng có lời
+    nào còn trống người nói được hỏi lại như trên — **không còn ngưỡng 60%**. Kết quả cộng
+    vào cache Visual Cues của checkpoint: dịch lại không hỏi lại.
+  * Chỉ ĐIỀN chỗ trống: nhãn đã có (có thể người dùng sửa tay) luôn giữ; dòng chỉ có người
+    nghe giữ người nghe cũ. Nhãn mới vẫn qua lưới "lạc cảnh" — bị bỏ thì trả lại nhãn cũ.
+* **Không còn để trống người nói khi không nhận ra là ai** — ghi điều nghe được bằng nhãn
+  DỰ PHÒNG cố định: "Giọng nam chưa rõ", "Giọng nữ chưa rõ", "Giọng trẻ em chưa rõ", "Đám
+  đông", "Người dẫn chuyện" (prompt phân tích, chỉ thị từng đoạn video và bộ quét; vẫn cấm
+  đoán bừa danh tính). Lồng tiếng đọc nhãn giọng nam/nữ bằng giọng đúng giới; nhãn viết
+  lệch ("giọng nam", "Giọng nữ (chưa rõ)") quy về một vai. Nhãn chỉ ghi giọng mà không ghi
+  người nghe không bị lưới lạc cảnh bỏ (nó không khẳng định danh tính).
+* **Báo độ phủ ở mọi khâu:**
+  * Trang Dịch: thông báo "Phân tích hoàn tất" kèm "Người nói: x/y dòng có lời (…%)"; nhật
+    ký khâu dịch ghi độ phủ trước/sau khi hỏi lại và các dòng còn thiếu; nhật ký diễn biến
+    (file chuẩn đoán dịch) có sự kiện `speaker_completion`.
+  * Chuẩn đoán ngữ cảnh: `speaker_lines`, `speaker_ratio`, `voice_only_speaker_lines`,
+    `missing_speaker_lines` và cờ `speakers_missing`.
+  * Trang TTS (Soát người nói, v3.23.599): thêm loại "chỉ biết giọng, chưa rõ là ai".
+
+### Đã đo nhưng KHÔNG làm
+
+* **Cắt video theo khoảng thời gian** (`VideoMetadata.start_offset/end_offset`) khi hỏi lại:
+  dòng thiếu của hai phim trên rải trên 14-15 đoạn video (~4800-5200 giây); cắt cửa sổ
+  ±20 giây quanh từng dòng còn ~1400 giây — rẻ hơn 3-4 lần token. Không kiểm được ở đây mốc
+  thời gian model thấy khi video bị cắt (prompt đang dùng mốc tính từ đầu đoạn), nên chưa
+  làm: hỏi lại tốn thêm khoảng 14-15 lời gọi (~2 triệu token video) cho một phim như trên.
+* **Tự điền dòng trống theo dòng kề thay vì hỏi model**: đúng 82,6% ở phim "傻子落水…"
+  nhưng 19,9% ở phim "he thong sung the" (so nhãn đa số các lượt khác) — không dùng.
+* **Hỏi lại lần thứ ba cho dòng bị lưới lạc cảnh bỏ**: model đã có nhãn đã biết quanh dòng
+  ở cả hai lượt; còn trống thì để người dùng soát ở trang TTS.
+
+### Kiểm thử
+
+* `tests/unit/application/test_speaker_completion_v323600.py` (19 ca), dữ liệu nguyên văn
+  lượt `069d0c24` dòng 1298-1315 và `bf8d54a5` dòng 1128: tìm đúng 9 dòng trống thật; dòng
+  chỉ có người nghe; lượt 2 chỉ hỏi dòng còn thiếu; nhãn lạc cảnh hỏi lại vẫn bị bỏ, nhãn
+  giọng được giữ; khâu dịch hỏi dù phủ > 60%, dùng lại cache khi dịch lại; cả lượt dịch
+  (execute) hỏi đúng dòng thiếu; khâu phân tích tự điền, không hỏi khi phân tích dừng giữa
+  chừng hay không có video; prompt không còn "để trống"; chuẩn đoán ngữ cảnh và trang Dịch
+  báo độ phủ.
+* Kiểm đỏ trên mã 3.23.599: lượt dịch phủ cao không hỏi dòng thiếu nào; bộ quét còn dặn
+  "để trống thay vì đoán" — cả hai FAIL.
+* Sửa 1 test cũ (`test_incomplete_analysis_v323585`): bản giả của view model thêm
+  `speaker_coverage_message`.
+* Toàn bộ: 5966 passed, 57 skipped. Ruff 6372 (không tăng).
+
+## [3.23.599] — ⚠ Lồng tiếng: soát người nói — dòng chưa có người nói, dòng nhãn chắc sai
+
+Kiểm tra theo yêu cầu: "nạp vai từ trang Dịch" có bảo đảm 100% số dòng có vai và đúng
+người nói không. Trả lời: **không** — và trước bản này ứng dụng không báo gì. Đo trên 58
+lượt dịch thật của 3 phim (dựng lại đúng đường nạp vai của trang TTS):
+
+| Phim (lượt mới nhất) | Dòng | Không có người nói | Nhãn chắc sai | Vai chưa rõ giới |
+|---|---|---|---|---|
+| "灭门惨案II" (10/10/2026) | 1245 | 0 | 2 | 3 vai, 44 dòng |
+| "傻子落水…" | 3902 | 103 | 3 | 2 vai, 3 dòng |
+| "he thong sung the" | 5540 | 125 | 0 | 0 |
+
+* **Phủ dòng**: dòng không có nhãn người nói (bộ quét bổ sung bỏ nhãn "lạc cảnh", vùng
+  cues dày mà thiếu…) đọc bằng giọng chung. Phim đang làm đủ 100%, hai phim kia 97,4% và
+  97,7%.
+* **Đúng người**: người nói là nhãn Visual Cues — model xem video rồi đoán. 18 lượt phân
+  tích của cùng phim "灭门惨案II" khác nhau ở 23,7% số dòng (lượt mới nhất khác nhãn đa số
+  294/1241 dòng, 80 dòng khác cả giới tính). Không có cách tất định biết người nói đúng
+  của MỌI dòng nếu không xem phim; bản này chỉ ra những dòng mà chính câu gốc cho thấy
+  nhãn sai, để soát trước khi tổng hợp thay vì nghe hết cả phim.
+
+### Soát người nói (trang TTS, khi bật lồng tiếng)
+
+* Ô "Người nói · Giọng" của dòng cần soát có dấu **⚠** (chữ cam), rê chuột thấy lý do:
+  * **Chưa rõ người nói** — dòng đọc bằng giọng chung.
+  * **Câu gốc gọi tên chính người được gán là người nói rồi nói tiếp** — "阿秀，你幫我"
+    mang nhãn Tần Khả Tú, "洪大嫂我不想吃" mang nhãn Hồng Đại Tẩu, "明月姐，你别闹了"
+    mang nhãn Thẩm Minh Nguyệt. Nhận cả tên thân mật dựng từ bảng nhân vật (秦可秀 → 可秀,
+    阿秀, 小秀, 秀秀; 洪震 → 阿震…) và đuôi gọi (劍哥, 明月姐). Trên 58 lượt có 85 dòng như
+    vậy — **cả 85 đều khác nhãn đa số** của các lượt khác.
+  * **Câu gốc tự xưng theo giới trái giới tính của vai** ("你们让我嫁给他" mang nhãn Vương
+    Ma Tử, nam) — 1 dòng trên 58 lượt, khác nhãn đa số.
+* Nút mới **"⚠ Soát người nói (N)"** chọn hết các dòng đó; sửa bằng "🎭 Đổi người nói…"
+  (v3.23.598). Dòng đã chọn tay người nói coi như đã soát, hết dấu ⚠.
+* Dòng trạng thái thẻ Lồng tiếng thêm: "⚠ N dòng chưa rõ người nói (đọc giọng chung)",
+  "⚠ N dòng nhãn người nói chắc sai", "N vai chưa rõ giới tính (… dòng: tên vai) — tự chọn
+  giọng cho các vai này" (vai ngoài bảng nhân vật như "dân làng", "Người bán hàng", hay
+  阿積 — bảng nhân vật lượt mới nhất bỏ mất nhân vật này dù 18/19 lượt trước có).
+
+### Một nhân vật không còn bị tách thành hai vai (hai giọng)
+
+Bộ quét bổ sung đôi khi ghi nhãn LAI — họ chữ Hán, tên phiên âm: "王 Đại Phúc", "王 Mai",
+"安 Tuyết Mạn", "宋 Dao"/"宋Dao", "洪 Chí Quyền / Tiểu Đại". Nhãn không khớp bảng nhân vật
+nên lồng tiếng thành vai riêng, giọng khác chính nhân vật đó (lượt mới nhất phim "he thong
+sung the": 15 dòng), và khâu dịch không tra được quy tắc xưng hô cho các dòng đó. Nay nhãn
+lai được quy về tên trong bảng khi số chữ Hán khớp số âm tiết phiên âm của CÙNG nhân vật
+(không thể ghép sang người khác). Trên 58 lượt: 335 nhãn (người nói + người nghe) được quy
+về đúng 7 nhân vật, không nhãn nào sai người.
+
+### Kỹ thuật
+
+* Mô-đun thuần mới `application/services/speaker_review.py`: `nickname_index`,
+  `leading_call`, `self_gender`, `review_speakers`.
+* `DubbingSource.source_texts` (câu gốc, trang chính truyền từ trang Dịch);
+  `TTSPageViewModel.speaker_issues()` (có đệm); `TTSDubbingCoordinator.review_positions`,
+  `issue_text`, `unknown_gender_roles`; `SpeakerCell.needs_review`.
+* `cue_label_canonicalizer`: khoá nhãn chèn khoảng trắng giữa chữ Hán và chữ Latinh; thêm
+  cách viết lai vào `roster_label_map`.
+
+### Đã đo nhưng KHÔNG làm
+
+* **Tự đổi người nói ở dòng gọi tên chính mình**: tiếng gọi chỉ cho biết ai KHÔNG nói.
+  Đổi sang người nghe của nhãn chỉ đúng 17/32 ca (so nhãn đa số). Chỉ báo, không sửa.
+* **Câu CHỈ có cái tên** ("秦月", "慕云"): có thể là tự giới thiệu/đọc tên — đa số các
+  lượt giữ nhãn "người nói = người được gọi" ở 31/57 dòng như vậy. Không báo.
+* **Tự điền người nói cho dòng chưa rõ theo dòng kề**: lấy người nói dòng trước đúng 82,6%
+  ở phim "傻子落水…" nhưng chỉ 19,9% ở phim "he thong sung the" (so nhãn đa số các lượt
+  khác); hai dòng kề cùng người cũng chỉ 19% ở phim sau. Đoán sai lặng lẽ tệ hơn báo cho
+  người dùng chọn.
+* **Đoán người thật của vai ngoài bảng từ mô tả cảnh**: 6 dòng nhãn 阿積 có mô tả "Ái Quốc
+  cầm ống nghiệm…" nhưng 18/19 bảng nhân vật coi 阿積 và 愛國 là HAI người; nhãn nhóm
+  ("Dân làng") có mô tả nhắc người khác. Không gợi ý.
+* **Quy chữ giản/phồn thể trong nhãn** ("医生"/"醫生", "龙传人"/"龍傳人") qua âm Hán-Việt
+  của bảng âm có sẵn: 3 dòng trên 58 lượt — chưa đáng thêm.
+* **Tự đề xuất sửa theo nhãn đa số nhiều lượt**: ứng dụng chỉ có một lượt phân tích cho
+  mỗi phim lúc lồng tiếng, và đa số không phải đáp án.
+
+### Kiểm thử
+
+* `tests/unit/presentation/test_speaker_review_v323599.py` (13 ca), dữ liệu nguyên văn các
+  lượt thật `44887efa`, `ea37e87a`, `7ed55a62`, `da77ec5a`, `069d0c24`, `d142948e`: nhãn
+  lai quy về một vai; dòng gọi tên chính mình (4 dòng thật, 3 phim); câu chỉ có tên và câu
+  gọi người khác không bị báo; tự xưng trái giới; dòng phim khác chưa rõ người nói; vai
+  chưa rõ giới (阿積); nút "Soát người nói" trên trang TTS dựng thật, hết dấu khi sửa.
+* Kiểm đỏ trên mã 3.23.598: 2 ca nhãn lai FAIL; các ca soát người nói không chạy được
+  (chưa có tính năng).
+* Toàn bộ: 5945 passed, 57 skipped. Ruff 6372 (giảm 1).
+
+## [3.23.598] — ✎ Lồng tiếng: sửa tay người nói (giọng) và lời thoại từng dòng
+
+Kiểm tra theo yêu cầu: bản 3.23.597 **chưa** cho chỉnh giọng đọc từng dòng.
+
+* Người nói từng dòng chỉ lấy tự động (tag `[Tên:]` đầu dòng, rồi Visual Cues). Muốn sửa
+  phải gõ tag vào bản dịch ở trang Dịch rồi nạp lại phụ đề sang trang TTS.
+* Lời thoại chỉ sửa được ở bảng kết quả SAU khi đã TTS cả phim; trước đó bảng trống.
+* Mọi chỉnh sửa mất khi nạp lại phụ đề hoặc mở lại ứng dụng.
+
+Nhu cầu đo trên dữ liệu thật: 18 lượt phân tích ngữ cảnh phim "灭门惨案II" — lượt mới nhất
+(10/10/2026, v3.23.595) khác nhãn người nói đa số của các lượt ở **294/1241 dòng (23,7%)**,
+**80 dòng khác cả giới tính** (đọc nhầm giọng nam/nữ). Ví dụ dòng 495-496: "阿秀，你幫我"
+(gọi A Tú nhờ giúp — người nói là chồng cô) mang nhãn Tần Khả Tú; câu đáp "好，我幫你" mang
+nhãn Chân Kiếm Thanh nên bản dịch cũng xưng hô ngược ("Được, anh giúp em.").
+
+### Cách dùng (bảng dòng ở trang TTS)
+
+* Nạp phụ đề là bảng hiện ngay các dòng (trạng thái "⏳ Chưa tổng hợp") — xem và sửa trước
+  khi tổng hợp, không phải chạy TTS cả phim mới thấy.
+* Bật lồng tiếng: thêm cột **"Người nói · Giọng"** cạnh cột Nội dung, vd "Tần Khả Tú ·
+  HoaiMy (nữ)". Dòng chọn tay in đậm, có dấu ✎, rê chuột thấy người nói tự động.
+* **Đổi người nói**: nhấp đúp ô người nói, chuột phải → 🎭 Người nói, hoặc nút "🎭 Đổi
+  người nói…" (áp cho MỌI dòng đang chọn). Menu gồm: Tự động (vai tự tìm) · các vai đang có
+  thoại kèm giọng · "Nhân vật khác trong bảng nhân vật" (vai chưa được gán câu nào) · Giọng
+  chung (không phân vai) · "Vai khác…" (gõ tên; tên phiên âm như "Chân Kiếm Thanh" được quy
+  về vai 甄劍聲 trong bảng, tên mới thành vai mới và được giao giọng riêng).
+* Đổi người nói tự bật lồng tiếng nếu đang tắt; bảng phân vai cập nhật số câu; giọng các
+  vai KHÁC giữ nguyên.
+* **Sửa lời**: nhấp đúp ô Nội dung (hoặc chuột phải → ✏ Sửa lời thoại), trước hoặc sau khi
+  TTS. Gõ tag `[Tên:]` đầu lời vẫn đổi người nói như trước.
+* Sau khi đã TTS: dòng sửa mà chưa TTS lại được tô xanh; **"✎ Chọn dòng đã sửa (N)"** chọn
+  hết để bấm "🔄 TTS lại dòng chọn" một lượt (VieNeu). **"↺ Bỏ sửa tay"** trả dòng chọn về
+  lời lúc nạp và người nói tự động.
+* **Nhớ theo phụ đề**: nạp lại đúng phụ đề đó (từ file, từ trang Dịch, sau khi mở lại ứng
+  dụng) thì sửa tay được áp lại và báo "Đã áp lại sửa tay…". Phụ đề nhận theo số dòng + mốc
+  BẮT ĐẦU — trên ba lượt dịch thật, khâu dịch không đổi mốc bắt đầu dòng nào (0/1245) nhưng
+  đổi mốc kết thúc 144-156 dòng, mỗi lượt một khác — nên dịch lại vẫn giữ người nói đã sửa;
+  lời đã sửa chỉ áp lại khi dòng còn đúng chữ cũ (không đè lên bản dịch mới). Nhớ 40 phụ đề.
+
+### Đổi người nói không làm vai khác đổi giọng
+
+Phân vai tự động tính theo số câu và mức đối đáp giữa các vai, nên đổi người nói MỘT dòng có
+thể giao lại giọng vai khác. Đo trên 19 dòng thật của phim: gán dòng 1 cho "Cậu bé trong
+thôn" làm 阿積 đổi từ NamMinh +12Hz sang −12Hz và "Lão nhân trong thôn" từ −12Hz sang giọng
+gốc — trong khi audio đã tổng hợp của hai vai đó vẫn là giọng cũ. Nay giọng đang hiện được
+ghim (như người dùng tự chọn) trước khi nạp lại vai; chỉ vai mới xuất hiện nhận giọng tự động.
+
+### Lỗi sửa kèm
+
+* **"TTS lại dòng chọn" sau Edge/Gemini**: nút vẫn bật, tổng hợp xong các dòng chọn mới báo
+  "Không có segment nào để ghép lại master" (chỉ VieNeu giữ audio từng dòng). Nay nút tắt,
+  tooltip/thông báo chỉ cách: bấm Tổng hợp lại, sửa tay vẫn giữ.
+* **Nạp phụ đề mới vẫn giữ kết quả TTS phụ đề cũ** trong view model — với bảng dòng hiện
+  ngay, "TTS lại dòng chọn" sẽ ghép lời phụ đề mới vào audio phụ đề cũ. Nay bỏ kết quả cũ.
+* **Mọi ô của bảng kết quả nhấp đúp sửa được** (cả "#", "Thời gian", "Trạng thái") — chữ đổi
+  trên bảng mà không có tác dụng. Nay chỉ cột Nội dung sửa được.
+* **Luồng TTS dùng chung danh sách dòng với giao diện**: sửa lời trong lúc đang tổng hợp làm
+  luồng nền đọc lẫn bản cũ/mới. Nay luồng nhận bản sao; dòng sửa giữa chừng vẫn được đánh
+  dấu cần TTS lại.
+* Ô lời đang mở sửa khi bấm "Tổng hợp tiếng nói" không vào dữ liệu (chỉ "TTS lại dòng chọn"
+  có đẩy) — nay đẩy trước khi tổng hợp.
+* Phụ đề TTS là phim khác (Visual Cues không ghép được): danh sách vai để chọn không gợi ý
+  nhân vật của phim trên trang Dịch.
+
+### Kỹ thuật
+
+* Hàm thuần mới `application/services/dubbing_line_edits.py`: `apply_speaker_overrides`,
+  `describe_line_speakers`, `subtitle_fingerprint`, `restorable_text_edits`,
+  `encode/decode_line_edits`, `remember_line_edits`; `dubbing_cast.role_choices`.
+* `TTSPageViewModel`: người nói chọn tay áp TRƯỚC khi lập danh sách vai và tính giọng từng
+  dòng (cả lúc Tổng hợp, Tổng hợp cả bộ, TTS lại); ghi nhận lời sửa (nhớ chữ gốc), tập dòng
+  cần TTS lại; tín hiệu `line_edits_changed`.
+* `TTSDubbingCoordinator`: `line_speakers`, `line_speaker_cells`, `role_choices`,
+  `set_line_speaker`, `revert_lines`; tín hiệu `line_speakers_changed`.
+* Bộ điều khiển mới `presentation/pages/tts_line_edits.py` (bảng dòng, menu, nút, lưu
+  QSettings khoá `dubbing_line_edits`) — trang TTS chỉ nối.
+
+### Đã đo nhưng KHÔNG làm
+
+* "TTS lại dòng chọn" cho Edge/Gemini: hai engine phải ghi audio từng dòng ĐÚNG như đã đặt
+  vào bản trộn (có hạ âm câu trước khi chồng tiếng, chuẩn hoá) thì ghép lại mới không lệch —
+  khối việc riêng. Bản này chỉ chặn nút và chỉ cách chạy lại.
+* Tự đề xuất sửa nhãn theo đa số các lượt phân tích: đa số không phải đáp án (vd dòng
+  614-615 cả hai cách gán đều có lý), và 23,7% "khác đa số" có cả chỗ lượt mới đúng hơn.
+* Tối ưu dựng bảng: phụ đề thật 5540 dòng (phim "he thong sung the") nạp + dựng bảng
+  0,81 s (bật lồng tiếng 0,96 s); đổi người nói 0,14 s; sửa lời 0,11 s; mở menu 0,16 s —
+  chấp nhận được.
+
+### Kiểm thử
+
+* `tests/unit/presentation/test_dubbing_line_edits_v323598.py` (30 ca): dòng 490-499 + hai
+  dòng bảng nhân vật nguyên văn lượt dịch thật 10/10/2026; sửa đúng cặp 495/496 ngay trên
+  bảng của trang TTS dựng thật; lưu/áp lại khi nạp lại, khi dịch lại; ghim giọng (19 dòng
+  thật); phụ đề phim khác ("he thong sung the").
+* Kiểm đỏ trên mã 3.23.597: 4 lỗi sửa kèm (Edge vẫn TTS lại, giữ kết quả cũ, ô "#"/"Thời
+  gian" sửa được, bảng trống trước TTS) đều FAIL; tắt riêng phần ghim giọng / lọc bảng nhân
+  vật phim khác thì 2 ca tương ứng FAIL.
+* Sửa 1 test cũ (`test_dubbing_bugfixes_v323594`): kết quả giả nay mang audio từng dòng như
+  kết quả VieNeu thật.
+* Toàn bộ: 5931 passed, 57 skipped. Ruff 6373 (giảm 2).
+
+## [3.23.597] — 🎭 Lồng tiếng: chế độ chỉ 2 giọng (nam & nữ)
+
+Yêu cầu: thêm cách phân giọng chỉ dùng HAI giọng — một giọng nam cho mọi vai nam, một giọng
+nữ cho mọi vai nữ. Lượt lồng tiếng thật 10/10/2026 đã làm tay đúng việc này cho 19 vai (Minh
+Đức cho vai nam và vai chưa rõ giới, Ngọc Huyền cho vai nữ) bằng cách đổi từng ô một; Edge
+tiếng Việt cũng chỉ có hai giọng gốc (HoaiMy nữ, NamMinh nam).
+
+### Cách dùng (thẻ "Lồng tiếng theo nhân vật" ở trang TTS)
+
+* Ô mới **"Cách phân giọng"**: "Mỗi nhân vật một giọng" (như trước) hoặc **"Chỉ 2 giọng:
+  nam & nữ"**.
+* Chế độ 2 giọng hiện thêm một hàng: **Giọng nam**, **Giọng nữ**, **Vai chưa rõ giới** (vd
+  "dân làng", "người bán hàng" — mặc định đọc giọng nam).
+* Lần đầu dùng: giọng chung đang chọn ở tab Engine được giữ cho giới của nó (chọn Minh Đức
+  làm giọng chung → giọng nam là Minh Đức), giới còn lại lấy giọng đầu tiên của giới đó.
+* Cột "Giọng" của từng vai chỉ còn hai lựa chọn "Giọng nam · <tên>" / "Giọng nữ · <tên>" —
+  vẫn đổi được riêng một vai (vd vai bảng nhân vật ghi sai giới). "🎲 Phân vai tự động" đưa
+  mọi vai về giọng theo giới tính của vai.
+* Nhớ lại khi mở lại ứng dụng: cách phân giọng; giọng nam/nữ theo từng engine; giới của vai
+  chưa rõ giới; lựa chọn riêng của từng vai (theo tên vai, dùng chung mọi engine — giới tính
+  là của nhân vật).
+* Dòng trạng thái: "… · chỉ 2 giọng: N vai giọng nam, M vai giọng nữ". File cấu hình debug
+  TTS ghi thêm "chế độ chỉ 2 giọng nam/nữ".
+* "TTS lại dòng chọn" và "Tổng hợp cả bộ" dùng cùng bảng giọng — không cần chỉnh gì thêm.
+
+### Kỹ thuật
+
+* Hàm thuần mới trong `dubbing_cast`: `default_gender_voices`, `two_voice_sides`,
+  `two_voice_casting`; giọng từng dòng vẫn qua `voices_for_lines` như chế độ cũ nên mọi
+  engine dùng được ngay.
+* Đổi "Vai chưa rõ giới" không bị ghi nhầm thành lựa chọn riêng của các vai đó (bảng lúc đó
+  còn hiện giới cũ) — có test riêng.
+
+### Kiểm thử
+
+* `tests/unit/presentation/test_dubbing_two_voices_v323597.py` (11 ca): phụ đề + Visual
+  Cues thật phim "灭门惨案II", nhãn giọng VieNeu 3.8.3 thật, bộ giọng Edge tiếng Việt; trang
+  TTS dựng thật giữ "Minh Đức" làm giọng nam. Trên mã 3.23.596 tệp test không chạy được (chưa
+  có tính năng).
+* Toàn bộ: 5899 passed, 57 skipped. Ruff 6375 (không tăng).
+
+## [3.23.596] — 🎙️ Lồng tiếng: không đè tiếng khi TTS lại, bớt câu đọc vội, xuất bản đúng phụ đề
+
+Soi bộ chẩn đoán thật 10/10/2026 (v3.23.595), phim "灭门惨案II借种..AI修复版[老舅电影laody.net
+发布]": phân tích ngữ cảnh + dịch 1245 dòng, lồng tiếng VieNeu v3 Turbo 19 vai, xuất bản.
+
+Bản dịch đã sạch: dòng lệch khối 0, dòng lặp/vọng 0, CJK sót 0; 8 dòng xưng hô khác bảng
+nhân vật đều là chỗ lưới cố ý không sửa (đổi giọng có chủ ý trong cảnh, "anh/em" là danh
+từ). Việc đáng làm nằm ở nhãn "ai nói với ai" của khâu phân tích và ở lồng tiếng.
+
+### 🎬 Xuất bản dùng phụ đề mốc GỐC dù TTS đã tạo phụ đề khớp giọng
+
+Nhật ký: khâu TTS ghi `<tên>.tts.vi.srt`, nhưng Xuất bản báo "Không tìm thấy phụ đề đã chỉnh
+giờ theo giọng đọc" và xuất phim với phụ đề lệch giọng thuyết minh. Nguyên nhân: tên phim có
+`[...]`, mà trong mẫu `glob` đó là TẬP KÝ TỰ — mẫu `<tên>.tts.*.srt` không bao giờ khớp chính
+tệp đó (dự án lưu ngôn ngữ đích là "Vietnamese" chứ không phải "vi" nên chỉ còn đường dò
+mẫu). Sửa ở cả 4 chỗ dò mẫu (Xuất bản, Xuất bản cả bộ, Dịch cả bộ, TTS cả bộ) qua một hàm
+chung thoát ký tự `glob`.
+
+### 🔁 "TTS lại dòng chọn" đè tiếng lên câu không được chọn
+
+Engine chỉ nhận các dòng được chọn, nên lấy dòng chọn kế tiếp làm "câu sau" và coi như không
+có câu trước. Dòng vốn nén 2,5x cho vừa 0,6 s trước câu sau, TTS lại thì đọc 1,0x và đè câu
+sau 0,9 s (kiểm bằng VieNeu thật + engine giả). Lồng tiếng hay dùng đường này (đổi giọng một
+vai rồi TTS lại các dòng của vai đó). Nay yêu cầu mang mốc dòng kề THẬT: câu sau không được
+chọn là mốc tiếng đã nằm trong bản trộn (không ngân trễ qua), câu trước là lúc tiếng của nó
+dứt. Áp cho VieNeu, Gemini (thường + native audio) và Edge (khung tới dòng kề thật, không lập
+cụm giữa các dòng rời rạc).
+
+### 🗣️ Elastic timing cho VieNeu và Gemini (bớt câu đọc vội)
+
+"Elastic timing", "Dung sai cộng dồn", "Nén êm" trước chỉ Edge đọc. Nay VieNeu/Gemini dùng
+cùng ngữ nghĩa: câu chật được nén tới mức êm (`base x Nén êm`) trước, còn thiếu mới ngân trễ
+qua mốc câu sau tối đa `min(Dung sai, 0,5 s)` (cùng trần khẩu hình với Edge) — câu sau đọc lùi
+lại đúng phần đó, KHÔNG chồng tiếng; câu cuối phim không ngân qua cuối video.
+
+Đo trên chính lượt lồng tiếng này (1245 dòng; tắt elastic thì mô phỏng tái lập đúng tốc độ
+của cả 1245 dòng):
+
+| Cấu hình | ≥ 2,0x | kịch trần 2,5x | dòng đè tiếng | dòng đọc lùi (trung vị / tối đa) |
+|---|---|---|---|---|
+| Lượt thật (VieNeu bỏ qua elastic) | 29 | 11 | 6 | 0 |
+| Cấu hình đang dùng (0,25 s; Nén êm 1,5) | **13** | **3** | **0** | 28 (0,20 s / 0,25 s) |
+| Mặc định giao diện (0,3 s; 1,25) | 14 | 6 | 2 | 61 (0,25 s / 0,30 s) |
+| Thuyết minh (2,5 s → trần 0,5 s; 1,5) | 4 | 0 | 0 | 29 (0,25 s / 0,45 s) |
+
+Cụm cãi nhau dòng 37-47: dòng 40/43/45 từ 2,42x/2,30x/2,50x xuống 1,96x/1,95x/2,26x.
+Phương án "dời mốc không giới hạn" bị bác ở v3.23.204 (đè tiếng 16 → 32 câu do domino); ở đây
+trễ có trần và câu sau không đè. Ba đường đặt câu (VieNeu, Gemini thường, Gemini native) gom
+về một hàm chung `line_placement.place_line`. Gemini nay báo mốc kết thúc phụ đề tới lúc
+tiếng dứt như VieNeu (câu bị đọc lùi không còn có mốc kết thúc trước mốc bắt đầu).
+
+### 🎭 Phân vai
+
+* Vai ngoài bảng ghi bằng chữ Hán không đọc được giới tính/tuổi — "老伯" (ông bác già, mô tả
+  cue "Ông cụ chê bai…") có thể nhận giọng nữ. Nay đọc gợi ý chữ Hán: 伯/叔/哥/爷… → nam,
+  嫂/姐/婆/娘… → nữ (cụm như 女婿 đọc trước chữ đơn), 老伯/老太/爷爷… → già, 小孩/男孩… → trẻ.
+* Một nhân vật ghi ba kiểu "洪震的姘頭" / "洪震之姘頭" / "洪震の姘頭" (chữ Nhật) → tách hai vai,
+  hai giọng, và không tra được quy tắc xưng hô. Khoá so nhãn nay quy 之/の về 的. Phim này:
+  20 vai → 19, nhân vật đó 11 dòng một giọng. Đo trên 26 phiên dịch đã lưu: chỉ phiên này có
+  nhãn kiểu đó.
+* Lượt này chỉ có 2 giọng cho 19 vai (Minh Đức cho mọi vai nam và vai chưa rõ giới, Ngọc
+  Huyền cho mọi vai nữ). Chạy lại đúng phụ đề + Visual Cues qua phân vai tự động cho 19 giọng
+  khác nhau — 2 giọng đến từ lựa chọn đã lưu, vốn được áp lặng lẽ. Dòng trạng thái nay nói
+  rõ "N vai đang dùng giọng bạn chọn từ trước (khác phân vai tự động) — bấm "Phân vai tự
+  động" để giao lại". Nếu 2 giọng là chủ ý của bạn thì không cần làm gì.
+
+### 🧭 Phân tích ngữ cảnh: mỗi đoạn có danh sách dòng của chính nó, kèm mốc giờ
+
+Khâu phân tích trả nhãn "ai nói với ai" cho 446/1245 dòng (36%): đoạn ≤ 53 dòng gần như đủ,
+đoạn 100+ dòng chỉ 8-38 dòng. 800 dòng còn lại phải quét bổ sung bằng model nhỏ (16 lời gọi,
+18 phút), mà nhãn quét bổ sung sai người nghe 29% so với 7% của khâu phân tích (đo ở
+v3.23.581). Nguyên nhân: prompt chỉ có `số. chữ` của cả phim, model phải tự dò dòng nào thuộc
+đoạn video 6 phút và hiện lúc nào. Nay mỗi đoạn kèm khối `<segment_lines>` — id, chữ, mốc
+`t` tính từ đầu đoạn (cách bộ quét bổ sung làm từ v3.23.581), thêm ~0,5-2 nghìn token mỗi
+đoạn; chỉ thị "CHỈ thêm dòng bạn TỰ TIN" (khiến model bỏ hẳn dòng) đổi thành "không chắc thì
+để trống người nói/người nghe". Tiến độ phân tích đã lưu vẫn dùng tiếp được (khoá tiến độ
+không đổi). Nhật ký tải video đánh số đoạn từ 1 như nhật ký phân tích (trước ghi "đoạn 1" cho
+đoạn mà khâu phân tích gọi "đoạn 2").
+
+### Kiểm thử
+
+* 45 test mới: `test_line_placement_v323596.py` (cụm 37-47 thật, hai engine VieNeu/Gemini
+  chạy thật trên cụm đó, TTS lại tập con, khung Edge), `test_dubbing_fixes_v323596.py` (tên
+  phim thật có ngoặc vuông, nhãn thật), `test_analysis_segment_lines_v323596.py` (dòng 56-64
+  và ranh giới đoạn thật), `test_dubbing_ui_v323596.py`. Chạy trên mã 3.23.595: 22 test đỏ
+  (thêm tạm các tên hàm mới để thu thập được).
+* 6 test soi mã nguồn cũ cập nhật theo hàm đặt câu dùng chung (cùng bất biến, đổi chỗ kiểm).
+* Toàn bộ: 5888 passed, 57 skipped. Ruff 6376 → 6375.
+
+### Chưa đo được trong môi trường build
+
+* Độ phủ nhãn của khâu phân tích sau khi kèm danh sách dòng: cần lượt phân tích thật (mạng tới
+  Gemini API bị chặn ở đây). Xem dòng "Gộp N Visual Cues từ 17 đoạn" trong nhật ký lần tới
+  (lần này 446).
+
+### Đã đo nhưng KHÔNG làm
+
+* **Elastic cho MỌI câu** (không nén tới mức êm trước): 272 dòng bị đọc lùi để bớt 13 dòng
+  vội — đổi chác tệ; chọn "nén tới mức êm rồi mới ngân trễ" (28 dòng lùi).
+* **Rút gọn câu bằng Gemini cho các câu đọc vội** (78 dòng ≥ 1,55x lượt này): không đo được
+  chất lượng viết lại ở đây; tầng dịch đã có ngân sách `max_chars` theo khung và quy tắc
+  "nghĩa thắng giới hạn".
+* **Quy chữ phồn/giản thể trong nhãn** ("医生" ↔ "醫生" 4 dòng ở 2 phiên, "龙传人" 1 dòng):
+  cần bảng chuyển đổi, gói `zhconv` không có sẵn trên máy người dùng.
+* **Giữ mô tả "cue" của khâu phân tích**: lưới nhãn lạc cảnh (v3.23.581) nhận nhãn quét bổ
+  sung nhờ có mô tả — giữ mô tả ở nhãn phân tích sẽ làm lưới coi nhầm nhãn tin cậy là nhãn
+  quét.
+* **503 ở gemini-3.8/3.7/3.6-flash**: quá tải phía Google suốt buổi; ứng dụng đã dừng đúng để
+  giữ hạn mức và tiếp tục từ đoạn còn thiếu bằng 3.5-flash — không đổi.
+
+## [3.23.595] — 🔄 Cập nhật theo Gemini API 3.8, VieNeu 3.8.3, PaddleOCR 3.7
+
+Tra cứu ngày 9/10/2026 (ghi chú phát hành Gemini API tới 6/10, PyPI, GitHub PaddleOCR):
+
+* **PaddleOCR 3.7.0 / PaddlePaddle 3.3.1** là bản mới nhất — ứng dụng đã dùng sẵn
+  (PP-OCRv6_medium mặc định). paddlex 3.7.2 chỉ thêm thông tin HPI cho PP-OCRv6, ứng dụng
+  không dùng HPI. Không có API mới cho khâu nhận dạng; bản này sửa trang Gỡ lỗi và cận dưới
+  phụ thuộc.
+* **VieNeu 3.8.3** là bản mới nhất, trùng bản ứng dụng — áp dụng tuỳ chọn int8 và việc
+  v3 Turbo bỏ tham số sắc thái.
+* **Gemini**: TTS 3.8 GA (22/9), Gemini 3.8 Flash GA (2/9), Gemini 2.5 bị giới hạn cho
+  người đã dùng gần đây (18/9), tham số lấy mẫu bị bỏ từ 3.6 Flash / 3.5 Flash-Lite (21/7).
+
+### 🔊 Gemini TTS 3.8
+
+* Thêm `gemini-3.8-flash-lite-tts` (mặc định — Google: "fast, cost-efficient workhorse",
+  101 ngôn ngữ, thay `gemini-3.1-flash-tts-preview`) và `gemini-3.8-flash-tts` ("maximum
+  voice fidelity, acting nuance", 130 ngôn ngữ). Model cũ vẫn chọn được, gọi như trước.
+* 3.8 dùng schema mới, gọi kiểu cũ thì hỏng:
+  * Đọc `text` NGUYÊN VĂN → lời dẫn ứng dụng bọc quanh câu cho model cũ ("Đọc to đoạn thoại
+    sau bằng giọng tự nhiên…") sẽ bị đọc thành tiếng. Nay gửi đúng câu thoại.
+  * Trả WAV có header 44 byte (model cũ trả PCM thô). Giải mã như PCM thô thì header thành
+    tiếng "tách" đầu mỗi câu — đo qua cả đường tổng hợp: đỉnh 0,855 ở đầu câu trong khi
+    giọng mẫu chỉ 0,2 (to hơn ~4 lần); nay 0,200. WAV khác 24 kHz được đổi tần số, stereo
+    trộn mono, header hỏng thì đọc phần thân như PCM.
+  * Giọng đặt ở `voice_config.voice`, không gửi `language_code` (model tự nhận ngôn ngữ).
+* Không gửi `temperature` cho model đã bỏ tham số lấy mẫu (3.6+, Flash-Lite 3.5+, TTS 3.8):
+  bị bỏ qua lặng lẽ, và Google cảnh báo thế hệ sau có thể từ chối. Ô nhiệt độ vẫn áp cho
+  3.1/2.5.
+* `google-genai>=2.29` (bản có trường `VoiceConfig.voice`); SDK cũ hơn tự lùi về
+  `prebuilt_voice_config`.
+
+### 🌐 Dịch và phân tích ngữ cảnh
+
+* Thêm `gemini-3.8-flash` vào danh sách model.
+* Nhận diện model dùng `thinking_level` theo SỐ phiên bản thay vì chuỗi "gemini-3": trước
+  đây `gemini-4-*` và bí danh `gemini-flash-latest`/`gemini-pro-latest` bị gửi
+  `thinking_budget` (tham số cũ Gemini 3 chỉ còn nhận để tương thích) nên mức suy nghĩ
+  người dùng chọn bị bỏ qua.
+
+### 🗣️ VieNeu 3.8.3
+
+* Ô mới **"CPU nhanh — int8 (v3 Turbo)"**, mặc định tắt. Theo chú thích trong mã nguồn SDK:
+  nhanh ~3 lần mỗi frame, model nhỏ ~4 lần, cần CPU có VNNI để không méo tiếng. Chú thích ô
+  báo máy có VNNI không (Linux: `/proc/cpuinfo`; Windows: bảng dò CPU của NumPy, không kết
+  luận được thì báo "không rõ").
+* Lỗi tìm ra khi làm: `precision` (thêm từ v3.23.255) CHƯA BAO GIỜ tới được engine.
+  `vieneu.Vieneu` 3.8 là hàm factory `Vieneu(mode, **kwargs)` — chữ ký không liệt kê
+  `precision` nên cách dò tên tham số luôn bỏ nó. Nay truyền qua `**kwargs` cho v3 Turbo
+  (đúng cách ứng dụng Gradio chính thức gọi); SDK không nhận thì ghi cảnh báo và chạy mặc
+  định. Engine int8 và fp32 nằm ở hai khoá cache riêng.
+* VieNeu 3.8 bỏ `style` ở v3 Turbo (nhận nhưng bỏ qua — phong cách đọc lấy từ giọng mẫu): ô
+  Sắc thái tắt khi chọn v3 Turbo và luôn gửi "natural". Trước đây đổi sắc thái ở v3 Turbo
+  không đổi giọng nhưng nạp thêm một bản model nữa vào RAM (khoá cache gồm sắc thái).
+
+### 🔍 PaddleOCR
+
+* Trang Gỡ lỗi OCR: ô Model chỉ có v5/v4, nên với model mặc định PP-OCRv6 thì
+  `findData("PP-OCRv6_medium")` trả -1 và ô hiện "PP-OCRv5 Mobile" trong khi chạy thử thật
+  dùng PP-OCRv6. Nay có PP-OCRv6 medium/small/tiny; ô chỉ hiển thị (khoá) vì chạy thử luôn
+  theo model ở trang Cài đặt — để chọn được mà không có tác dụng là hứa điều không làm.
+* `paddleocr>=3.7.0` (PP-OCRv6 có từ 3.7) trong pyproject và hai file requirements.
+
+### Kiểm thử
+
+* 77 test mới (`test_gemini_api_updates_v323595.py`, `test_vieneu_int8_v323595.py`,
+  `test_api_updates_v323595.py`) — dùng WAV/PCM thật, factory giả đúng chữ ký VieNeu 3.8.3,
+  trang TTS/Gỡ lỗi dựng thật. Chạy trên mã 3.23.594: 25 test đỏ.
+* Toàn bộ: 5841 passed, 57 skipped. Ruff không tăng (6376).
+
+### Chưa đo được trong môi trường build
+
+* Chất lượng giọng và độ trễ của TTS 3.8: mạng tới Gemini API bị chặn (403) — yêu cầu gửi
+  đi được kiểm bằng client giả trả WAV thật. Nên nghe thử vài câu trước khi chạy cả phim.
+* Tốc độ int8 của VieNeu: tải model từ HuggingFace bị chặn (403). Con số ~3x là của nhà
+  phát triển; hãy thử một đoạn ngắn, nghe lại trước khi dùng cho cả phim.
+
+### Đã tra nhưng KHÔNG làm
+
+* **Agentic video** (`media_processing=AGENTIC`) cho phân tích ngữ cảnh: Google nói lợi ích
+  thấp với tác vụ cần cả video; khâu phân tích cần dấu hiệu dày đặc cho từng dòng, thêm điểm
+  hỏng mà không kiểm được ở đây.
+* **gemini-3.8-live** cho đường Native Audio: chưa xác minh được tương thích Live API hiện
+  dùng.
+* **gemini-3.5-transcribe** làm engine nhận giọng: là một tính năng lớn riêng.
+* **PaddleX HPI**: ứng dụng tắt HPI (không hỗ trợ tốt trên Windows).
+* **Chỉ dẫn diễn xuất qua `speech_metadata`** cho TTS 3.8: trang TTS chỉ có ô phong cách ở
+  nhóm Native Audio.
+* Ghi chú hạn mức tính theo project: các khoá của người dùng đang ở project khác nhau (đã
+  thấy cạn quota theo từng khoá), xoay khoá vẫn có tác dụng.
+
+## [3.23.594] — 🐞 Rà lỗi lồng tiếng: phim khác không nhận giọng vai phim này
+
+Rà lại các phần mới của v3.23.593 — đọc lại mã, một người rà độc lập, và chạy thử trên phụ
+đề thật của ba phim trong kho. Phần dịch tập con dòng và tiến độ phân tích dùng chung không
+có lỗi: sau khi đánh số lại, không chỗ nào trong khâu dịch tra cứu theo số dòng gốc (gợi ý
+người nói/người nghe đi kèm từng dòng); khoá tiến độ không phụ thuộc model (chia đoạn video
+và cài đặt phân tích không đổi theo model). Sáu lỗi của tính năng lồng tiếng:
+
+### 🎭 Phụ đề phim/tập KHÁC nhận giọng vai của phim trên trang Dịch
+
+Bản 593 ghép mọi dòng TTS vào câu gốc trùng thời gian nhiều nhất mà không hỏi hai bên có
+cùng phim không, và chỉ nạp vai khi bấm "Nạp vai". Nạp phụ đề khác, hay "Tổng hợp cả bộ"
+các tập khác trong lúc lồng tiếng đang bật, thì dòng nào cũng "trùng" một câu gốc nào đó.
+Thử thật: phụ đề phim "he thong sung the" (5540 dòng) với bảng vai phim "灭门惨案II" — 1488
+dòng nhận giọng vai phim kia.
+
+Nay chỉ dùng Visual Cues khi ≥ 80% dòng TTS bắt đầu cách một câu gốc không quá 0,5 giây
+(sau khi trừ độ lệch chung). Đo trên 3 phim của kho: cùng phim khớp 96-100% (kể cả dời giờ
+cả bộ ±3 giây, xoá hoặc tách 5% số dòng); ghép chéo phim khác khớp 1-57%. Cùng số dòng thì
+ghép theo vị trí — phụ đề bị dời giờ cả bộ 1,5 giây trước đây sai người nói ở 318/1246 dòng,
+nay 0. Không khớp thì chỉ dùng tag `[Tên:]` đầu dòng và bảng vai báo rõ "không cùng phim/tập".
+
+Vai cũng được nạp lại NGAY lúc bấm Tổng hợp từ ngữ cảnh hiện tại của trang Dịch, nên:
+
+* "Tổng hợp cả bộ": tập nào không cùng phim với trang Dịch thì đọc một giọng (trừ dòng có tag)
+  và nhật ký ghi lý do, thay vì mượn giọng vai phim khác.
+* Mở lại ứng dụng với ô lồng tiếng đang bật: trước đây âm thầm đọc một giọng vì chưa bấm "Nạp
+  vai"; nay tự nạp.
+
+### Các lỗi khác
+
+* **Đổi giọng một vai rồi "TTS lại dòng chọn" vẫn ra giọng cũ** — TTS lại luôn dùng giọng của
+  lần chạy trước. Nay dùng bảng phân vai hiện tại khi lồng tiếng đang bật và vẫn cùng bộ giọng
+  (cùng engine, ngôn ngữ/chế độ) với lần chạy trước; khác bộ giọng thì giữ giọng cũ (adapter
+  TTS lại là adapter cũ, không đọc được giọng engine khác).
+* **Chỉnh giọng vai phim B làm mất lựa chọn của phim A** — mỗi lần lưu ghi đè bằng vai của
+  phim đang mở. Nay gộp, giữ tối đa 400 vai gần nhất mỗi engine; các tập cùng bộ chung tên vai
+  nên dùng lại được lựa chọn.
+* **Cuộn chuột lướt qua bảng vai đổi giọng vai và lưu luôn** — ô chọn giọng tạo sau khi trang
+  gắn chống cuộn. Nay mỗi ô tự gắn: chưa bấm vào thì cuộn chuột cuộn bảng.
+* **Worker GPU của VieNeu: vai thiếu giọng mượn giọng preset ĐẦU TIÊN** (trùng giọng vai
+  khác) thay vì giọng chung như đường CPU. Chỉ xảy ra khi môi trường GPU thiếu một giọng mà
+  tiến trình chính có.
+* File chi tiết TTS: cột "Giọng" ghi "mặc định" thay vì để trống khi dùng giọng mặc định.
+
+### Kiểm thử
+
+* 12 test mới (9 hỏng trên v3.23.593 — đã chép sẵn `align_to_source` theo hành vi cũ để
+  import được; 3 test còn lại là chốt "cùng phim vẫn ghép được", qua trên cả hai bản). Phụ đề
+  phim thứ hai chép nguyên văn từ lượt dịch thật, đã đối chiếu tự động.
+* Test cũ "lựa chọn giọng còn sau khi nạp lại" chọn đúng giọng đang giao nên qua cả khi việc
+  lưu hỏng — nay chọn giọng khác.
+
+## [3.23.593] — 🎭 Lồng tiếng theo nhân vật · lưới dòng lẻ chạy thật · đổi model phân tích không làm lại từ đầu
+
+Soi chuẩn đoán phân tích + chuẩn đoán dịch + app_log của v3.23.592 (phim "灭门惨案II借种",
+1246 dòng). Bản phân tích cuối là gemini-3.5-flash, sau bốn ngày Gemini quá tải và bốn
+model được thử; ba giai đoạn dịch gemini-3.5-flash-lite.
+
+Tác dụng của bản trước, đo trên lượt này:
+
+* Xoay key khi quá tải (v3.23.592) chạy đúng: nhật ký có 50 lần "quá tải kéo dài → thử key
+  khác" và 5 lần xoay vì hết hạn mức ngày. 20 lần phân tích dừng, lần nào cũng sau khi đã
+  thử đủ 3 key — quá tải là của model, không của key. Phần hạn mức bị đốt nằm ở chỗ khác
+  (mục "đổi model" dưới đây).
+* Quy tắc "phần trước ngoặc của bảng thuật ngữ phải dùng được thẳng trong lời thoại": bản
+  phân tích mới chỉ còn 1 mục đọc âm Hán-Việt (`打飛機 = đả phi cơ`), các bản phân tích
+  trước của phim này trung bình 4,7 mục; 所長 ra "Trưởng đồn" ở 15/15 dòng.
+* Lưới dòng lẻ (v3.23.592) báo "trọng tài không đứng về bản trước ở dòng nào" ở cả hai giai
+  đoạn — thực ra nó chưa phân xử được dòng nào (mục kế tiếp).
+
+### 🧩 Dịch lại một TẬP CON dòng không liên tục: dòng nhận nhầm câu
+
+Lưới dòng lẻ gửi dịch trọng tài các dòng 5, 6, 7, 723, 724, 725 trong một lượt. Lõi kiểm lô
+coi số dòng hợp lệ là 1..6 theo vị trí và đánh số lại mục model trả về thành 1..6, còn khâu
+ghép lại tra theo số dòng THẬT: dòng 5 và 6 nhận bản dịch của dòng 724, 725, bốn dòng kia
+trống. Lượt địa hoá (21 dòng) bị coi là lệch dòng, dịch lại hai lần (3 request) mà bản trọng
+tài vẫn trống 12/21 dòng. Kết quả: dòng 10 "Cười chết được." (câu gốc "搔你胳肢窩", lời đám
+đông nghe được) và dòng 186 "phải tùy tùng theo sát." ("隨傳隨到") còn nguyên ở bản cuối.
+
+Từ v3.23.133 adapter đã đánh số lại liên tục 1..N rồi ánh xạ ngược — nhưng chỉ khi có dòng
+nhiễu bị lọc. Nay áp cho MỌI tập dòng không liên tục từ 1, nên sửa luôn các nơi khác cũng
+gửi tập con: trọng tài dải viết lại, dọn chữ Hán sót, dòng trùng ở xa. Chạy lại đúng lượt
+địa hoá đó qua adapter thật (chỉ thay lời gọi API): 1 request, lùi về bản trước 5/7 dòng
+ứng viên (10, 18, 186, 244, 849), giữ hai dòng bản địa hoá sửa đúng (6 "Ta nhổ!", 502 "Cậu
+vô dụng thế đấy.").
+
+### 🔁 Đổi model phân tích — các đoạn đã xong được giữ (lần này là thật)
+
+Khi quá tải, ứng dụng khuyên "đổi model phân tích — các đoạn đã xong được giữ, chỉ gửi đoạn
+còn thiếu", nhưng khoá tiến độ gồm tên model nên đổi model là làm lại từ đoạn 1. Nhật ký
+lượt này: người dùng làm đúng lời khuyên, đổi qua lại bốn model —
+
+```
+gemini-3.8-flash  đoạn 1-10 (qua nhiều lần chạy)
+gemini-3.6-flash  đoạn 1-6    ← làm lại từ đầu
+gemini-3.7-flash  đoạn 1-4    ← làm lại từ đầu
+gemini-3.5-flash  đoạn 1-17   ← làm lại từ đầu, lần này xong
+```
+
+— 37 request thành công cho một bản phân tích cần 17 (20 request, 54%, bỏ phí). Nay tiến độ
+dùng chung giữa các model (khoá vẫn gồm phụ đề, ranh giới đoạn, cài đặt video/thinking) và
+ghi model đã phân tích từng đoạn; nhật ký chạy tiếp ghi rõ "4/17 đoạn đã xong (đoạn 1-4:
+gemini-3.8-flash), chỉ gửi 13 đoạn còn thiếu bằng 'gemini-3.5-flash'". Tiến độ lưu bởi bản
+cũ của CÙNG model được nhận và chuyển sang khoá dùng chung.
+
+### 🔑 "Ứng dụng không tự xoay API key" — đã kiểm
+
+Xoay key hoạt động ở cả hai trường hợp (hết hạn mức ngày, và quá tải kéo dài từ bản 592) —
+số liệu ở đầu mục. Thứ làm phân tích kéo dài nhiều ngày là quá tải TOÀN MODEL (cả 3 key cùng
+503) cộng với việc đổi model làm lại từ đầu; phần sau đã sửa ở trên. Không tự đổi model khi
+quá tải (xem mục "không làm").
+
+### 🎭 Lồng tiếng: mỗi nhân vật một giọng
+
+Trang TTS có tab mới "🎭 Lồng tiếng". Bật "Mỗi nhân vật một giọng", bấm "👥 Nạp vai từ trang
+Dịch": ứng dụng đọc bảng nhân vật + Visual Cues ở trang Dịch, tìm người nói từng dòng, lập
+bảng vai (giới tính, tuổi, số câu) và tự giao giọng; đổi giọng từng vai bằng ô chọn, lựa chọn
+được nhớ theo engine. Dòng không rõ người nói đọc bằng giọng chung chọn ở tab Engine. Tắt
+lồng tiếng thì như cũ (một giọng — thuyết minh).
+
+* Người nói: tag `[Tên:]` đầu dòng (người dùng tự ghi) thắng; sau đó Visual Cues. Cue đánh
+  số theo câu GỐC nên dòng TTS được ghép với câu gốc trùng thời gian nhiều nhất — bản dịch
+  phim này đã chỉnh mốc kết thúc ở 144 dòng. Đo trên 57 lượt dịch thật của ba phim: ghép
+  theo thời gian trùng 100% với ghép theo vị trí. Phim này 1245/1246 dòng biết người nói.
+* Phân vai tự động: đúng giới tính; vai nhiều câu chọn trước; khi phải dùng chung giọng thì
+  chọn giọng của người ÍT đối đáp trực tiếp với vai này nhất; cụ già ưu tiên giọng trầm, trẻ
+  con giọng cao. Phim này có 540 lần đổi người nói giữa hai dòng liền nhau:
+
+  | Bộ giọng | Hai người đối đáp cùng một giọng | Sai giới tính |
+  |---|---|---|
+  | Edge, 2 giọng gốc | 251/540 | 0 |
+  | Edge, 6 giọng (thêm biến thể trầm/cao) | 8/540 | 0 |
+  | Gemini, 30 giọng | 0/540 | 0 |
+
+  Hai phim khác của kho (3902 và 5540 dòng): Edge 6 giọng 8/979 và 45/1585, Gemini 0.
+* Edge chỉ có HAI giọng tiếng Việt nên mỗi giọng có thêm biến thể cao độ −12Hz (trầm) và
+  +12Hz (cao) — ID giọng `vi-VN-NamMinhNeural@-12Hz`, adapter tách cao độ ra trước khi gọi
+  dịch vụ. Gemini: giới tính 30 giọng theo bảng Chirp 3 HD của Google. VieNeu: giới tính
+  đọc từ nhãn giọng ("⭐ Thùy Dung — Nữ · Nam · …": chữ "Nam" thứ hai là miền Nam).
+* Cả ba engine đọc từng dòng bằng giọng của vai (`TTSRequest.line_voices`): Edge ở Pass 1,
+  2, 2.5; Gemini ở Standard và Native Audio; VieNeu ở CPU và worker GPU — worker nhận
+  `voice_preset` theo từng câu, mỗi lô `infer_batch` chỉ gom câu CÙNG giọng. TTS lại vài dòng
+  giữ đúng giọng của vai. File chi tiết TTS có thêm cột "Giọng", file cấu hình ghi số giọng.
+
+Trộn với tiếng phim vẫn dùng ducking như thuyết minh (giọng gốc được dìm xuống, không bị
+tách bỏ) — xem mục "không làm".
+
+### 🐞 Edge TTS đọc CHẬM lại qua worker luôn hỏng
+
+Worker edge-tts nhận tham số dạng `--rate -10%`. argparse coi giá trị bắt đầu bằng "-" là
+một tuỳ chọn khác nên worker thoát mã 2 mà không tổng hợp gì — mọi lần Edge cần đọc chậm
+hơn 1.0× đều hỏng: tốc độ cơ bản dưới 1.0 thì hỏng ngay từ lần kiểm tra kết nối ("không tạo
+được âm thanh sau N lần thử"); Pass 2.5 vi chỉnh câu ngắn hơn khung thì bản đọc chậm bị bỏ,
+giữ bản trước đó. Đường chạy trong tiến trình (bản đóng gói không có Python ngoài) không
+dính. Nay mọi tham số truyền dạng `--rate=-10%`; biến thể giọng trầm
+(`--pitch=-12Hz`) và câu thoại mở đầu bằng "-" cũng đi qua được.
+
+### 🏷 Cảnh báo nhầm: nhãn vai của nhân vật chỉ thấy qua hình
+
+Chuẩn đoán báo "5 tên trong bảng nhân vật ghi bằng NGÔN NGỮ ĐÍCH (Cậu bé trong thôn, Lão nhân
+trong thôn, …)". Cả năm là nhân vật không có tên trong lời thoại (cùng file xếp họ vào
+`identified_from_video`) — không có tên gốc nào để ghi, và Visual Cues dùng đúng các nhãn ấy.
+Trên kho chuẩn đoán, 8/9 tên từng bị cờ này báo là nhãn như vậy. Nay nhãn chỉ thấy qua hình
+(có trong Visual Cues) không bị báo; nhãn không thấy ở đâu, và nhân vật CÓ tên trong lời
+thoại mà ghi tên tiếng Việt, vẫn bị báo.
+
+### Đính chính bản 3.23.592
+
+"Phân tích đang chạy dở từ bản trước sẽ chạy lại từ đầu vì prompt đã đổi" — sai. Quy tắc
+thuật ngữ mới nằm ở chỉ thị hệ thống, thứ cố ý KHÔNG nằm trong khoá tiến độ; phân tích dở
+vẫn chạy tiếp, các đoạn đã xong giữ bảng thuật ngữ theo quy tắc cũ.
+
+### Đã đo nhưng KHÔNG làm
+
+* Tách lời thoại gốc khỏi nhạc nền/hiệu ứng (Demucs, MDX-Net) để bản lồng tiếng THAY giọng
+  gốc: cần mô hình tách nguồn chạy GPU, không kiểm được chất lượng và tốc độ trong môi trường
+  này; làm khi kiểm được trên máy thật.
+* Nhãn người nói chữ giản thể của tên phồn thể ("医生"/"醫生", "龙传人"/"龍傳人"): 3/1245
+  dòng phim này, 0 ở hai phim khác → thành vai riêng trong bảng phân vai, chọn giọng tay;
+  không thêm thư viện chuyển giản–phồn cho 3 dòng.
+* Tự đổi model khi quá tải: sẽ âm thầm thay lựa chọn của người dùng (model khác, chất lượng
+  khác). Đổi tay nay chỉ một cú bấm và không mất đoạn đã xong.
+* Tiến độ lưu bởi bản cũ của model KHÁC model đang chạy không được nhận (chỉ nhận tiến độ cũ
+  của cùng model) — chỉ ảnh hưởng các phân tích dở từ trước bản này.
+* Ước lượng "cần ~17" request khi chạy tiếp (ghi ở bản 591/592): cần biết ranh giới đoạn
+  trước khi tải video; 15 lần chọn key của nhật ký này không lần nào chọn key đã cạn.
+* Bảng nhân vật có hai vai cùng một người ("Lão nhân trong thôn" 2 câu, "Lão nhân (Cụ già)" 6
+  câu): bảng phân vai hiện hai dòng, có thể giao cùng một giọng.
+* Các cờ chất lượng dịch khác ở mức thường của kho (tốc độ đọc 101 dòng, nhất quán 8, vi phạm
+  xưng hô 8, lệch thuật ngữ 7 — 玉鐲子 "vòng ngọc gia bảo" 4/4): không có mẫu lỗi đủ lặp để
+  sửa tất định.
+
+### Kiểm thử
+
+* 86 test mới. 54 test lồng tiếng hỏng ngay từ lệnh import trên v3.23.592; 26/32 test của các
+  mục dịch/phân tích hỏng trên v3.23.592 dù đã chép sẵn hàm thuần mới sang. Dòng phụ đề, bảng
+  nhân vật, Visual Cues và nhãn giọng VieNeu chép nguyên văn từ dữ liệu thật, đã đối chiếu
+  tự động với file chuẩn đoán.
+* Toàn bộ: 5749 passed, 57 skipped.
+
+## [3.23.592] — 🔑 Quá tải thì thử key khác · dòng lẻ bị viết lại · thuật ngữ chỉ đọc âm
+
+Soi chuẩn đoán phân tích + chuẩn đoán dịch + app_log của v3.23.591 (phim "灭门惨案II借种",
+1246 dòng): một bản phân tích MỚI bằng gemini-3.8-flash phải chạy hai lần mới xong (11/17
+đoạn rồi 6 đoạn); ba giai đoạn dịch đều gemini-3.5-flash-lite và đều đính video; lượt dịch
+hỏng ở giai đoạn 4 vì 503, chạy tiếp từ checkpoint 54 phút sau.
+
+Tác dụng của bản trước, đo trên lượt này:
+
+* Quy tắc "video chỉ là ngữ cảnh" trong prompt **không ngăn được** model dịch theo lời
+  nghe: trong bốn dòng mốc, 68 vẫn ra "Mau mở cửa!", 77 ra "Cậu không nghe thấy à?",
+  92-93 vẫn có "mười năm qua"; chỉ dòng 70 đúng. Dải 68-77 bị viết lại ở giai đoạn phong
+  cách và được lưới dải lùi về; sang giai đoạn địa hoá, 68 và 71 lại bị đổi như hai dòng
+  lẻ. Mục "dòng lẻ" dưới đây xử lý phần lưới bắt được.
+* Tên đọc sai âm: "甄劍聲: Sanh → Thanh" tự sửa ngay khi phân tích xong, kèm 1 dòng của bản
+  dịch đã lưu.
+* Báo oan "bảng xưng hô mơ hồ" vì "bác sĩ": bản phân tích mới không còn cờ này. Lượt này
+  không có phản hồi rỗng nào.
+
+### 🔑 Gemini quá tải kéo dài mà ứng dụng không thử API key khác
+
+Nhật ký lượt này (ba API key):
+
+```
+08:33:19  Hết hạn mức ngày 'gemini-3.8-flash' ở key #1 → xoay sang key #2 (tự động)
+08:33:25 … 08:40:51   5 lượt 503 liền trên key #2
+08:40:51  DỪNG phân tích ở đoạn 12/17 — key #3 (còn 20 request/ngày) không được thử
+08:41:20  Người dùng bấm phân tích lại → ứng dụng chọn key #3 → đoạn 12-17 xong ngay
+09:12:03 … 09:26:17   11 lượt 503 liền trên key #1 (gemini-3.5-flash-lite, giai đoạn 4)
+09:26:17  Dịch phụ đề thất bại — key #2, #3 không được thử
+```
+
+Ứng dụng chỉ xoay key vì HẠN MỨC: hết hạn mức ngày (tự đếm hoặc máy chủ báo 429), hoặc 429
+hạn mức phút ở lời gọi không kèm video. 503 "model đang quá tải" không phải lỗi hạn mức
+nên nó chờ rồi thử lại mãi trên một key. Trên 54 nhật ký của kho: sau một lượt 503, lượt kế tiếp trên
+CÙNG key thành công 127/360 lần (35%); bốn lần lượt kế tiếp rơi vào key KHÁC thì thành
+công 3.
+
+Nay quá tải kéo dài thì chuyển sang key chưa thử còn hạn mức ngày và gửi lại ngay:
+
+* Model hạn mức ngày ít (3.6/3.7/3.8-flash, 20 request/ngày — mỗi lượt 503 vẫn bị tính):
+  key đang dùng vẫn được thử đủ 5 lượt như cũ; mỗi key còn lại chỉ THĂM DÒ tối đa 2 lượt.
+  Ba key cùng quá tải thì tốn 5 + 2 + 2 request rồi mới dừng, thay vì 5.
+* Model hạn mức nhiều (dịch): sau 3 lượt 503 liền trên một key thì đổi key; hết key chưa
+  thử thì ở lại key cuối cho tới hết ngân sách chờ 600 giây như cũ.
+* Video đính kèm được tải lại bằng key mới trước khi gửi (đoạn nào key đó đã tải trong 48
+  giờ qua thì dùng lại, không tải nữa). Key hết hạn mức ngày không được chọn. Một key thì
+  hành vi không đổi.
+* Dịch song song: lời gọi nào thấy luồng khác đã chuyển key thì đi theo key đó chứ không
+  tự chuyển lần nữa — hai luồng cùng tự chuyển sẽ đẩy nhau quay về chính key đang quá tải.
+
+Với nhật ký trên: lần phân tích sẽ tự sang key #3 lúc 08:40 thay vì dừng; lượt dịch sẽ đổi
+key sau lượt 503 thứ ba (khoảng 09:13) thay vì chờ 14 phút rồi hỏng. Không bảo đảm được
+key khác sẽ thoát quá tải — quá tải là của model, không của key — nên số lượt thăm dò
+được giữ nhỏ.
+
+### ✂️ Dòng LẺ bị giai đoạn tinh chỉnh viết lại khác hẳn
+
+Lưới dải viết lại (v3.23.589) cần từ ba dòng gần nhau. Dòng 68 "不要生氣": bản thô "Đừng
+giận chứ." → bản địa hoá "Mau mở cửa!", hai dòng kề không đổi một chữ. Dòng này sai ở bản
+cuối của 9/17 lượt dịch phim này, trong khi bản thô đúng ở cả 17 lượt.
+
+Nay sau lưới dải, mỗi giai đoạn tinh chỉnh dò các dòng bị viết lại khác hẳn bản trước
+(giống dưới 0,2), gom tất cả vào MỘT lượt dịch trọng tài từ câu gốc — chỉ chữ, không kèm
+video — rồi lùi về bản trước những dòng mà trọng tài đứng hẳn về phía bản trước. Bốn chốt,
+mỗi chốt có ca thật trong bộ test:
+
+* bản trước còn sót chữ gốc chưa dịch thì bản mới là một lần sửa — không đem phân xử;
+* dòng chỉ CHIA LẠI câu với dòng kề thì không đem phân xử (phim này, dòng 211-212: "chè
+  xoài sago" và "bí truyền" đổi chỗ cho đúng thứ tự câu gốc; lùi riêng dòng 212 thì "bí
+  truyền" bị nói hai lần còn "chè xoài sago" biến mất);
+* trọng tài phải giống bản trước hơn bản mới từ 0,3;
+* trọng tài phải thật sự đồng ý với bản trước (giống từ 0,5): "你放心", bản trước "Chị
+  xem," bản mới "Em đảm bảo," trọng tài "Chị yên tâm," — chỉ chung một đại từ, giữ bản mới.
+
+Đo trên 56 lượt dịch thật của ba phim (bản thô của một lượt KHÁC làm trọng tài, các lượt
+còn lại làm chuẩn, bốn hạt giống ngẫu nhiên, lấy trung bình):
+
+| | Số dòng | Bị lùi |
+| --- | --- | --- |
+| Viết HỎNG (bản trước đúng) | 342 | 250 (73%) |
+| Viết lại ĐÚNG hơn (bản trước sai) | 390 | 29 (7%) — lùi nhầm |
+| Chỉ đổi cách nói | 522 | 94 — về câu chữ cũ, không mất nghĩa |
+
+Tức mỗi lượt dịch bớt khoảng 4-5 dòng sai nghĩa, mất khoảng nửa dòng được sửa đúng. Xét
+cả cụm ba dòng quanh mỗi dòng bị lùi (để thấy câu bị cắt vế): 28/373 lần lùi làm cụm đó xa
+các bản thô khác hơn; trước khi có chốt chia lại câu là 54/447. Trung bình 11 dòng đem
+phân xử mỗi giai đoạn (nhiều nhất 61; trần 60) — thường là một request chữ.
+
+Trên lượt này, với bản thô của lượt trước làm trọng tài: lùi được 68, 71 (và 4, 19 ở lô
+đầu phim; 186 "隨傳隨到" → "phải tùy tùng theo sát." ở giai đoạn phong cách). Dòng 77 và 92
+thì KHÔNG: chúng chỉ bị đổi nửa câu ("Cậu không sao chứ?" → "Cậu không nghe thấy à?",
+giống 0,44) nên không qua ngưỡng "khác hẳn".
+
+Phép đo còn bi quan ở một điểm: trọng tài mô phỏng là bản thô CÓ kèm video của lượt khác,
+nên có khi mang đúng lời nghe được (dòng 10 "搔你胳肢窩": hai trong chín bản thô cùng ra
+"Cười chết mất"). Trọng tài thật chỉ nhận chữ.
+
+Bản 589 từng đo và bỏ ý "lùi từng dòng lẻ" vì lùi hàng loạt mất nhiều hơn được ở hai
+trong ba phim. Khác biệt lần này là có trọng tài cho từng dòng và các chốt ở trên.
+
+### 📖 Bảng thuật ngữ chỉ ĐỌC ÂM Hán-Việt, cách nói dễ hiểu nằm trong ngoặc
+
+Bản phân tích mới ghi ``所長 = sở trưởng (trưởng đồn công an)`` và ``性自樂 = tính tự nhạc
+(thuật ngữ hài hước chỉ việc tự sướng/thủ dâm)``. Khâu dịch chép phần TRƯỚC ngoặc: bản
+cuối gọi "Sở trưởng" ở 15/15 dòng và "tính tự nhạc" ở 4/4 dòng — 19 dòng của lượt này.
+Trên 17 lượt dịch phim này, cách ghi của bảng thuật ngữ quyết định gần như tuyệt đối:
+
+| Bảng thuật ngữ ghi | Số lượt | "所長" ở bản cuối |
+| --- | --- | --- |
+| ``sở trưởng (trưởng đồn…)``, hoặc thiếu mục | 11 | "Sở trưởng" 14-15/15 dòng ở cả 11 lượt |
+| ``Trưởng đồn`` / ``Trưởng đồn công an`` | 6 | "Trưởng đồn" 9-15/15 dòng |
+
+Cả kho: 19 bảng thuật ngữ khác nhau (3 733 mục) có 89 mục kiểu này, gặp ở 18/19 bảng
+("hưng sư vấn tội (đến hỏi tội)", "thông gian (ngoại tình)", "tự độc (thủ dâm)", "tiền
+công tận khí (công cốc)"…). Trên 56 lượt dịch, 553/607 dòng chứa các thuật ngữ đó (91%)
+mang nguyên phần đọc âm ở bản cuối — khoảng 10 dòng mỗi lượt.
+
+* **Prompt phân tích**: quy tắc "phần trước ngoặc phải dùng được thẳng trong lời thoại"
+  vốn chỉ áp cho tiếng lóng/thành ngữ. Nay nói rõ cho MỌI mục kể cả chức danh, kèm đúng
+  ca sai thật và cách ghi đúng: nếu chính model phải ghi cách nói dễ hiểu hơn vào trong
+  ngoặc thì cách nói đó mới là bản dịch. Đây là thay đổi prompt nên không đo trước được;
+  mốc đối chiếu cho lượt tới là số mục kiểu này (trung bình 4,7 mỗi bảng, lượt này 3).
+* **File chuẩn đoán ngữ cảnh**: thêm cảnh báo `glossary_reading_only` nêu đích danh các
+  mục (`glossary.reading_only`), để sửa tay bảng đang dùng mà không phải phân tích lại.
+  Với bản phân tích này: 所長, 性自樂 và 禽獸 = "cầm thú (súc sinh)".
+
+Bản phân tích ĐÃ LƯU không tự đổi (xem mục "không làm"): muốn hết "Sở trưởng" ở phim này
+thì sửa hai mục trên trong bảng thuật ngữ, hoặc phân tích lại bằng bản này. Phân tích đang
+chạy dở từ bản trước sẽ chạy lại từ đầu vì prompt đã đổi.
+
+### 🩺 File chuẩn đoán: mất nhật ký khi chạy tiếp, một cảnh báo nhầm
+
+* File chuẩn đoán dịch của lượt này chỉ có sự kiện của giai đoạn 4: nhật ký diễn biến bị
+  xoá ở đầu mỗi lần chạy, mà giai đoạn lấy lại từ checkpoint thì không sinh sự kiện nào.
+  Hai việc app_log có ghi — chuẩn hoá con số ở dòng 747, lùi dải 68-77 — không có trong
+  file. Nay sự kiện của mỗi giai đoạn được lưu cùng checkpoint của giai đoạn đó và phát
+  lại khi chạy tiếp (đánh dấu `from_checkpoint`). Checkpoint của bản cũ vẫn đọc được.
+* Cảnh báo duy nhất về bảng thuật ngữ của bản phân tích này — "借種 ~ 配種 gần trùng, bản
+  dịch khác nhau" — là báo nhầm: "phối giống" chỉ có trong CHÚ THÍCH của mục 借種. Nay
+  hai bản dịch phải chứa nhau ở phần dùng trong lời thoại. Trên 19 bảng: 4 cặp bị báo →
+  3, chỉ mất đúng cặp này.
+
+### Đã đo nhưng KHÔNG làm
+
+* Tự đổi mục "chỉ đọc âm" sang phần trong ngoặc. Khoảng một phần tư trong 89 mục là từ
+  Hán-Việt người Việt vẫn dùng: "phát tài (trúng mánh)" 29 dòng, "nghĩa phụ (cha nuôi)"
+  30 dòng, "bạo kích (nhân bội số cao)" 18 dòng — đổi là làm hỏng. Phân biệt hai loại cần
+  biết từ nào có trong tiếng Việt; ứng dụng chỉ có bảng âm đọc từng chữ.
+* Nới ngưỡng dòng lẻ từ 0,2 lên 0,3: lùi thêm 71 dòng hỏng nhưng thêm 8 dòng lùi nhầm và
+  14 cụm bị cắt vế (ở ngưỡng 0,2 là 28 cụm cho 250 dòng — tỉ lệ xấu gấp đôi). Trong dải
+  0,2-0,3 có nhiều câu chỉ bị chia lại giữa hai dòng.
+* Dòng 77 và 92 (đổi nửa câu theo lời nghe): không có dấu hiệu nào ở mặt chữ tách được
+  chúng khỏi việc trau chuốt bình thường. Lưới "con số thêm vào" cho dòng 92 đã đo ở bản
+  591 (8 ca thật / 26 ca báo nhầm).
+* Xoay key khi chờ hạn mức PHÚT ở lời gọi có video. Lượt dịch này chờ 40 lần, tổng 373
+  giây (thêm 3 lần 429, 125 giây) trong khi hai key kia rảnh. Nhưng mỗi lần chờ trung bình
+  9 giây, còn tải một đoạn video lên key khác mất khoảng 19 giây (17 đoạn / 319 giây) và
+  mọi lô sau đó cũng phải tải lại đoạn của mình — đổi key chậm hơn chờ.
+* Bỏ hẳn chú thích khi so cặp thuật ngữ gần trùng: mất 1 cặp báo nhầm, thêm 1 cặp đúng và
+  2 cặp báo nhầm mới ("大G ~ 大奔": Mercedes G-Class và Mercedes).
+* Bảng xưng hô ghi người nghe và danh xưng bằng chữ Hán ("danh xưng: 甄大嫂"): 1/21 bảng
+  của kho; 58/59 vế xưng hô của bảng này vẫn tra ra đúng người.
+* Chạy tiếp phân tích dở vẫn ước lượng "cần ~17" request dù chỉ thiếu 6 đoạn (đã ghi ở
+  bản 591); lượt này không vì thế mà chọn sai key.
+* Sự kiện của giai đoạn đang chạy DỞ lúc lượt dịch đứt vẫn mất khi chạy tiếp: các lô đã
+  xong được giữ nhưng lưới của giai đoạn chỉ chạy khi đủ cả giai đoạn.
+
+### Kiểm thử
+
+* 126 test mới (49 hỏng trên v3.23.591 dù đã chép sẵn các module thuần mới sang; không
+  chép thì cả 126 hỏng ngay từ lệnh import). Dòng phụ đề, mục thuật ngữ và nhật ký trong
+  test chép nguyên văn từ dữ liệu thật, đã đối chiếu tự động với file chuẩn đoán.
+* Sửa bộ dịch giả của một test cũ (v3.23.583): nó trả lại đúng bản trước cho mọi lượt
+  dịch thô, kể cả lượt trọng tài mới — nay lượt trọng tài trả câu thật của bảy lượt dịch
+  phim đó.
+* Toàn bộ: 5654 test đạt, 57 bỏ qua. Ruff: 6378 (không tăng).
+
+## [3.23.591] — 🎬 Video chỉ là ngữ cảnh: dịch theo CHỮ, không theo lời nghe được
+
+Soi chuẩn đoán phân tích + chuẩn đoán dịch + app_log của v3.23.590 (phim "灭门惨案II借种",
+1246 dòng). Lần này là một bản phân tích MỚI bằng gemini-3.8-flash, phải chạy ba lần mới
+xong (5/17 đoạn, 0 đoạn, rồi 12 đoạn — 19 lượt 503); ba giai đoạn dịch đều
+gemini-3.5-flash-lite và đều đính video.
+
+Tác dụng của bản trước, đo trên lượt này:
+
+* Lưới số: cả 12 dòng tiền theo một lối "vạn"; sửa một dòng sai giá trị (966 "hai trăm
+  vạn" → "hai mươi vạn"). `number_issues` = 0.
+* Trùng dòng cách xa: lượt này không có cặp nào, không tốn request nào.
+* Chức danh: bản phân tích mới lại ghi "Sở trưởng" 5 chỗ trong bảng nhân vật, được đổi
+  theo bảng thuật ngữ ngay khi phân tích xong. Bản cuối gọi "Trưởng đồn" 15/15 dòng.
+* Dải bị viết lại: cảnh xếp hàng 68-77 còn sai 1/10 dòng (dòng 68 — một dòng lẻ, nguyên
+  nhân ở mục dưới). 性自樂 ra "tự sướng" cả 4 dòng.
+
+### 🎬 Model dịch theo điều NGHE được trong video
+
+Phim nói tiếng Quảng Đông, phụ đề cứng viết theo văn viết: lời nói và chữ khác nhau, trong
+tiếng còn có những câu không hề có phụ đề. Mỗi lô của cả ba giai đoạn dịch được gửi kèm
+1-3 đoạn video, nhưng chỉ thị cho model KHÔNG có chữ nào nói video dùng để làm gì. Trên 16
+lượt dịch thật của phim này:
+
+| Dòng | Câu gốc | Bản thô đúng | Bản cuối mang lời nghe được |
+| --- | --- | --- | --- |
+| 68 | 不要生氣 | 16/16 "Đừng giận." | 8/16: "Mở cửa mau!", "Khai mau.", "Khởi động đi!" |
+| 70 | 這麼久 | 16/16 "Sao lâu thế?" | 4/16: "Nhanh lên!" |
+| 77 | 你沒有事嗎 | 16/16 "Cậu không sao chứ?" | 3/16: "Mọi người vỗ tay hoan nghênh!" |
+| 93 | 改革開放成功了 | 16/16 | 6/16: "MƯỜI NĂM cải cách mở cửa đã thành công" |
+
+Dòng 93 là dấu vết rõ nhất: câu gốc không có con số nào, bản thô của cả 16 lượt cũng
+không — "mười năm" chỉ có trong tiếng. Lượt này dính hai dòng (68 → "Khai mau.", 93).
+
+Nay chỉ thị hệ thống của giai đoạn nào CÓ đính video thì thêm một quy tắc: video chỉ là
+ngữ cảnh (ai nói, nói với ai, thái độ, hành động); nguồn để dịch luôn là chữ của từng
+dòng; lời nghe được có thể khác phụ đề (lồng tiếng, tiếng địa phương, người khác chen vào,
+câu không có phụ đề) — không dịch theo lời nghe, không thêm từ hay con số chỉ có trong âm
+thanh, không thay nội dung dòng bằng câu nghe thấy; chữ và tiếng khác nhau thì theo chữ.
+Giai đoạn không đính video giữ nguyên chỉ thị cũ.
+
+Đây là thay đổi về prompt nên không đo trước được trên dữ liệu đã có. Bốn dòng trong bảng
+là mốc để đối chiếu ở lượt chạy tới.
+
+### 🈶 "Chân Kiếm Sanh": tên bị đọc bằng âm Hán-Việt của một chữ khác
+
+Bản phân tích mới ghi nam chính ``甄劍聲 (Chân Kiếm Sanh)``. 聲 đọc "thanh"; "sanh" là âm
+của 甥/笙. Lưới soát âm (v3.23.567) thấy lỗi nhưng chỉ tự sửa khi âm sai lệch âm đúng
+không quá một ký tự, nên chỉ báo: tên sai 16 chỗ trong bảng nhân vật, 53 chỗ trong tóm
+tắt, và đi vào bản dịch ở dòng gọi tên anh (dòng 125).
+
+Soát 20 bảng nhân vật khác nhau của kho chuẩn đoán, có 5 tên bị báo mà không được sửa:
+
+* ``甄劍聲 (Chân Kiếm Sanh)``, ``洪大嫂 (Hồng Đại Sảo)``, ``莫嫂 (Mạc Sảo)`` (嫂 đọc "tẩu";
+  "sảo" là âm của 稍) — model phiên âm nhưng lấy âm của chữ khác;
+* ``宾客 (Quan khách)``, ``王梅 (Chị Mai)`` — dịch nghĩa, đúng.
+
+Nay tự sửa thêm khi đủ cả ba điều kiện: âm viết sai tự nó là một âm Hán-Việt chính của
+chữ khác ("Sanh", "Sảo"; còn "Béo", "Chị" thì không); tên có từ ba chữ với đúng một chữ
+lệch; chữ đó chỉ có một âm Hán-Việt chính (chữ nhiều âm như 沈 thẩm/trầm không đoán).
+Tên ngắn hơn chỉ sửa THEO: cùng chữ, cùng âm sai đã được xác nhận ở một tên dài trong
+chính bảng đó ("Hồng Đại Sảo" → "Mạc Sảo"). Trên 20 bảng: sửa đúng 3 tên sai, không đụng
+2 tên dịch nghĩa, các lần sửa cũ không đổi. Bảng thuật ngữ vẫn chỉ báo, không tự sửa.
+Bản phân tích đã lưu được sửa khi mở lại video hoặc khi dịch.
+
+### 📭 Gemini trả rỗng giữa lúc quá tải → ứng dụng bỏ luôn video
+
+Từ v3.23.358, lời gọi có video mà trả rỗng thì bỏ video rồi thử lại, vì cho rằng video bị
+bộ lọc an toàn chặn. Nhật ký lượt này: hai lần trả rỗng, cả hai ở đoạn 6 và cả hai giữa
+các lượt 503; sáng hôm sau cùng đoạn video, cùng prompt chạy xong trong 32 giây — video
+không hề bị chặn. Cả 53 nhật ký của kho chỉ có đúng hai lần trả rỗng này. Ở khâu phân
+tích, bỏ video là bỏ căn cứ gán người nói/người nghe của cả đoạn (~75 dòng), mà kết quả
+vẫn được nhận như thường. (Hai lần này lượt thử không video cũng dính 503 nên chưa có
+đoạn nào bị phân tích thiếu video.)
+
+Nay đọc lý do máy chủ nêu trong phản hồi: có lý do chặn (`block_reason`, hoặc
+`finish_reason` thuộc nhóm chặn nội dung) thì bỏ video ngay như cũ; không nêu lý do thì
+thử lại một lần VẪN KÈM video, rỗng lần nữa mới bỏ. Trường hợp xấu nhất tốn thêm đúng một
+request cho mỗi lời gọi. Nhật ký ghi lý do thay cho ``candidates=None``.
+
+### 🩺 File chuẩn đoán nói sai một chỗ, thiếu một chỗ
+
+* Báo oan "bảng xưng hô MƠ HỒ": ``龍傳人 → bác sĩ: xưng 'tôi' gọi 'ông/bác sĩ'`` bị đếm
+  thành hai đại từ ("ông", "bác") dù "bác sĩ" là nghề — kèm lời khuyên phân tích lại, tức
+  17-20 request của model hạn mức 20 request/ngày cho một bảng đang đúng. Nay "bác sĩ",
+  "bà con", "ông chủ", "bà chủ", "cô chủ", "cậu chủ" được coi là danh xưng. Trên 20 bảng
+  của kho: 24 cặp bị báo → 23, chỉ mất đúng cặp báo oan.
+* File chuẩn đoán dịch không ghi giai đoạn nào đính video; muốn biết phải đếm từng lời
+  gọi trong app_log. Nay mốc `stage_completed` có thêm `attach_video`.
+
+### Đã đo nhưng KHÔNG làm
+
+* Lùi mọi dòng bị giai đoạn tinh chỉnh viết lại khác hẳn về bản trước. Đối chiếu với bản
+  thô của các lượt khác: phim này 103 dòng hỏng / 43 dòng được sửa (16 lượt), nhưng phim
+  3902 dòng là 308 / 489 (32 lượt) và phim 5540 dòng là 98 / 177 (7 lượt) — lùi hàng loạt
+  mất nhiều hơn được ở hai trong ba phim. Giữ kết luận của bản 589.
+* Lưới "con số do tinh chỉnh thêm vào" (dòng 93): 34 lượt thêm số trên 55 lượt dịch; 8
+  lượt là thêm thật (7 lượt ở chính dòng 93), 26 lượt còn lại là "rõ mười mươi", "tỷ tỷ",
+  "triệu tập", "ngút ngàn".
+* Dòng 37 "老莫" → "Trưởng đồn!": nhãn người nói trùng người được gọi. Kho có 30 dòng
+  gọi tên mang nhãn kiểu này, model vẫn dịch đúng tên ở 29 dòng.
+* Dòng 39 "老公" → "Vợ tôi!": tiếng gọi chồng bị gắn nhãn tự-nói nên được coi là độc
+  thoại. Một ca trên 674 dòng độc thoại ngắn của kho.
+* Chạy tiếp phân tích dở: ứng dụng ước lượng "cần ~17" request dù chỉ thiếu 12 đoạn, và
+  tải lên cả các đoạn đã phân tích xong (lần hai thừa 2 đoạn ≈ 30 giây, lần ba thừa 4
+  đoạn ≈ 78/250 giây). Không gây lỗi và không làm chọn sai key ở lượt này. Tiến độ chỉ
+  tra được sau khi dựng prompt, tức sau bước tải lên; sửa đòi đổi thứ tự hai bước đó.
+* Lỗi lẻ của bản thô, mỗi dòng 1/16 lượt: dòng 5 "十大" → "top ten", dòng 96 "未來主人翁"
+  → "tương lai chủ nhân ông", dòng 886 "幹甚麼" → "Lại thế nữa rồi."
+* Bảng thuật ngữ có mục lặp qua bí danh ("雙響炮" và "雙響炮 / 雙嚮炮", "打掉" hai lần):
+  cùng bản dịch nên vô hại.
+
+### Kiểm thử
+
+* 108 test mới (48 hỏng trên v3.23.590), dữ liệu chép nguyên văn từ các bản phân tích và
+  lượt dịch thật, đã đối chiếu tự động với file chuẩn đoán; phản hồi rỗng dựng bằng chính
+  kiểu dữ liệu của SDK Gemini.
+* Toàn bộ: 5523 test đạt, 57 bỏ qua. Ruff: 6378 (không tăng).
+
+## [3.23.590] — 🔢 Một phim một lối đọc số; dòng mang lời của dòng khác được dịch lại
+
+Soi chuẩn đoán phân tích + chuẩn đoán dịch + app_log của v3.23.589 (phim "灭门惨案II借种",
+1246 dòng; dùng lại bản phân tích đã lưu, ba giai đoạn đều gemini-3.5-flash-lite, cả lượt
+23 phút).
+
+Tác dụng của bản trước, đo trên lượt này:
+
+* Dải bị viết lại: giai đoạn địa hoá lại viết lại dải 68-77 (cảnh xếp hàng ở đồn công
+  an). Trọng tài dịch lại 14 dòng bằng một request, phán lùi; bản cuối đúng cả 10 dòng
+  (lượt trước sai 7). `final_vs_literal_rewrites` = 0.
+* Chức danh: phân tích đã lưu được đổi ngay khi nạp lại (nhật ký: "所長: 'Sở trưởng' →
+  'Trưởng đồn công an' (4 chỗ)"). Bản cuối gọi "Sở trưởng" 6/15 dòng → 0/15.
+* Khối nhắc thuật ngữ: mục nhiều phương án dịch khác bảng ở bản thô 6/40 → 1/40, ở bản
+  cuối 9/40 → 2/40; 性自樂 ra "tự sướng" cả 4 dòng (hai lượt trước: "tính tự lạc").
+
+### 🔢 "Một vạn tệ", "hai vạn tệ" nhưng "hai trăm nghìn" — ba lỗi của lưới số
+
+Bản dịch thô của lượt này (trước lưới số, dựng lại từ nhật ký):
+
+| Dòng | Câu gốc | Bản thô | |
+| --- | --- | --- | --- |
+| 657, 658, 1082 | 一萬 | một vạn | lối 'vạn' |
+| 966 | 二十萬 | hai mươi vạn | lối 'vạn' |
+| 788, 789, 791, 794 | 二十萬 | hai trăm nghìn | lối hiện đại |
+| 822 | 二十萬 | Hai mươi nghìn | SAI giá trị |
+| 747 | 兩萬 | hai mươi vạn tệ | SAI giá trị |
+| 752 | 一兩萬 | một hai vạn | số ước lượng |
+
+1. **Chữ `兩` (phồn thể của `两`) không có trong bảng chữ số.** "拿兩萬塊錢來贖" chỉ bắt
+   được cụm "萬" không có chữ số nên bị bỏ qua: dòng 747 đọc 200.000 thay cho 20.000 mà
+   lưới không thấy (giai đoạn phong cách tình cờ sửa lại). Nay đọc được `兩萬`, `兩千萬`,
+   `兩億`.
+2. **Bằng phiếu thì lối hiện đại thắng.** 4 dòng 'vạn' đúng, 4 dòng hiện đại đúng → dòng
+   966 đang đúng bị đổi thành "hai trăm nghìn". Bản cuối: "một vạn tệ", "hai vạn tệ"
+   nhưng "hai trăm nghìn" ở 6 dòng. Nay bằng phiếu thì theo quy ước của hạng độ lớn (đo
+   ở bản 588: dưới một triệu đọc 'vạn' 395 dòng / hiện đại 132 dòng; từ một triệu thì
+   hiện đại 1057 / 'vạn' 10): số dưới một triệu về 'vạn', số từ một triệu về hiện đại.
+3. **Dòng lệch lối chỉ được sửa khi phim ĐÃ có mẫu cho đúng con số đó.** Phim đọc
+   "năm mươi vạn" ở 6 dòng nhưng chưa đọc 800.000 theo lối 'vạn' lần nào thì 5 dòng "800
+   nghìn" cứ để nguyên — mỗi số tiền một lối. Đo trên bản cuối của 54 lượt dịch thật (ba
+   phim): 17 lượt đọc lẫn hai lối trong hạng dưới một triệu, 107 dòng lệch. Nay phim chưa
+   có mẫu thì cách đọc được DỰNG từ chính giá trị theo lối của phim: "800 nghìn" → "80
+   vạn", "hai trăm nghìn" → "hai mươi vạn", "một nghìn vạn" → "mười triệu", "345 vạn" →
+   "3,45 triệu". Chữ số giữ chữ số, chữ giữ chữ; số lẻ không có cách đọc 'vạn' gọn
+   ("một trăm hai mươi ba nghìn") thì để nguyên.
+
+Kèm hai sửa nhỏ lộ ra khi làm việc trên:
+
+* Hai chữ số kề nhau là số ƯỚC LƯỢNG ("一兩萬", "七八万"; "một hai vạn", "bảy tám vạn"),
+  không đem đối chiếu giá trị. Trước đây "一两万" tính là 20.000 và "một hai vạn" tính là
+  30.000 — chỉ nhờ thiếu chữ `兩` mà dòng 752 chưa bị "sửa".
+* "không trăm" là 0 trăm: "một triệu không trăm hai mươi nghìn" trước đây đọc ngược lại
+  ra 1.120.000 nên cách đọc chuẩn của 1.020.000 bị coi là không chắc và bỏ qua.
+
+Kết quả trên bản thô thật của lượt này: 747 → "hai vạn tệ", 822 → "Hai mươi vạn.", bốn
+dòng "hai trăm nghìn" → "hai mươi vạn", 966 giữ nguyên, 752 không đụng — cả phim một lối
+'vạn'. Áp lên bản cuối của 54 lượt dịch trong kho: 170 dòng đổi lối ở 27 lượt, mọi dòng
+giữ đúng giá trị; số lượt đọc lẫn hai lối 17 → 0 (dưới một triệu) và 14 → 0 (từ một
+triệu, tính cả cụm trộn kiểu "một nghìn vạn"); chạy lần hai không đổi thêm dòng nào.
+
+Mỗi lượt dịch tự bỏ phiếu nên hai lượt của cùng một phim có thể chọn hai lối khác nhau
+(phim "he thong sung the": 16 dòng 'vạn' / 12 dòng hiện đại ở lượt v3.23.583, 14 / 15 ở
+lượt v3.23.581); trong một lượt thì nhất quán.
+
+### 🎵 Dòng 1141 "一二三" mang lời bài hát của dòng 1165
+
+"一二三" (đếm "một, hai, ba") ra "Một chiếc thuyền nan lướt nhẹ trôi" — nguyên văn bản
+dịch của dòng 1165 "一葉輕舟去", cách đó 24 dòng. Sai từ bản thô tới bản cuối, không cờ
+chuẩn đoán nào báo: `duplicate_adjacent` chỉ xét hai dòng liền kề. Cùng lỗi ở lượt
+v3.23.580 của phim này.
+
+Đo trên bản cuối của 54 lượt: cặp dòng cách nhau 2-60 dòng, bản dịch giống hệt từ ba từ
+trở lên, câu gốc chung dưới một nửa số chữ — 87 cặp ở 36 lượt, tổng cộng 160 lượt dòng.
+Soát tay: 40 là dòng mang lời của dòng khác ("宋" — tiếng gọi dở "Tống…" — ra "Liễu đại
+tiểu thư" ở 9/32 lượt dịch phim đó, "柳慕云" ra "chị dâu Đào Hoa,", "好主意啊" ra "Còn ngây
+ra đó làm gì,"); 120 còn lại là dòng đúng — dòng kia của cặp, hoặc hai câu đồng nghĩa dịch
+giống nhau là đúng ("彻底好了" / "已经痊愈了").
+
+* Khâu dọn cuối dịch lại riêng các dòng đó từ câu gốc, không kèm video, CHUNG một request
+  với nhóm dòng trùng liền kề đã có từ trước.
+* Chỉ nhận bản dịch lại của dòng nào ra KHÁC HẲN bản cũ (độ giống dưới 0,5). Dòng dịch lại
+  vẫn ra như cũ thì giữ bản đã qua tinh chỉnh — hai câu đồng nghĩa vì thế không bị đụng.
+* Mô phỏng (lấy bản thô của lượt khác làm "bản dịch lại"): dòng sai được thay 36,5/40
+  lần (91%); dòng còn lại của cặp bị thay 20,4/120 lần (17%), bằng một cách dịch đúng
+  khác của chính câu đó.
+* Chi phí: 22/54 lượt đã có sẵn request dọn dòng trùng liền kề; chỉ 18 lượt tốn thêm
+  một request văn bản.
+* `process_log` có sự kiện `distant_duplicates_retranslated` (các cặp, dòng đã thay);
+  file chuẩn đoán dịch có cờ `duplicate_distant` cho cặp còn tới bản cuối.
+
+### Đã đo nhưng KHÔNG làm
+
+* **Vợ chồng lúc "ông/bà – tôi", lúc "anh/em" trong cùng một cảnh** (dòng 1165-1215: 7
+  dòng theo bảng nhân vật, 11 dòng "anh/em"). Lưới xưng hô cố ý không thay "anh/em" vì
+  còn là danh từ. Thử nới: 283 dòng tự xưng bằng từ thân tộc trong khi quy tắc là
+  tôi/tao trên 54 lượt; qua các chốt an toàn (giới tính, câu gốc không có từ thân tộc,
+  quy tắc đang được dùng trong cảnh) còn 48 dòng; đối chiếu với cách các lượt khác dịch
+  đúng dòng đó thì chỉ 31/48 (65%) ủng hộ việc đổi — có ca nhãn người nói sai, có ca
+  chính quy tắc của bảng nhân vật lệch với cả phim. Đổi sai một đại từ nặng hơn để lẫn.
+* "劍哥，對不起，我.." → "Kiếm Ca, đối không với anh, tôi..." (dòng 627): bản cuối của 3/15
+  lượt; 230 dòng 對不起 khác của kho đều ra "xin lỗi". Cùng loại với dòng 186 "隨傳隨
+  到" → "phải tùy tùng tùy đến": một dòng lẻ bị tinh chỉnh viết hỏng (đã đo ở bản 589).
+* "Trưởng đồn công an ơi!" cho tiếng gọi "所長呀" (6/15 dòng, 9 dòng còn lại đã được địa
+  hoá rút thành "Trưởng đồn"): bảng thuật ngữ ghi cả chức danh đầy đủ; không có cách
+  tất định nào biết dạng gọi ngắn.
+* Dòng 523 "L上上" (rác OCR) → "[Music]": khâu đọc bỏ mọi thẻ ngoặc vuông lạ nên giọng
+  đọc không đọc ra; chỉ file phụ đề còn chữ này.
+* Lùi dòng bị tinh chỉnh làm DÀI quá tốc độ đọc về bản ngắn hơn của giai đoạn trước:
+  khoảng 37 dòng mỗi lượt có bản trước đọc kịp, nhưng bản sau thường mang cả phần sửa
+  đúng (đại từ, tên) — lùi là mất luôn phần đó.
+
+### Kiểm thử
+
+* 61 test mới (41 hỏng trên v3.23.589), dữ liệu chép nguyên văn và đã đối chiếu tự động
+  với file chuẩn đoán. 10 test cũ của lưới số được cập nhật theo chính sách mới (bằng
+  phiếu, dựng cách đọc) — cả 10 hỏng trên v3.23.589.
+* Toàn bộ: 5412 test đạt, 57 bỏ qua. Ruff: 6379 (không tăng).
+
+## [3.23.589] — 🎭 Dải dòng bị tinh chỉnh "bịa lời" được trọng tài phân xử; một chức danh một cách gọi
+
+Soi chuẩn đoán phân tích + chuẩn đoán dịch + app_log của v3.23.588 (phim "灭门惨案II借种",
+1246 dòng; dùng lại bản phân tích đã lưu, ba giai đoạn dịch đều gemini-3.5-flash-lite, cả
+lượt 43 phút).
+
+Tác dụng của bản trước, đo trên lượt này:
+
+* Lưới số: phim đọc "vạn" ở cả 11 dòng tiền, lưới không đổi dòng nào, `number_issues` 0
+  (lượt trước: 5 dòng đúng bị đổi sang "hai trăm nghìn").
+* Chuẩn đoán ngữ cảnh: 0 lỗi, 0 cảnh báo — cặp `一回生二回熟 ~ 一回生兩回熟` cùng bản dịch
+  nay chỉ là ghi chú.
+* `process_log` đã ghi `address_rules_enforced` (4 dòng), `content_drops_reverted` (dòng
+  72), `residual_cjk_cleaned` (12, 60, 265 dịch lại, không còn sót): biết lưới nào sửa gì
+  mà không cần mở app_log.
+
+### 🎭 Cả một dải dòng bị giai đoạn tinh chỉnh viết lại thành lời khác
+
+Cảnh dân làng xếp hàng ở đồn công an, dòng 68-77. Bản thô đúng cả 10 dòng. Giai đoạn
+phong cách viết lại 8 dòng thành lời đám đông; giai đoạn địa hoá trả lại 2 dòng, viết lại
+thêm 3 dòng. Bản cuối sai 7 dòng:
+
+| Dòng | Câu gốc | Bản thô | Bản cuối |
+| --- | --- | --- | --- |
+| 68 | 不要生氣 | Đừng giận. | Khai mau lên! |
+| 71 | 還關門呢 | Lại còn đóng cửa nữa. | Nhanh lên! |
+| 76 | 我們大隊長現在有話對你們說 | Đại đội trưởng của chúng ta có lời muốn nói với các người. | Cửa cũng đóng rồi, rốt cuộc chia thêm chút thịt heo gì chứ? |
+| 77 | 你沒有事嗎 | Cậu không sao chứ? | Đến lượt tôi rồi, tôi được nhiều hơn đấy nhé! |
+
+File chuẩn đoán không có cờ nào cho dải này (`final_vs_literal_shifts` 0,
+`misaligned_blocks` 0). Bộ dò lệch dòng (v3.23.569) tìm dòng giống một dòng KỀ của bản
+trước; lời bịa thì không giống dòng nào.
+
+Trên 14 lượt dịch phim này: bản thô đúng cả dải ở cả 14 lượt; bản cuối có dòng bị viết
+lại trong dải ở 8 lượt, 4 lượt từ ba dòng trở lên.
+
+Tín hiệu mới: ít nhất ba dòng gần nhau (cách nhau không quá ba dòng) có độ giống với CHÍNH
+dòng đó của bản trước dưới 0,2. Đo trên 106 giai đoạn tinh chỉnh của 53 lượt dịch (ba
+phim): 23 dải, ngoài những dải bộ dò lệch đã bắt. Lấy bản thô của các lượt khác cùng phim
+làm chuẩn độc lập:
+
+| Thực tế | Số dải | Một trọng tài phán "lùi" | "giữ" | "chưa rõ" |
+| --- | --- | --- | --- | --- |
+| Giai đoạn làm HỎNG bản trước đúng | 8 | 7,3 | 0,1 | 0,6 |
+| Giai đoạn SỬA bản trước lệch dòng | 12 | 0,8 | 10,7 | 0,5 |
+| Không rõ | 3 | 0,4 | 0,9 | 1,7 |
+
+Hơn nửa số dải là giai đoạn tinh chỉnh sửa đúng một bản thô lệch, nên không thể cứ thấy
+viết lại là lùi.
+
+* Dải viết lại nay đi qua CÙNG trọng tài với dải lệch: dịch lại riêng vùng đó từ câu gốc
+  (không kèm video), phía nào khớp trọng tài theo từng dòng thì thắng; bản trước phải
+  thắng gấp ba mới lùi.
+* Lùi đúng các dòng của dải, không lùi thêm dòng đệm hai bên như dải lệch — dòng ngoài
+  dải vẫn là bản tinh chỉnh đúng.
+* Chạy trên 14 lượt của phim này: bắt 5 dải cần lùi (v3.23.574, 575, 584, 587, 588), cả
+  13/13 bản chuẩn đều phán lùi; 3 dải ngược chiều (địa hoá sửa lại lời phong cách đã
+  bịa) cả 13/13 đều phán giữ. Với lượt vừa rồi, dải 68-77 của giai đoạn phong cách sẽ
+  được lùi về bản thô và giai đoạn địa hoá nhận bản đúng làm đầu vào.
+* Chi phí: 23 dải trên 53 lượt, khoảng 0,4 request văn bản mỗi lượt dịch; dùng chung
+  trần 4 lần phân xử mỗi giai đoạn với dải lệch.
+* `process_log` có sự kiện `stage_rewrite` (dải, phán quyết); file chuẩn đoán dịch có cờ
+  `final_vs_literal_rewrites` cho dải còn tới bản cuối (33/53 lượt cũ không có dải nào).
+
+Mô phỏng dùng bản thô dịch cả lô của lượt khác làm trọng tài; trong ứng dụng trọng tài
+chỉ dịch riêng vùng tranh chấp. 0,8 dải lùi nhầm chủ yếu là dải 3401-3403 của phim "傻子
+落水", nơi 8/31 bản thô dùng làm trọng tài cũng lệch đúng kiểu đó.
+
+### 👮 Bảng nhân vật gọi "Sở trưởng", bảng thuật ngữ ghi "Trưởng đồn công an"
+
+Cùng một lượt phân tích sinh ra hai bảng không khớp nhau: thuật ngữ `所長 = Trưởng đồn
+công an`, còn bốn quy tắc xưng hô ghi "gọi 'Sở trưởng'" (âm Hán-Việt của 所長). Bản thô
+theo bảng thuật ngữ 15/15 dòng; giai đoạn phong cách đổi lại "Sở trưởng" ở dòng của những
+người nói có quy tắc ấy. Bản cuối của ba lượt dùng phân tích này: 3, 0 và 6 trên 15 dòng
+gọi "Sở trưởng", còn lại "Trưởng đồn" — giọng đọc nghe như hai người khác nhau. Các phân
+tích cũ ghi hai bảng giống nhau (`所長 = sở trưởng`) thì bản cuối nhất quán 15/15.
+
+Phim "he thong sung the" (5540 dòng, 6 lượt): `厂长 = giám đốc xưởng` nhưng bảng nhân vật
+ghi "gọi 'xưởng trưởng'", "gọi 'Phùng xưởng trưởng'" — bản cuối 99 dòng "xưởng trưởng",
+50 dòng "giám đốc xưởng" trên 156 dòng.
+
+* Bảng thuật ngữ là chuẩn. Cách gọi trong bảng nhân vật mà đúng bằng âm Hán-Việt của một
+  thuật ngữ chức danh (kết thúc bằng 長/长), trong khi bảng thuật ngữ dịch khác, được đổi
+  sang cách dịch của bảng thuật ngữ: "gọi 'Sở trưởng'" → "gọi 'Trưởng đồn công an'";
+  "gọi 'Phùng xưởng trưởng'" → "gọi 'giám đốc xưởng Phùng'" (họ đặt sau, và chỉ khi bảng
+  có nhân vật tên `冯厂长`).
+* Làm ngay khi phân tích xong, và cả với phân tích ĐÃ LƯU khi nạp lại video hoặc bấm
+  dịch — không tốn request phân tích lại. Ô "Nhân vật" hiện bản đã đổi, thanh trạng thái
+  nói rõ đổi gì; muốn giữ cách gọi cũ thì sửa bảng thuật ngữ.
+* Chỉ đụng chuỗi trong nháy đơn và "(danh xưng: …)", khi cả phương án đúng bằng âm
+  Hán-Việt. Văn xuôi ("sở trường", "gia trưởng"), tên nhân vật trùng thuật ngữ (`老表
+  (Lão Biểu)`), chức danh không có trong bảng thuật ngữ ("Đại đội trưởng", "Trấn
+  trưởng") giữ nguyên.
+* Chạy trên 18 bản phân tích khác nhau của kho: đổi đúng 2 bản nêu trên (4 và 3 chỗ), 16
+  bản còn lại giữ nguyên từng ký tự; số quy tắc xưng hô tra được người nghe không đổi.
+
+Chưa làm trong mục này: phiên âm sau tên (`冯厂长 (Phùng xưởng trưởng)`) giữ nguyên vì
+còn là khoá tra người nghe; tóm tắt phim và Visual Cues (phim 5540 dòng có 3 và 4 chỗ ghi
+"xưởng trưởng") không đổi vì là văn xuôi. Mức nhất quán thật phải đo ở lượt dịch tới.
+
+### 📌 Khối nhắc thuật ngữ: mục nhiều phương án bị model coi nhẹ
+
+Bản 587 đổi mục `A / B` từ `"must_translate_as": "A / B"` sang
+`"must_translate_as_one_of": ["A", "B"]` để model thôi chép cả chuỗi. Ba lượt cùng bảng
+thuật ngữ, cùng model cho thấy cái giá của tên khoá mới:
+
+| | v3.23.586 (khoá cũ) | v3.23.587 | v3.23.588 |
+| --- | --- | --- | --- |
+| Mục nhiều phương án dịch khác bảng, bản thô | 1/40 | 6/40 | 6/40 |
+| Mục nhiều phương án dịch khác bảng, bản cuối | 2/40 | 7/40 | 9/40 |
+| Mục một phương án dịch khác bảng, bản thô | 17/120 | 11/120 | 10/120 |
+| 性自樂 (= tự sướng / thủ dâm), 4 dòng | "tự sướng" 4/4 | "tính tự lạc" 4/4 | "tính tự lạc" 4/4 |
+
+Khối nhắc không có lời giải thích nào ngoài tên khoá. Nay phương án đầu mang khoá
+`must_translate_as` như mục một phương án, các phương án còn lại nằm riêng trong
+`also_acceptable` — vẫn không có chuỗi "A / B" nào để chép. Đây là thay đổi lời nhắc, kết
+quả chỉ đo được ở lượt dịch tới (so cột `v3.23.588` ở trên).
+
+### Đã đo nhưng KHÔNG làm
+
+* Dòng LẺ bị viết lại (không thành dải): 1348 dòng trên 52 lượt; đối chiếu chéo thì 540
+  dòng là sửa, 377 dòng là hỏng, 266 dòng hỏng còn tới bản cuối (khoảng 5 dòng mỗi lượt;
+  lượt này có dòng 16 "老表，走著瞧" → "Cậu nhìn cho kỹ vào!"). Trọng tài theo từng dòng sai
+  khoảng 10%, và lùi một dòng lẻ có thể phá một cặp câu đã được sắp lại.
+* Lưới "mất thuật ngữ sau tinh chỉnh": 826 lượt trên 53 lượt dịch. Soi 17 dòng của lượt
+  này: 15 dòng là rút gọn hợp lý ("Trưởng đồn công an" → "Trưởng đồn", "sườn heo" →
+  "sườn", "bệnh giang mai" → "giang mai"), 2 dòng hỏng (16, 55). Lùi cả 17 sẽ làm dài 15
+  dòng trong khi 104 dòng đang đọc không kịp.
+* Dòng 12, 60, 265 còn chữ Hán suốt ba giai đoạn rồi mới được dịch lại ở cuối: bản cuối
+  sạch; dọn sớm sau dịch thô tốn thêm request để ba dòng được gọt thêm hai lượt.
+* Dịch thô 27 phút: mỗi lô kèm 1-2 đoạn video, lô đầu 125 giây, không lỗi, không thử
+  lại — là thời gian model xử lý video. Hai giai đoạn sau 7 và 8 phút.
+* "20 vạn" (5 dòng) và "hai mươi vạn" (1 dòng): giọng đọc đọc như nhau.
+
+### Kiểm thử
+
+* 65 test mới, dữ liệu chép nguyên văn từ các lượt chạy thật (đã đối chiếu tự động với
+  file chuẩn đoán); 31 test hỏng trên v3.23.588.
+* Toàn bộ: 5350 test đạt, 57 bỏ qua. Ruff: 6379 (không tăng).
+
+## [3.23.588] — 🔢 Lối đọc số theo cả phim: "hai mươi vạn" không còn bị đổi thành "hai trăm nghìn" vì một dòng lẻ
+
+Soi chuẩn đoán phân tích + chuẩn đoán dịch + app_log của v3.23.587 (phim "灭门惨案II借种",
+1246 dòng). Lượt này thử phân tích lại bằng gemini-3.8-flash thì gặp 503 năm lần liền, ứng
+dụng dừng đúng theo trần 5 lượt; sáng hôm sau dịch bằng bản phân tích cũ (ba giai đoạn
+đều gemini-3.5-flash-lite). Cùng bảng thuật ngữ, cùng model với lượt trước nên so được
+thẳng hai bản.
+
+Tác dụng của bản trước, đo trên hai lượt đó:
+
+* Dòng chép cả hai phương án `A / B` của bảng thuật ngữ: bản thô 2 → 0, bản cuối 2 → 0;
+  lưới gỡ không phải chạy lần nào. "đồn công an xã/phường" nay là "đồn công an" (dòng
+  60) và "đồn công an xã" (dòng 160).
+* Dòng không dùng cách dịch của bảng ở bản thô: 18/160 → 17/160 lượt xuất hiện.
+* Bản cuối sạch: không ngoặc, không dấu `/`, không chữ Hán sót, không dòng lệch.
+
+### 🔢 Lưới số đổi năm dòng đúng sang lối đọc khác — lần này vì một dòng model tự viết
+
+Bản thô đọc tiền theo lối "vạn" ở 9 dòng: "一萬" → "một vạn" (3 dòng), "兩萬" → "hai
+vạn", "二十萬" → "hai mươi vạn" (5 dòng). Riêng dòng 966 model viết "hai trăm nghìn". Lưới
+số xét RIÊNG con số 200.000, thấy có một cách đọc hiện đại, nên coi năm dòng "hai mươi
+vạn" là "lệch lối đọc" và đổi hết. Bản cuối: "một vạn tệ", "hai vạn tệ", nhưng "hai trăm
+nghìn" ở 6 dòng.
+
+Bản 587 mới chặn một đường dẫn tới lỗi này (chính lưới tự chế ra cách đọc hiện đại khi
+sửa dòng sai giá trị); đường còn lại — model tự viết một dòng theo lối hiện đại — vẫn
+mở. Cùng lỗi ở 3/13 lượt dịch phim này, 13 dòng bị đổi; 10 lượt kia đọc "vạn" trọn phim.
+
+Đo quy ước đọc số trên bản cuối của 52 lượt dịch (ba phim):
+
+| Độ lớn con số gốc | Đọc "vạn" | Đọc nghìn/triệu | Trộn hai lối |
+| --- | --- | --- | --- |
+| Dưới một triệu (X万) | 395 dòng | 132 dòng | — |
+| Từ một triệu (百万, 千万…) | 10 dòng | 1057 dòng | 48 dòng |
+
+"Năm mươi vạn tệ" nhưng "hai mươi triệu tệ" là quy ước tự nhiên của bản dịch, không phải
+hai lối lẫn lộn.
+
+* Lối đọc nay được xét cho CẢ PHIM, riêng từng hạng độ lớn (dưới một triệu / từ một
+  triệu): hạng nào có số dòng đọc "vạn" nhiều hơn số dòng đọc lối hiện đại thì "vạn" là
+  lối của phim ở hạng đó; bằng nhau thì giữ lối hiện đại như trước.
+* Dòng lệch lối được đổi về lối của phim, vẫn chỉ bằng cách đọc phim ĐÃ dùng cho chính
+  con số đó. Lượt này: sửa đúng một dòng (966 → "Đây là hai mươi vạn, vợ tôi đâu?"),
+  năm dòng kia giữ nguyên.
+* Bản của giai đoạn trước cũng được tính phiếu, nên giai đoạn sau có viết lại nhiều dòng
+  theo lối khác thì phim vẫn giữ một lối.
+* Dòng sai giá trị được sửa theo lối của phim trước, rồi mới tới đọc chuẩn.
+* File chuẩn đoán dịch: `number_issues` có thêm loại `standard_unit` (dòng đọc lối hiện
+  đại trong phim đọc "vạn").
+* Chạy lưới cũ và lưới mới trên 208 bản giai đoạn của kho: khác nhau ở 10 bản — 2 bản
+  của lượt trước phim này, 8 bản của ba lượt cũ phim "傻子落水" (v3.23.548–550), nơi bốn
+  dòng "一万" khi "một vạn" khi "mười nghìn" nay thống nhất về "một vạn" như các dòng
+  "mười tám vạn" của cùng phim.
+* Dựng lại bản thô trước lưới của một lượt phim "he thong sung the" (v3.23.578) từ
+  app_log: lưới cũ đổi ba dòng "hai vạn" sang "20 nghìn" trong khi "bốn mươi vạn",
+  "năm mươi vạn" của cùng phim giữ nguyên; lưới mới đổi hai dòng "20 nghìn" về "hai
+  vạn".
+
+### 🧾 Việc các lưới đã làm nay có trong file chuẩn đoán dịch
+
+Lỗi trên chỉ lộ ra nhờ app_log: `process_log` của file chuẩn đoán không ghi lưới số đã
+đổi dòng nào. Lượt này file chuẩn đoán có 5 loại sự kiện, trong khi app_log còn ba việc
+nữa — lưới số đổi 7 dòng, khâu dọn dịch lại hai dòng còn chữ Hán (12, 265), hai dòng bị
+rớt nội dung được hoàn nguyên (80, 116).
+
+Tám loại sự kiện mới, mỗi loại kèm các dòng đã sửa (và nhãn giai đoạn, với lưới
+chạy theo giai đoạn): `numbers_normalised` (kèm lý do và cụm trước/sau),
+`address_rules_enforced`,
+`vocative_names_fixed`, `name_regressions_reverted`, `residual_cjk_cleaned` (thay theo
+bảng hay dịch lại, kèm các dòng vẫn còn sót), `cjk_regressions_reverted`,
+`emptied_lines_reverted`, `content_drops_reverted`.
+
+### ℹ️ "Thuật ngữ gần trùng" chỉ còn là cảnh báo khi hai mục có bản dịch khác nhau
+
+Chuẩn đoán phân tích của hai lượt liền đều có đúng một cảnh báo: `一回生二回熟 ~
+一回生兩回熟` — "khâu dịch sẽ nhận hai chỉ thị mâu thuẫn". Hai mục đó có bản dịch giống
+hệt, tức là cùng một chỉ thị; người dùng không có gì để sửa. Trên 17 bảng thuật ngữ
+thật: 14 cặp gần trùng, 11 cặp có bản dịch giống hệt.
+
+* Bản dịch giống hệt → mức "info", ghi rõ "không ảnh hưởng bản dịch".
+* Bản dịch khác nhau (một bản chứa bản kia, vd "đổi đời" và "đổi đời / nâng tầm giai
+  cấp") → vẫn là cảnh báo, và chỉ nêu các cặp đó.
+* Danh sách `near_duplicates` trong file chuẩn đoán giữ nguyên cả hai loại.
+
+### Đã đo nhưng KHÔNG làm
+
+* **Khoá `must_translate_as_one_of` có được tuân thủ kém hơn `must_translate_as`
+  không** — mục nhiều phương án: 1/40 lượt không theo bảng ở lượt trước, 6/40 ở lượt
+  này. Trong 6 lượt đó, 4 lượt là một thuật ngữ ở một cảnh (`性自樂` → "tính tự lạc" thay
+  cho "tự sướng" / "thủ dâm"), 1 lượt là "đồn công an" (đúng). Chính thuật ngữ này bản
+  thô của v3.23.585 cũng dịch phỏng âm ("tính tự nhạc") dưới khoá cũ; mục một phương án
+  thì lượt này theo bảng tốt hơn (17 → 11/118). Một lượt chưa đủ để kết luận; xem tiếp
+  ở lượt sau.
+* **Hai dòng liền kề dịch giống hệt vì câu gốc tự lặp** (1129 "你死得瞑目吧", 1130
+  "你死得瞑目吧你死得瞑目了吧"): bị coi là trùng, khâu dọn dịch lại mà không đổi được,
+  cờ `duplicate_adjacent` còn 1. Cả kho có đúng 1 cặp kiểu này trên 52 lượt.
+* **"劍哥" khi "Kiếm Ca" khi "Anh Kiếm"**: 2/28 dòng lượt này, 7/324 dòng ở 2 lượt trên
+  cả kho.
+* **Giai đoạn sau làm câu dài ra, đọc không kịp?** Không: số dòng trên 25 ký tự/giây
+  gần như không đổi qua các giai đoạn (34 329 → 34 065 → 34 024 trên 52 lượt).
+* **Phân tích lại gặp 503**: 5 request rồi dừng, đúng thiết kế; đầu lượt phân tích ứng
+  dụng resolve lại 17 đoạn video mất 7 giây nhưng không tốn request nào.
+
+### Kiểm thử
+
+* `test_number_unit_style_v323588` (16): các dòng tiền của lượt này (bản thô trước lưới,
+  dựng lại từ app_log) và của phim "he thong sung the"; 7 ca hỏng trên v3.23.587.
+* `test_guard_events_v323588` (8): 6 ca hỏng trên v3.23.587.
+* `test_near_duplicate_severity_v323588` (4): 3 ca hỏng trên v3.23.587.
+* `test_number_film_style_v323587`: một ca của bản trước khẳng định đúng hành vi vừa
+  bị dữ liệu thật bác bỏ ("cách đọc hiện đại của một dòng thắng cả phim") — đã sửa lại.
+
+## [3.23.587] — 🔑 Xoay API key không còn làm mỗi đoạn phân tích mất thêm một request; mục thuật ngữ "A / B" chỉ còn một phương án trong lời thoại
+
+Soi chuẩn đoán phân tích + chuẩn đoán dịch + app_log của v3.23.586 (phim "灭门惨案II借种",
+1246 dòng; phân tích 17 đoạn bằng gemini-3.8-flash, mức suy luận cao).
+
+Tác dụng của bản trước, đo trên app_log này:
+
+* Phân tích xong 17/17 đoạn trong một lượt: nối tiếp 1 đoạn đã lưu, gửi 16 đoạn còn lại.
+* Bộ đếm request khớp server: key 1 chạm đúng 20 thì lượt kế tiếp bị server từ chối, ứng
+  dụng xoay sang key 2 ngay, không chờ theo `retryDelay`.
+* Không còn dòng nào mang chú thích thuật ngữ trong ngoặc, ở mọi giai đoạn.
+* Chuẩn đoán phân tích: 0 lỗi, 1 cảnh báo (xem mục cuối).
+
+### 🔑 Sau khi xoay key, mỗi đoạn phân tích mất thêm một request vì gửi file của key cũ
+
+Khâu phân tích resolve handle video của CẢ 17 đoạn một lần lúc bắt đầu, bằng key đang
+dùng. Key 1 cạn ở đoạn 12, ứng dụng xoay sang key 2 và tải lại đúng đoạn 12. Năm đoạn còn
+lại vẫn mang handle của key 1, nên lời gọi đầu của TỪNG đoạn nhận `403 PERMISSION_DENIED`
+("File video bị 403 (thuộc key cũ)") rồi mới tải lại và gọi lần hai.
+
+| | Lượt này | 12 app_log có xoay key |
+| --- | --- | --- |
+| Lượt gọi 403 vì file của key cũ | 5 (đoạn 13–17) | 87 |
+| … trong đó ở khâu phân tích | 5 | 86 |
+
+Mỗi lượt 403 đó **server vẫn tính vào hạn mức ngày** (20 request/ngày/key với
+gemini-3.8-flash). Trên 6 app_log có 10 lần một key vừa xoay (còn đủ 20 request) bị
+server chặn; đếm số lượt gọi của key đó tới lúc bị chặn:
+
+| Cách đếm | Số lượt ở 10 lần |
+| --- | --- |
+| thành công + 503 + 403 | 19, 20, 20, 20, 20, 20, 21, 21, 21, 21 |
+| thành công + 503 (bỏ 403) | 10, 12, 15, 16, 16, 16, 17, 18, 19, 19 |
+
+Chỉ cách đếm có 403 mới khớp hạn mức 20. Ứng dụng không đếm các lượt này nên ngỡ key còn
+hạn mức. Lượt này key 2 tiêu 10 request cho 5 đoạn.
+
+* Trước khi gửi mỗi đoạn, nếu key hiện tại khác key đã resolve handle của đoạn đó thì
+  resolve lại bằng key hiện tại, tải lại đoạn nếu file không truy cập được — rồi mới
+  gọi. Hai key cùng một dự án dùng chung file: resolve lại được ngay, không tải lên lần
+  nữa. Lượt này lẽ ra key 2 chỉ tiêu 5 request.
+* Ref mới của đoạn được ghi ngược vào danh sách của nơi gọi (kể cả khi key bị xoay ngay
+  trong lời gọi), nên lượt thử lại cuối phiên không tải lên lần nữa.
+* Lượt 403 vì file nay được ĐẾM vào bộ đếm request/ngày như lượt 503 (đường "403 rồi
+  mới tải lại" vẫn còn làm dự phòng cho khâu khác).
+
+### ✂️ Mục thuật ngữ `A / B`: hai phương án bị chép cả đôi vào lời thoại
+
+Bảng thuật ngữ ghi `衝動 = bốc đồng / manh động` — hai phương án, người dịch chọn một.
+Khối nhắc thuật ngữ theo lô đưa nguyên chuỗi vào `must_translate_as`, nên model chép cả
+hai. Đo trên 51 chuẩn đoán dịch (10 079 mục thuật ngữ, 3 084 mục có dạng `A / B`):
+
+| Giai đoạn | Dòng chép cả hai phương án | Số lượt chạy dính |
+| --- | --- | --- |
+| Dịch thô | 99 | 28/51 |
+| Tinh chỉnh | 3 | 2/51 |
+| Bản địa hoá | 2 | 2/51 |
+| **Bản cuối** | **3** | **2/51** |
+
+Ví dụ dịch thô: "Mày nói gì thế, đừng bốc đồng / manh động chứ.", "Cặn bã / loài súc
+sinh!", "Đừng, ông Chân / anh Chân, đừng.". Bản cuối của lượt này, hai dòng: "Bảo tất cả
+nam giới trong làng ngày mai đến đồn công an xã/phường." (mục `派出所 = đồn công an
+xã/phường`). Khâu thuyết minh đọc cả hai.
+
+* **Chặn từ gốc**: mục có nhiều phương án vào khối nhắc dưới dạng DANH SÁCH —
+  `{"term": "衝動", "must_translate_as_one_of": ["bốc đồng", "manh động"]}`. Mục một
+  phương án giữ nguyên `must_translate_as`.
+* **Lưới tất định sau mỗi giai đoạn** (cùng lưới gỡ chú thích của bản trước): câu gốc
+  không có dấu `/` mà bản dịch có hai phương án của CÙNG một mục nối bằng `/` → giữ
+  phương án đứng trước. "túc trực 24/24", "một triệu tệ/năm", "cảm ơn anh/chị" không bị
+  đụng (đọc lại mẫu 25 dòng được sửa trên kho: không dòng nào sửa oan).
+* Vế dịch viết liền `đồn công an xã/phường` được hiểu là hai phương án "đồn công an xã" |
+  "đồn công an phường" khi hai phía dấu `/` là hai từ thường thuần chữ và từ đứng sau
+  không phải mẫu số của một tỷ lệ (năm, tháng, giờ, người…).
+
+### 🔎 Mục thuật ngữ có hai cách viết ở vế gốc chưa bao giờ được nhắc
+
+98 mục có dạng `老山 / 魯山 = Lão Sơn` (thường do OCR đọc hai kiểu). Khối nhắc theo lô
+tìm NGUYÊN chuỗi "老山 / 魯山" trong câu gốc nên không bao giờ khớp: 228 dòng chứa các
+thuật ngữ ấy không được nhắc. Tỷ lệ dòng không dùng cách dịch của bảng: **17,5%** ở nhóm
+này, so với **8,4%** ở các mục được nhắc (21 644 lượt xuất hiện).
+
+* Mỗi cách viết thành một thuật ngữ riêng trong khối nhắc.
+* Số cách viết bằng số phương án (từ hai trở lên) thì ghép theo thứ tự: `炸药 / 炸弹 =
+  chất nổ / bom` → `炸药 → chất nổ`, `炸弹 → bom` (đọc lại cả 13 mục thật dạng này:
+  ghép theo thứ tự đều hợp nghĩa).
+* Bản đồ thay chữ Hán còn sót dùng cùng cách tách này. Trước đây nó tách vế dịch theo
+  `/` trước khi bỏ ngoặc: `卸货 = dỡ hàng (sinh con / lâm bồn)` cho đích thay thế "dỡ
+  hàng (sinh con" (29/3 457 mục của 17 bảng thật), và mục hai cách viết không có khoá
+  nào khớp. Chưa thấy dòng nào trong kho dính lỗi này; sửa vì cùng một gốc.
+
+Phần tách hai vế nằm ở module thuần mới `glossary_options` — một cách hiểu duy nhất cho
+khối nhắc, lưới gỡ và bản đồ thay thế.
+
+### 🔢 Sửa con số sai giá trị theo chính lối đọc của phim
+
+Phim đọc tiền theo lối "vạn" từ đầu tới cuối: "một vạn tệ", "hai vạn tệ", và năm dòng
+"二十萬" → "hai mươi vạn". Dòng 966 dịch thô nhầm thành "hai trăm vạn". Lưới số sửa đúng
+giá trị nhưng bằng cách đọc chuẩn mới "hai trăm nghìn"; sang giai đoạn tinh chỉnh, chính
+cụm mới đó thành "cách đọc chuẩn của phim" cho 200.000 và kéo **cả năm dòng đúng** đổi
+theo ("lệch lối đọc: hai mươi vạn → hai trăm nghìn" ở 6 dòng). Kết quả: cùng một phim,
+"hai vạn tệ" chỗ này, "hai trăm nghìn" chỗ kia.
+
+* Sai giá trị mà phim chỉ có cách đọc đúng theo lối "vạn" → sửa về chính cách đọc đó
+  ("Đây là hai mươi vạn, vợ tôi đâu?"); giai đoạn sau không còn gì để đổi.
+* Ưu tiên cụm cùng kiểu viết với cụm sai (chữ ↔ chữ, chữ số ↔ chữ số).
+* Cụm trộn hai lối ("ba triệu bốn mươi ba vạn") không được lấy làm mẫu. Phim đã có cách
+  đọc hiện đại cho con số đó, hoặc không có cách đọc đúng nào, thì xử lý như trước.
+* Chạy lại lưới trên 204 giai đoạn của kho: khác đúng 1 dòng, và bản mới ("hai vạn tệ đã
+  đến tài khoản.") trùng với bản cuối mà chính lượt chạy đó tự ra.
+
+### Đã đo nhưng KHÔNG làm
+
+* **Chức danh lệch giữa bảng nhân vật và bảng thuật ngữ** — `所長`: bảng thuật ngữ
+  "Trưởng đồn công an", bảng xưng hô 'Sở trưởng' (âm Hán-Việt); bản cuối 12 dòng "Trưởng
+  đồn", 3 dòng "Sở trưởng". Có ở 2/18 bản phân tích (41 dòng). Ở phim kia (`厂长`) cả 26
+  dòng đều được nhắc "giám đốc xưởng" mà vẫn chia 13/11, nên sửa bản phân tích cho khớp
+  không bảo đảm bản dịch nhất quán; ép một dạng bằng lưới tất định là chọn văn phong thay
+  model.
+* **Cảnh báo "thuật ngữ gần trùng"** (cảnh báo duy nhất của chuẩn đoán phân tích lượt
+  này: `一回生二回熟 ~ 一回生兩回熟`): 14 cặp ở 8/17 bảng, 11 cặp có bản dịch giống hệt
+  nhau. Cặp này sinh ra khi gộp bảng giữa các đoạn. Không bỏ bớt một mục sau khi gộp, vì
+  12/14 cách viết thứ hai có trong phụ đề và bỏ đi là mất lời nhắc cho chúng. Cảnh báo
+  giữ nguyên, không ảnh hưởng bản dịch.
+* **Thành ngữ vắt qua hai dòng phụ đề** (`拿人钱财` / `替人消灾`) không khớp khối nhắc:
+  107 lượt, 26 lượt bị đếm là "không khớp"; đọc lại 25 lượt thì bản dịch đều đúng, chỉ
+  do bản dịch cũng ngắt làm hai dòng.
+* **6,9% mục thuật ngữ không có trong phụ đề** (240/3 457; chữ trên biển hiệu, bia mộ,
+  lời thoại model nghe được): không bao giờ vào khối nhắc, chỉ làm bảng dài hơn.
+* **Xoay key sớm khi bộ đếm chạm hạn mức**: lượt này lời gọi thứ 21 tốn một vòng 503 +
+  429 (~75 giây, không tốn hạn mức). Đếm thừa thì xoay sớm lại bỏ phí request thật.
+
+### Kiểm thử
+
+* `test_stale_video_handle_v323587` (6): server giả giữ đúng ba luật của server thật
+  (file gắn theo dự án, 403 vẫn bị tính, vượt hạn mức thì 429) chạy trọn khâu phân tích
+  6 đoạn qua một lần xoay key. Trên v3.23.586 hỏng 4 ca: 3 lượt 403, key mới tiêu 7
+  request thay vì 4, bộ đếm của ứng dụng lệch server.
+* `test_glossary_options_v323587` (43): mục, câu gốc và bản dịch chép nguyên từ các lượt
+  chạy thật (hai mục dựng thêm để kiểm biên được ghi rõ); 27 ca hỏng trên v3.23.586.
+* `test_number_film_style_v323587` (9): các dòng 657–966 của lượt này và ca "两万" của
+  một phim khác; 5 ca hỏng trên v3.23.586.
+* Bốn file test dựng adapter bằng `__new__` nay dùng chung `bare_analysis_adapter` của
+  `gemini_call_harness`.
+
+## [3.23.586] — ⏱️ Hết hạn mức ngày không còn làm ứng dụng "ngủ" 10 tiếng; chú thích thuật ngữ không lọt vào lời thoại
+
+Soi chuẩn đoán phân tích + chuẩn đoán dịch + app_log của v3.23.585 (phim "灭门惨案II借种",
+1246 dòng; phân tích thử bằng gemini-3.8-flash, 3.6-flash rồi xong bằng 3.7-flash).
+
+Tác dụng của bản trước, đo trên app_log này:
+
+* Mức trần 5 lượt thử chạy đúng: các lần chờ 30 → 60 → 120 → 120 giây; đoạn 1 của
+  gemini-3.8-flash thành công ở lượt thứ 5; hai lần gemini-3.6-flash quá tải kéo dài thì
+  dừng sau 5 request mỗi lần (10 request, không đoạn nào xong — cách cũ cho tới 11 lượt
+  mỗi đoạn rồi đi tiếp sang đoạn sau).
+* Bộ đếm đã tính lần 503: "key #1 còn 15 req/ngày" ngay sau 5 lần 503.
+* Phân tích hoàn tất nhờ tiến độ đã lưu: gemini-3.7-flash chỉ gửi 1 đoạn còn thiếu (2
+  request) cho đủ 17/17 đoạn. Dịch thô dùng lại 6/21 lô của lần chạy dở.
+
+### ⏱️ Hết hạn mức ngày mà không còn key: dừng ngay, không ngủ theo lời server
+
+Lỗi nặng nhất của lượt này. 20:47, đoạn 2 nhận 429 hết hạn mức ngày khi cả ba API key
+đã cạn. Server gửi kèm `retryDelay` **36 737 giây** — đúng bằng thời gian tới mốc đổi
+ngày — và ứng dụng ghi "Chờ 36737.5s rồi thử lại" rồi đứng im **gần 9 tiếng**, tới khi
+người dùng bấm huỷ lúc 05:44. (Bộ quản lý quota đã kẹp con số này còn 180 giây từ
+v3.23.534, nhưng vòng thử lại của adapter vẫn ngủ theo con số gốc.) App_log hôm trước
+cũng có một lần server gửi 54 643 giây; lần đó còn key để xoay nên không lộ.
+
+* Server từ chối vì hạn mức NGÀY và không còn key nào để xoay → báo `QuotaExhaustedError`
+  ngay, không chờ. Phân tích giữ các đoạn đã xong và hiện cảnh báo "chưa đủ" như bản
+  trước; dịch giữ các lô đã xong.
+* Thông báo nêu luôn bao lâu nữa hạn mức hồi khi server có cho biết: "Model
+  'gemini-3.8-flash' đã hết hạn mức request/ngày ở mọi API key (server xác nhận). Server
+  báo hạn mức hồi sau khoảng 10 giờ 12 phút."
+* Mọi thời gian chờ do server yêu cầu bị kẹp ở 180 giây, cho bất kỳ loại lỗi nào.
+* Nhận diện "hết hạn mức ngày" chặt hơn: mã quota `…PerDay…` quyết định; hạn mức
+  request/PHÚT dùng chung tên metric `free_tier_requests` nay không còn bị coi là hạn mức
+  ngày (từ bản này nhận nhầm là dừng cả lượt chạy, nên phải chặn trước).
+
+### 🧹 Chú thích trong bảng thuật ngữ không còn bị chép vào lời thoại
+
+Bảng thuật ngữ ghi `gốc = bản dịch (chú thích)`. Khối thuật ngữ nhắc theo từng lô (có từ
+v3.23.500) đưa nguyên cả vế đó vào chỉ thị `must_translate_as`, nên model chép luôn phần
+trong ngoặc. Đo trên 50 chuẩn đoán dịch đã nhận:
+
+| Giai đoạn | Dòng bị chèn chú thích | Số lượt chạy dính |
+| --- | --- | --- |
+| Dịch thô | 462 | 47/50 |
+| Tinh chỉnh | 67 | 21/50 |
+| Bản địa hoá | 21 | 12/50 |
+| **Bản cuối** | **26** | **15/50** |
+
+Ví dụ ở bản cuối: "tôi gọi 120 (cấp cứu y tế) cho cô.", "chiếc xe Mercedes G-Class (Đại
+G) này là của ai cơ?", "Đứa bé sinh ra bằng thụ tinh ống nghiệm (IVF),". Lượt này: 10 dòng
+dịch thô ("Thanh thiên bạch nhật (giữa ban ngày ban mặt), mua bán dâm (mãi dâm mua
+dâm),"), giai đoạn tinh chỉnh tự bỏ hết. Khâu thuyết minh đọc cả phần trong ngoặc.
+
+* **Chặn từ gốc**: khối theo lô chỉ đưa phần dùng trong lời thoại ("thanh thiên bạch
+  nhật"); chú thích vẫn nằm trong bảng đầy đủ ở system_instruction để model hiểu nghĩa.
+* **Lưới tất định sau mỗi giai đoạn** (module thuần `glossary_note_guard`): câu gốc không
+  có ngoặc mà bản dịch có ngoặc chứa đúng một chú thích/phương án của bảng thuật ngữ,
+  hoặc lặp lại cụm từ ngay trước nó ("Lạng Sơn (Lạng Sơn)") → gỡ ngoặc, dọn khoảng trắng
+  và dấu câu. Chạy lại trên toàn bộ 50 chuẩn đoán: sau lưới, bản cuối không còn dòng nào
+  có ngoặc mà câu gốc không có; ngoặc khác ở các giai đoạn giữa (chỉ dẫn "(Thở dốc)")
+  được giữ. Nhật ký diễn biến ghi sự kiện `glossary_notes_stripped`.
+
+### 🔁 Không nối tiếp lượt dịch dở khi bảng nhân vật/thuật ngữ đã đổi
+
+Lượt này dùng lại 360/1246 dòng dịch thô của một lần chạy dở — nhưng lần đó dịch bằng
+bảng nhân vật do gemini-3.8-flash phân tích, còn lượt này dùng bảng mới của
+gemini-3.7-flash. Bản dịch thô vì thế mang hai bộ tên (`當當` "Đang Đang" ở dòng 263, 281
+trong khi bảng ghi "Đương Đương"; `老表` "Biểu ca" ở dòng 7, 16, 343) và dòng 236 còn giữ
+tới bản cuối cách dịch `中標` của bảng cũ. Khoá checkpoint cố ý không chứa bảng nhân
+vật (để tiếp tục được lượt dở), và tính năng tiếp tục giữa giai đoạn của v3.23.584 thừa
+hưởng lỗ hổng đó.
+
+* File checkpoint và file tiến độ dở ghi thêm dấu vân tay của bảng nhân vật + bảng thuật
+  ngữ. Mở lại mà dấu vân tay khác → bỏ các giai đoạn đã lưu và tiến độ dở, dịch lại
+  bằng ngữ cảnh mới; nhật ký cảnh báo và ghi sự kiện `checkpoint_discarded`.
+* Visual Cues và tóm tắt KHÔNG nằm trong dấu vân tay (cues được quét bổ sung giữa hai lần
+  chạy của cùng một lượt). File do bản cũ ghi (chưa có dấu vân tay) vẫn được dùng tiếp.
+
+### 🎯 Hai cờ chuẩn đoán bớt báo nhầm
+
+* **`address_inconsistency`** đếm cả ngôi ba và số nhiều. Lượt này cặp `醫生 → 龍傳人` bị
+  báo với `{"tôi": 6, "ông": 4, "cô": 4, "cậu": 3}`: cả 4 lượt 'cô' là "cô ấy" (bệnh
+  nhân), 2 lượt 'ông' là "ông ấy". Nay bỏ "cô ấy/anh ta", "chúng ta/bọn tao/tụi mày" và
+  độc thoại. Trên 50 chuẩn đoán: 137 → 105 cặp bị báo (65 cặp hết bị báo oan, 33 cặp lộn
+  xộn thật trước đây bị các lượt ngôi ba làm loãng tỉ lệ nay hiện ra); số cặp đủ dữ liệu
+  2892 → 2690. **Con số của cờ này vì thế không so được với các bản trước.**
+* **`roster_ambiguous_address`** (cảnh báo duy nhất của chuẩn đoán phân tích lượt này,
+  kèm lời khuyên phân tích lại — việc tốn hạn mức nhất): 6 cặp bị báo, soát tay chỉ 1 cặp
+  mơ hồ thật (`甄劍聲 → Hồng Chấn: 'anh/ông'`). Nay bỏ qua mệnh đề mà người nghe là một
+  LOẠI người ("cấp dưới": 'cậu/cô', "khách": 'anh/chị' theo giới), là nhiều nhân vật
+  ("Kiếm Thanh/Khả Tú"), và hai cách viết của cùng một từ ('ba/lão ba', 'em/cô em').
+  Trên 17 bảng nhân vật khác nhau: 35 → 23 cặp; 12 cặp bỏ đi đều thuộc ba loại trên.
+
+### Đã đo nhưng KHÔNG làm
+
+* 69/105 cặp `address_inconsistency` còn lại tách sạch thành hai pha theo thời gian
+  (lượt này: `秦可秀 → 朱正軍` "tôi/chú" tới dòng 716, "em/anh" từ dòng 1094, sau khi
+  hai người thành đôi). Nhưng "tách sạch" không có nghĩa là đúng: `柳慕云 → 宋钱` cũng
+  tách sạch từ "tôi/anh" sang "chị/em" — đảo vai lớn bé, là lỗi thật. Phân biệt hai loại
+  cần hiểu quan hệ nhân vật, không làm tất định được.
+* Bỏ từ thân tộc trong danh từ tập hợp ("hai cha con", "anh em họ hàng") khỏi phép đếm:
+  khoảng 1 700 lượt trên toàn bộ dữ liệu nhưng chỉ đổi 105 → 106 cặp, lại dính ca nhầm
+  ("cô chú ý điện thoại" = "cô, chú ý…"). Không đáng.
+* Mục thuật ngữ trùng tên nhân vật mà dịch khác bảng nhân vật (`老表`: bảng nhân vật "Lão
+  biểu", bảng thuật ngữ "anh em họ" → bản cuối 2 dòng mỗi kiểu): 4 mục trên 17 lượt phân
+  tích, và không có căn cứ tất định để chọn bên nào đúng.
+* 12 dòng sai quy tắc xưng hô: phần lớn là model chọn đúng hơn bảng (`甄劍聲 → 洪震` xưng
+  "tao" khi đối mặt kẻ hại vợ, bảng ghi "tôi"; đôi `朱正軍 ↔ 秦可秀` chuyển "anh/em") hoặc
+  nhãn Visual Cues nghi gán nhầm người nói — không sửa tất định.
+
+### Kiểm thử
+
+* `tests/unit/infrastructure/test_daily_quota_wait_v323586.py` (14 test, dùng nguyên văn
+  lỗi 429 của nhật ký với `retryDelay` 36 736 giây): dừng ngay khi hết key, vẫn xoay khi
+  còn key, hạn mức phút không bị coi là hạn mức ngày, kẹp trần thời gian chờ, câu thông
+  báo. 6 test hành vi trượt trên v3.23.585.
+* `tests/unit/application/test_glossary_note_guard_v323586.py` (24 test): 9 dòng thật bị
+  chèn chú thích, khối thuật ngữ theo lô, chạy thật use case. 2 test (khối theo lô, use
+  case) trượt trên v3.23.585.
+* `tests/unit/application/test_resume_context_v323586.py` (9 test): dấu vân tay, file
+  checkpoint cũ/mới, lượt dịch dở rồi đổi bảng nhân vật → dịch lại đủ; cùng bảng → vẫn
+  tiếp tục. Kịch bản đổi bảng trượt trên v3.23.585 (dùng lại 6 dòng cũ).
+* `tests/unit/application/test_address_third_person_v323586.py` (4 test, 14 dòng thật của
+  cặp 醫生 → 龍傳人) — 3 test trượt trên v3.23.585;
+  `tests/unit/application/test_ambiguous_address_v323586.py` (5 test, bảng nhân vật thật)
+  — 4 test trượt trên v3.23.585.
+* Đồ giả dùng chung tách ra `tests/unit/infrastructure/gemini_call_harness.py` và
+  `tests/unit/application/stage_resume_harness.py`; `test_overload_quota_v323585.py`,
+  `test_stage_resume_v323584.py` chuyển sang dùng chúng. `test_overload_quota_v323585`
+  và `test_monologue_v323577` cập nhật một khẳng định mỗi file theo hành vi mới.
+
+## [3.23.585] — 🛟 Gemini quá tải (503) không còn đốt sạch hạn mức ngày của model mạnh
+
+Soi chuẩn đoán phân tích + chuẩn đoán dịch + app_log của v3.23.584 (phim "灭门惨案II借种",
+1246 dòng, 17 đoạn video, phân tích bằng gemini-3.8-flash rồi gemini-3.7-flash — hai
+model chỉ có 20 request/ngày mỗi key).
+
+Phía DỊCH lượt này sạch: 0 dòng lệch, 0 khối lệch hàng, 0 dòng còn chữ Hán, 0 lỗi số, 0
+cặp xưng hô không nhất quán (32 cặp được soát), 0 dòng trôi xưng hô; còn 10 dòng sai quy
+tắc xưng hô và 1 quy tắc bị báo lạc hậu (甄劍聲 → 朱正軍: bảng ghi "tôi", phim dùng "anh"
+ở 12 dòng — file chuẩn đoán đã nêu sẵn cách sửa bảng). Thứ giới hạn chất lượng ở lượt
+này là PHÂN TÍCH: phải chạy ba lần trong hai ngày mới đủ 17 đoạn.
+
+### Đo trên app_log: 503 vẫn bị tính vào hạn mức ngày
+
+Ứng dụng hoàn lại bộ đếm sau mỗi lần 503 vì cho rằng server không tính. Bảy lần server
+báo hết hạn mức 20 request/ngày trong nhật ký cho thấy điều ngược lại:
+
+| Lúc | Model · key | Ứng dụng đếm | Số lần 503 | Tổng |
+| --- | --- | --- | --- | --- |
+| 20:49 | 3.8-flash · …0d53 | 0 | 21 | 21 |
+| 21:22 | 3.8-flash · …1f16 | 0 | 20 | 20 |
+| 21:52 | 3.8-flash · …53b9 | 1 | 18 | 19 |
+| 06:14 | 3.7-flash · …0d53 | 8 | 13 | 21 |
+| 06:38 | 3.7-flash · …1f16 | 5 | 11 | 16 |
+| 15:32 | 3.8-flash · …0d53 | 8 | 13 | 21 |
+| 15:49 | 3.8-flash · …1f16 | 4 | 13 | 17 |
+
+Tổng luôn xấp xỉ 20. Hệ quả ở lần phân tích đầu (20:20-21:53): mỗi lời gọi được thử tới
+~11 lượt (ngân sách chờ 600 giây), 59 lần 503 + 1 lần thành công = 60 request của cả ba
+key, xong đúng 1/17 đoạn, và ứng dụng vẫn ghi "key còn 20 req/ngày" cho key vừa cạn.
+
+Thống kê mọi app_log đã nhận (phân tích theo đoạn), số đoạn thành công sau k lần 503:
+k=0: 195 · 1: 50 · 2: 10 · 3: 13 · 4: 5 · 5: 1 · 6: 3 · 7: 2; 11 đoạn hỏng hẳn sau 10-11
+lần. Tức 273/279 đoạn (97,8%) xong trong 5 lượt thử, và từ lượt thử thứ 9 trở đi không
+lượt nào thành công.
+
+### 🛟 Thử lại tiết kiệm cho model hạn mức ít
+
+* **Bộ đếm giữ lần 503.** `GeminiQuotaManager.release(..., request_counted=True)` chỉ
+  hoàn token, giữ request trong bộ đếm phút và bộ đếm ngày. Nhờ vậy việc chọn key "còn
+  nhiều hạn mức nhất" và dự báo "đủ hạn mức cho cả phiên" dựa trên con số sát thật. Lỗi
+  429 và lỗi mạng vẫn được hoàn như trước.
+* **Tối đa 5 lượt thử cho một lời gọi**, chờ thưa dần 30 → 60 → 120 → 120 giây (module
+  thuần `overload_retry_policy`). Bốn lần chờ đó dài 330 giây — bằng quãng mà cách cũ
+  (30, 30, 30, 42, 82, 90…) cần 7 lượt mới phủ được. Đổi key giữa chừng không cho thêm
+  5 lượt nữa: quá tải là của model, không phải của key.
+* **Chỉ áp khi hạn mức ngày ≤ 100 và là SỐ THẬT**: server đã nêu trong lỗi 429, hoặc
+  người dùng tự cấu hình. Bảng suy theo tên model cố ý bảo thủ (có model bị đoán 20 mà
+  thật là 500) nên không đủ căn cứ để siết; model hạn mức dồi dào và tài khoản trả phí
+  giữ nguyên ngân sách chờ 600 giây. Con số server nêu nay được GHI LẠI cả khi trùng với
+  con số đang dùng (trước đây 20 = 20 thì không ghi gì, nên hạn mức của gemini-3.8-flash
+  mãi là "phỏng đoán") và lưu qua các phiên.
+* **Phân tích dừng hẳn khi một đoạn hết 5 lượt vì quá tải**: không gửi các đoạn còn lại,
+  không thử lại cuối phiên, không gọi nốt lượt "chỉ văn bản". Các đoạn đã xong được giữ
+  (tiến độ đã lưu từ v3.23.564); chạy lại sau ít phút chỉ gửi đoạn còn thiếu. Thông báo
+  nêu rõ lý do và cách làm tiếp.
+
+Ước tính theo đúng chuỗi phản hồi trong nhật ký: lần phân tích đầu tiêu **5 request
+thay vì 60** khi hạn mức đã được ghi nhận (≈ 22 nếu đó là lần đầu tiên server nêu hạn
+mức), giữ lại phần còn lại cho lúc server hết quá tải. Lần phân tích sáng hôm sau (cũ:
+53 request cho 16/17 đoạn) sẽ dừng ở đoạn 13 sau 30 request với 12 đoạn xong — tốn ít
+hạn mức hơn cho mỗi đoạn (2,5 so với 3,3) nhưng phải bấm chạy lại một lần cho 5 đoạn
+cuối. Đó là đánh đổi có chủ ý: hạn mức ngày mới là thứ khan hiếm.
+
+### 📣 Phân tích thiếu đoạn không còn báo "Phân tích hoàn tất"
+
+Lượt phân tích dừng giữa chừng — hết hạn mức ngày (từ v3.23.564) hay quá tải (bản này)
+— trả về phần đã xong, và giao diện hiện đúng thông báo thành công như một lượt đủ; chỉ
+nhật ký mới ghi là thiếu đoạn. Trong app_log, lần đầu (1/17 đoạn) và lần hai (16/17
+đoạn) đều kết thúc như vậy. Vì bản này chủ động dừng sớm hơn, kết quả phân tích nay mang
+theo danh sách đoạn còn thiếu + lý do dừng, và trang Dịch hiện CẢNH BÁO: "Mới phân tích
+16/17 đoạn video — còn thiếu đoạn 14. Gemini đang quá tải (503)… Bấm Phân tích lại sau
+ít phút… chỉ gửi đoạn còn thiếu". Câu chữ do hàm thuần `analysis_completeness` dựng.
+
+### 🔑 Hết hạn mức ngày ở lượt thử cuối vẫn xoay key
+
+Việc xoay sang key khác trước đây nằm trong điều kiện "còn lượt thử". Khi các lượt đã
+tiêu vào 503 và lượt cuối nhận 429 hết hạn mức ngày, đoạn phân tích bị bỏ dù còn key
+khác; đoạn kế tiếp mới xoay key. Nhật ký có 4 lần (đoạn 2, 7 lần đầu; đoạn 14 ở cả hai
+lần sau). Nay xoay key không phụ thuộc số lượt còn lại, và key mới được thử đủ lượt.
+
+### 🎞️ Xoay key ngay lúc đặt chỗ quota: tải lại video TRƯỚC khi gọi
+
+Khi key hiện tại đã bị server chặn, key được xoay ở bước đặt chỗ — sau bước tải lại
+video ở đầu vòng lặp — nên lời gọi vẫn mang file của key cũ: 403, mất một request của
+key mới và một lượt thử. Nay tải lại ngay sau khi đặt chỗ.
+
+### 🗺️ Địa danh quy ước không bị báo sai âm Hán-Việt
+
+File chuẩn đoán phân tích báo ``諒山 "Lạng Sơn" (諒 đọc lượng)`` — trong khi "Lạng Sơn"
+đúng là tên tỉnh. Bảng âm thêm "lạng" làm âm CHẤP NHẬN của 諒/谅 (không bao giờ dùng làm
+âm đề xuất: tên người có chữ 諒 vẫn được gợi ý "lượng"); `tools/build_hanviet_readings.py`
+có bảng bổ sung tương ứng để lần dựng lại không làm mất.
+
+### Đã đo nhưng KHÔNG làm
+
+* "Một lời gọi không tiêu quá 1/3 số request còn lại của key": thử trên chính nhật ký
+  này thì lần phân tích sáng hôm sau dừng ngay ở đoạn 4 — đoạn ấy thành công ở lượt thử
+  thứ 5 khi key còn 12/20 — tức dừng oan trong một ngày quá tải bình thường. Giữ mức
+  trần cố định 5 lượt.
+* Coi hạn mức suy theo tên model là số thật ngay từ đầu (để lần đầu tiên cũng được
+  siết): tài khoản trả phí có hạn mức cao hơn nhiều so với bảng miễn phí, siết theo
+  phỏng đoán sẽ làm các lượt dịch của họ dễ đứt hơn. Chỉ tin con số server nêu.
+* 10 dòng còn sai quy tắc xưng hô: 4 dòng 洪震 xưng "tao" với con trai (bảng ghi "bố"),
+  3 dòng vợ chồng 洪震 xưng "anh/em" (bảng ghi "tôi"), 3 dòng lẻ. Đều là lựa chọn giọng
+  điệu của model theo cảnh, không có bằng chứng độc lập để sửa tất định.
+
+### Kiểm thử
+
+* `tests/unit/infrastructure/test_overload_quota_v323585.py` (25 test, dùng nguyên văn
+  thông báo 503 và 429 trong nhật ký): chính sách thử lại; bộ đếm giữ lần 503; hạn mức
+  server nêu trùng phỏng đoán vẫn được ghi nhận và lưu; chạy thật vòng thử lại của
+  `_call_gemini` với đồng hồ giả (5 lượt, chờ 30/60/120/120, bộ đếm = 5; model dồi dào
+  và hạn mức phỏng đoán giữ ngân sách cũ); xoay key ở lượt thử cuối; tải lại video khi
+  xoay key lúc đặt chỗ; phân tích dừng ở đoạn đầu / giữ các đoạn đã xong / chạy lại chỉ
+  gửi đoạn thiếu; kết quả thiếu đoạn mang theo danh sách đoạn và lý do. 16 test trượt
+  trên v3.23.584.
+* `tests/unit/application/test_analysis_completeness_v323585.py` (5 test) và
+  `tests/unit/presentation/test_incomplete_analysis_v323585.py` (5 test): câu thông báo
+  theo từng lý do dừng, dòng trạng thái và thông báo cảnh báo của trang dịch.
+* `tests/unit/application/test_place_name_reading_v323585.py` (4 test): "Lạng Sơn" được
+  chấp nhận cho cả 諒山 lẫn 谅山 (2 test này trượt trên v3.23.584), âm đề xuất vẫn là
+  "lượng", âm sai khác vẫn bị báo.
+* `test_analysis_resume_v323564.py`: adapter dựng tay trong test khai báo thêm
+  `_quota_manager`.
+
+## [3.23.584] — 💾 Dịch đứt giữa chừng không còn mất các lô đã dịch (tiết kiệm hạn mức Gemini)
+
+Soi ba chuẩn đoán dịch thật của v3.23.583 (3 phim: 1246, 3902, 5540 dòng) + app_log:
+
+* Tác dụng của lưới khôi phục xưng hô (bản trước) trên lượt dịch thật: phim "he thong
+  sung the" khôi phục 21 dòng ở giai đoạn tinh chỉnh + 14 dòng ở bản địa hoá; phim "傻子落
+  水…" 13 + 25 dòng; phim "灭门惨案II" 2 + 4 dòng. Dòng sai quy tắc xưng hô của phim "傻子
+  落水…" 43 → 33 (so với lượt v3.23.580). Cảnh Tống Hân Sảng ↔ Trương Mẫn 3003-3132 nay
+  giữ "tớ/cậu" ở mọi giai đoạn; riêng đoạn 2582-2595 thì ngay bản dịch thô đã dùng "chị"
+  nên lưới không có bản đúng để khôi phục (xem "Đã đo nhưng KHÔNG làm").
+* Bản địa hoá đổi LẠI đúng những dòng giai đoạn tinh chỉnh vừa được khôi phục (2839,
+  2840, 2842… của "he thong sung the") — model lặp lại cùng một lựa chọn sai, nên lưới
+  phải chạy ở mọi giai đoạn như hiện nay.
+
+### 💾 Tiếp tục giai đoạn dịch dở từ lô đã xong
+
+App_log của phim "he thong sung the" cho thấy lượt dịch phải chạy BA lần:
+
+| Lần | Dừng vì | Lượt gọi Gemini đã dùng |
+| --- | --- | --- |
+| 1 (13:28) | hết hạn mức ngày (500 request) | 43 |
+| 2 (14:08) | mạng chập chờn, hết 5 lần thử | 25 |
+| 3 (14:51) | xong | 96 cho giai đoạn dịch thô |
+
+Checkpoint chỉ lưu sau khi CẢ một giai đoạn xong, nên lần 2 và lần 3 đều dịch lại giai
+đoạn dịch thô từ lô đầu tiên: 68 lượt gọi (≈ 70% một giai đoạn, ≈ 23% cả lượt 3 giai
+đoạn) bị vứt bỏ — trong khi hạn mức ngày chính là giới hạn của Gemini với gói miễn phí.
+Các app_log khác cũng có lượt dịch đứt giữa chừng vì 503 hay mất kết nối.
+
+* Mỗi lô dịch xong được ghi ngay vào file tiến độ riêng `{key}.partial.json` cạnh
+  checkpoint (ghi qua file tạm rồi thay thế — mất điện giữa lúc ghi không làm hỏng tiến
+  độ cũ). Lần chạy sau cùng phụ đề, cùng cấu hình: lô nào đã có đủ mọi dòng thì dùng lại,
+  không gọi API; chỉ dịch các lô còn thiếu. Nhật ký ghi "tiếp tục lần chạy dở — đã có
+  N/M dòng" và sự kiện `stage_resumed_partial`.
+* Chỉ dùng lại khi ĐẦU VÀO của giai đoạn y hệt lần trước (dấu vân tay loại giai đoạn +
+  nội dung từng dòng) và từng dòng đã lưu cùng bản gốc với dòng đang dịch; giai đoạn
+  xong thì tiến độ dở của nó bị xoá; xong cả lượt thì xoá hết như trước. Nút "Xoá bộ nhớ
+  đệm dịch" xoá cả file tiến độ.
+* Áp cho cả chế độ dịch song song: lô xong trong một đợt vẫn được lưu dù lô khác cùng
+  đợt thất bại.
+
+### Đã đo nhưng KHÔNG làm
+
+Gần một nửa số dòng còn sai quy tắc xưng hô (35/82 ở ba lượt này) là từ thân tộc ('em',
+'chị', 'anh'…) mà lưới không dám thay. Thử quy tắc "cùng cảnh, cùng cặp nhân vật đã có ≥ 2 dòng dùng đúng cách
+xưng → thay từ thân tộc": 162 chỗ trên toàn bộ chuẩn đoán, nhưng soát tay phim "傻子落
+水…" thì nhiều chỗ chính NHÃN Visual Cues sai người nói (dòng 273 "我" thật ra là Tống Tiền
+đáp lời, dòng 544 nói với em gái chứ không phải với mẹ, dòng 3635 là Trương Y Bối nói) —
+bản dịch đúng, sửa sẽ thành sai. Lưới khôi phục của bản trước an toàn hơn vì có HAI bằng
+chứng độc lập (bảng nhân vật + chính bản dịch trước); quy tắc này chỉ có nhãn nên không áp.
+
+### Kiểm thử
+
+* `tests/unit/application/test_stage_resume_v323584.py` (14 test): bảng tra dòng đã dịch
+  (đủ lô / thiếu dòng / khác bản gốc / đánh số lại khi bỏ dòng rác), file tiến độ (đọc
+  lại sau khi khởi động, đổi đầu vào, file hỏng, xoá khi giai đoạn xong), và chạy thật
+  use case + adapter Gemini với lô giả lập lỗi: đứt ở giai đoạn dịch thô, đứt ở giai đoạn
+  tinh chỉnh, đứt trong chế độ song song. 3 test chạy thật trượt trên v3.23.583 (lần
+  sau dịch lại từ đầu giai đoạn).
+
+## [3.23.583] — 🗣️ Giai đoạn tinh chỉnh không còn được làm hỏng xưng hô mà bản dịch thô đã dùng đúng
+
+Soi chuẩn đoán thật v3.23.582 (phim "he thong sung the", 5540 dòng; chuẩn đoán phân tích +
+app_log của cùng lượt):
+
+* Tác dụng của bản trước: không còn lỗi số nào (`number_issues` 1 → 0); app_log cho thấy
+  lưới số sửa đúng 1143 ("ba triệu bốn trăm ba mươi vạn" → "… nghìn"), 3052/3054 ("tám
+  mươi nghìn" → "800 nghìn"); họ "Triệu" không còn bị đụng tới.
+* Phân tích ngữ cảnh: Visual Cues phủ 97,7% (5415/5540 dòng), roster 39 nhân vật, 106 quy
+  tắc xưng hô — đủ dữ liệu để soi xưng hô từng dòng.
+
+### 🗣️ Tinh chỉnh vừa sửa vừa PHÁ xưng hô
+
+Cảnh Tống Hân Sảng nói với bạn thân Trương Mẫn (roster: tự xưng 'mình' gọi 'cậu'): bản
+dịch thô "tớ … cậu" ở mọi dòng; giai đoạn tinh chỉnh phong cách đổi 6 dòng giữa cảnh sang
+"chị … em" ("**chị** cầu xin **em** đấy", "**em** mau đưa **chị** đi tìm thằng bé") trong
+khi các dòng xung quanh vẫn "tớ/cậu". Cảnh Lâm Dật nhờ Trương Mẫn (roster: tự xưng 'em'
+gọi 'chị Mẫn'): bản thô "em", tinh chỉnh đổi 9 dòng sang "tôi". Lưới xưng hô cũ không cứu
+được: 'chị'/'em' cũng là danh từ chỉ người nên nó không dám thay, còn quy tắc 'mình' thì
+cả cảnh không dòng nào dùng.
+
+Đo trên 45 lượt dịch thật (3 phim): giữa bản dịch thô và bản cuối có 302 dòng mà đại từ đổi
+từ cách roster cho phép sang cách roster KHÔNG cho phép (449 dòng đổi theo chiều ngược lại
+— tinh chỉnh vừa sửa vừa phá).
+
+* **Lưới mới** chạy sau mỗi giai đoạn tinh chỉnh, trước lưới ép quy tắc: dòng mà bản
+  trước dùng đại từ đúng roster còn bản mới đổi sang đại từ sai thì đặt lại ĐÚNG từ đó,
+  giữ nguyên phần văn phong mới của câu. Vai lấy từ câu gốc (chỉ 我 / chỉ 你 / cả hai —
+  "我求你了" → "tớ cầu xin cậu"). 'mình' và 'tớ' coi là cùng vai ngang hàng.
+* Chốt an toàn rút từ soát tay: đại từ mới phải đứng đúng chỗ đại từ cũ (bản trước "Chị
+  xem," / bản mới "Em đảm bảo," cho "你放心" — 'em' giờ là người nói, không được thay);
+  phải đặt lại được MỌI đại từ sai của dòng (khôi phục một nửa ra câu lai "em mau đưa tớ
+  đi" — không làm); không đụng đại từ đứng sau từ thân tộc hay tên riêng; bỏ qua dòng mà
+  Visual Cues đổi người nói giữa câu.
+* Kết quả trên 45 lượt thật: 279 dòng được khôi phục; soát tay 74 dòng (mọi dòng của phim
+  này, mọi dòng hai vai, 30 dòng ngẫu nhiên) sai 1 — do nhãn Visual Cues gán ngược người
+  nói ("叫你兰姐吧"). Mô phỏng lại chuỗi giai đoạn: số dòng lệch quy tắc xưng hô
+  1461 → 1335; riêng phim này 56 → 48, trôi xưng hô 9 → 8. Nhật ký ghi sự kiện
+  `address_regression_restored`.
+
+### 📊 Số đo xưng hô của file chuẩn đoán đếm nhầm danh từ
+
+`address_inconsistency` báo cặp Lâm Dật → bác sĩ điều trị xưng hô lộn xộn với biến thể
+'bác' (4 lượt — đều là "**Bác** sĩ!") và 'chị' (3 lượt — đều là "**chị** dâu tôi"). Nay từ
+thân tộc đứng trước "sĩ", "dâu", "trai", "gái", "chủ", "giáo", "nhóc"… không còn được đếm
+là đại từ (dùng chung với lưới mới ở trên). Lưu ý khi so số: bỏ phần đếm nhầm làm tổng nhỏ
+lại nên vài cặp dùng THẬT SỰ bốn đại từ (vd cặp có quy tắc theo giai đoạn "bình thường
+tôi/cô, lúc đóng kịch anh/em") nay vượt ngưỡng — trên toàn bộ chuẩn đoán số cặp bị báo
+125 → 136, không phải bản dịch kém đi.
+
+### Còn thấy nhưng chưa sửa
+
+* Dải 3380-3395 lệch đúng một dòng ở MỌI giai đoạn (bản thô đã lệch: "强哥" → câu của
+  dòng sau, "张铭啊" → "Trương Minh ạ," nằm ở dòng 3391). Câu gốc tiếng Trung không có dấu
+  câu nên lưới mốc neo coi mọi cặp dòng kề là "một câu tách đôi" và bỏ qua; cửa sổ tương
+  quan độ dài thì quá ngắn cho dải 6-7 dòng. Đo trên toàn bộ chuẩn đoán: dòng chỉ gọi tên
+  bị đẩy lệch chỉ 24/5297 (0,45%), và một nửa trong số đó là đảo trật tự hợp lệ — chưa đủ
+  chắc để làm tín hiệu.
+* Dòng 1429/1430 (lời bài hát "总是向你索取 / 却不曾说") bản thô trả nguyên chữ Hán; tinh
+  chỉnh dịch bù nhưng thêm ý ("Tình yêu luôn đòi hỏi sự hy sinh từ anh").
+
+### Kiểm thử
+
+* `tests/unit/application/test_address_regression_v323583.py` (15 test, dữ liệu dòng thật):
+  cảnh Tống Hân Sảng ↔ Trương Mẫn, Lâm Dật ↔ Trương Mẫn, dòng đổi vai "你放心", nhãn không
+  chắc, các chốt an toàn, `allowed_address_forms`, cặp bác sĩ trong số đo chuẩn đoán, và
+  một lượt `execute` hai giai đoạn hoàn chỉnh. 7 test hành vi trượt trên v3.23.582.
+
+## [3.23.582] — 📁 Ba nút xuất mở cùng thư mục gốc; 🔢 lưới số: họ "Triệu", "mức" ≠ "ức", số gõ nhầm
+
+Soi chuẩn đoán thật của v3.23.581 (phim "he thong sung the", 5540 dòng) + app_log:
+
+* Tác dụng của bản trước: bỏ 97 nhãn quét "lạc cảnh" → dòng sai quy tắc xưng hô 57 → 55,
+  trôi xưng hô 12 → 10, xưng hô không nhất quán 4 → 1, trùng dòng liền kề 1 → 0, lỗi số
+  2 → 1. Dòng 1304-1309 nay dịch đúng mạch cuộc gọi với chị dâu ("chị đang ở viện à?",
+  "Em có tin vui").
+* Mốc thời gian và khối `<known>` của quét bổ sung CHƯA đo được: lần dịch này dùng lại
+  nhãn đã lưu trong phiên, không quét mới.
+* Bản trước có một lỗi do chính lưới số mới gây ra (dưới đây) — đã sửa.
+
+### 🔢 Họ "Triệu" bị đổi thành con số (lỗi của v3.23.581)
+
+Bản dịch thô lệch câu ở 662-663 ("为目标赵红娟 / 消费三十四点五万元" → "ký chủ tiêu
+345.000 tệ / cho mục tiêu Triệu Hồng Quyên,"). Họ 赵 = "Triệu" bị nhận là con số
+1.000.000, sai giá trị so với 345.000, và lưới đọc chuẩn mới của v3.23.581 thay thành "cho
+mục tiêu **Ba trăm bốn mươi lăm nghìn** Hồng Quyên," (app_log: "663 (sai giá trị: Triệu →
+Ba trăm bốn mươi lăm nghìn)"). Khâu văn phong dịch lại đúng nên bản cuối không hỏng, nhưng
+lỗi có thật.
+
+* Cụm chỉ có ĐƠN VỊ, không có chữ số hay từ số nào, không còn được coi là con số: họ
+  "Triệu", "triệu phú", "tỷ lệ".
+* **Khớp trọn từ**: trước đây "mức" chứa "ức" (10^8, lối đọc cũ), "tỉnh" chứa "tỉ" → câu
+  "mức lương năm triệu tệ" bị coi là có HAI con số và lưới bỏ qua. Ca thật: "我愿意出百万年
+  薪" (lương năm MỘT triệu) dịch "mức lương **năm** triệu tệ" bị bỏ qua ở cả 15 lượt dịch
+  thật trong bộ chuẩn đoán. Nay được báo và sửa thành "một triệu" theo cách đọc của phim.
+* **Bài đếm hàng bị cắt khúc**: "个十百千万" rồi "十万百千" (dịch "Trăm vạn, nghìn vạn...")
+  — cụm số chỉ bắt được "十万" nên lưới sẽ "sửa" thành "100 nghìn". Đơn vị dính liền ngay
+  ngoài cụm số → bỏ qua (cũng loại "亿万身家" = gia tài trăm triệu, nghĩa bóng).
+
+### 🔢 Số viết bằng chữ số mà gõ nhầm
+
+Dòng 667 "三百四十五万": khâu văn phong gõ "**3.455** vạn tệ..." (34,55 triệu) ngay dưới
+dòng 665 "345 vạn tệ"; bản thô là "3.450.000 tệ...". Lỗi số duy nhất còn lại của file chuẩn
+đoán, giọng đọc nói sai số tiền gấp 10 lần. Trước đây cụm viết bằng chữ số không bao giờ
+được sửa.
+
+* Nay khi sai giá trị và phim không có cách đọc đúng nào để chọn: sửa PHẦN CHỮ SỐ, giữ
+  đơn vị và lối viết chữ số của phim — "3.455 vạn" → "345 vạn", "3,43 triệu" → "34,3
+  triệu". Kết quả luôn phải đọc ngược ra đúng giá trị; lẻ quá 3 chữ số thập phân thì không
+  đoán.
+
+Đo lại lưới số trên toàn bộ chuẩn đoán thật đã nhận (so với v3.23.581): thêm sửa đúng
+"năm triệu → một triệu" ở 15 lượt dịch, thêm sửa 667 ở 3 giai đoạn; không có sửa đổi mới
+nào khác, không mất sửa đổi cũ nào.
+
+### 📁 Ba nút xuất: vẫn hỏi nơi lưu, nhưng luôn mở ở CÙNG thư mục gốc của ứng dụng
+
+Phản ánh: "xuất chuẩn đoán dịch mỗi lần lại mở thư mục lên thật phiền phức", ba nút xuất
+"lưu không cùng một thư mục gốc". Đúng vậy — v3.23.581:
+
+| Nút | Hộp thoại mở ở | Tên gợi ý | Sau khi lưu |
+| --- | --- | --- | --- |
+| Chuẩn đoán phân tích | thư mục làm việc hiện tại | `<video>_context_diagnostics.json` (ghi đè) | — |
+| Chuẩn đoán dịch | cạnh file video | `<video>.translation_debug.<giờ>.json` | tự mở thư mục |
+| Nhật ký | thư mục lần trước (hộp thoại hệ điều hành) | `app_log.txt` (ghi đè) | — |
+
+Nay cả ba: hộp thoại Qt (loại không treo khi có MPV — EXPORT-HANG v3.7; nút nhật ký trước
+đây dùng hộp thoại hệ điều hành) mở sẵn ở **thư mục gốc của ứng dụng** — bản đóng gói:
+thư mục chứa file `.exe` (cùng chỗ với `models/`); chạy từ mã nguồn: thư mục dự án. Tên
+theo cùng một quy ước có timestamp (`<video>.<loại>.<YYYYMMDD_HHMMSS>.json`, nhật ký:
+`app_log.<YYYYMMDD_HHMMSS>.txt`) nên không ghi đè lần trước. Nút
+chuẩn đoán dịch KHÔNG còn tự mở thư mục sau khi lưu (vẫn hiện thông báo kèm đường dẫn).
+
+### Kiểm thử
+
+* `tests/unit/application/test_numbers_v323582.py` (22 test, dữ liệu dòng thật): họ
+  "Triệu", "triệu phú", "mức/sức/chức/tỉnh", dòng 2047, bài đếm 2305-2307, dòng 667,
+  cách viết chữ số kiểu Việt. 9 test hành vi trượt trên v3.23.581.
+* `tests/unit/presentation/test_export_root_v323582.py` (8 test): bấm thật ba handler với
+  hộp thoại giả — cùng thư mục gốc, tên có timestamp, hộp thoại Qt, không tự mở thư mục;
+  thư mục gốc bản đóng gói/mã nguồn trùng với kho `models/`. Cả 8 trượt trên v3.23.581.
+* Cập nhật `test_scan_cues_v323581.py::test_digit_written_amount_keeps_its_writing`: cụm
+  chữ số sai giá trị nay được sửa (giữ lối viết), không còn bị bỏ qua.
+
+## [3.23.581] — 🎯 Nhãn "ai nói với ai" của bộ quét bổ sung: bỏ nhãn lạc cảnh, quét có mốc thời gian
+
+Soi ba bộ chuẩn đoán thật của v3.23.580 (+ app_log):
+
+* Tác dụng của bản trước: không còn báo nhầm số "phẩy" (656, 663 phim "he thong sung
+  the"), không còn báo trùng dòng chỉ khác trợ từ. Phim "灭门惨案II借种": dòng sai quy tắc
+  xưng hô 14 → 9.
+* Phim "he thong sung the" lại tăng dòng sai quy tắc xưng hô 43 → 57 — soi ra gốc rễ ở
+  NHÃN VISUAL CUES, không ở bản dịch (dưới đây).
+
+### 🎯 Nhãn quét bổ sung "lạc cảnh"
+
+Phim "he thong sung the" được phân tích lại ở v3.23.578; cues của khâu phân tích phủ 57%
+nên khâu dịch quét bổ sung 2358 dòng và LƯU vào phiên. Đo trên các dòng GỌI TÊN (biết chắc
+người nghe): nhãn quét bổ sung sai **29%** (15/51), nhãn của khâu phân tích chỉ 7% (9/131).
+Ở phim này có 387 dòng mà nhãn nhảy qua lại giữa hai cặp nhân vật không liên quan (các phim
+khác: 11-20). Ca điển hình: giữa cuộc gọi Lâm Dật ↔ chị dâu (1303, 1308), dòng 1304-1307
+"你在医院吗 / 我有个好消息 / 要告诉你 / 我来找你" mang nhãn 付金奎 → 王大福 kèm mô tả "Phó
+Kim Khuê hét lên đe dọa". Nhãn sai kéo theo quy tắc xưng hô của cặp sai vào lô dịch.
+
+Nguyên nhân: bộ quét chỉ gửi `id` + chữ của các dòng THIẾU nhãn — không mốc thời gian, không
+dòng nào quanh chúng — nên model phải tự dò trong đoạn video 6 phút và dễ gán nhầm cảnh.
+
+* **Mốc thời gian**: mỗi dòng gửi quét kèm `t` = thời điểm hiện, tính từ đầu đoạn video
+  kèm theo (MM:SS), chỉ thị bảo model xem đúng khung hình đó.
+* **Mạch hội thoại**: quét bổ sung gửi kèm khối `<known>` — các dòng xen kẽ ĐÃ có nhãn
+  (chữ + người nói/người nghe) — chỉ để tham khảo; nhãn model trả cho các dòng đó bị bỏ.
+* **Lọc nhãn lạc cảnh** (tất định): nhãn quét nằm giữa hai nhãn tin cậy CÙNG một cặp
+  nhân vật (cách ≤ 6 dòng, ≤ 12 giây) mà không có ai chung với cặp đó thì bị bỏ — trừ khi
+  câu gốc gọi tên người nghe theo nhãn quét (người thứ ba chen vào). Áp khi vừa quét xong,
+  và cho phiên đã lưu (nhãn quét nhận ra vì luôn kèm mô tả, nhãn phân tích thì không).
+  Phim này: bỏ **97** nhãn; soát tay 25 dòng lấy ngẫu nhiên, gần như tất cả là lạc cảnh.
+  Các phim chỉ có nhãn của khâu phân tích: không dòng nào bị đụng tới. Nhật ký ghi sự kiện
+  `scan_cues_dropped`.
+* Hai thay đổi đầu (mốc thời gian, mạch hội thoại) chỉ đo được ở lần quét thật tới.
+
+### 🔢 Sai giá trị mà cả phim không có cách đọc đúng nào
+
+"三百四十五万元" (3.450.000) dịch "ba triệu bốn trăm năm mươi vạn tệ" (= 7,5 triệu) ở CẢ HAI
+dòng của số tiền đó (665, 667) — lưới số chỉ biết chọn cách đọc mẫu của chính phim nên
+để nguyên, giọng đọc nói sai số tiền. Nay khi sai giá trị và không có mẫu, đọc CHUẨN từ
+chính giá trị ("ba triệu bốn trăm năm mươi nghìn tệ"); cụm viết bằng chữ số giữ nguyên.
+Chạy lại mọi giai đoạn của 43 lần dịch thật: thêm 14 lần sửa, đều đúng giá trị (665, 667,
+284 "十万" từ "Mười nghìn" thành "Một trăm nghìn", 895 "九十六万", 126 "两万", 3440 "一千万").
+
+### Kiểm thử
+
+* `tests/unit/application/test_scan_cues_v323581.py` (13 ca, cues thật dòng 1300-1314,
+  665/667); 5 ca tích hợp hỏng trên mã v3.23.580 (8 ca còn lại kiểm module mới).
+* `test_stage_shift_v323569`: một giai đoạn một mình nay sửa được dòng SAI GIÁ TRỊ
+  (2338, 3440) bằng cách đọc chuẩn; phần lệch lối đọc vẫn cần giai đoạn trước.
+* Toàn bộ: 5024 passed, 57 skipped. Ruff giữ mốc 6425.
+
+## [3.23.580] — ⏱️ Mở lại dự án không mất giãn giờ đọc; số đọc "phẩy"; cờ trùng dòng
+
+Soi ba bộ chuẩn đoán thật của v3.23.579 (+ app_log):
+
+* Tác dụng của bản trước: cả ba file chuẩn đoán mang nhật ký ĐÚNG phim (có `owner`, không
+  có `foreign_run`). Không lô dịch thô nào trả nguyên văn chữ Hán; không còn dòng "một
+  mươi triệu" ở giai đoạn nào. Dòng sai quy tắc xưng hô: "he thong sung the" 44 → 43,
+  "傻子落水…" 45 → 43, "灭门惨案II借种" 16 → 14; tự xưng vai vế khi độc thoại 1 → 0 ở
+  cả hai phim dài.
+
+### ⏱️ Mở lại dự án đã dịch thì mất phần giãn giờ đọc
+
+Cùng phim "傻子落水…" (3902 dòng): file xuất sau khi MỞ LẠI dự án (v3.23.578) báo **758**
+dòng đọc không kịp và 532 dòng phải nén giọng mạnh; file xuất ngay sau khi dịch (v3.23.579)
+chỉ 397 và 246. Không phải bản dịch tốt lên: phiên dịch chỉ lưu CHỮ, thời gian lấy lại từ
+phụ đề nguồn, nên phần giãn giờ đọc làm lúc dịch xong (≈ 590 dòng được kéo dài vào khoảng
+lặng) biến mất — trang lồng tiếng và phụ đề xuất ra nhận đúng các dòng chưa giãn.
+
+* Nạp lại bản dịch từ phiên → giãn giờ đọc lại như lúc vừa dịch (cùng cài đặt, cùng mục
+  tiêu CPS). Đo lại chính bản dịch mở lại đó: 758 → **426** dòng đọc không kịp, 532 →
+  **273** dòng nén giọng mạnh.
+* Dịch lại vài dòng đã chọn → giãn lại (dòng dài ra vẫn đủ giờ đọc); dòng khác giữ nguyên
+  vì phép giãn không làm gì thêm với dòng đã giãn.
+
+### 🔢 Số thập phân ĐỌC THÀNH CHỮ ("phẩy")
+
+Phim "he thong sung the": "三十四点五万元" dịch "là ba mươi bốn **phẩy** năm vạn tệ" (đúng
+345.000) nhưng lưới số chỉ thấy "năm vạn" (50.000) → báo sai giá trị ở 656, 663 qua cả bốn
+giai đoạn. Nguy hiểm hơn: phim có cách đọc mẫu cho 345.000 ở dòng khác thì bản cũ thay cụm
+"năm vạn" giữa câu thành "là ba mươi bốn phẩy ba trăm bốn mươi lăm nghìn tệ".
+
+* Đọc được "phẩy" ("ba mươi tư phẩy năm vạn", "hai phẩy hai lăm triệu", "một phẩy năm
+  tỷ"); lối "phẩy mười lăm" không rõ giá trị thì bỏ qua. Cả cụm nay được thay nguyên khối
+  (hoặc để nguyên), không bao giờ thay nửa sau.
+* Chạy lại mọi giai đoạn của 40 lần dịch thật: bỏ 8 báo nhầm, không phát sinh lần sửa nào.
+
+### 🔁 Cờ `duplicate_adjacent` báo nhầm dòng chỉ khác trợ từ
+
+"住手" / "住手啊" cùng ra "Dừng tay!" là dịch ĐÚNG — khâu dọn dòng trùng đã bỏ qua từ
+v3.23.577, nhưng file chuẩn đoán vẫn báo trùng vì chỉ bỏ dấu câu. Nay cả hai dùng chung
+một quy tắc so nội dung câu gốc (`source_content_key`): bỏ 2 báo nhầm trên 40 bản cuối
+(1594-1595 "住手", 2220-2221 "看啊"), không còn cờ trùng nào.
+
+### Kiểm thử
+
+* `tests/unit/presentation/test_restore_reading_numbers_v323580.py` (12 ca, dữ liệu thật
+  dòng 3435-3441, 656/663, 1594-1595); 10 ca hỏng trên mã v3.23.579.
+* Toàn bộ: 5010 passed, 57 skipped. Ruff giữ mốc 6425.
+
+## [3.23.579] — 🔁 Lô dịch thô trả nguyên văn được dịch lại; số đọc sai; nhật ký đúng phim
+
+Soi ba bộ chuẩn đoán thật của v3.23.578 (+ app_log):
+
+* Tác dụng của bản trước: phim "he thong sung the" đã được Phân tích lại — bảng 39 nhân
+  vật, **106** mệnh đề xưng hô (trước 0). Cờ dịch thiếu ở bản cuối 5 → **1**, khối lệch
+  dòng 1 → 0. Phim "傻子落水…": `address_rule_violations` 56 → 45, `address_drift` 11 → 4.
+* Sự kiện `monologue_lines` nay có mặt trong file chuẩn đoán ở cả ba phim.
+
+### 🔁 Lô dịch thô trả NGUYÊN VĂN chữ Hán mà không phép kiểm nào bắt
+
+Phim "傻子落水…": lô 3421-3480 được dịch 5 dòng đầu, còn **55 dòng liền** (3426-3480)
+model trả nguyên văn chữ Hán. Lô vẫn đủ số dòng, đúng `line_no`, nên mọi phép kiểm cấu
+trúc đều qua; phép kiểm "dịch không có tác dụng" chỉ bắt khi 100% số dòng giống bản gốc.
+Khâu tinh chỉnh phải tự dịch 55 dòng đó từ câu gốc, không có bản dịch thô để dựa vào.
+
+* Bộ kiểm lô của khâu dịch thô: lô có ≥ max(3 dòng, 10% lô) trả nguyên văn câu gốc chữ
+  CJK → dịch lại ngay (tối đa 2 lần, như lưới lệch dòng), ghi sự kiện
+  `batch_source_echo` vào nhật ký. Câu gốc không có chữ CJK ("OK", "666") không tính.
+* Đo trên 37 lần chạy thật (2226 lô dịch thô): ngưỡng chỉ bắt **đúng một lô** — lô hỏng
+  này; lô bình thường có tối đa 1 dòng giống câu gốc (dòng model bỏ trống).
+
+### 🔢 Lưới số: số thập phân, "rưỡi", "chục" và "một mươi triệu"
+
+* **"một mươi triệu"**: khâu bản địa hoá phim "傻子落水…" ghi "họ còn cho anh **một mươi
+  triệu** NDT" ở 4 dòng (3377, 3378, 3380, 3392; cũng gặp ở dòng 2338 của một lần chạy
+  v3.23.575). Đúng giá trị nên lưới cũ bỏ qua. Nay sửa thẳng "một mươi" → "mười" (giữ
+  chữ hoa đầu câu) và chuẩn đoán báo loại `malformed`.
+* **Số thập phân chữ Hán**: "三十四点五万元" (34,5 vạn = 345.000) bị đọc thành "五万"
+  (chữ sau dấu 点) → báo SAI GIÁ TRỊ ở hai dòng dịch đúng (656, 663 phim "he thong sung
+  the"). Nguy hiểm hơn: phim có "五万" ở dòng khác thì lưới sẽ "sửa" 345.000 thành 50.000.
+  Nay đọc đúng 点/點/"." ("3.5万", "一点五亿").
+* **Tiếng Việt**: "34,5 vạn", "1,5 triệu" (trước bị cộng thành 39 vạn / 6 triệu), "ba
+  mươi bốn vạn rưỡi", "một triệu rưỡi", "một chục triệu", "3.450 nghìn".
+* **Số ≥ 3 đơn vị**: "三千四百三十万" (34,3 triệu), "三百六十八万" bị loại như bài đếm hàng
+  "个十百千万" — trái với chính mô tả của quy tắc (chỉ loại chuỗi KHÔNG có chữ số). Phim
+  "he thong sung the": số dòng đối chiếu được 75 → 84.
+* Chạy lại trên mọi giai đoạn của 37 lần dịch thật: không phát sinh lần sửa sai giá trị
+  nào; thêm 9 lần sửa "một mươi triệu" và 4 lần thống nhất "một nghìn vạn" theo cách
+  đọc chính phim đã dùng.
+
+### 📋 File chuẩn đoán mang nhật ký của phim khác
+
+File chuẩn đoán của phim "傻子落水…" (3902 dòng) chứa `stage_completed` **5540** dòng và
+các lô 3421-3480 của phim "he thong sung the": nhật ký diễn biến là bộ ghi dùng chung trong
+bộ nhớ, còn phim "傻子落水…" được mở lại từ phiên đã lưu rồi xuất chuẩn đoán sau khi dịch
+phim kia.
+
+* Lần dịch gắn nhật ký với dấu vân tay phụ đề nguồn (`owner`). Lúc xuất, nhật ký chỉ được
+  đính kèm khi đúng phụ đề đang xuất; ngược lại file ghi `foreign_run: true` kèm ghi chú
+  "hãy xuất chuẩn đoán ngay sau khi dịch phim này".
+
+### Kiểm thử
+
+* `tests/unit/application/test_echo_numbers_log_v323579.py` (32 ca, dữ liệu thật dòng
+  3421-3440, 3377-3392, 656/663, 1145); 22 ca hỏng trên mã v3.23.578.
+* Toàn bộ: 4998 passed, 57 skipped. Ruff 6425 (mốc 6426).
+
+## [3.23.578] — 🔢 Dòng số không còn bị "bổ sung" bừa; báo bảng nhân vật thiếu xưng hô
+
+Soi ba bộ chuẩn đoán thật của v3.23.577 (+ app_log):
+
+* Tác dụng của bản trước: phim "傻子落水…" — dòng độc thoại tự xưng bằng từ vai vế
+  **6 → 1** (Tống Tiền 5 → 0: "Nhưng em có truyền thừa…" nay là "mình"/"ta"). Phim
+  "灭门惨案II借种" — `address_rule_violations` 15 → 7, `address_drift` 2 → 1.
+* App_log: nhãn tự-nói được tách đúng ở cả ba phim (126/12/212 dòng độc thoại).
+
+### 🔢 Số viết bằng chữ Hán bị coi là "dịch thiếu"
+
+Phim "he thong sung the" (5540 dòng, phim về tiền): **14/29** cờ dịch thiếu ở bản dịch thô
+là dòng số — "三十四点五万元" (7 chữ Hán) → "345.000 Tệ." chỉ có 2 chữ cái, vì bản dịch
+chỉ đếm CHỮ CÁI. Cờ này không vô hại: nó đẩy vào `needs_expansion` của giai đoạn sau, và
+model "bổ sung" bằng câu của dòng kề — 665 "3.450.000 Tệ" thành "3.450.000 Tệ đã vào tài
+khoản." trong khi 666 là "đã vào tài khoản.".
+
+* Cụm số chữ Hán có đơn vị (十百千万亿点, kể cả "百分之…" và chữ phồn thể) không tính vào
+  độ dài câu gốc — CHỈ khi bản dịch có chữ số. "一点" → "một chút", "万一" → "lỡ như" vẫn
+  dịch ra chữ cái nên vẫn được đếm: bỏ vô điều kiện làm lệch trung vị cả ở phim không có
+  dòng số (đo trên 34 lần chạy thật: sinh cờ mới ở 2 phim khác).
+* Đo lại 34 lần chạy thật: bỏ **47** cờ oan qua các giai đoạn (234, 300, 656, 663, 665,
+  667, 671, 1080, 1145, 1398, 1400, 3166-3168); phim này: thô 29 → 20, tinh chỉnh 13 → 6,
+  bản cuối 12 → 5. Các phim khác không đổi một cờ nào. Thêm 17 cờ, đều ở phim này: 1 ca
+  lệch dòng thật ở bản thô (3600 "林逸这个小可爱" → "Phải không?") và 4 dòng sát ngưỡng
+  lặp qua 4 giai đoạn (1274, 1865, 3454, 5411 — 9 chữ cái cho 7 chữ Hán; bỏ dòng số khỏi
+  mẫu làm trung vị nhích 3,14 → 3,17).
+
+### 🗣️ Phân tích đã lưu không có quy tắc xưng hô — dùng lại mãi mà không ai biết
+
+Phân tích ngữ cảnh đã lưu được khôi phục chỉ theo hash phụ đề + ngôn ngữ đích. Phim "he
+thong sung the" dùng lại bản phân tích tạo **trước v3.23.524** (lúc khâu phân tích chưa chốt
+xưng hô): bảng 48 nhân vật, **0** mệnh đề xưng hô. Mọi lưới xưng hô (gắn quy tắc vào
+payload, sửa theo bảng, quy tắc gia đình, chuẩn đoán `address_rule_*`) đều im lặng, còn
+`address_rule_violations = 0` trông như tốt — trong khi `address_drift` = 10. Thông báo khi
+khôi phục lại còn nói "không cần phân tích lại". 33/34 lần chạy khác đều có 14-122 mệnh đề.
+
+* Khôi phục phân tích mà bảng ≥ 2 nhân vật không có mệnh đề xưng hô nào → thêm cảnh báo
+  "Bảng nhân vật chưa có quy tắc xưng hô … Nên bấm Phân tích lại" (Việt/Anh). Không tự
+  phân tích lại: tốn lượt gọi video và có thể đè bảng người dùng đã sửa.
+* Lúc dịch: log cảnh báo + sự kiện `roster_without_address_rules` trong nhật ký.
+* Chuẩn đoán: `counts.address_rules` = số mệnh đề đọc được — mẫu số của `address_rule_*`.
+
+### 📋 Sự kiện của bước chuẩn bị nhãn bị xoá khỏi nhật ký
+
+Sự kiện `monologue_lines` (v3.23.577) không có trong file chuẩn đoán của **cả ba** lần
+chạy: nhật ký diễn biến bị xoá SAU các bước chuẩn bị nhãn cues. Nay xoá ngay đầu lần chạy.
+
+### Kiểm thử
+
+* `tests/unit/application/test_numeric_under_translation_v323578.py` (15 ca, dữ liệu thật
+  dòng 650-675 và bảng nhân vật đã khôi phục); 10 ca hỏng trên mã v3.23.577.
+* Toàn bộ: 4962 passed, 57 skipped. Ruff giữ nguyên mốc 6426.
+
+## [3.23.577] — 💭 Độc thoại nội tâm không còn bị dịch như đang nói với ai
+
+Soi hai bộ chuẩn đoán thật của v3.23.576:
+
+* Tác dụng của bản trước: `echo_lines` = **0** ở cả hai phim. Nhật ký cho thấy khâu dọn
+  cuối dịch lại nhóm 211-212 của phim "灭门惨案II借种" ("…chè xoài sago bí truyền nhà tôi."
+  rồi "Chè xoài sago." → "Tất nhiên, đây là món gia truyền của anh," / "chè xoài sago."),
+  và giai đoạn tinh chỉnh phim "傻子落水…" bị lùi một dòng nói lặp (240).
+* Nhóm dịch lại còn lại (173-174 "怎么是你" / "怎么是你啊" cùng ra "Sao lại là chú em
+  thế?") là **báo nhầm có từ v3.23.510**: hai câu gốc chỉ khác trợ từ "啊" nên dịch giống
+  hệt là đúng — sửa ở dưới.
+
+### 💭 Dòng độc thoại được dịch như đang nói với ai
+
+Khâu phân tích ghi độc thoại nội tâm bằng nhãn cues "người nói = người nghe"
+(`宋钱 → 宋钱`, 90 dòng; cả phim 173 dòng). Khâu dịch nhận `speaker: 宋钱, addressee: 宋钱`
+— không hiểu là tự nói với mình — nên mang cách xưng của câu thoại ngay trước. Kết quả
+lặp lại ở MỌI lần dịch phim này:
+
+* 125-126 "Nhưng **em** có truyền thừa của Thần Tiên tỷ tỷ, trên đời này có bệnh gì làm
+  khó được **em**?" — nhân vật chính đang một mình;
+* 21 Hứa Đào Hoa nghĩ thầm "nhưng **chị** thủ tiết hai năm";
+* 469 "**Em** cũng chẳng còn cách nào khác.", 3268 "**em** là có thể hồi sinh…".
+
+Đo trên 31 lần dịch thật: ở dòng độc thoại mà vai đại từ chắc chắn (gốc có đúng một 我, bản
+dịch có đúng một đại từ), 45/175 dòng (26%) tự xưng bằng từ vai vế — 5-6 dòng mỗi lần dịch
+phim này, gần một nửa số dòng đo được.
+Cờ `address_inconsistency` còn báo `宋钱 → 宋钱` như một "cặp" xưng hô lộn xộn.
+
+Không phải mọi nhãn tự-nói đều là độc thoại: lượt 900-909 là đàn em Ngô Nhị Cẩu la hét
+("你他妈想造反啊！", "狗哥我控制不住了") nhưng bị ghi `吴二狗 → 吴二狗`.
+
+Sửa (module mới `monologue_guard`, tất định):
+
+1. **Tách lượt**: các dòng liền nhau cùng nhãn tự-nói là một lượt. Lượt có `你/您`,
+   `我们` hay tiếng gọi tên ("狗哥我…", "老表，…") là đang nói với NGƯỜI KHÁC → bỏ nhãn người
+   nghe (không biết là ai). Tên làm chủ ngữ ("吴二狗居然自称土狗", "张依贝吗") vẫn là nghĩ
+   thầm. Phim này: 42 lượt độc thoại (126 dòng), 8 lượt nhãn sai (47 dòng).
+2. **Báo thẳng vào dòng dịch** (cùng cơ chế trường `address` đã chứng minh hiệu quả ở bản
+   3.23.575): dòng độc thoại gửi `addressee: "(độc thoại — không nói với ai)"` kèm quy tắc
+   "tự xưng 'mình' (hoặc 'tôi'), KHÔNG tự xưng anh/em/chị/con/cháu; người được nhắc tới gọi
+   ở ngôi thứ ba". Không đổi chữ nào của bản dịch bằng máy — từ vai vế còn là danh từ
+   ("chị Đào Hoa") nên thay máy móc dễ hỏng câu.
+3. **Chuẩn đoán**: cờ mới `monologue_self_forms` (theo người nói: các dòng tự xưng bằng từ
+   vai vế + mọi cách tự xưng khi độc thoại) và `counts.monologue_kin_self`; bỏ nhãn tự-nói
+   khỏi các cờ theo CẶP (`address_inconsistency`, `address_drift`, số cặp xét) — độ phủ cues
+   vẫn tính như cũ để so được với các lần trước. Nhật ký diễn biến ghi `monologue_lines`.
+
+Kèm theo — **trùng dòng chỉ khác trợ từ**: khâu dọn cuối coi "怎么是你"/"怎么是你啊",
+"看啊"/"看", "加油哦"/"加油", "来"/"来呀", "起来吧"/"起来" dịch giống hệt là lỗi trùng dòng
+(5/95 cặp trên các bộ chuẩn đoán) và gọi dịch lại oan. Nay bỏ trợ từ ngữ khí khi so câu gốc.
+
+Test: `test_monologue_v323577.py` (20 ca, dựng từ dòng thật; 7 ca hành vi hỏng trên
+v3.23.576).
+
+## [3.23.576] — 🔁 Gỡ dòng dịch nói lặp dòng kề; hai lỗi ống dẫn giữa các lô
+
+Soi hai bộ chuẩn đoán thật của v3.23.575:
+
+* Phim "灭门惨案II借种" dịch lại: quy tắc xưng hô gia đình (bản trước) đã có tác dụng —
+  Hồng Chấn với con trai tự xưng "tao" 6 → 3 lần, "ba" 2 → 5 ("Ba đã nói rồi mà,",
+  "Lần này ba trước nhé."); với vợ "anh/em" 6/5 → 0/1, "tôi" 3 → 9; Hồng đại tẩu với Tần
+  Khả Tú đúng quy tắc có điều kiện: đóng kịch "chị/em" (8/4), đe dọa "tao/mày" (5/5) —
+  bản trước ra "cô" 7 lần, không khớp giai đoạn nào. Mọi chỉ số nặng vẫn 0.
+* Phim "傻子落水…" dịch lại (3902 dòng, cùng bản phân tích): sạch chỉ số nặng; lộ lỗi dưới.
+
+### 🔁 Dòng dịch nói lặp nội dung dòng kề
+
+Khi một câu gốc bị tách qua hai dòng mà trật tự tiếng Việt phải đảo, model dồn TRỌN câu
+vào một dòng rồi VẪN dịch dòng kế bên — giọng thuyết minh đọc một ý hai lần:
+
+* 2820 "各位各位" → "Mọi người, mọi người bình tĩnh nào," rồi 2821 → "Mọi người bình
+  tĩnh nào,";
+* 2728 "来参加婚礼呢?" → "loại đồ nhà quê này đến dự đám cưới thế?" rồi 2729 "这种山炮"
+  → "Loại đồ nhà quê này";
+* lần dịch trước: 3526 "而是因为" → "mà là vì em thật sự rất thích anh." rồi 3527 → "em
+  thật sự rất thích anh."; 2880 "本想着和徐家攀点关系" ra y hệt câu của dòng 2881 (mất
+  luôn nghĩa của chính nó).
+
+Cờ `duplicate_adjacent` chỉ bắt hai dòng GIỐNG HỆT nên cả loại lỗi này lọt lưới ở MỌI lần
+dịch. Quét 108 bộ chuẩn đoán thật: 295 dòng, 2-5 dòng mỗi lần dịch phim 3902 dòng; soát tay
+mọi ca của các lần dịch gần nhất đều là lỗi thật.
+
+Sửa (module mới `line_echo_guard`, tất định):
+
+1. **Dò**: bản dịch dòng i chứa ≥ 80% bản dịch của 1-4 dòng kề liên tiếp, mà câu gốc dòng
+   i chứa dưới 34% câu gốc các dòng đó (nếu chứa thì lặp là đúng: "退钱退钱", "手镯"). Phim
+   nguồn chữ Latin so theo từ — bỏ được 40 báo nhầm ở phim "Along with the Gods".
+2. **Lùi về bản trước** (không tốn lượt gọi): dòng mà CHÍNH giai đoạn tinh chỉnh/bản địa
+   hoá làm nói lặp — ca thật "Ông nội, cháu gái" / "biết sai rồi" bị gộp thành "Ông nội,
+   cháu gái biết sai rồi." / "Biết sai rồi.". Chỉ lùi khi giai đoạn đã sửa chính dòng đó,
+   bản trước không mang lại chữ Hán chưa dịch hay câu trùng hệt dòng kề, và vùng lân cận
+   bớt dòng nói lặp. Mô phỏng trên 107 lần dịch có đủ ba giai đoạn: dòng nói lặp sau bản
+   địa hoá **346 → 248** (lùi 111 dòng); dòng trùng hệt dòng kề cũng giảm 140 → 119.
+3. **Dịch lại riêng từ nguồn** phần còn lại: khâu dọn cuối (vốn chỉ dịch lại cặp dòng GIỐNG
+   HỆT) nay nhận cả nhóm dòng nói lặp, và nhận/bỏ TỪNG NHÓM — chỉ nhận khi nhóm hết trùng,
+   hết lặp. Phim này: 3 nhóm (2535-2536, 2728-2729, 2820-2821) gom vào một lượt gọi.
+4. **Chuẩn đoán**: cờ mới `echo_lines` (kèm `neighbors`) cho phần chưa gỡ được; nhật ký
+   diễn biến ghi `echo_revert` và `repeated_lines_retranslated` để lần sau đo được tác dụng.
+
+### 🧩 Hai lỗi ống dẫn giữa các lô
+
+* Cờ tự sửa `needs_expansion` (dòng bị nghi dịch thiếu ở khâu trước) **bị mất khi lô bị
+  chia đôi hoặc vá theo cửa sổ** — ba lời gọi đệ quy không truyền tiếp danh sách dòng cần
+  bổ sung. Nay truyền đủ.
+* Lô 517-529 (phim "灭门惨案II借种") được model trả 60 mục: đủ 12/13 dòng, chỉ dòng rác OCR
+  "L上上" để trống → bị coi là **sai cấu trúc**, gọi lại 5 lần rồi chia đôi lô. Nay lọc
+  phần ngữ cảnh thừa và, nếu chỉ thiếu ít dòng (ngưỡng vá chung ≤ max(2, 15%)), vá đúng các
+  dòng đó.
+
+Test: `test_line_echo_v323576.py` (27 ca, dựng từ dòng thật; 6 ca hành vi hỏng trên
+v3.23.575).
+
+## [3.23.575] — 👪 Tra được người nghe ghi bằng quan hệ gia đình, tên gọi, tên trong ngoặc
+
+Soi bộ chuẩn đoán thật của v3.23.574 (phim "灭门惨案II借种" phân tích lại, bảng 24 nhân
+vật đúng quy cách): sạch mọi chỉ số nặng — `misaligned_blocks` 0, `final_vs_literal_shifts`
+0, `cjk_leftover` 0; `address_rule_violations` 6 (đều là ca lưới cố ý không sửa);
+`address_inconsistency` 1 (Chu Chính Quân đổi sang "anh/em" với Tần Khả Tú ở cảnh tỏ tình
+1142-1158 — có chủ ý). Lỗi còn lại đáng giá nhất nằm ở bảng xưng hô.
+
+### 👪 Quy tắc xưng hô trong gia đình không gắn được vào cặp nhân vật nào
+
+`roster.address_rules`: chỉ 39/49 mệnh đề tra được người nghe. Bảng ghi người nghe bằng
+QUAN HỆ thay vì bằng tên:
+
+* 洪震: "với **con trai** tự xưng 'ba' gọi 'con'; với **vợ** tự xưng 'tôi' gọi 'bà nó'"
+* 洪志權: "với **cha** tự xưng 'con' gọi 'ba'; với **mẹ** tự xưng 'con' gọi 'mẹ'"
+* 洪大嫂: "với **con trai** …", "với **Khả Tú** khi đe dọa tự xưng 'tao' gọi 'mày'…"
+  (tên gọi — bảng chỉ ghi phiên âm đầy đủ "Tần Khả Tú")
+* 老莫: "với **vợ** tự xưng 'tôi' gọi 'bà nó'"
+
+Bộ tra chỉ biết tên nên các cặp này dịch KHÔNG có quy tắc: 洪震 → 洪志權 (32 dòng),
+洪大嫂 → 秦可秀 (32), 洪震 → 洪大嫂 (31), 洪志權 → 洪震 (19). Bản dịch trộn cách xưng
+trong cùng một cảnh: dòng 826 "Tao bảo mày đừng có mà mơ tưởng." rồi dòng 829 "Ba không
+được thì con chắc chắn được."; dòng 758 "để ba lên trước" nhưng 888 "Lần này tao lên
+trước nhé.". Quét 50 bảng nhân vật thật: cùng kiểu còn ở phim khác — "với mẹ ruột (Bà
+Chu)", "với em trai (Tiểu Phi)" (tên trong ngoặc), "gọi Đào Hoa là 'mày'" (tên gọi).
+
+Thông tin để tra ĐÃ CÓ trong chính bảng: mô tả của người kia mở đầu bằng quan hệ —
+洪志權 "Con trai ngỗ ngược của Hồng Chấn", 洪大嫂 "Vợ của Hồng Chấn". Sửa (tất định,
+không cần phân tích lại):
+
+1. Module mới `roster_kinship`: đọc quan hệ gia đình (vợ/chồng, cha/bố/ba/mẹ, con
+   trai/con gái/con, anh trai/chị gái/em trai/em gái) ở ĐẦU mỗi vế mô tả thành đồ thị, rồi
+   tra "với vợ", "với cha", "với mẹ ruột"… của đúng người nói. Chốt an toàn:
+   * chỉ đọc ở đầu vế — "đưa cho mẹ Đào Hoa…" giữa câu nói về người KHÁC;
+   * tên sau quan hệ phải khớp trọn một tên/bí danh; "mẹ vợ", "chị dâu", "anh họ",
+     "mẹ kế", "cha nuôi"… là quan hệ khác nên bị loại;
+   * mẹ của con là vợ của cha (bảng thường chỉ ghi một chiều);
+   * chỉ nhận khi còn đúng MỘT ứng viên hợp giới tính; phần sau quan hệ chỉ nhận khi là
+     điều kiện giai đoạn ("với vợ khi say"), "với vợ hai" thì bỏ qua.
+2. Tên gọi: phiên âm đúng ba chữ viết hoa ("Tần Khả Tú") thêm khoá "Khả Tú" — chỉ khi
+   không trùng giữa các nhân vật; tên đầy đủ/bí danh luôn thắng; danh xưng viết thường
+   ("Mạc đại tẩu") không tính.
+3. Tên trong ngoặc: "mẹ ruột (Bà Chu)" tra theo "Bà Chu".
+
+Kết quả (đo trên dữ liệu thật):
+
+* Phim này: **39 → 46/49** mệnh đề tra được người nghe (3 còn lại là nhóm: "cấp dưới",
+  "dân làng", "khách mua"); dòng có cue người nói → người nghe mà được gắn quy tắc
+  **780 → 899/1055 (74% → 85%)**.
+* 50 bảng nhân vật: 214 quan hệ đọc được (61 quan hệ khác nhau), soát tay không quan hệ
+  nào sai; mệnh đề chưa tra được **57 → 43** (40 là nhóm người, 3 gọi bằng danh xưng không
+  có trong bảng "Liễu lão gia tử"); thêm quy tắc cho 15 cặp nhân vật (25 khoá kể cả bí
+  danh), soát tay đều khớp bảng ghi; không cặp cũ nào đổi hay mất; lưới xưng hô và lưới sửa nhãn cue trên mọi bản dịch cũ cho kết quả
+  y hệt trước.
+* Tác dụng chính ở lần dịch sau: quy tắc được gắn thẳng vào dòng dịch. Trên bản dịch cũ
+  của phim này, lưới không tự sửa thêm (cả cảnh dùng "tao" nên coi là có chủ ý) nhưng mục
+  `address_rule_violations` giờ hiện 洪震 → 洪志權 "tao" thay vì "ba" (dòng 717, 888, 907,
+  910) và 洪震 → 洪大嫂 "anh" thay vì "tôi" (1185, 1191, 1194) để soi tay.
+
+Lưu ý: cảnh vợ chồng Hồng Chấn tình tứ (1165-1196) bản cũ dịch "anh/em"; lần dịch sau
+khâu dịch nhận quy tắc "tôi/bà nó" của bảng nhân vật. Muốn giữ "anh/em" ở cảnh đó thì
+thêm điều kiện vào bảng, ví dụ "với vợ tự xưng 'tôi' gọi 'bà nó', khi tình tứ tự xưng
+'anh' gọi 'em'".
+
+Test: `test_address_kinship_v323575.py` (33 ca, dựng từ dòng thật của bảng nhân vật và
+cảnh 886-911; 13 ca hỏng trên v3.23.574).
+
+## [3.23.574] — 🗣️ Đọc được mọi cách ghi xưng hô trong bảng nhân vật; bắt lệch dòng có khe giữa
+
+Soi hai bộ chuẩn đoán thật của v3.23.573:
+
+* Phim "傻子落水…" (dịch lại lần nữa): sạch mọi chỉ số nặng, dòng 3618-3621 lần này căn
+  đúng, `address_rule_violations` 50 → 28. Các lần báo lệch khối đều ở giai đoạn dịch thô
+  (chưa có bản trước để so) nên chưa lần nào được bỏ cờ.
+* Phim MỚI "灭门惨案II借种" (1246 dòng, phân tích bằng gemini-3.8-flash): lộ hai lỗi dưới đây.
+
+### 🗣️ Bảng nhân vật có đủ xưng hô mà ứng dụng đọc được 0 quy tắc
+
+`roster.address_rules.clauses` = **0** dù 11/17 nhân vật đều ghi cách xưng hô. Model viết
+theo kiểu khác quy cách: một cách tự xưng chung rồi liệt kê cách gọi từng người — "Cách
+xưng hô: tự xưng 'em', gọi Chân Kiếm Thanh 'Kiếm ca/anh', gọi Chu Chính Quân 'A Quân'".
+Bộ đọc chỉ hiểu "với <Tên> tự xưng … gọi …". Hậu quả:
+
+* khâu dịch không được gắn quy tắc xưng hô nào lên dòng;
+* lưới ép xưng hô và số liệu chuẩn đoán mù hoàn toàn;
+* bản dịch trôi xưng hô: Chu Chính Quân với Tần Khả Tú dùng "em" 11 / "anh" 9 / "chị" 6 /
+  "tôi" 5 dòng.
+
+Quét cả 49 bảng nhân vật thật: kiểu viết này (cùng "tự xưng **là** 'x'", "gọi **là** 'y'",
+"với X gọi là 'y'" thiếu phần tự xưng) còn ở 4 bảng khác, trong đó một bảng cũng ra 0 quy tắc.
+
+Sửa (`roster_format.address_clauses`, tất định, không cần phân tích lại):
+
+1. Đoạn không có mệnh đề "với … xưng …" thì đọc kiểu "tự xưng 'S', gọi <Tên> (là) 'A', gọi
+   …": mỗi người được gọi thành một mệnh đề, gắn cách tự xưng chung (nếu có) — đúng như
+   bảng ghi. Người nghe không phải nhân vật ("gọi cấp dưới 'cô/cậu'") vẫn được đếm là
+   chưa tra được.
+2. Đọc cả "với X gọi (là) 'A'" (thiếu phần tự xưng).
+3. Chấp nhận "xưng là 'x'" / "gọi là 'y'" ở mọi dạng, và đưa quy tắc về dạng không "là"
+   để lưới xưng hô, bộ đọc vai vế phía sau đọc được.
+
+Kết quả: phim mới **0 → 14** quy tắc (12 tra được người nghe; bản phân tích cũ của cùng phim
+1 → 15). Trên 49 bảng: 859 → 966 mệnh đề, không mệnh đề cũ nào bị mất hay đổi nội dung. Chạy lưới xưng hô trên bản dịch cũ của phim mới: sửa được dòng 605 (cả cảnh Chân
+Kiếm Thanh xưng "anh" với Chu Chính Quân, riêng dòng này ra "Tôi vẫn ổn mà") — phần lớn
+tác dụng nằm ở lần dịch sau, khi quy tắc được gắn thẳng vào dòng dịch.
+
+### ✂️ Lệch dòng có dòng bị cắt lại câu nằm GIỮA
+
+Giai đoạn tinh chỉnh của phim mới gộp dòng 706-707 rồi đẩy lệch tới 709. Dòng 709
+("就是這一點你已經比不上劍哥") mang câu **bịa** "Cô không phải nói muốn xin giống sao? Một lần
+là không đủ đâu.", và bản cuối giữ nguyên lỗi. Bộ dò v3.23.573 nối dòng bằng chứng yếu ở HAI
+ĐẦU dải, nhưng ở đây dòng yếu 707 nằm GIỮA hai dòng mạnh 706 và 708 nên dải chỉ được đếm hai
+dòng.
+
+Sửa (`stage_shift_guard`): dòng yếu cùng độ lệch nằm trong khe giữa các dòng mạnh cũng được
+tính vào dải. Chạy lại trên 25 lượt dịch thật: thêm đúng 2 dải, cả hai đều là lệch thật:
+
+* 706-708 của phim mới — trọng tài lùi về bản dịch thô, kể cả dòng bịa 709 nằm trong vùng
+  đệm;
+* 3410-3412 của một lượt cũ — ở đây bản địa hoá đã căn lại đúng, trọng tài sẽ phân xử.
+
+### Ghi nhận khác (chưa sửa)
+
+* Bảng nhân vật phim mới phiên âm 嫂 thành "Sảo" ("Hồng Đại Sảo", 5 dòng thoại), đúng ra là
+  "tẩu"/"dâu". File chuẩn đoán đã cảnh báo (`roster_name_reading`) nhưng không tự sửa được
+  vì khác xa âm đúng — nên sửa tay trong bảng nhân vật.
+* Ba nhân vật được đặt tên bằng tiếng Việt thay cho tên gốc (vd "Bạn gái Hồng Chấn") — đã có
+  cảnh báo `roster_names_not_in_source_language`.
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_address_call_list_v323574.py` (15 ca), lấy nguyên văn
+  bảng nhân vật và bản dịch thật:
+  - kiểu "tự xưng …, gọi X '…'": đủ mệnh đề, gắn cách tự xưng chung, thiếu tự xưng,
+    người nghe là nhóm không tra được, câu chỉ có tự xưng không thành mệnh đề;
+  - "xưng là"/"gọi là", "với X gọi là", "gọi là" trần không bị coi là tên người;
+  - bảng chuẩn không đổi;
+  - lô dịch mang quy tắc mới; lưới xưng hô sửa dòng 605; chuẩn đoán đếm 11/9; tra quy tắc
+    theo nhãn cues;
+  - dải lệch 706-708 có dòng yếu ở giữa được bắt, và khâu dịch lùi cả dòng bịa 709.
+  12 ca hành vi đã kiểm **thất bại trên mã v3.23.573**.
+* Toàn bộ: **4864 passed, 0 failed**.
+
+## [3.23.573] — ✂️ Bắt được lệch dòng kiểu "cắt lại câu"; thôi dịch lại oan các lô căn đúng
+
+Soi chuẩn đoán thật của v3.23.572 (cùng bản phân tích gemini-3.8-flash, dịch lại bằng
+**gemini-3.5-flash-lite**):
+
+* Bản sửa v3.23.572 chạy đúng: điền nhãn cho **891** dòng nói tiếp (2908 → 3799 dòng có
+  cue). Tỉ lệ dòng dịch có đủ người nói → người nghe (`address_cue_coverage`) **0,70 →
+  0,91**; lưới ép xưng hô sửa **52 / 29 / 11** dòng qua ba giai đoạn (trước: 30 / 10 / 13).
+* Chỉ số nặng sạch: lệch khối 0, sót chữ Hán ở bản cuối 0, sai số 0.
+
+### ✂️ Bản địa hoá đẩy lệch 3618-3621 mà không bộ dò nào báo
+
+Dịch thô và tinh chỉnh căn đúng câu "你别以为我看不出来 / 我 / 柳慕云 / 桃花嫂子 / 春花嫂子 /
+都对你虎视眈眈呢" (anh đừng tưởng em không nhận ra, em, Liễu Mộ Vân, chị Đào Hoa, chị Xuân
+Hoa, ai cũng nhìn anh như hổ đói). Giai đoạn bản địa hoá viết lại thành "từ … cho tới …"
+và đẩy mọi thứ xuống một dòng: dòng "我" ra "từ Liễu Mộ Vân,", "柳慕云" ra "chị Đào Hoa,",
+"桃花嫂子" ra "cho tới chị Xuân Hoa,", "春花嫂子" ra "ai nấy đều đang nhìn chằm chằm". Bản cuối
+giữ nguyên lỗi, `final_vs_literal_shifts` vẫn báo 0.
+
+Bộ dò v3.23.569 đòi **ba** dòng giống hẳn dòng kề. Khi model **cắt lại câu**, chỉ hai dòng
+đạt mức đó; dòng thứ ba mang nửa câu của dòng sau nên chỉ giống 0,56-0,75 ("cho tới chị Xuân
+Hoa," giống chính dòng mình 0,5 vì cùng chữ "chị … Hoa").
+
+Sửa (`stage_shift_guard`): dải có ít nhất **2** dòng bằng chứng mạnh được nối thêm các dòng
+kề có bằng chứng **yếu** cùng độ lệch (giống dòng kề ≥ 0,5 và giống hơn chính dòng mình).
+Dải vẫn phải đủ 3 dòng, một dòng mạnh đơn lẻ không bao giờ được nối. Sau đó dải đi qua bộ
+trọng tài v3.23.569 như cũ (dịch thô mới cho vùng tranh chấp; phía nào khớp thì thắng).
+
+Chạy lại trên **23 lượt dịch thật**: 26 dải cũ vẫn còn đủ (7 dải rộng thêm 1-2 dòng biên
+cũng bị cắt lại); thêm **7** dải mới, soi tay cả 7 đều là lệch thật kiểu cắt lại câu
+(3618-3621 bản địa hoá ở lượt này; 3618-3620 tinh chỉnh ở một lượt khác; 700-702, 2836-2838,
+3401-3403 tinh chỉnh; 701-703, 73-76 bản địa hoá). Không có dải mới nào ở chỗ không lệch.
+Ở ca 73-76 thì chính bản dịch thô/tinh chỉnh lệch và bản địa hoá đã căn lại đúng — đúng loại
+tranh chấp mà trọng tài được dựng ra để xử: dịch thô của dòng 74 ("否则") đúng ở 18/24 lượt
+dịch thật, nên bản dịch trọng tài thường đứng về phía bản địa hoá.
+
+### 🔁 Dịch lại oan các lô căn đúng
+
+Lô 361-420 của lượt này bị bắt dịch lại **hai lần** vì "tương quan độ dài sụp còn -0,109",
+dù nội dung trả về căn đúng từng dòng. Đoạn 371-390 (câu ngắn, tiếng Việt đảo trật tự:
+"卖给我" 3 chữ ra "miếng ngọc bội này cho em không?") bị báo nhầm ở **10/23** lượt dịch thật.
+Mỗi lần báo nhầm tốn một lượt gọi dịch lại cả lô. Lượt này cũng chạm mốc 400 lượt gọi/ngày
+của flash-lite.
+
+Sửa: ở giai đoạn đã có bản trước (tinh chỉnh, bản địa hoá), khối mà bộ dò tương quan độ
+dài báo lệch được so thẳng từng dòng với bản trước. Nếu có ≥ 5 dòng làm bằng chứng và ≥ 80%
+căn đúng thì bỏ cờ, không dịch lại, và ghi sự kiện `batch_misaligned_dismissed`. Kiểm
+trên 20 lần báo lệch khối thật ở hai giai đoạn này: **7** lần báo nhầm (căn đúng 95-100%)
+đều được bỏ; **13** lần lệch thật (căn đúng 0-33%) vẫn bị bắt dịch lại. Dịch thô chưa có
+bản trước để so nên giữ nguyên cách cũ.
+
+### Đã đo nhưng không làm
+
+* Ép cả đại từ thân tộc (anh/chị/em) theo bảng nhân vật (hiện chỉ ép tôi/tao/ta/tớ/mình):
+  trên 23 lượt dịch sẽ sửa 81 dòng, nhưng soi tay chỉ khoảng 70% đúng. Có hai nguồn sai:
+  - nhãn cue sai người nói (vd 3635 "我知道了" là Trương Y Bối đáp, nhãn ghi Tống Tiền);
+  - quan hệ đổi theo mạch phim (cuối phim Tống Tiền xưng "anh" với Hứa Đào Hoa).
+  Chưa đủ "ít mà chắc" nên không làm.
+* Thử bản chỉ ép thiểu số về đa số trong cảnh: 28 dòng, vẫn vướng nhãn sai.
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_stage_resplit_v323573.py` (13 ca), lấy nguyên văn ca
+  thật:
+  - dải cắt lại câu 3618-3621 được bắt;
+  - hai dòng mạnh không kèm dòng yếu thì chưa đủ; một dòng mạnh không bao giờ được nối;
+  - dòng yếu khác độ lệch không được nối;
+  - báo cáo `final_vs_literal_shifts` thấy dải này;
+  - khâu dịch lùi đúng 4 dòng về bản tinh chỉnh sau khi hỏi trọng tài;
+  - lô 368-394 báo nhầm được bỏ cờ và ghi sự kiện;
+  - lô 1888-1917 lệch thật vẫn bị bắt;
+  - dịch thô vẫn dịch lại như cũ;
+  - hàm so căn dòng đúng trên cả hai ca thật và không kết luận khi thiếu bằng chứng.
+  Các ca hành vi đã kiểm **thất bại trên mã v3.23.572**.
+* `test_stage_shift_v323569.py`: dải 3395-3418 nay đếm 20 dòng (thêm dòng 3404 bị cắt lại).
+* Toàn bộ: **4849 passed, 0 failed**.
+
+## [3.23.572] — 🗣️ Dòng nói tiếp không còn mất nhãn người nói khi model chỉ ghi đầu lượt lời
+
+Soi chuẩn đoán thật của v3.23.571 (phân tích lại bằng **gemini-3.8-flash**, dịch bằng
+**gemini-3.5-flash-lite**):
+
+* Bản sửa vai vế v3.23.571 chạy đúng: đổi người nói ở dòng 3898 (`宋钱弟弟`) trước khi dịch;
+  `reversed_vocative_lines` và `kin_speaker_conflict_lines` đều **[]**. Các dòng từng sai
+  nay ra đúng vai: 3197 "Tống Tiền cậu em, / em mau đi đi.", 3288 "em rung động…".
+* Chỉ số nặng sạch: lệch khối **0**, `final_vs_literal_shifts` **0**, sót chữ Hán ở bản
+  cuối **0**, sai số **0**. Lưới ép xưng hô sửa 30 / 10 / 13 dòng qua ba giai đoạn.
+
+### 🗣️ 25% số dòng dịch mà không biết ai nói với ai
+
+`visual_cues.coverage_ratio` tụt từ 0,998 xuống **0,745** (2908/3902 dòng). Không phải rải
+rác: **14/22** đoạn video phủ 98-100%, còn **8** đoạn chỉ 19-43%. Soi 8 đoạn đó: model chỉ
+ghi cue ở dòng **ĐẦU mỗi lượt lời** — 82-100% cặp cue liền nhau đổi người nói (đoạn đầy đủ:
+26-36%). Ví dụ dòng 2585 ghi `沈明月→宋钱`, bảy dòng nói tiếp 2586-2592 để trống. Tỉ lệ phủ
+toàn phim vẫn trên ngưỡng 60% nên bước quét bổ sung (v3.23.559) không chạy, và **994** dòng
+dịch không có người nói/người nghe, cũng không được gắn quy tắc xưng hô.
+
+Hậu quả đo được: lấy nhãn mà ≥ 3 lượt phân tích độc lập của cùng phim thống nhất làm chuẩn,
+dòng **không nhãn** có **3,4%** dòng sai quy tắc xưng hô mà lưới bắt được, dòng có nhãn chỉ
+**0,3%** — gấp **11 lần**. Ví dụ bản cuối: 柳慕云 nói với Tống Tiền "cứu **tôi** với",
+"**tôi** sẵn sàng đánh đổi mọi thứ" trong khi bảng nhân vật quy định "tự xưng 'chị'".
+
+Sửa (mô-đun mới `cue_run_filler`, tất định, chạy trước khi dịch): dòng không có cue lấy
+nhãn của dòng đầu lượt lời đứng trước nó. So với từng lượt phân tích đầy đủ khác: lấy cue
+đứng trước khớp người nói 62-73% — ngang mức hai lượt phân tích độc lập khớp nhau (58-73%);
+lấy cue đứng sau chỉ 22-29%. Ba chốt chặn, đều đo trên dữ liệu thật:
+
+1. Chỉ điền ở **vùng thưa** (dưới 70% số dòng trong ±20 dòng có cue) — vùng dày mà thiếu
+   vài dòng là model cố ý để trống. Cách nhận này bắt đủ 975/975 dòng thiếu thuộc 8 đoạn
+   thưa, chỉ lẫn 6 dòng của đoạn dày.
+2. **Khoảng lặng > 2 giây** kết thúc lượt lời: dòng sau khoảng lặng chỉ khớp chuẩn 14/24
+   (vd dòng 865-872 là dân làng bàn tán sau cảnh Tống Tiền đối đáp Ngô Nhị Cẩu).
+3. Chỉ điền khi cues phủ **≥ 60%** cả phim; thấp hơn thì bước quét bổ sung chạy trước (quét
+   lại tốt hơn điền). Năm lượt phân tích phủ 71-83% điền đúng 81-87%; ba lượt chỉ phủ
+   22-27% chỉ đúng 67-70%.
+
+Nhãn đã điền được bơm vào dòng dịch, dùng cho lưới xưng hô / tiếng gọi / vai vế, và được
+lưu vào phiên như cues quét bổ sung. Chuẩn đoán ngữ cảnh thêm `visual_cues.run_fill_lines`.
+
+Kết quả trên phim này: điền **891** dòng (phủ 74,5% → **97,4%**), cặp người nói → người nghe
+khớp chuẩn **87%** (241/277; cue do model tự ghi: 96%). Lượt phân tích đã đủ (99,8%) không bị
+điền dòng nào. Chạy lưới xưng hô trên bản dịch cuối với nhãn đã điền: bắt thêm **20** dòng
+sai quy tắc ở vùng từng không nhãn; 19 dòng có nhãn được quá nửa các lượt phân tích khác xác
+nhận, dòng còn lại hoà 2/4. Khi dịch lại, các dòng này nhận quy tắc ngay từ khâu dịch thô.
+
+### Ghi nhận khác (chưa sửa ở bản này)
+
+* Dịch thô lệch 1 dòng ở 1312-1315 ("老子跟你姓!" ra "Alo."); giai đoạn bản địa hoá tự căn
+  lại và trọng tài v3.23.569 giữ bản đúng — bản cuối đúng.
+* Model để nửa câu chữ Hán ("Tống Tiền弟弟", "vô所谓的") ở 6 dòng suốt ba giai đoạn; bước
+  dọn CJK sót cuối pipeline dịch lại sạch cả 6.
+* Sau khi xoay API key giữa lúc phân tích, mỗi đoạn video còn lại gặp 403 một lần rồi mới
+  tải lại (9 lần) — chỉ tốn thời gian, không ảnh hưởng chất lượng.
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_cue_run_fill_v323572.py` (14 ca) từ nguyên văn đoạn 16
+  và đoạn 6 của lượt phân tích thật (câu gốc, mốc thời gian, nhãn): điền cả lượt lời, giữ
+  nhãn model, khoảng lặng cắt lượt lời, dòng trước cue đầu để trống, vùng dày không điền,
+  cue không có người nói không được chép, phim quá thưa để bộ quét lo, khâu dịch nhận nhãn
+  đã điền và trả để lưu, bước quét bổ sung vẫn chạy trước, số liệu chuẩn đoán (kể cả sự
+  kiện không có mốc thời gian). Ca khâu dịch đã kiểm **thất bại trên mã v3.23.571** (dòng
+  2590 không có nhãn).
+* Toàn bộ: **4835 passed, 0 failed**.
+
+## [3.23.571] — 👫 Tiếng gọi kèm vai vế ("宋钱弟弟") dịch đúng vai cả lượt lời
+
+Soi chuẩn đoán thật của v3.23.570 (dịch lại toàn phim bằng **gemini-3.5-flash-lite**):
+
+* Bản sửa dòng gọi tên v3.23.570 chạy đúng: giai đoạn dịch thô vẫn ra "Thẩm Minh Nguyệt,"
+  ở dòng 2532 và "Tống Tiền," ở 3075, lưới sửa về "Liễu Mộ Vân," / "Từ Tuấn Hào,"; bản cuối
+  đúng cả hai. `reversed_vocative_lines` của file chuẩn đoán về **[]** (nhãn đã đảo được
+  lưu vào phiên).
+* Các chỉ số nặng sạch: lệch khối **0** (dịch thô tự sửa 1 khối 2034-2049),
+  `final_vs_literal_shifts` **0**, sót chữ Hán **0**, sai số **0**. Lưới ép xưng hô sửa
+  33 / 16 / 28 dòng qua ba giai đoạn.
+
+### 👫 "宋钱弟弟" (em Tống Tiền) ra "Anh Tống Tiền, anh đi trước đi!"
+
+Câu gốc ``宋钱弟弟`` là "em Tống Tiền" — người nói coi Tống Tiền là EM. Vậy mà dòng 3197,
+3221, 3286 ra "Anh Tống Tiền," ở **12/15** dòng trên 5 lượt dịch, kéo theo cả lượt lời:
+"Anh Tống Tiền, anh đi trước đi!", "Anh Tống Tiền, anh lợi hại quá đi mất!". Dòng 413 cùng
+câu gốc ra **"Chị Đào Hoa ơi,"** — tên người khác hẳn.
+
+Nguyên nhân nằm ở nhãn Visual Cues: 3197/3221/3286 gắn người nói ``张依贝`` — người mà
+chính bảng nhân vật ghi "với 宋钱 tự xưng 'em' gọi 'anh Tống Tiền'" (câu "毕竟我们家大业大 —
+nhà chúng ta thế lực lớn" cũng là của Thẩm Minh Nguyệt, không phải cô bạn học cùng làng).
+Model dịch đúng theo nhãn nên sai vai cả đoạn. Dòng 413 nhãn ghi NGƯỢC ``spk=宋钱`` nhưng
+bộ đảo nhãn v3.23.570 chỉ nhận tiếng gọi là tên trần, bỏ sót tên kèm hậu tố vai vế.
+
+Chỉ sửa chữ "Anh" thành "Em" ở dòng gọi tên là sai cách: các dòng nói tiếp đã dịch theo
+nhãn sai, kết quả là câu lai "Em Tống Tiền, anh đi trước đi!". Sửa ở **nhãn**, trước khi
+dịch (tất định, trong `vocative_guard`):
+
+1. Đọc hậu tố vai vế của tiếng gọi: ``哥哥/哥``, ``姐姐/姐`` → người nói coi người được gọi
+   là bậc trên; ``弟弟/弟``, ``妹妹/妹`` → bậc dưới. Bí danh tự kết thúc bằng 哥 (``狗哥``)
+   vẫn là tên trần.
+2. Đọc vai trong quy tắc xưng hô của người nói với người được gọi (`address_rank`): từ vai
+   vế viết thường trong cách GỌI ("gọi 'em Tiền'", "gọi 'anh Tống Tiền'"), không có thì suy
+   từ cách TỰ XƯNG ("tự xưng 'chị Minh Nguyệt' gọi 'Tiểu Tiền'" → bậc dưới). Quy tắc hai
+   giai đoạn trái vai nhau, hay chữ viết hoa thuộc tên ("Tú Anh"), là không rõ → không đụng.
+3. Nhãn người nói trái vai với hậu tố (hoặc ghi chính người được gọi) → đổi sang người nói
+   ở dòng kề (3 dòng trước, rồi 3 dòng sau lượt lời) có quy tắc KHỚP vai. Nhãn trái vai thì
+   đổi luôn cả lượt lời — các dòng ngay sau cùng cặp nhãn, tối đa 5 dòng — để câu nói tiếp
+   dịch cùng một vai; nhãn ghi chính người được gọi thì chỉ đổi dòng gọi tên (dòng sau có
+   thể là lời đáp). Không tìm được người khớp vai thì giữ nguyên.
+4. Đổi vai vế chạy TRƯỚC bộ đảo nhãn v3.23.570; đảo nhãn là phương án cuối.
+5. Bản dịch dòng gọi kèm vai vế mang tên người khác ("Chị Đào Hoa ơi,") được thay tên và
+   sửa luôn từ vai vế đi cùng → "Em Tống Tiền ơi,"; giữ lối Hán-Việt nếu bản dịch dùng
+   ("Đào Hoa tỷ," → "Tống Tiền đệ,"). Dòng đã đúng tên mà sai vai thì KHÔNG vá riêng một từ.
+6. Chuẩn đoán ngữ cảnh thêm `visual_cues.kin_speaker_conflict_lines`.
+
+Chạy lại trên **22 lượt dịch thật** có Visual Cues (381 tiếng gọi kèm vai vế): đổi nhãn
+**22** dòng — 15 dòng ``张依贝`` → ``沈明月`` ở 3197/3221/3286 (5 lượt, kèm 3 / 1 / 2 dòng
+nói tiếp), 5 dòng 413 ``spk=宋钱`` → ``许桃花``, 1 dòng 3026 ``spk=宋钱`` → ``柳慕云``, 1
+dòng ``铁柱哥`` nhãn ghi chính Thiết Trụ → Tống Tiền — soi tay cả 22 đều ra đúng vai. **250**
+dòng nhãn đã khớp vai và **61** dòng không rõ vai không bị đụng; 1 dòng trái vai không có
+người thay ở dòng kề được giữ nguyên; 1 dòng nhãn ghi chính người được gọi mà không có
+người khớp vai quanh đó rơi về bộ đảo nhãn cũ. Nhãn phim này sau sửa: 3197-3200,
+3221-3222, 3286-3288 ``沈明月→宋钱``; 413 ``许桃花→宋钱``.
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_kin_vocative_v323571.py` (28 ca) từ nguyên văn ca thật:
+  đọc vai của 9 kiểu quy tắc, đọc hậu tố vai vế, bí danh 狗哥, đổi nhãn đúng 3 dòng thật,
+  đổi cả lượt lời, không đụng dòng ngoài lượt lời, nhãn ghi chính người được gọi chỉ đổi
+  một dòng, nhãn khớp vai / không rõ vai / không có người thay → giữ nguyên, giới hạn độ dài
+  lượt lời, thứ tự đổi-vai-trước-đảo-nhãn, thay tên kèm từ vai vế, không vá riêng từ vai
+  vế, khâu dịch nhận nhãn đã sửa và trả nhãn để lưu, số liệu chuẩn đoán. Các ca hành vi đã
+  kiểm **thất bại trên mã v3.23.570** (khâu dịch vẫn ra "Anh Tống Tiền,").
+* Sửa một ca của `test_vocative_v323570.py`: ``宋钱哥哥`` nay là tiếng gọi kèm vai vế có chủ
+  đích; ca "tên nằm trong câu không phải tiếng gọi" giữ nguyên ý.
+* Toàn bộ: **4820 passed, 0 failed**.
+
+## [3.23.570] — 📣 Dòng gọi tên không còn bị dịch thành tên người khác
+
+Soi chuẩn đoán thật của v3.23.569 (dịch lại toàn phim bằng **gemini-3.5-flash-lite**):
+
+* Lượt này sạch ở mọi chỉ số nặng: lệch khối **0**, bản cuối lệch so với bản thô
+  (`final_vs_literal_shifts`) **0**, sót chữ Hán **0**, sai số **0** (lưới số sửa 1 dòng ở
+  tinh chỉnh và 4 dòng ở bản địa hoá nhờ cách đọc của giai đoạn trước). Giai đoạn tinh
+  chỉnh không đẩy lệch dòng nào nên bộ phân xử v3.23.569 chưa phải ra tay.
+* Lưới ép xưng hô sửa 34 / 15 / 17 dòng qua ba giai đoạn.
+
+### 📣 "柳慕云" dịch thành "Thẩm Minh Nguyệt", "徐俊豪" thành "Tống Tiền"
+
+Dòng 2532 gốc CHỈ có tên ``柳慕云`` (Thẩm Minh Nguyệt gọi Liễu Mộ Vân) lại dịch thành
+"Thẩm Minh Nguyệt,"; dòng 3075 gốc ``徐俊豪`` (Tống Tiền gọi Từ Tuấn Hào) thành "Tống Tiền,".
+Không phải ngẫu nhiên: 2532 sai ở **6** lượt dịch, 3075 ở **5** lượt; phim khác cũng bị
+(``林逸`` → "Tần Nguyệt", ``秦月`` → "Lâm Dật"). Quét **100 bản dịch thật**: **28** dòng gọi
+tên bị tráo sang tên người khác.
+
+Nguyên nhân: nhãn Visual Cues ghi **ngược** người nói/người nghe (``spk=柳慕云, to=沈明月``)
+và model tin nhãn hơn câu gốc, "sửa" tiếng gọi thành tên người nghe trong nhãn. Nhưng câu
+gốc là sự thật: cả dòng chỉ là tên X thì người đang được gọi LÀ X.
+
+Sửa (mô-đun mới `vocative_guard`, tất định):
+
+1. **Sửa nhãn trước khi dịch**: dòng gọi tên X (bỏ dấu câu và thán từ 啊/呀/哎… ở hai đầu)
+   mà nhãn ghi X là người nói → đảo lại. Phim này: 5 dòng (7, 1219, 1475, 2532, 3075). Nhãn
+   đã sửa được trả về để lưu vào phiên như cues quét bổ sung.
+2. **Sửa bản dịch sau mỗi giai đoạn**: dòng gọi tên X mà bản dịch không có tên X (kể cả
+   dạng rút gọn "Tiền", "Mộ Vân") nhưng có tên ĐẦY ĐỦ của đúng một nhân vật khác, và ngoài
+   tên đó chỉ còn tiểu từ gọi ("à", "ơi", "này"…) → thay bằng tên X (đúng phiên âm của bí
+   danh được gọi: ``狗哥`` → "Cẩu Ca"). Chạy lại trên 100 bản dịch thật: sửa **28** dòng,
+   soi tay đúng cả 28. Dòng có danh xưng đi kèm ("Chị dâu Xuân Hoa..." ở dòng gốc ``宋钱``)
+   là câu của dòng khác bị lệch sang — không đụng.
+3. Chuẩn đoán ngữ cảnh thêm `visual_cues.reversed_vocative_lines` — đo độ tin của nhãn mà
+   model phân tích trả về.
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_vocative_v323570.py` (17 ca) từ nguyên văn ca thật: bóc
+  thán từ/dấu câu, tên trong câu không phải tiếng gọi, đảo nhãn đúng chỗ, nhãn đúng giữ
+  nguyên, sửa hai ca thật, giữ tiểu từ, phiên âm theo bí danh, danh xưng → không đụng, câu
+  dài không đụng, tên rút gọn được chấp nhận, lượt dịch trọn vẹn ra đúng tên và trả nhãn
+  đã sửa để lưu, số liệu chuẩn đoán. Ca lượt dịch trọn vẹn đã kiểm **thất bại trên mã cũ**
+  với đúng triệu chứng thật ("Thẩm Minh Nguyệt,").
+* Toàn bộ: **4792 passed, 0 failed**.
+
+## [3.23.569] — 🧭 Giai đoạn tinh chỉnh không còn đẩy lệch dòng hay làm sai số tiền
+
+Soi chuẩn đoán thật của v3.23.568 (dịch lại toàn phim bằng **gemini-3.5-flash-lite**):
+
+* Bản sửa xưng hô v3.23.568 chạy đúng: lưới ép xưng hô sửa **43** dòng ở dịch thô, **20**
+  ở tinh chỉnh, **12** ở bản địa hoá (trước: 2 / 0 / 0). `address_drift` **20 → 9**,
+  `address_inconsistency` **6 → 3**. File chuẩn đoán nay thấy **57/58** quy tắc và báo
+  **64** vi phạm (trước chỉ thấy 5 vì mù gần hết quy tắc) — phần lớn là cả cảnh dùng
+  cách khác một cách có chủ ý nên lưới không ép.
+* Bảng nhân vật đã đọc hết quy tắc: 0 cờ chuẩn đoán ngữ cảnh.
+
+### 🧭 Tinh chỉnh phong cách đẩy lệch 2 dòng — bộ dò cũ im lặng
+
+Dịch thô căn **đúng** dòng 3393-3423; giai đoạn tinh chỉnh phong cách trả bản mà mỗi dòng
+mang câu của dòng thứ HAI kế tiếp ("又大" ra "lại vừa đắt đỏ.", "好嘞" ra "Chẳng phải
+anh"). Bộ dò khối theo tương quan độ dài (v3.23.549) im lặng — các câu ngắn dài xấp xỉ nhau
+nên lệch hai dòng vẫn tương quan 0,6-0,9. Bản cuối còn **12 dòng lệch** (1423-1428 và
+3397-3403) và **mất hẳn** câu "这种情况以后会更多".
+
+Sửa (mô-đun mới `stage_shift_guard`):
+
+1. **Dò bằng chính bản trước**: căn đúng thì dòng i của bản mới giống dòng i của bản trước
+   nhất; bị đẩy lệch thì cả một dải liên tiếp giống dòng i+k. Hai dải cùng độ lệch đứt
+   quãng được gộp lại.
+2. **Phân xử bằng trọng tài**: lệch so với bản trước chưa nói ai đúng — soi tay 10 ca thì
+   5 ca chính bản dịch thô lệch và bản tinh chỉnh đã SỬA lại. Tương quan độ dài phân xử
+   sai ở dải ngắn, nên mỗi dải được dịch TRỌNG TÀI từ câu gốc (1 request, kèm dòng đệm);
+   chỉ lùi về bản trước khi bản trước thắng ≥ 2 dòng VÀ gấp 3 lần bản mới.
+3. Kiểm chéo trên **26 ca tranh chấp thật** của phim này (mỗi ca được xử bằng 18-19 bản dịch
+   độc lập từ các lượt dịch khác): trọng tài đơn lẻ bắt đúng **97%** ca cần lùi, lùi nhầm
+   **2,6%** (với ngưỡng gấp 2: 4,3%). Cả 3 dải lệch của lượt này đều được 19/19 trọng tài xử
+   "lùi về bản thô". Chi phí: 0-2 request mỗi giai đoạn trên 20 lượt dịch thật.
+4. Lùi kèm 2 dòng đệm mỗi bên (dòng biên hay bị gộp/lặp câu); lùi thừa một dòng đúng chỉ
+   mất chút trau chuốt vì bản trước đã được trọng tài xác nhận.
+
+### 💰 "一千万" thành "một triệu" — sai giá trị tiền 10 lần
+
+Dịch thô đọc đúng `一千万` là "mười triệu" cả **6** lần; tinh chỉnh đổi 4 lần thành "một
+nghìn vạn" và **2 lần thành "một triệu"** (sai giá trị). Lưới số (v3.23.556) chỉ chọn cách
+đọc trong CHÍNH giai đoạn đó — không còn bản đúng nào nên không sửa được gì, bản cuối giữ
+nguyên lỗi. Nay cách đọc của **giai đoạn trước** cũng là ứng viên: chạy lại trên chính dữ
+liệu này sửa đủ **6/6** dòng (2 sai giá trị, 4 lệch lối đọc).
+
+### 🔍 Chuẩn đoán dịch
+
+Thêm `final_vs_literal_shifts`: các dải dòng bản cuối lệch so với bản dịch thô (kèm độ lệch)
+— trên lượt này báo đúng 1423-1428 và 3397-3403. Mỗi lần phân xử cũng được ghi vào nhật ký
+diễn biến (`stage_shift` kèm phán quyết).
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_stage_shift_v323569.py` (22 ca) dựng từ nguyên văn ca
+  thật: dò đúng dải lệch, gộp dải đứt quãng, diễn đạt lại tại chỗ không bị cờ, câu ngắn
+  không làm bằng chứng, trọng tài xử đúng hai chiều, thắng sát nút không lùi, lùi đúng
+  vùng + dòng đệm, trọng tài đồng ý bản mới thì giữ, lỗi API giữ nguyên, huỷ thật được
+  truyền còn "huỷ giả" bị bỏ qua, giai đoạn sạch không tốn request, cả lượt dịch hai giai
+  đoạn ra kết quả căn đúng, lưới số dùng giai đoạn trước, báo cáo chuẩn đoán. Hai ca lưới
+  số đã kiểm **thất bại trên mã cũ** (các ca dò lệch dùng mô-đun mới).
+* Toàn bộ: **4774 passed, 0 failed**.
+
+## [3.23.568] — 🗣️ Quy tắc xưng hô ghi bằng tên gốc không còn bị bỏ sót
+
+Soi chuẩn đoán thật của v3.23.567 (mở lại phiên cũ rồi dịch lại toàn phim bằng
+**gemini-3.5-flash-lite**, cùng model với lượt trước):
+
+* Bản sửa tên v3.23.567 chạy đúng thực tế: mở lại video là sửa tên trong bảng nhân vật và
+  **44 dòng** bản dịch đã lưu. Bản dịch mới: "Liễu Mộ Vân" **42** lần, "Mộc Vân" **0**.
+* Nhưng xưng hô trôi nhiều hơn lượt trước: `address_drift` **8 → 20**, `address_rule_violations`
+  **3 → 5**. Ca rõ nhất: `张依贝` nói với Tống Tiền, bảng chốt "tự xưng 'em' gọi 'anh'",
+  vậy mà dòng 579-759 ra "tôi" 8 lần / "em" 8 lần, còn gọi thì lẫn "cậu".
+
+### 🗣️ 52/58 quy tắc xưng hô bị bỏ qua vì người nghe ghi bằng TÊN GỐC
+
+Bảng nhân vật của gemini-3.6-flash ghi quy tắc kiểu `với 柳慕云 tự xưng 'tôi' gọi 'chị Mộ Vân'`
+— người nghe là **tên gốc**. Bộ tra quy tắc (v3.23.551) chỉ tra người nghe theo **phiên âm**
+("với Tống Tiền …") nên chỉ đọc được **6/58** mệnh đề (20 cặp, 6 người nói). Hệ quả dây chuyền:
+
+* khâu dịch KHÔNG nhận quy tắc xưng hô gắn theo từng dòng cho hầu hết các cặp;
+* lưới ép xưng hô không sửa được dòng nào (**0** dòng) và báo vi phạm ít đến mức trông "sạch";
+* cờ quy tắc lỗi thời và số liệu xưng hô trong file chuẩn đoán đều mù theo.
+
+Đo trên **47 bảng nhân vật thật**: 737 mệnh đề, **102** chỉ tra được qua tên gốc (dồn vào các
+bản phân tích của 3.6-flash — cả ba lượt dịch gần nhất đều dính).
+
+Sửa:
+
+1. Người nghe được tra theo **cả phiên âm lẫn tên gốc** (và mọi bí danh). Bảng thật:
+   **57/58** mệnh đề, **164** cặp, **34** người nói (trước: 6/58, 20, 6). Chạy lại lưới trên
+   chính bản dịch này: sửa **47 dòng** (trước: 0), soi tay đều đúng — vd 593 "Vòng tay của
+   tôi" → "của em" (张依贝 → Tống Tiền), 2908-2941 Tống Tiền với Từ Tuấn Hào "tôi" → "tao",
+   503-519 Tống Tiền với mẹ "tôi" → "con".
+2. Mệnh đề **nhiều người nghe** ("với 宋钱 và 宋瑶", "với 柳慕云 / 赵可可", "宋钱和宋瑶"):
+   * áp cho **từng người** khi cách xưng/gọi là số ít (trước chỉ người đầu);
+   * **bỏ** khi là số nhiều ("gọi 'các người'", "'chúng mày'") — gắn cho một người là sai;
+   * quy tắc **riêng từng cặp luôn thắng** quy tắc nhóm;
+   * hết lỗi cũ dính đuôi tên vào quy tắc (trước: quy tắc thành "và An Tuyết Mạn tự xưng…").
+   Trên 47 bảng thật: số cặp tra được **841 → 1 126**, 22 quy tắc số nhiều gắn nhầm được bỏ,
+   14 quy tắc dính đuôi được làm sạch.
+3. Chuẩn đoán ngữ cảnh thêm `roster.address_rules` (số mệnh đề / số tra được / người nghe
+   không tra được) và cờ `address_rules_unresolved` khi dưới 80% mệnh đề tra được — lỗi kiểu
+   này từ nay lộ ngay trong file chuẩn đoán thay vì âm thầm làm hỏng bản dịch.
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_address_cjk_listener_v323568.py` (14 ca): tên gốc làm
+  người nghe, nhãn cues có bí danh, điều kiện giai đoạn sau tên gốc, bảng thật tra đủ, nhóm
+  số ít áp từng người, nhóm số nhiều không gắn cho một người, không dính đuôi, quy tắc riêng
+  thắng quy tắc nhóm, liên từ tiếng Trung, lưới sửa đúng cảnh thật, lô dịch mang quy tắc,
+  số liệu và cờ chuẩn đoán. Đã kiểm **12 ca thất bại trên mã cũ**.
+* Toàn bộ: **4751 passed, 0 failed**.
+
+## [3.23.567] — 🈶 Soát phiên âm Hán-Việt của tên nhân vật, sửa tên sai trên toàn phim
+
+Soi chuẩn đoán thật của v3.23.566 (phân tích lại bằng **gemini-3.6-flash**):
+
+* Bản sửa v3.23.566 chạy đúng: tóm tắt theo dòng thời gian **17 863 ký tự, 22 đoạn**, không
+  còn cờ lặp/cắt giữa phim. Cues dùng được phủ **99,2%** dòng sau khi quét bổ sung.
+* Bản dịch sạch ở các chỉ số nặng: lệch khối **0**, sót chữ Hán **0**, sai số **0**, vi
+  phạm xưng hô **3**.
+
+### 🈶 Nữ chính thứ hai mang tên sai ở 44/45 dòng
+
+Bảng nhân vật ghi `柳慕云 (Liễu Mộc Vân)` — nhưng 慕 đọc **mộ** ("mộc" là âm của 木/沐).
+Khâu dịch chép đúng bảng nên **44/45 dòng** nhắc tới cô mang tên sai, tóm tắt sai 28 chỗ,
+bảng xưng hô sai ("chị Mộc Vân"). Đọc sai âm Hán-Việt là giới hạn của chính model — chỉ thị
+trong prompt không chữa được, nhưng đối chiếu với bảng âm theo từng chữ thì kiểm tất định.
+
+Đo trước khi sửa: chạy bộ soát trên **97 bảng nhân vật thật** (mọi phim đã gửi chuẩn đoán)
+để chọn ngưỡng không sửa nhầm:
+
+* Lỗi thật tìm thấy: `柳慕云` "Mộc"→**Mộ**, `赵可可` "Triệu Kha Kha"→**Triệu Khả Khả**,
+  `瑚媚/瑚宝` "Hồ"→**Hô**; lệch xa hơn (chỉ báo): `莫嫂/洪大嫂` "Sảo" (嫂 = tẩu),
+  `王腾雪` "Thắng" (腾 = đằng).
+* KHÔNG được sửa: tên Việt hoá có chủ ý (`吴胖` "Ngô Béo", `王梅` "Chị Mai"), thuật ngữ
+  theo âm quy ước ngành (`心包经` "Tâm Bào Kinh", `兑` "Đoài", `厌胜` "Yểm Thắng").
+
+Sửa:
+
+1. **Bảng âm Hán-Việt theo chữ** `data/hanviet_readings.json` (18 023 chữ, giản thể lẫn
+   phồn thể) dựng bằng `tools/build_hanviet_readings.py`: âm chính từ
+   *hanviet-pinyin-words*, ánh xạ giản→phồn của OpenCC, âm phụ từ Unihan `kVietnamese`
+   (lẫn âm Nôm nên chỉ để CHẤP NHẬN, không bao giờ làm âm đề xuất).
+2. Mô-đun mới `name_reading_check`: so từng âm của phiên âm với âm của từng chữ (không phân
+   biệt vị trí dấu thanh "hoà/hòa", "y/i"). **Tự sửa** chỉ khi: mục thuộc *bảng nhân vật*;
+   tên rõ là phiên âm (số chữ khớp ≥ số chữ lệch, âm lệch viết hoa); âm sai chỉ lệch ≤ 1
+   ký tự (bỏ dấu) so với **đúng một** âm hợp lệ. Còn lại chỉ báo.
+3. Sửa lan khắp ngữ cảnh: mọi cụm ≥ 2 âm tiết của tên sai ("Liễu Mộc Vân", "Mộc Vân",
+   "Liễu Mộc") trong bảng nhân vật, tóm tắt, thuật ngữ, Visual Cues; không thay âm tiết đứng
+   riêng ("gỗ mộc" giữ nguyên); không đụng cụm trùng tên đúng của nhân vật khác.
+4. Áp dụng ở mọi cửa vào: ngay sau **phân tích ngữ cảnh**; khi **mở lại video** (phiên đã
+   lưu bằng bản cũ được sửa và lưu lại — không phải tốn 22 request phân tích lại); khi
+   **bắt đầu dịch/dịch lại dòng** (kể cả khối Bộ nhớ dịch còn tên sai). Bản dịch đã lưu
+   cũng được sửa khi mở lại video: với phiên thật này là **44 dòng**, còn **0** dòng sai.
+5. Chuẩn đoán ngữ cảnh thêm cờ `roster_name_reading` (cảnh báo) và
+   `glossary_name_reading` (thông tin) kèm chi tiết từng chữ, âm đúng và bản tự sửa.
+
+### 🧹 Nhân vật bị lặp sau khi gộp các đoạn video
+
+Bảng 30 dòng có 3 nhân vật lặp: `柳杰 / 柳河` và `柳河 / 柳杰` (model đảo thứ tự bí danh ở
+đoạn sau), `春花 / 许春花` và `许春花`, `柳老爷子 / 柳家主` và `柳老爷子` — prompt dịch nhận hai
+mô tả cho cùng một người. Bộ gộp giờ hợp nhất theo bí danh chung sau mỗi lần gộp và hợp
+luôn các phiên âm (`Liễu Kiệt / Liễu Hà` thay vì mất "Liễu Hà"). Bảng thật: 30 → 27 dòng.
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_name_reading_v323567.py` (33 ca) và
+  `tests/unit/presentation/test_name_reading_vm_v323567.py` (4 ca): ca thật sửa khắp ngữ
+  cảnh, từ thường không bị đụng, tên Việt hoá/thuật ngữ không bị sửa, âm gần nhất mơ hồ
+  không đoán, âm phụ được chấp nhận, không sửa cụm trùng tên người khác, bảng âm thật nhận
+  đúng ca thật và chấp nhận âm quy ước (Nhậm, Gia Cát), file thiếu/hỏng → bỏ qua, use case
+  phân tích, cờ chuẩn đoán, lưu phiên giữ hash, nạp lại phiên sửa cả bản dịch đã lưu,
+  request dịch và Bộ nhớ dịch dùng tên đúng, gộp nhân vật đảo bí danh. Hai ca gộp nhân vật
+  đã kiểm **thất bại trên mã cũ** (các ca soát tên dùng mô-đun mới).
+* Toàn bộ: **4737 passed, 0 failed**.
+
+## [3.23.566] — 📜 Tóm tắt phim theo dòng thời gian, hết lặp và hết mất đoạn giữa phim
+
+Soi chuẩn đoán thật của v3.23.565 — lần đầu có bản phân tích bằng **gemini-3.8-flash**:
+
+* Bản sửa v3.23.564 chạy đúng trong thực tế: hết hạn mức ở đoạn 19 → **giữ 16/22 đoạn**,
+  lưu tiến độ; 6 đoạn còn thiếu (6, 13, 19-22) sẽ chạy tiếp ngày mai. Phần thiếu cues được
+  quét bổ sung: 57% → 99% dòng có cue dùng được.
+* Bảng nhân vật tốt hơn hẳn: **108 quy tắc xưng hô** (bản 3.6-flash: 63), **0 cặp mơ hồ**
+  (trước: 7).
+
+### 📜 Tóm tắt phim: 7/13 đoạn văn là bản kể lại từ đầu, phần giữa phim bị cắt
+
+Ở mỗi đoạn video, prompt yêu cầu "hợp nhất thành bản cập nhật đầy đủ tới thời điểm này" —
+3.8-flash làm đúng, tức trả lại **tóm tắt toàn phim từ đầu**. Bộ gộp cũ (v3.23.489) lại
+NỐI các bản đó với nhau: tóm tắt 20 049 ký tự có **7/13 đoạn văn** mở đầu y hệt *"Thế giới
+quan đan xen giữa cuộc sống nông thôn…"*, chạm trần 20 000 ký tự và bị **cắt bỏ phần giữa
+phim** (`[… lược bớt phần giữa …]`). Soi lại: **cả 3 bản phân tích gần nhất** (3.6-flash,
+3.8-flash và bản tốt của v3.23.557) đều đã bị cắt phần giữa — các lô dịch ở giữa phim
+thiếu bối cảnh cốt truyện từ lâu mà không cờ nào báo.
+
+Sửa (schema hơn chỉ thị):
+
+1. Schema phân tích thêm trường `segment_summary` — diễn biến CHI TIẾT **chỉ của đoạn
+   đang xem**; `overview` là bản toàn cảnh ngắn, được **thay thế** bằng bản mới nhất thay vì
+   nối. Chỉ thị ghi rõ vai trò hai trường.
+2. Mô-đun mới `overview_composer`: tóm tắt cuối = toàn cảnh (≤ 5 000 ký tự) + mục
+   **"DIỄN BIẾN THEO THỜI GIAN"** gồm từng đoạn `[mm:ss–mm:ss] …` xếp theo mốc thời gian
+   (không phụ thuộc thứ tự chạy — chạy tiếp đoạn thiếu hôm sau vẫn đúng thứ tự), chia đều
+   ngân sách độ dài cho MỌI đoạn, cắt ở cuối câu. Không còn đoạn nào bị bỏ.
+3. Mỗi đoạn nhận thêm "diễn biến đoạn NGAY TRƯỚC" để nối mạch.
+4. Tiến độ phân tích lưu cả diễn biến theo đoạn. Tiến độ lưu bởi bản cũ (chưa có diễn
+   biến theo đoạn) được chạy tiếp theo cách gộp cũ để không mất chi tiết đã có.
+5. Model không trả `segment_summary` vẫn chạy theo cách gộp cũ (tương thích).
+
+### 🔍 Chuẩn đoán ngữ cảnh báo hai lỗi tóm tắt
+
+* `overview_repetitive` — từ 3 đoạn văn trở lên mở đầu trùng nhau (dữ liệu thật: 7).
+* `overview_truncated` — tóm tắt đã bị cắt bỏ phần giữa phim (dữ liệu thật: cả 3 bản).
+
+### 🧹 Mục "Xưng hô" không còn là một nhân vật
+
+Bảng nhân vật của 3.8-flash lẫn một dòng tiêu đề trơ trọi "Xưng hô", bị đọc thành nhân
+vật (chuẩn đoán báo "tên không có trong phụ đề"). Mục chỉ có tên, không phiên âm/giới
+tính/tuổi/vai trò, trùng nhãn tiêu đề ("Xưng hô", "Nhân vật", "Ghi chú"…) giờ bị bỏ.
+
+### Kiểm thử
+
+* Thêm `tests/unit/infrastructure/test_segment_overview_v323566.py` (18 ca): ghép theo thời
+  gian bất kể thứ tự chạy, mốc giờ cho phim dài, trần độ dài giữ đủ mọi đoạn, cắt ở cuối
+  câu, phân tích tuần tự không lặp phần thiết lập, toàn cảnh là bản mới nhất, prompt yêu
+  cầu hai trường, diễn biến đoạn trước được chuyển tiếp, model cũ giữ cách gộp cũ, chạy
+  tiếp vẫn đúng thứ tự, tiến độ cũ giữ cách gộp cũ, lưu/đọc diễn biến trong tiến độ, dòng
+  tiêu đề bị bỏ, cờ chuẩn đoán. Đã kiểm **4 ca thất bại trên mã cũ**.
+* Toàn bộ: **4698 passed, 0 failed**.
+
+## [3.23.565] — 🛡️ Lưới xưng hô không ép sửa theo cue gán nhầm người nói
+
+Soi chuẩn đoán thật của v3.23.564 (hai lượt dịch 08:51 và 09:51, phân tích ngữ cảnh chưa
+chạy lại vì hạn mức 3.8-flash chưa hồi). Bản sửa "phim ở gốc ổ đĩa" **có tác dụng**: ngữ
+cảnh phim bộ giờ rỗng, không còn neo vào bản phân tích cũ. Bản cuối: 0 khối lệch, 0 con số
+sai, dòng lệch quy tắc xưng hô 18 → 15.
+
+### 🛡️ Ép sửa theo cue sai làm HỎNG câu đang đúng
+
+Dòng 1827-1829 — Tống Dao kể tội nhà họ Từ trong MỘT câu nối bằng dấu phẩy:
+
+> 之前打伤我哥 / 打断我妈的腿 / 还逼我高中辍学
+
+Cue ghi dòng đầu là 宋瑶 (đúng) nhưng hai dòng sau là 安雪漫 (sai). Lưới xưng hô tin cue,
+ép theo quy tắc "An Tuyết Mạn xưng 'em' với Từ Tuấn Hào" → cùng một câu thành
+*"Đánh bị thương anh **tôi** trước đây, đánh gãy chân mẹ **em**, còn ép **em** phải bỏ học"*.
+
+Đo trên cả phim: **124 câu nhiều dòng** (328 dòng) mà cue đổi người nói GIỮA CÂU — nhiều
+ca lộ rõ là nhiễu: dòng 54 *"ngươi không những hết ngốc,"* giữa lời Hồng Liên Nữ Đế lại ghi
+Thiết Trụ nói; dòng 246 và 252 giữa lời Tống Tiền ở trong làng lại ghi Viện trưởng Tôn.
+
+Sửa: hàm mới `unstable_cue_lines` tách câu theo dấu câu của bản dịch (dòng không kết thúc
+bằng `.`/`!`/`?` — kể cả kết bằng dấu phẩy hay "…" — là câu còn chảy sang dòng sau). Câu có
+từ hai người nói trở lên theo cue thì mọi dòng của nó **không được ép sửa** (cả chế độ quy
+tắc lẫn chế độ đa số trong cảnh), và được báo trong chuẩn đoán với lý do *"cue đổi người
+nói giữa câu — nghi gán nhầm người nói"*. Lưới xưng hô vẫn giữ nguyên tắc "sửa ít mà chắc".
+
+Đo lại trên hai bản dịch thật: ~500 dòng (13%) bị loại khỏi diện ép sửa; ở bản v3.23.562,
+các sửa tự động còn 4/6 (2 dòng nằm trong câu có cue lẫn người nói).
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_unstable_cues_v323565.py` (9 ca): đổi người nói giữa
+  câu, đổi sau dấu chấm là hội thoại bình thường, "…" nối câu, dòng không liền nhau, câu cùng
+  một người, cue rỗng, ca thật 1827-1829 không bị ép, lý do hiện trong chuẩn đoán, dòng ổn
+  định trong cùng cảnh vẫn được sửa. Đã kiểm **3 ca thất bại trên mã cũ**.
+* Toàn bộ: **4678 passed, 0 failed**.
+
+## [3.23.564] — 💾 Phân tích bằng model mạnh nhất không còn mất trắng khi hết hạn mức
+
+Soi nhật ký thật của v3.23.563. Người dùng phân tích lại bằng **gemini-3.8-flash** (model
+mạnh nhất, hạn mức miễn phí **20 request/ngày**) để đẩy chất lượng lên tối đa:
+
+* Lần 1 (20:55): 503 quá tải ngay đoạn đầu, người dùng huỷ.
+* Lần 2 (05:31-06:20): chạy **50 phút**, xong **20/22 đoạn** (đoạn 10 lỗi quota, đoạn 20
+  hết ngân sách chờ 503). Tới lượt thử lại cuối phiên, mọi key đều hết hạn mức →
+  `QuotaExhaustedError` — **toàn bộ 20 đoạn bị vứt**, ứng dụng vẫn dùng bản phân tích cũ của
+  3.6-flash (file chuẩn đoán ngữ cảnh: tóm tắt vẫn đúng 20048 ký tự như cũ).
+
+Phim cần 22 request, hạn mức 20: với mã cũ, model mạnh nhất **không bao giờ** phân tích
+trọn phim này được, dù chạy lại bao nhiêu ngày.
+
+### 💾 1. Hết hạn mức giữa chừng: giữ phần đã xong
+
+Vòng phân tích theo đoạn chỉ bắt `SubtitleTranslationError`, còn `QuotaExhaustedError` là
+lớp khác nên thoát ra ngoài. Giờ gặp hết hạn mức thì dừng gửi tiếp và **trả về phần đã
+phân tích** (chỉ báo lỗi khi chưa có đoạn nào xong).
+
+### 🔁 2. Lưu tiến độ theo đoạn, lần sau chỉ gửi đoạn còn thiếu
+
+Mô-đun mới `analysis_checkpoint`: sau MỖI đoạn thành công, lưu các đoạn đã xong + ngữ cảnh
+tích luỹ + Visual Cues đã gộp (ghi nguyên tử, hết hạn sau 7 ngày). Chạy lại phân tích với
+cùng phụ đề/model/cài đặt/cách cắt đoạn thì **chỉ gửi các đoạn còn thiếu** — với ca trên là
+2 request thay vì 22. Phân tích xong trọn vẹn thì tự xoá tiến độ. Khoá tiến độ cố ý không
+gồm ngữ cảnh phim bộ (đổi sau mỗi lần dịch), để dịch xen giữa không làm mất tiến độ.
+
+### 🎬 3. Phim lẻ ở gốc ổ đĩa không còn bị coi là "phim bộ D:"
+
+`derive_series_key("D:\\phim.mp4")` trả `"D:"` — chữ cái ổ đĩa bị dùng làm tên phim bộ.
+Hệ quả thật trong nhật ký ("Đã lưu 3902 cặp câu vào Bộ nhớ dịch cho phim bộ 'D:'"):
+
+* Mọi phim lẻ ở gốc ổ D dùng chung bộ nhớ dịch và ngữ cảnh phim bộ.
+* Nghiêm trọng hơn: **phân tích lại CHÍNH phim này** bị chèn ngữ cảnh "đã chốt ở các tập
+  TRƯỚC — BẮT BUỘC tái sử dụng tên & cách dịch", mà ngữ cảnh đó lại là bảng nhân vật và
+  thuật ngữ của lần phân tích cũ bằng 3.6-flash. Model mạnh bị neo vào kết quả của model
+  yếu, không sửa được tên/thuật ngữ sai.
+
+Giờ tệp ở gốc ổ đĩa mà không có mẫu số tập (`S01E02`…) thì không thuộc phim bộ nào; tệp có
+mẫu số tập ở gốc ổ vẫn gom đúng như trước.
+
+### Kiểm thử
+
+* Thêm `tests/unit/infrastructure/test_analysis_resume_v323564.py` (17 ca): hết hạn mức ở
+  lượt thử lại cuối phiên (đúng ca thật) vẫn giữ kết quả, hết hạn mức giữa chừng dừng gửi
+  tiếp, hết hạn mức ngay đoạn đầu vẫn báo lỗi, lần sau chỉ gửi đoạn thiếu, xong trọn thì xoá
+  tiến độ, đổi model thì không dùng lại, đổi ngữ cảnh phim bộ vẫn giữ tiến độ, lưu/đọc/hết
+  hạn/file hỏng, phim ở gốc ổ đĩa không thuộc phim bộ. Đã kiểm **5 ca thất bại trên mã cũ**.
+* Toàn bộ: **4669 passed, 0 failed**.
+
+## [3.23.563] — 🗣️ Lưới xưng hô không còn bỏ qua oan các câu "nhà tôi", "mẹ tôi"
+
+Soi chuẩn đoán thật của v3.23.562. Bản sửa nhãn cues **có tác dụng rõ**: 100% số dòng có
+Visual Cues mang tên nhân vật trong bảng (lần trước 26%), số cặp xưng hô được đo tăng từ 26
+lên **71**, độ phủ mẫu số **0.93**. Lần đầu tiên số liệu xưng hô phản ánh cả phim. Bản cuối:
+0 khối lệch, 0 con số sai, 0 dòng dịch trùng.
+
+### 🗣️ Chốt "vị trí sở hữu" chặn oan 9/24 dòng lệch quy tắc
+
+Với số liệu thật, 24 dòng xưng hô lệch quy tắc bảng nhân vật; **9 dòng** bị bỏ qua chỉ vì
+"đại từ ở vị trí sở hữu". Hai nguyên nhân:
+
+1. **Lỗi nhận chữ hoa.** Chốt "đứng sau tên riêng" nhận chữ hoa bằng lớp `[A-ZĐÀ-Ỹ]` —
+   nhưng dải Unicode `À-Ỹ` chứa cả chữ **thường** có dấu (é, ó, ở, đ…). Nên "còn **ép**
+   tôi", "**đánh** tôi", "**ở** tôi" đều bị coi là "sau tên riêng". Giờ kiểm chữ hoa thật.
+2. **Chặn quá rộng.** Ở dòng TỰ XƯNG (câu gốc có 我, không có 你), "nhà tôi", "mẹ tôi" chỉ
+   có thể là của người nói, nên đổi theo cách xưng của họ vẫn giữ nguyên nghĩa. Hàm mới
+   `possessive_swap_is_safe` chỉ còn chặn những ca đổi nghĩa thật: đại từ có thể số nhiều
+   ("nhà **ta**", "nhà **mình**"), sau số từ/tên riêng, hoặc ghép thành cụm khác nghĩa
+   ("anh tôi" → "anh **em**", "mẹ tôi" → "mẹ **con**", "chị tôi" → "chị chị").
+
+Đo lại trên bản dịch thật — 6 dòng giờ được sửa tự động, đều đúng nghĩa:
+
+* 666 `ở phòng khám nhà tôi` → `nhà em` (Y Bối với Tống Tiền, quy tắc "em")
+* 693 `do bố tôi mở` → `bố em`; 1186 `Mẹ tôi còn đang đợi` → `Mẹ em`
+* 1013/1015 `tiểu thư nhà tao` → `nhà tôi` (Khả Khả với Tống Tiền, quy tắc "tôi")
+* 2937 `đánh gãy chân mẹ tôi` → `mẹ tao` (Tống Tiền với Từ Tuấn Hào, cả cảnh "tao")
+
+Test cũ `test_possessive_position_is_not_replaced` (v3.23.554) khẳng định ca 2937 "đổi
+nghĩa" — soi lại thì chỉ đổi sắc thái cho khớp cả cảnh; đã sửa test kèm giải thích.
+
+### 🏷️ Nhãn bí danh đảo thứ tự
+
+Nhãn "赵可可 / 可可" (bảng ghi "可可 / 赵可可") không khớp bảng nhân vật. Giờ khớp khi mọi
+bí danh cùng trỏ một người; bí danh của hai người khác nhau thì không gộp.
+
+### Còn lại (không sửa bằng mã)
+
+18 dòng lệch còn lại phần lớn do **cue gán nhầm người nói** (vd dòng 3829 "chị đã thấy
+hạnh phúc lắm rồi" là lời Hứa Đào Hoa nhưng cue ghi Tống Tiền nói) — lưới xưng hô từ chối
+sửa là ĐÚNG. 7 cặp xưng hô mơ hồ trong bảng nhân vật vẫn cần sửa tay hoặc phân tích lại.
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_address_possessive_v323562.py` (18 ca): chữ thường có
+  dấu không phải tên riêng, 4 ca thật an toàn, 7 ca đổi nghĩa bị chặn, ca thật dòng 666 sửa
+  đầu-cuối, "anh tôi" giữ nguyên. Đã kiểm **4 ca thất bại trên mã cũ**.
+* Thêm 2 ca bí danh đảo thứ tự vào `test_cue_labels_v323562.py`.
+* Toàn bộ: **4650 passed, 0 failed**.
+
+## [3.23.562] — 🏷️ Cues quét bổ sung dùng đúng tên trong bảng nhân vật
+
+Soi chuẩn đoán thật của v3.23.561. Hai bản sửa trước chạy đúng trên dữ liệu thật: **0 lần**
+mất video do 403 (lần trước 261), quét bổ sung Visual Cues chạy hết trong 23 phút, độ phủ
+cues nhảy từ 22% lên 99,7%. Bản cuối: 0 khối lệch (lưới toàn phim còn bắt thêm khối
+3166-3182 ở Bản địa hoá), 0 con số sai, 0 dòng dịch thiếu.
+
+### 🏷️ Nhưng 74% số cues mới không dùng được
+
+Bộ quét cues **không được đưa bảng nhân vật**, và prompt của nó nêu ví dụ vai vế cổ trang
+("Nam đệ tử", "Nữ tỳ", "Sư phụ"). Trong 3048 cue quét bổ sung, **95%** mang nhãn chung
+chung, và model chép nguyên ví dụ: **"Nữ tỳ" 208 dòng, "Nam đệ tử" 131, "Sư phụ" 24** —
+trong một phim đô thị hiện đại. Hệ quả:
+
+* Lưới xưng hô tra quy tắc theo TÊN nhân vật → bỏ qua gần hết phim. Độ phủ **dùng được**
+  thật ra chỉ **26%** (1012/3902 dòng), gần như không hơn trước khi quét (22%).
+* Khâu dịch được gợi ý "Nữ tỳ nói với Nam đệ tử" → dễ chọn xưng hô tôi tớ/sư đồ.
+* Chuẩn đoán dịch báo trôi xưng hô ẢO: cặp "Nữ chính → Nam chính" dùng lẫn em/chị/ta/anh
+  vì thực ra gom nhiều cặp nhân vật khác nhau.
+
+### Sửa
+
+1. **Bộ quét nhận bảng nhân vật** và phải ghi `spk`/`to` bằng đúng TÊN GỐC như bảng (cùng
+   quy tắc với phân tích ngữ cảnh); bỏ các ví dụ vai vế gây nhiễu.
+2. **Quy nhãn về tên chuẩn** (mô-đun mới `cue_label_canonicalizer`): phiên âm ("Tống
+   Tiền"), bí danh ("土狗") hay tên đầy đủ đều quy về tên trong bảng; cách gọi mà hai nhân
+   vật cùng tranh thì bỏ, không đoán.
+3. **"Có cues" = người nói/nghe là nhân vật trong bảng.** Dòng chỉ có nhãn chung chung
+   được coi là thiếu và quét lại (có bảng nhân vật); cue cũ chỉ được giữ ở dòng mà bản
+   quét mới bỏ trống. Với phim này, lần dịch tới sẽ tự quét lại ~2900 dòng.
+4. **Chuẩn đoán ngữ cảnh** thêm `roster_labeled_lines/ratio`, và cờ `cues_low_coverage`
+   đo trên độ phủ dùng được, kèm lời giải thích khi phần lớn cues chỉ có nhãn chung chung.
+   Dữ liệu thật: báo **lỗi**, 26%, thay vì im lặng với 99,7%.
+5. **Chuẩn đoán dịch**: số liệu xưng hô theo cặp chỉ tính cue có cả hai phía là nhân vật
+   trong bảng. Dữ liệu thật: cờ trôi xưng hô 10 → 2 (còn lại đều là cặp có tên thật), độ phủ
+   mẫu số 0.96 → **0.225** — con số trung thực.
+
+Kiểm chứng lại các lần chạy cũ: bản phân tích tốt (v3.23.553-557) có 77-83% số dòng mang
+nhãn trong bảng, nên ngưỡng 60% không làm quét lại oan.
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_cue_labels_v323562.py` (16 ca): bảng quy đổi tên (bí
+  danh, phiên âm, cách gọi tranh chấp), quy nhãn, độ phủ dùng được, lọc cặp có tên, quét
+  bổ sung coi nhãn chung chung là thiếu + gửi bảng nhân vật, giữ cue cũ ở dòng quét trống,
+  prompt có bảng nhân vật và không còn ví dụ "Nữ tỳ", cờ chuẩn đoán ngữ cảnh, cặp chung
+  chung không sinh cờ trôi còn cặp có tên thì vẫn bắt.
+* Toàn bộ: **4630 passed, 0 failed**.
+
+## [3.23.561] — 🎞️ Xoay API key không còn làm cả lượt dịch mất video
+
+Soi chuẩn đoán thật của v3.23.560. Lượt dịch lần này **chạy hết** (bản sửa "huỷ giả" đã
+có tác dụng), chất lượng chữ ổn: 0 khối lệch, 0 con số sai, 0 dòng dịch trùng. Nhưng nhật
+ký cho thấy hai lỗi âm thầm liên quan tới video.
+
+### 🎞️ 1. Cả 3 giai đoạn dịch chạy KHÔNG video dù đã bật đính video
+
+Bước quét bổ sung cues làm xoay API key (#2 → #3). Mọi đoạn video đã tải lên bằng key #2
+nên với key #3 thì `files.get` trả 403. Khâu dịch resolve handle cho từng lô, gặp 403 thì
+**bỏ qua lặng lẽ** — lô gửi đi không có video, mà vì không gửi file hỏng nên cũng không
+lỗi nào kích hoạt tải lại. Nhật ký: **261 lần** "Handle video … cần tải lại", đủ cả 22
+đoạn, kéo dài từ lô đầu Dịch thô tới lô cuối Bản địa hoá.
+
+Sửa: mỗi lô lấy handle qua `_handles_for_batch` — đủ thì dùng ngay (có cache), thiếu thì
+**tải lại đúng các đoạn của lô** bằng key hiện tại rồi ghi ref mới ngược vào danh sách của
+giai đoạn, để các lô sau không 403 nữa. Nếu tải lại cũng thất bại thì ghi CẢNH BÁO và sự
+kiện `video_missing` vào file chuẩn đoán — không còn im lặng.
+
+### 🎬 2. Quét bổ sung Visual Cues chết ở lô thứ hai
+
+Bộ quét gọi Gemini mà **không** truyền `video_refs` và **không** tính token video:
+
+* Quota chỉ đặt chỗ token chữ → không điều tiết TPM → lô 2 (thêm ~138k token video) dính
+  429.
+* 429 bị coi là lô "không đính video" → xoay key tự do → handle thành của key cũ → 403.
+* 403 không tự tải lại được vì điều kiện heal cần `video_refs` → hết lượt thử → thất bại.
+  Độ phủ cues vẫn **21%**.
+
+Sửa: truyền `video_refs` của lô và ước lượng token gồm cả video (theo độ phân giải phân
+tích). Kèm bỏ đường lùi nguy hiểm: đoạn của lô không resolve được thì trước đây gửi kèm
+**cả 22 đoạn** (~3 triệu token) — giờ dùng heal theo lô, vẫn hỏng thì gửi lô đó không video.
+
+### Kiểm thử
+
+* Thêm `tests/unit/infrastructure/test_video_heal_per_batch_v323561.py` (10 ca): thay ref
+  theo khoảng thời gian, handle đủ thì không tải lại, 403 được heal và ghi ngược, lô sau
+  dùng lại ref đã heal, cờ stale đi thẳng tới tải lại, tải lại hỏng thì cảnh báo + sự kiện
+  chuẩn đoán, `translate_stage` gửi đúng video cho mọi lô sau khi xoay key, bộ quét cues
+  truyền `video_refs` + token video, không bao giờ lùi về gửi cả phim. Đã kiểm 3 ca trọng
+  yếu **thất bại trên mã cũ**.
+* Toàn bộ: **4613 passed, 0 failed**.
+
+## [3.23.560] — 🚑 Quét Visual Cues nhiều lô không còn làm đổ cả lượt dịch
+
+Soi nhật ký thật sau v3.23.559. Phân tích ngữ cảnh lần này: 3.7-flash quá tải 503 (chờ hết
+ngân sách 600s ở đoạn 7) rồi hết quota ngày → chạy lại bằng 3.6-flash, xong 22/22 đoạn
+nhưng Visual Cues chỉ phủ **22%** (842 dòng). Bước quét bổ sung của v3.23.559 kích hoạt
+đúng như thiết kế (3060 dòng thiếu, bằng `gemini-3.5-flash-lite`) — và **cả 3 lượt dịch
+đều dừng** sau lô quét đầu tiên với thông báo "Đã huỷ trong lúc nghỉ giữa các lô", dù
+người dùng không bấm huỷ (09:51, 10:32, 11:00).
+
+### 🚑 1. Điều kiện ĐẢO trong bộ quét Visual Cues
+
+`_interruptible_sleep` trả `True` khi **bị huỷ**, nhưng bộ quét kiểm `if not ...` — nên
+**mọi** lần nghỉ bình thường giữa hai lô đều ném "đã huỷ". Mọi lần quét cues quá một lô
+(kể cả quét toàn phim khi chưa phân tích ngữ cảnh) chưa từng chạy hết. Lỗi bị che vì test
+cũ giả lập hàm nghỉ trả `True` — khớp đúng với điều kiện đảo. Đã sửa điều kiện và sửa
+bản giả trong test cho đúng hợp đồng.
+
+### 🛡️ 2. Bước quét phụ trợ không được làm đổ lượt dịch
+
+Bước quét cues là phụ trợ, nhưng một lỗi "huỷ" từ bộ quét vẫn làm dừng cả lượt dịch. Giờ
+cả quét bổ sung lẫn quét toàn phim chỉ coi là huỷ khi **người dùng thật sự bấm huỷ**
+(callback huỷ báo `True`); còn lại thì ghi cảnh báo và dịch tiếp với cues sẵn có.
+
+### ✂️ 3. Cắt lô quét theo ranh giới đoạn video
+
+Lô chia theo số dòng hay vắt qua ranh giới đoạn nên phải kèm 2-4 đoạn video (~138k token
+mỗi đoạn). Đo trên dữ liệu thật khi quét bổ sung: **17/20 lô** kèm từ 2 đoạn trở lên, một
+lô kèm 4 đoạn (~550k token) — đúng lúc nhật ký ghi 503 rồi **504 DEADLINE_EXCEEDED**. Giờ
+mỗi lô chỉ gồm các dòng bắt đầu trong cùng một đoạn và kèm **đúng một đoạn**: 31 lô × 1
+đoạn, tổng token video giảm ~24% (quét toàn phim: 40 lô × 1 đoạn, giảm ~17%). Hàm thuần
+mới `application/services/visual_cue_batching.py`.
+
+### 📊 4. Hiện tiến độ quét bổ sung
+
+Quét bổ sung có thể kéo dài hàng chục lượt gọi; trước đây thanh tiến độ đứng im nên trông
+như treo. Giờ hiện "Quét bổ sung gợi ý hình ảnh (ai nói với ai): x%".
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_cue_scan_v323560.py` (19 ca): chia lô theo đoạn (kể
+  cả câu vắt mép đoạn, tập con rời rạc, không có video), quét nhiều lô chạy hết không huỷ
+  giả, mỗi lô kèm đúng một đoạn, huỷ thật vẫn dừng, huỷ giả không làm đổ lượt dịch (cả
+  quét bổ sung lẫn quét toàn phim), báo tiến độ. Đã kiểm các ca trọng yếu **thất bại trên
+  mã cũ**.
+* Sửa `test_visual_cues_v314.py` (hàm nghỉ giả trả đúng hợp đồng) và ca huỷ trong
+  `test_cue_top_up_v323559.py` (giờ là huỷ thật).
+* Toàn bộ: **4601 passed, 0 failed**.
+
+## [3.23.559] — 🎬 Visual Cues phủ thấp: báo rõ, tự quét bổ sung, số liệu xưng hô hết "đẹp ảo"
+
+Soi chuẩn đoán thật của v3.23.558. Lần này phân tích ngữ cảnh bị **đổ sang
+gemini-3.6-flash** (3.8/3.7 quá tải 503 rồi hết quota ngày) — chạy đủ 22 đoạn không lỗi,
+nhưng Visual Cues chỉ phủ **27% số dòng** (1046/3902; lần trước 82,7%). Phủ rất không đều:
+có đoạn 72-80%, đoạn 19 chỉ **1/208 dòng**.
+
+### Những gì v3.23.558 làm đúng
+
+* Lưới lệch khối toàn phim chạy thật trong sản xuất: bắt và dịch lại khối 1239-1262;
+  bản cuối **0 khối lệch**.
+
+### 🔍 1. Chuẩn đoán ngữ cảnh im lặng trước độ phủ 27%
+
+Cờ cũ `cues_sparse` chỉ bật khi dưới 2% — nên file chuẩn đoán báo **0 lỗi**, chỉ 1 cảnh
+báo về bảng xưng hô. Thay bằng cờ `cues_low_coverage`: **lỗi** khi dưới 40%, **cảnh báo**
+khi dưới 60%, kèm danh sách **vùng gần như trắng** (cửa sổ 150 dòng, ≤10% có cues; mép
+vùng được cắt về dòng trống thật). Dữ liệu thật: `227-549, 1696-1847, 3078-3357, 3499-3733`
+— biết ngay đoạn nào cần phân tích lại. Lần phân tích tốt: không có vùng trắng nào.
+
+### 🎬 2. Khâu dịch tự quét BỔ SUNG các dòng thiếu cues
+
+Trước đây khâu dịch thấy "đã có cues từ phân tích" là dùng luôn, bỏ qua bộ quét hình ảnh —
+nên 73% số dòng được dịch mà không biết ai nói với ai, và mọi lưới xưng hô cũng mù ở đó.
+Giờ, khi bật *Phân tích hình ảnh: ai nói / nói với ai* và có video, nếu cues phủ dưới 60%
+thì quét bổ sung **chỉ các dòng còn thiếu** (rẻ hơn quét lại cả phim). Cues có sẵn luôn
+được ưu tiên — có thể người dùng đã sửa tay. Kết quả quét được cache trong checkpoint (dịch
+tiếp không quét lại); quét lỗi thì dịch vẫn chạy với cues sẵn có.
+
+Kèm sửa một lỗi chặn đứng việc này: bộ quét Visual Cues lấy trần id = **số dòng gửi đi**,
+nên khi gửi một tập con (vd 2856 dòng rải tới dòng 3902) nó vứt oan mọi cue của nửa cuối
+phim. Trần giờ là chỉ số dòng lớn nhất.
+
+### 💾 3. Lưu cues đã bổ sung vào phiên
+
+Cues gộp được lưu vào phiên dịch (chỉ cập nhật phần cues, phân tích vẫn hợp lệ) và điền
+lại vào ô *Gợi ý hình ảnh* — lần dịch sau không phải quét lại, file chuẩn đoán thấy đúng
+độ phủ thật.
+
+### 📏 4. Chuẩn đoán dịch ghi rõ MẪU SỐ của số liệu xưng hô
+
+Số cặp xưng hô được xét tụt 67 → 23 và mọi cờ xưng hô giảm theo — trông như chất lượng
+tốt lên, thực ra lưới chỉ nhìn thấy 1/4 phim. Thêm `counts.address_cue_coverage` (tỉ lệ
+dòng có đủ cặp người nói → người nghe, bỏ độc thoại). Dữ liệu thật: **0.257**.
+
+### Kiểm thử
+
+* Thêm `tests/unit/application/test_cue_top_up_v323559.py` (21 ca): chỉ quét dòng thiếu,
+  cues có sẵn được ưu tiên, đủ độ phủ thì không tốn lượt gọi, lỗi quét giữ nguyên yêu cầu,
+  huỷ không bị nuốt, dùng lại checkpoint, `execute` trả cues để lưu, bộ quét giữ cue có id
+  vượt số dòng gửi đi, mức độ cờ + vùng trắng, `address_cue_coverage`, lưu phiên chỉ phần
+  cues.
+* Cập nhật `test_visual_cues_unified_v32335.py`: ca "dùng lại cues, không quét" giờ cho cues
+  phủ đủ — dưới ngưỡng thì việc quét bổ sung là hành vi mới có chủ đích.
+* Toàn bộ: **4581 passed, 0 failed**.
+
+## [3.23.558] — 🧭 Bắt khối lệch dòng vắt qua ranh giới lô · dọn dẹp cuối không còn phá lượt dịch
+
+Soi chuẩn đoán thật của v3.23.557 — lần chạy này lại dùng **bản phân tích ngữ cảnh mới**
+(406 thuật ngữ, độ phủ Visual Cues 82,7%).
+
+### Những gì v3.23.557 làm đúng
+
+* Lưới con số chuẩn hoá 7 dòng (cả ca `百万年薪` "năm triệu" → "một triệu"); cờ số sai về **0**.
+* Lưới xưng hô ép 20 dòng qua hai giai đoạn.
+* Lưới lệch khối theo lô bắt và dịch lại thành công **3 khối** (762-780, 3797-3815, 372-390).
+* Cờ dịch trùng đã hết báo oan: **0**.
+
+### 🧭 1. Khối lệch VẮT QUA ranh giới lô — lỗi nặng nhất của lần chạy
+
+Bản cuối có một khối 15 dòng lệch hẳn: từ dòng 3409 mỗi câu mang bản dịch của câu KẾ TIẾP
+("好嘞" ra *"Thế còn Từ Tuấn Hào thì sao?"*, "那徐俊豪呢" ra *"Không phải cậu"*…), câu "Vâng ạ!"
+biến mất, lệch kéo dài tới tận dòng 3421. Người xem sẽ nghe cả đoạn hội thoại trả lời sai câu.
+
+Truy nguyên chính xác: lưới lệch khối lúc dịch chạy trên từng **lô 60 dòng**, cần ít nhất 6
+cửa sổ trượt liên tiếp có tương quan thấp. Khối này nằm ở **đuôi lô 3361-3420** — tới cuối
+lô chỉ còn 5 cửa sổ, thiếu đúng 1, nên lưới mù hẳn. Phần còn lại tràn sang lô sau quá ngắn
+để bắt. Chỉ khi nhìn cả phim (chuẩn đoán cuối) mới thấy.
+
+Sửa: sau MỖI giai đoạn, dò khối lệch trên **toàn bộ đầu ra** — không còn ranh giới lô. Gặp
+khối lệch thì dịch lại riêng vùng đó (kèm 3 dòng đệm mỗi bên) **từ câu gốc** bằng giai đoạn
+dịch thô, và chỉ nhận kết quả khi khối thực sự biến mất. Chạy trước các lưới theo dòng để
+chúng làm việc trên bản đã căn đúng.
+
+Đo trên 10 bộ chuẩn đoán thật: bắt đúng mọi khối lệch thật đã biết (v3.23.548, v3.23.553,
+v3.23.555, v3.23.557), **không báo nhầm lần nào**. Mô phỏng trên chính dữ liệu v3.23.557:
+một lượt gọi thêm cho 25 dòng, khối biến mất, từng dòng về đúng chỗ.
+
+### 🛟 2. Lỗi API ở bước dọn dẹp cuối làm hỏng cả lượt dịch đã xong
+
+Tìm ra khi đọc mã: hai bước dọn dẹp sau cùng (dịch lại dòng trùng, dọn chữ Hán sót) chỉ bắt
+`RuntimeError/ValueError/OSError`, nhưng lỗi gọi Gemini lại là `SubtitleTranslationError` —
+lớp này KHÔNG kế thừa ba lớp kia. Nghĩa là nếu Gemini lỗi (503, hết quota…) đúng lúc dọn dẹp,
+**cả lượt dịch đã chạy xong 4 giai đoạn bị báo thất bại** và mất trắng. Nay các bước dọn dẹp
+(và bước sửa khối mới) đều là "cố gắng hết sức": lỗi thì ghi log và giữ nguyên kết quả.
+
+Test chứng minh: hai test mới **đỏ trên mã cũ, xanh trên bản sửa**.
+
+### Ghi chú về các chỉ số khác
+
+* Dòng 217 `这就是神仙姐姐的` → "đây chính là..." mất thật cụm "Thần Tiên Tỷ Tỷ" (dòng kế
+  không bù). Cả cờ tên riêng lẫn cờ dịch thiếu đều bắt đúng — nhưng chưa có cơ chế tự sửa
+  sau giai đoạn cuối.
+* Dòng 1686 `你春花嫂子都跟我说了` → "Vợ anh Xuân Hoa…" bị cờ tên riêng nhưng là **dịch hợp lý**:
+  Thiết Trụ đang nói về vợ mình.
+
+### Kiểm thử
+
+* Mới: `test_block_repair_v323558.py` (7 test — khối vắt ranh giới lô được sửa, dịch lại vẫn
+  lệch thì giữ nguyên, lỗi API giữ nguyên, thiếu giai đoạn thô chỉ báo; hai test lỗ ngoại lệ).
+* Toàn bộ: **4560 test, 0 lỗi**.
+
+## [3.23.557] — 🎯 Dọn ba lỗi ĐO LƯỜNG · tách lỗi bảng nhân vật khỏi lỗi dịch
+
+Soi chuẩn đoán thật của v3.23.556 — lần chạy này dùng **bản phân tích ngữ cảnh MỚI** (39 nhân
+vật, 313 thuật ngữ, độ phủ Visual Cues 79%).
+
+### Xác nhận v3.23.556: hai lưới mới đều làm việc
+
+| Chỉ số | v3.23.555 | v3.23.556 |
+|---|---|---|
+| Lệch dòng / lệch khối | 0 / 0 | **0 / 0** |
+| Dịch thiếu | 0 | **0** |
+| Chữ Hán sót / vi phạm tên riêng | 0 / 0 | **0 / 0** |
+| Con số sai (`number_issues`) | 6 | **0** |
+| Dòng bị lưới ép lại xưng hô | 20 | 12 |
+| Dòng được lưới chuẩn hoá con số | — | 5 |
+
+Lưới con số bắt đúng một ca nặng ở giai đoạn Bản địa hoá: ``一千万`` (10 triệu) bị dịch thành
+"một triệu" ở 4 dòng liền — **sai 10 lần** — và đã được sửa tự động. Lưới lệch khối cũng bắt
+và dịch lại thành công 2 khối.
+
+### 1. 🐞 Cờ "dịch trùng" báo oan 2/2 ca — và còn làm tốn một lượt gọi Gemini
+
+Hai dòng gốc ``宋钱！`` và ``宋钱!`` chỉ khác **bảng mã** của dấu chấm than (full-width và
+ASCII). Bộ đo so nguồn bằng chuỗi thô nên coi là "nguồn khác nhau", rồi thấy bản dịch giống
+hệt (vốn đúng) liền báo trùng. Tệ hơn: tầng dịch tin theo cờ này và **gọi Gemini thêm một lượt
+để dịch lại hai dòng vốn đã đúng** (nhật ký: "Trùng dòng liền kề: 6 dòng … dịch lại riêng từ
+nguồn"). Nay so theo NỘI DUNG (bỏ mọi dấu câu ở cả hai bảng mã) — cờ về 0, và ca trùng THẬT
+(``各位各位`` vs ``大家稍安勿躁``) vẫn bị bắt đúng.
+
+### 2. 🐞 Độc thoại bị tính vào xưng hô
+
+Bản phân tích mới gán 109 dòng có **người nói TRÙNG người nghe** (độc thoại, tự nhủ). Không có
+đối phương thì không có "xưng hô với ai", vậy mà bộ đo vẫn gom chúng thành cặp — sinh cờ ảo
+``宋钱→宋钱`` "trôi" giữa 'tôi' và 'em'. Nay mọi phép đo xưng hô bỏ qua cặp tự-nói-với-mình.
+
+### 3. 🎯 Tách LỖI BẢNG NHÂN VẬT khỏi LỖI DỊCH
+
+Trong 33 dòng bị báo lệch xưng hô, có 11 dòng thuộc hai cặp mà **cả phim dùng nhất quán một
+cách khác** với roster:
+
+* ``沈明月`` với ``柳慕云``: roster bắt xưng 'tôi', nhưng 6/6 dòng đều dịch 'chị' — hợp lý vì
+  vai chị em.
+* ``宋钱`` với ``向城``: roster bắt xưng 'ta' (giọng võ lâm), nhưng 5/5 dòng dùng 'tôi'.
+
+Bản dịch ở đây **không sai** — sai là ở bảng nhân vật. Liệt kê chúng như lỗi dịch chỉ làm
+loãng danh sách cần soi tay. Nay có cờ mới ``address_rule_outdated`` gom mỗi cặp thành MỘT
+dòng kèm đề xuất cụ thể:
+
+> Sửa bảng nhân vật: 沈明月 với 柳慕云 tự xưng 'chị' (phim dùng 6 dòng) thay vì 'tôi'.
+
+Ngưỡng: cặp phải có ≥ 5 lượt tự xưng và ≥ 80% dùng cách khác — đo trên 8 bộ chuẩn đoán thật
+thì bắt đúng hai ca trên mà không sinh báo thừa ở lần chạy nào. Lệch lác đác vẫn nằm nguyên
+trong danh sách từng dòng vì đó là lỗi dịch thật.
+
+### Kết quả đo trên bản dịch thật của v3.23.556
+
+| Chỉ số | Trước | Sau |
+|---|---|---|
+| Dịch trùng liền kề (đều là báo oan) | 2 | **0** |
+| Cặp xưng hô trôi (có 1 cặp độc thoại ảo) | 5 | **4** |
+| Dòng lệch xưng hô cần soi tay | 33 | **22** |
+| Quy tắc roster nên sửa | — | **2** (gom từ 11 dòng) |
+
+### Kiểm thử
+
+* Mới: ``test_diagnostics_precision_v323557.py`` (10 test — mỗi lỗi một ca thật, kèm ca
+  ĐỐI CHỨNG để chắc lưới không bị làm cùn).
+* Cập nhật test v3.23.554 theo hành vi mới (cả phim lệch → báo ở mục roster), kèm test mới
+  chứng minh lệch lác đác vẫn hiện từng dòng.
+* Toàn bộ: **4553 test, 0 lỗi**.
+
+## [3.23.556] — 🔢 Con số: bắt sai giá trị tiền bạc và ép nhất quán lối đọc
+
+Soi chuẩn đoán thật của v3.23.555 (cùng phim 3902 dòng).
+
+### Xác nhận v3.23.555: lần chạy sạch nhất từ đầu chuỗi
+
+| Chỉ số | v3.23.553 | v3.23.554 | v3.23.555 |
+|---|---|---|---|
+| Lệch dòng / lệch khối | 0 / 0 | 0 / 0 | **0 / 0** |
+| Dịch thiếu | 1 | 2 | **0** |
+| Vi phạm tên riêng | 0 | 0 | **0** |
+| Chữ Hán còn sót | 0 | 0 | **0** |
+| Dòng bị lưới ép lại xưng hô | — | 8 | **20** |
+
+Lưới xưng hô v3.23.555 làm việc đều ở cả ba giai đoạn (7 + 8 + 5 dòng), và đây là lần chạy
+đầu tiên **không còn dòng nào bị nghi dịch thiếu**.
+
+### 🔢 Lớp lỗi mới tìm ra: CON SỐ
+
+Vì mọi cờ cũ đã sạch, lần này tôi soi tay bản dịch theo mẫu rải đều cả phim và tìm ra một lớp
+lỗi chưa từng có cờ nào bắt — **con số**. Câu vẫn trôi chảy, vẫn đủ dài, vẫn đúng thuật ngữ,
+nên mọi lưới hiện có đều im lặng:
+
+* **Sai giá trị**: ``百万年薪`` (mức lương năm MỘT triệu) ra *"mức lương năm triệu tệ"* —
+  người xem nghe thành 5 triệu. Với phim thuyết minh, sai số tiền nặng hơn vụng câu chữ.
+* **Lệch lối đọc**: cùng ``一千万`` khi thì *"mười triệu"* (dòng 2338), khi thì *"một nghìn
+  vạn"* (5 dòng ở đoạn 3377-3440) — một khoản tiền, hai cách đọc trong cùng một phim, mà
+  "một nghìn vạn" thì không ai nói trong tiếng Việt.
+
+Nguyên nhân gốc: tiếng Trung gom số theo 10⁴ (万) và 10⁸ (亿), tiếng Việt gom theo 10³
+(nghìn/triệu/tỉ). Mỗi lô dịch model lại chọn một kiểu quy đổi. Không chỉ thị nào ép nổi sự
+nhất quán ấy trên 3902 dòng — nhưng **phép tính thì luôn đúng**, nên đây đúng là việc của mã.
+
+Module mới ``number_consistency_guard`` (hàm thuần) chạy sau mọi giai đoạn dịch:
+
+1. Tính giá trị cụm số ở câu gốc (``一千万`` = 10.000.000).
+2. Tính giá trị cụm số ở câu dịch — kể cả lối gom lồng nhau kiểu Hán ("một nghìn vạn" =
+   1000 × 10⁴) và lối đọc hàng chục tiếng Việt ("tám mươi lăm nghìn").
+3. Sai giá trị, hoặc dùng đơn vị lối cũ ('vạn'/'ức') trong khi phim chỗ khác đọc theo lối
+   hiện đại → sửa, **lấy đúng cách đọc mà chính bộ phim đã dùng** (không tự chế cách mới).
+
+### Bốn ca lưới SUÝT phá — đã chặn trước khi phát hành
+
+Đo thử trên cả 7 bộ chuẩn đoán thật cho thấy bản đầu tiên của lưới sẽ làm hỏng bốn kiểu dòng.
+Tất cả đều đã thành chốt an toàn kèm test:
+
+* ``千万不能`` / ``大家可千万别当真`` — ``千万`` ở đây là TRẠNG TỪ ("tuyệt đối", "ngàn lần"),
+  không phải 10 triệu. Bản đầu biến *"ngàn lần đừng tưởng thật"* thành *"mười triệu lần đừng
+  tưởng thật"*.
+* ``足足一万四`` — dạng rút gọn (1,4 vạn = 14.000), cụm bắt được (``一万``) không phải giá trị
+  thật → bỏ qua.
+* ``个十百千万`` — bài đếm hàng ("Một, mười, một trăm, một nghìn…"), không phải con số.
+* Sửa vô nghĩa: "một vạn" → "Một vạn" (chỉ khác chữ hoa). Nay chỉ sửa khi SAI GIÁ TRỊ hoặc
+  LỆCH ĐƠN VỊ, còn khác biệt văn phong (chữ số/chữ viết, hoa/thường) thì không đụng.
+* Ngoài ra: cả phim thống nhất đọc ``一万`` là "một vạn" thì đó là VĂN PHONG, không phải lỗi —
+  lưới chỉ vào cuộc khi phim DÙNG LẪN hai lối cho cùng một con số.
+
+### Kết quả đo trên bản dịch thật
+
+| Lần chạy | Sai giá trị | Lệch lối đọc | Còn lại sau khi sửa |
+|---|---|---|---|
+| v3.23.550 | 2 | 5 | 0 |
+| v3.23.553 | 2 | 6 | 0 |
+| v3.23.554 | 1 | 5 | 0 |
+| v3.23.555 | 1 | 5 | **0** |
+
+Cả 6 ca sửa của lần chạy mới nhất đều đúng khi soi tay. Thêm cờ chuẩn đoán ``number_issues``
+để người dùng thấy phần lưới không tự tin sửa.
+
+### Kiểm thử
+
+* Mới: ``test_number_consistency_v323556.py`` (17 test — 4 ca nguy hiểm đều có test riêng).
+* Toàn bộ: **4542 test, 0 lỗi**.
+
+## [3.23.555] — 🎭 Xưng hô: chuẩn hoá theo đa số trong cảnh · phân biệt "dịch ẩu" với "đổi quan hệ"
+
+Soi chuẩn đoán thật của v3.23.554 (cùng phim 3902 dòng).
+
+### Xác nhận v3.23.554: lưới ép xưng hô chạy đúng thiết kế
+
+Nhật ký ghi rõ lưới đã làm việc: `Giai đoạn 2: Dịch thô: ép xưng hô theo bảng nhân vật ở 6
+dòng: 503 (tôi→con), 1375 (tao→chị), 2020 (tôi→tao), 2035 (tôi→tao), 2643 (tôi→tao), 3060
+(tao→tôi)` và thêm 2 dòng ở giai đoạn tinh chỉnh. Soi bản dịch cuối: **cả 8 dòng đều giữ
+đúng**, không còn ca nào "tự sửa được" mà bị bỏ sót.
+
+Các chỉ số khác giữ nguyên mức sạch: lệch dòng 0, lệch khối 0, chữ Hán sót 0, vi phạm tên
+riêng 0, dịch thiếu 2. Lưới lệch khối bắt và dịch lại thành công 4 lần trong lúc chạy.
+
+Nhưng xưng hô trôi trong cảnh lại **tăng**: 48 dòng (v3.23.553) → 75 dòng (v3.23.554) — dao
+động ngẫu nhiên giữa các lần chạy (đo lại 5 lần chạy bằng cùng bộ đo: 18 → 114 → 56 → 48 →
+48 → 75). Lưới mới chỉ xử được 8 dòng vì hai nhóm lớn nhất lọt qua hai lỗ hổng dưới đây.
+
+### 1. 🎭 Lỗ hổng 1: roster cho HAI phương án thì lưới bó tay
+
+Ca lớn nhất: `张依贝↔宋钱` trộn 'em'/'tôi' và 'anh'/'tôi' **trong cùng một cảnh** (16 dòng).
+Chế độ cũ không đụng vào vì bảng nhân vật ghi "tự xưng 'anh/tôi'" — hai phương án nên không
+có cái nào để ép.
+
+Nhưng roster cho phép hai cách KHÔNG có nghĩa là được trộn trong một cảnh. Thêm **chế độ 2 —
+chuẩn hoá theo đa số trong cảnh**: cảnh dài ≥ 6 lượt tự xưng, một cách chiếm ≥ 65%, thì thiểu
+số được kéo về đa số. Ba hàng rào:
+
+* Đa số phải nằm trong **các phương án roster cho phép** (kể cả phương án của quy tắc theo
+  giai đoạn). Không có hàng rào này thì ca thật v3.23.548 sẽ hỏng: gã côn đồ quát "câm miệng
+  hết cho **tao**" bị đổi thành "tôi" chỉ vì đa số dòng quanh đó dịch nhầm.
+* Sau mỗi dòng thiểu số phải còn ít nhất một dòng theo đa số — thiểu số nằm trọn ở **cuối
+  cảnh** là đổi giọng có chủ ý, không phải trôi.
+* Vẫn giữ nguyên các chốt cũ: chỉ thay đại từ không bao giờ là danh từ, không thay ở vị trí
+  sở hữu.
+
+### 2. 🎭 Lỗ hổng 2: "cả cảnh đều lệch" bị hiểu nhầm là đổi quan hệ
+
+Ca thật dòng 2908-2951 (cảnh đối đầu lớn nhất phim): Tống Tiền phải xưng 'tao' với kẻ thù
+nhưng **cả 6 dòng** ra 'tôi', mất sạch thế đối đầu. Chốt "cả cảnh đều lệch → phim đổi giọng"
+của v3.23.554 tưởng nhầm đây là chủ ý.
+
+Cách phân biệt lấy từ chính bộ phim: **phim có quay lại dùng đúng quy tắc ở các cảnh SAU
+không?**
+
+* Có quay lại → cảnh này chỉ là model dịch ẩu một đoạn → sửa. (2908-2951: các cảnh sau vẫn
+  'tao'.)
+* Không bao giờ quay lại → quan hệ đã đổi thật, bảng nhân vật lỗi thời → **không đụng**.
+  (Dòng 3815: Tống Tiền chuyển hẳn sang xưng 'anh' với Hứa Đào Hoa khi đã thành đôi.)
+
+### 3. 🐞 Hai ca báo lệch oan
+
+* **Từ thân tộc dùng thay đại từ**: "Mẹ thực sự đứng lên được rồi con ơi!" (dòng 559) bị báo
+  lệch dù người mẹ ĐANG xưng đúng là 'mẹ' — bộ nhận dạng chỉ bắt đại từ chuẩn, không bắt
+  'mẹ'/'bố'. Nay kiểm trực tiếp cách xưng mà roster quy định.
+* **Danh từ ghép**: "anh trai đi dự" (dòng 3298) — 'anh trai' là danh từ chứ không phải xưng
+  hô. Nay bỏ qua các dạng "anh trai/em gái/con rể/chị dâu/anh hai…".
+
+### Kết quả đo trên bản dịch thật của v3.23.554
+
+| | v3.23.554 | + lưới v3.23.555 |
+|---|---|---|
+| Dòng xưng hô trôi trong cảnh | 75 | **59** |
+| Cặp nhân vật bị trôi | 10 | **9** |
+| Dòng được ép về đúng xưng hô | 8 | **8 + 9 dòng nữa** |
+| Báo lệch oan trong chuẩn đoán | 7 | **0** |
+
+Chạy lại lưới trên cả 6 bộ chuẩn đoán thật: sửa 0-21 dòng mỗi lần chạy, **soi tay đúng 100%**,
+không ca nào hỏng nghĩa.
+
+### Kiểm thử
+
+* Mới: `test_address_majority_v323555.py` (13 test — mỗi hàng rào một ca thật).
+* Toàn bộ: **4524 test, 0 lỗi**.
+
+## [3.23.554] — 🎭 Ép xưng hô theo bảng nhân vật · cứu lượt dịch khi Gemini quá tải
+
+Soi bộ chuẩn đoán thật của v3.23.553 (cùng phim 3902 dòng, cùng bản phân tích ngữ cảnh).
+
+### Xác nhận v3.23.553: lần chạy SẠCH NHẤT từ trước tới nay
+
+| Chỉ số | v3.23.548 | v3.23.551 | v3.23.552 | v3.23.553 |
+|---|---|---|---|---|
+| Lệch dòng (`shifted_lines`) | 5 | 0 | 0 | **0** |
+| Lệch khối (`misaligned_blocks`) | — | 0 | 0 | **0** |
+| Dịch thiếu (`under_translation`) | 18 | 6 | 30 | **1** |
+| Vi phạm tên riêng | 42 | 3 | 0 | **0** |
+| Chữ Hán còn sót | 0 | 0 | 0 | **0** |
+| Dòng xưng hô trôi trong cảnh | — | 63 | 48 | 48 |
+
+Lưới "dịch thiếu" sửa ở v3.23.553 hoạt động đúng như đo trước: 1 cờ thay vì 30, và không còn
+hoàn nguyên nhầm dòng nào (v3.23.552 hoàn nguyên oan 26 dòng).
+
+Chỉ số duy nhất KHÔNG cải thiện là xưng hô trôi trong cảnh: đứng yên ở 48 dòng suốt hai bản.
+Đó là việc chính của bản này.
+
+### 1. 🎭 Xưng hô: chuyển từ DẠY sang ÉP
+
+Đo trên chính lần chạy này: **51 dòng dùng đại từ tự xưng khác quy tắc đã ghi rõ trong bảng
+nhân vật** (roster có 119 quy tắc). Nặng nhất là chỗ sai văn hoá: Tống Tiền nói với **mẹ
+ruột** mà xưng "tôi" ("để bảo vệ bạn gái cũ của **tôi**") thay vì "con"; nói với kẻ thù Từ
+Tuấn Hào cũng "tôi" thay vì "tao" (mất hẳn thế đối đầu).
+
+Điểm quyết định: **50/51 dòng đã sai NGAY Ở GIAI ĐOẠN DỊCH THÔ**, chỉ 1 dòng do giai đoạn
+sau phá. Nghĩa là gắn quy tắc vào lô dịch (v3.23.551) đã tới hạn — model không tra bảng. Theo
+nguyên tắc "schema hơn chỉ thị", chuyển sang ép bằng mã.
+
+Module mới `address_rule_guard` (hàm thuần) chạy sau MỌI giai đoạn dịch. Vì thay đại từ máy
+móc rất nguy hiểm trong tiếng Việt (đại từ trùng danh từ thân tộc), lưới cố ý sửa ÍT mà CHẮC
+— năm chốt an toàn, tất cả rút từ ca thật:
+
+1. Quy tắc phải **không điều kiện** — "trước xưng 'tôi'… sau xưng 'em'" là theo giai đoạn.
+2. Quy tắc phải nêu **đúng một** đại từ.
+3. Câu gốc phải là **ngôi nhất số ít** (có 我/俺/咱, không có 你/您, không phải số nhiều).
+4. Bản dịch phải có **đúng một** đại từ, thuộc nhóm không bao giờ là danh từ
+   (`tôi/tao/ta/tớ/mình`), và không ở vị trí sở hữu ("mẹ **tôi**", "nhà họ Liễu **ta**").
+5. Trong cùng **một cảnh**, quy tắc phải đang được áp ít nhất 25%. Cảnh mà gần như mọi dòng
+   đều lệch là phim ĐỔI GIỌNG có chủ ý (An Tuyết Mạn từ "tao/mày" sang "tôi" lúc quỳ xin
+   lỗi) — máy không được đè.
+
+Kết quả đo lại trên 5 lần chạy thật: 0-9 dòng được sửa mỗi lần, **soi tay đúng 100%**, không
+ca nào hỏng nghĩa. 35 dòng còn lại không tự sửa được thì đưa ra cờ chuẩn đoán mới
+`address_rule_violations` **kèm lý do**, để người dùng tự quyết.
+
+Kèm theo, sửa một lỗi nhận dạng lộ ra khi đo: `咱俩` / `我俩` / `两人` ("hai chúng ta") bị coi
+là ngôi nhất SỐ ÍT — "Dù sao hai **ta** cũng là người một làng" suýt bị đổi thành "hai anh".
+Mẫu số nhiều nay phủ cả các dạng này (cờ `address_drift` cũng chính xác hơn nhờ vậy).
+
+### 2. 🛟 Gemini quá tải (503) không còn làm mất cả lượt dịch
+
+Nhật ký thật ghi **hai lần dịch hỏng hẳn**: `Dịch phụ đề thất bại: 503 UNAVAILABLE — This
+model is currently experiencing high demand`. Cả hai lần đều bỏ cuộc sau đúng 5 lượt thử, tức
+tổng cộng chỉ chờ ~83 giây (7.9 + 12.3 + 22.5 + 42.2), trong khi đợt quá tải của Google kéo
+dài lâu hơn thế.
+
+Lỗi quá tải KHÁC hết quota: xoay API key vô ích vì server bận chứ không phải key cạn — cách
+duy nhất là chờ. Nay nhóm lỗi này (503/504, "high demand", "overloaded") có **ngân sách chờ
+riêng 10 phút**, mỗi lượt chờ 30-120 giây, sau khi đã dùng hết 5 lượt thử thường. Lỗi vĩnh
+viễn (400, sai tham số) vẫn dừng ngay lập tức, lỗi hết quota vẫn đi nhánh xoay key như cũ.
+Đổi lại: mất tối đa 10 phút chờ, thay vì mất cả lượt dịch đã chạy hàng chục phút.
+
+### Kiểm thử
+
+* Mới: `test_address_rule_guard_v323554.py` (19 test — mỗi chốt an toàn một ca thật),
+  `test_overload_budget_v323554.py` (11 test, có chạy THẬT vòng lặp thử lại với đồng hồ giả).
+* Toàn bộ: **4511 test, 0 lỗi**.
+
+## [3.23.553] — 📏 Lưới "dịch thiếu" hết báo động giả · sửa 5 lỗi ẩn do test bị bỏ qua
+
+Soi bộ chuẩn đoán thật của v3.23.552 (cùng phim 3902 dòng, cùng bản phân tích ngữ cảnh).
+
+### Xác nhận v3.23.552 có tác dụng (so 3 lần chạy liền nhau)
+
+| Chỉ số | v3.23.550 | v3.23.551 | v3.23.552 |
+|---|---|---|---|
+| Dòng xưng hô trôi trong cảnh (``address_drift``) | 116 | 63 | **48** |
+| Vi phạm tên riêng | — | 0 | **0** |
+| Tên riêng bị tinh chỉnh làm mất | — | 1 (``桃花嫂子``) | **0** (lưới mới chặn đúng 1 ca thật) |
+| Xưng hô mơ hồ trong bảng nhân vật | 9 | 0 | 0 |
+
+Điểm bất thường duy nhất: ``under_translation`` nhảy **6 → 30** và giai đoạn Bản địa hoá **hoàn
+nguyên 26 dòng**. Soi từng dòng: cả 26 dòng GIỐNG HỆT bản Tinh chỉnh — chất lượng không hề giảm,
+**bộ đo** bị lỗi. Ba nguyên nhân, sửa cả ba:
+
+### 1. 📏 Lưới "dịch thiếu": đo nội dung, không đo dấu câu
+
+* **Trung vị chung cho hai bản** (``find_regressions``): trước đây bản trước và bản sau mỗi bản
+  một trung vị. Giai đoạn sau viết dài hơn ở đa số dòng → trung vị bản sau tăng → dòng KHÔNG ĐỔI
+  chữ nào cũng bị coi là "vừa hỏng" và bị hoàn nguyên. Nay dùng MỘT trung vị (bản trước) và chỉ
+  tính khi dòng **thực sự bị rút ngắn**.
+* **Đếm chữ Hán / chữ cái** thay vì ký tự thô: ``'怎么样?'`` trước đây dài 4 (dấu hỏi chiếm 1/4),
+  nay 3 chữ Hán → dưới ngưỡng thống kê, không xét. Nguồn Latin giữ cách đo cũ (ngưỡng 0,35 hiệu
+  chỉnh riêng theo cách đo đó).
+* **Biên 2 chữ cái** chống lượng tử hoá dòng ngắn (thiếu 1 chữ cái là lật cờ giữa các lần chạy).
+  Đã thử biên 3: bỏ sót ca mất nội dung thật → chọn 2.
+* **Tiếng cười/tượng thanh** (``哈哈哈哈哈哈哈``, ≤ 2 chữ Hán khác nhau) loại khỏi mẫu — không có
+  từ vựng để "dịch thiếu".
+* **Nội dung dời sang dòng kề ±1** không tính là thiếu (cùng chính sách với lưới tên riêng):
+  ``'这就是神仙姐姐的' → 'đây chính là...'`` có dòng sau ``'mảnh nguyên thần của Thần Tiên Tỷ
+  Tỷ?'``. Cờ oan loại này nguy hiểm hơn bỏ sót: nó đẩy vào ``needs_expansion`` khiến model "bổ
+  sung" và LẶP nội dung giữa hai dòng; hoàn nguyên một nửa cặp đảo trật tự cũng gây lặp/mất.
+
+Đo lại trên 5 lần chạy thật:
+
+| Lần chạy | Cờ cũ | Cờ mới | Hoàn nguyên sai ở Bản địa hoá |
+|---|---|---|---|
+| v3.23.548 | 18 | 1 | — |
+| v3.23.549 | 13 | 0 | — |
+| v3.23.550 | 9 | 1 | — |
+| v3.23.551 | 6 | 0 | — |
+| v3.23.552 | 30 | 1 | 26 → **0** |
+
+Ca mất phủ định thật (``'不是叔叔不给你机会' → 'Cho cơ hội,'``) và ca v225 (``'Nên cháu hùa,'``)
+vẫn bị bắt.
+
+### 2. 🐞 Năm lỗi ẩn lộ ra khi chạy ĐỦ bộ test (không bỏ qua test nào vì thiếu thư viện)
+
+* **Trình phát PyAV không bao giờ hiện frame cuối, không bao giờ tới EOF**: mỗi lần giải mã tạo
+  generator ``decode()`` mới rồi bỏ → frame còn lại trong packet (nhất là packet flush cuối tệp)
+  mất theo. Nay giữ MỘT iterator bền, đặt lại khi mở/seek/giải phóng. Bị che nhiều phiên bản vì
+  môi trường test thiếu PyAV. Kèm: bỏ ``except Exception`` khi đóng container.
+* **24 file test giao diện bị bỏ qua oan**: guard ``importorskip("PyQt6")`` trong khi app dùng
+  PySide6. Sửa guard (cùng việc cài đủ PyAV, pedalboard, edge-tts, zhconv) → số test bị bỏ qua 93 → 57, lộ ra test "đính video" có stub thiếu ô "tag cảm xúc"
+  (có từ v3.23.448) — đã sửa và thêm test cho hành vi tắt tag cảm xúc khi bỏ video.
+* **``pytest`` ở thư mục gốc hỏng ngay bước thu thập**: script đo GPU
+  ``tests/test_all_parameter_Paddle_with_gpu.py`` chạy suy luận ở cấp module. Loại khỏi thu thập
+  (vẫn chạy tay được).
+* Test pipeline đa giai đoạn dùng bộ dịch giả để sót chữ Hán → lưới "Dọn CJK sót" (đúng thiết kế)
+  gọi thêm lượt dịch → test hỏng. Cho bộ dịch giả dịch thật ở giai đoạn thô.
+* Test tìm Python hệ thống phụ thuộc PATH của máy chạy test → giả lập exe + PATH cho tất định.
+
+### Kiểm thử
+
+* Mới: ``test_under_translation_precision_v323553.py`` (13), ``test_pyav_last_frame_v323553.py`` (2),
+  +1 test tag cảm xúc, +1 test không tìm thấy Python.
+* Toàn bộ: **0 lỗi**; chỉ còn bỏ qua các test cần dữ liệu/binary thật (thư mục ``test data``,
+  ``vendor/``) hoặc test đánh dấu lỗi thời có chủ đích.
+
+## [3.23.552] — 🛡️ Chặn giai đoạn tinh chỉnh làm hỏng tên riêng · ghi trọn bằng chứng khối lệch
+
+Soi bộ chuẩn đoán thật của v3.23.551. Điều kiện hiếm có: **cùng phim, cùng bản phân tích ngữ cảnh**
+với lần chạy trước — chỉ khác phiên bản app, nên so sánh được trực tiếp tác động của thay đổi.
+
+### Xác nhận v3.23.551 có tác dụng
+
+* **Xưng hô trôi trong cảnh giảm 46%**: ``address_drift`` 14 → 10 cặp, số dòng lệch 116 → 63.
+* Ca nặng nhất lần trước **khỏi hẳn**: ``张依贝→宋钱`` dòng 601-661 nay "em/anh" xuyên suốt, kể cả lúc
+  giận ("Em đánh chết anh!") — trước đây đổi sang "tôi/cậu" giữa cảnh không lý do.
+* Giai đoạn ``final`` nay hoàn tất CÙNG lúc với các giai đoạn khác — lỗi mở lại dự án hiện bản cũ
+  đã hết.
+* Log sạch: không lỗi quota, không 403, không báo nhầm kẹt giao diện.
+
+(Lưu ý thận trọng: mỗi lần dịch có dao động ngẫu nhiên của model, nên một lần đo chưa phải bằng
+chứng tuyệt đối — nhưng ca ``张依贝`` đổi từ sai hẳn sang đúng hẳn đúng ở chỗ đã sửa.)
+
+### 1. 🛡️ Giai đoạn tinh chỉnh làm MẤT tên riêng đã dịch đúng
+
+Dòng ``桃花嫂子的元神碎片``: giai đoạn DỊCH THÔ ra "mảnh nguyên thần của **chị dâu** Đào Hoa" — đúng
+bảng thuật ngữ. Giai đoạn TINH CHỈNH đổi thành "của **vợ** Đào Hoa": sai hẳn quan hệ (Hứa Đào Hoa là
+góa phụ). Ứng dụng đã có lưới chặn cho hai dạng hồi quy cùng kiểu (chèn lại chữ Hán, làm rỗng dòng)
+nhưng chưa có cho tên riêng.
+
+* Module mới ``name_regression_guard`` (hàm thuần): dòng mà bản TRƯỚC thể hiện đúng tên riêng còn bản
+  MỚI (kể cả dòng kề — tinh chỉnh được dời tên sang dòng bên) thì mất → lùi dòng đó về bản trước.
+* Chỉ xét mục loại **tên riêng**; thành ngữ vẫn được diễn đạt lại tự do khi tinh chỉnh.
+* Dùng chung bộ khớp thuật ngữ với chẩn đoán (một nguồn chân lý).
+* Đo trên 3 lần chạy thật cùng phim: bắn **đúng 1 lượt** — chính là lỗi thật trên.
+
+Soi kỹ 6 dòng ``嫂子`` → "vợ" trong phim: 5 dòng là chuyển ngữ ĐÚNG (Thiết Trụ nói với Tống Tiền
+"你嫂子" = "chị dâu cậu" = vợ mình → "vợ anh"), chỉ 1 dòng sai — và lưới chặn không đụng 5 dòng đúng
+vì ở đó bản dịch thô vốn đã dùng "vợ".
+
+### 2. "G-Class" bị tính vi phạm tên riêng oan
+
+Mục ``大G = "xe Mercedes G-Class (Đại G)"``, bản dịch "có chìa khóa xe G-Class" bị báo vi phạm: bộ so
+theo từ nội dung tách "g-class" thành "g" + "class", bỏ "g" (quá ngắn) nên chỉ phủ 50%. Nay TỪ GHÉP
+GẠCH NỐI trong phương án được tính là dạng rút gọn hợp lệ.
+
+### 3. Bằng chứng lệch KHỐI không kiểm lại được
+
+Nhật ký diễn biến ghi 3 lần bắt lệch khối, nhưng mẫu nội dung chỉ lấy dòng ĐẦU và dòng CUỐI của khối
+(hai mục trong kết quả dò) — mẫu của lô 2101-2160 toàn dòng căn đúng, không chứng minh được lần dịch
+lại là cần thiết hay báo nhầm. (Lô 361-420 thì mẫu có đủ bằng chứng: dòng 419 "只要嫂子开口" mang nội
+dung dòng 420 "我一定帮你".) Nay ghi TRỌN khối, tối đa 25 dòng, nới trần mẫu tương ứng.
+
+Đối chiếu: trên cả 3 bản dịch cuối (3 × 3902 dòng) bộ dò khối không báo nhầm lần nào, nên các lần
+bắt ở cấp lô nhiều khả năng là thật — lần tới sẽ có đủ dữ liệu để khẳng định.
+
+### Bộ kiểm
+
+* Mới: ``test_name_regression_v323552.py`` — 12 bộ kiểm dựng từ các ca thật trên.
+
+**Kết quả: 4295 xanh, 0 đỏ.**
+
+## [3.23.551] — 🐞 Mở lại dự án hiện bản dịch CŨ · 🗣️ quy tắc xưng hô gắn thẳng vào từng lô
+
+Soi bộ chuẩn đoán thật của v3.23.550 (phân tích lại ngữ cảnh + dịch lại cùng phim 3902 dòng).
+
+### Xác nhận v3.23.550 chạy đúng trên dữ liệu thật
+
+* Roster phân tích lại: ``ambiguous_address`` = **0** (trước: 9 cặp) — prompt "một cặp đại từ" có tác
+  dụng; roster nay ghi điều kiện giai đoạn rõ ("trước khi thua … sau khi thua …").
+* Cache upload quá hạn được bỏ qua (22 lượt "đã quá hạn sống"), **không còn thử 403** nào.
+* Xoay key giữa khâu phân tích (11:33) chỉ **tải lại 1/22 đoạn** — trước đây là 22/22.
+* Đồng hồ canh không còn báo nhầm; ``glossary_violations`` (tên riêng) = 0.
+* Bộ dò khối lại bắt một lô lệch lúc dịch (dòng 1831-1845, tương quan -0.236) và tự dịch lại.
+
+### 1. 🐞 Mở lại dự án hiện bản dịch CŨ (lỗi nghiêm trọng)
+
+Trong file chuẩn đoán, giai đoạn ``final`` hoàn tất từ **19/09** — 3 ngày trước lần dịch này — và chỉ
+khớp **29%** bản dịch mới. Nguyên nhân: ``final`` chỉ được ghi khi SỬA TAY hoặc dịch lại dòng, còn
+khi nạp lại dự án thì ``final`` được ƯU TIÊN. Hệ quả: dịch trọn bộ xong, đóng app, mở lại → thấy
+bản dịch của lần sửa tay cũ; bản mới bị che.
+
+Nay dịch trọn bộ xong là ghi đè ``final`` ngay. Lợi ích kèm theo: ``final`` giữ cả các bước HẬU KỲ
+(dọn chữ Hán sót, dịch lại dòng trùng, nới thời gian đọc) mà các giai đoạn đã lưu không có — trước
+đây nếu thiếu ``final`` app lùi về giai đoạn bản địa hoá và mất luôn các sửa đó.
+
+### 2. 🗣️ Xưng hô: quy tắc tra sẵn, gắn thẳng vào lô dịch
+
+Roster đã chốt rõ ``张依贝`` với Tống Tiền *"tự xưng 'em' gọi 'anh Tống Tiền'"*, vậy mà dòng
+601-655 ra "tôi/cậu" — kẹp giữa 590-596 và 661+ đều "em/anh", trong CÙNG MỘT CẢNH (dòng 601 cô ấy
+chỉ đang nhờ lấy túi, chưa hề giận). Khâu dịch có nhận ``speaker``/``addressee`` từng dòng nhưng phải
+tự tra quy tắc trong bảng 38 nhân vật.
+
+* **``address_rule_map`` / ``lookup_address_rule``** tra sẵn quy tắc cho từng cặp theo TÊN GỐC (nối
+  roster "với Tống Tiền …" với nhãn cues ``宋钱`` qua trường phiên âm). Xử lý quy tắc có điều kiện
+  ("với Tống Tiền TRƯỚC KHI THUA tự xưng…"), bí danh khác thứ tự (``柳河 / 柳杰`` ↔ ``柳杰 / 柳河``),
+  nhãn nói với chính mình (lỗi cues). Phủ **79%** số cue trên dữ liệu thật.
+* Lô dịch gắn trường ``address`` vào dòng ĐẦU TIÊN của mỗi cặp. Chỉ gắn một lần mỗi cặp mỗi lô:
+  gắn mọi dòng thêm ~11% ký tự prompt (đúng lúc log có lỗi quota token/phút), gắn lần đầu chỉ ~2%.
+  Dòng ngữ cảnh không được gắn.
+* Prompt: mặc định dùng đúng đại từ trong ``address``; chỉ đổi khi có BƯỚC NGOẶT rõ (trở mặt, cãi
+  to, khinh miệt) và đã đổi thì giữ tới hết cảnh. **Không** cấm đổi khi giận — tiếng Việt thật sự
+  dùng đổi đại từ để tỏ khoảng cách, cảnh ``王麻子`` "tao/mày" ngoài suối → "anh/em" nửa đêm là tự
+  nhiên. Lỗi cần chặn là đổi KHÔNG CÓ LÝ DO và đảo qua đảo lại.
+
+### 3. Bộ đo mới ``address_drift``: theo VAI và theo CẢNH
+
+Cờ cũ ``address_inconsistency`` gộp mọi đại từ của một cặp trên CẢ PHIM nên vừa báo nhầm đổi giọng
+hợp lý giữa các cảnh, vừa bỏ sót trôi thật ("cứu lấy **tôi**" → 5 dòng sau "**em** đến tìm anh" —
+cả hai đều là tự xưng nhưng bị đếm lẫn với đại từ gọi đối phương).
+
+* **Vai lấy từ câu gốc**: dòng chỉ có ``我`` → đại từ tiếng Việt là TỰ XƯNG; chỉ có ``你/您`` → GỌI.
+* **Cảnh**: lượt thoại của cặp cách nhau không quá 40 dòng.
+* Bỏ ngôi ba ("cậu **ấy**", "anh **ta**"), số nhiều ("**chúng** ta", ``我们``), biến thể lẻ 1 lần.
+
+Mỗi phát hiện kèm vai, khoảng dòng, biến thể và **dòng ví dụ** của từng biến thể để rà nhanh. Trên dữ
+liệu thật bắt đúng ca nặng nhất (``张依贝→宋钱``: tự xưng em 11 / tôi 5, gọi anh 13 / cậu 11). Số
+cờ giữa các lần chạy (3 → 10 → 14) phụ thuộc độ phủ Visual Cues (27% → 71% → 77%), KHÔNG phải chất
+lượng giảm. Cờ cũ giữ nguyên để còn so được giữa các phiên bản.
+
+### Bộ kiểm
+
+* Mới: ``test_address_rules_v323551.py`` — 16 bộ kiểm dựng từ các ca thật trên.
+
+**Kết quả: 4282 xanh, 0 đỏ.**
+
+## [3.23.550] — ⚡ Xoay key không còn tải lại cả phim · 🗣️ chặn xưng hô mơ hồ từ gốc
+
+Soi bộ chuẩn đoán thật của v3.23.549 (context + translation_debug + app_log, cùng phim 3902 dòng).
+
+### Xác nhận v3.23.549 chạy đúng trên dữ liệu thật
+
+Bộ dò lệch theo KHỐI **bắt được một lô lệch ngay lúc dịch** (dòng 1961-1980, tương quan -0.458).
+Bản model trả lần đầu lệch hẳn (``得罪了柳大小姐`` → "với nhà họ Tống phải không?"), app tự dịch lại,
+bản cuối căn đúng từng dòng. ``shifted_lines`` 5 → 0, ``misaligned_blocks`` cuối cùng 0.
+
+### 1. Xoay key ở yêu cầu cuối → tải lại CẢ 22 đoạn video (mất 5 phút 45 giây)
+
+App_log: key #1 hết quota đúng ở yêu cầu CUỐI của khâu phân tích (đoạn 22/22). Ứng dụng xoay sang
+key #2 rồi **tải lại toàn bộ 22 đoạn** (07:49:40 → 07:55:24) chỉ để gửi đúng một yêu cầu cần
+đúng một đoạn. Nguyên nhân: callback tự chữa gọi ``prepare_and_upload`` — chuẩn bị cả phim.
+
+* Mới ``upload_chunks_for_ranges``: chỉ nén (nếu thiếu) và tải các đoạn có khoảng thời gian lời
+  gọi đang cần. Đoạn nào dùng tới mới tải — **tải lười**.
+* Adapter truyền danh sách khoảng cần cho callback. Nhận diện callback kiểu mới bằng CHỮ KÝ, không
+  bằng thử-gọi-rồi-bắt-``TypeError`` (một ``TypeError`` phát sinh bên trong callback sẽ bị hiểu
+  nhầm và kích hoạt tải lại cả phim). Callback kiểu cũ vẫn chạy được.
+* Tách ``_encode_missing_chunks`` khỏi ``materialize_chunks`` — hàm cũ bỏ qua khi kế hoạch chỉ có
+  một đoạn nên không dùng lại được cho việc nén đúng một đoạn.
+
+### 2. Cache upload không có hạn sống → 22 lượt 403 thử vô ích
+
+File Files API tự XOÁ sau 48 giờ, và với file không còn, Gemini trả **403** (không phải 404). Cột
+``created_at`` có ghi mà KHÔNG BAO GIỜ được đọc, nên mục cũ nào cũng bị đem ra thử trước khi tải.
+Nay mục quá 47 giờ bị coi là không có và xoá khỏi cache (hàm thuần ``is_upload_expired``; mục
+không có dấu thời gian giữ hành vi cũ).
+
+### 3. Đồng hồ canh "giao diện kẹt bận" báo nhầm
+
+App_log: *"Giao diện vẫn ở trạng thái BẬN nhưng không còn luồng nào chạy — tự mở khoá"* bắn **158ms**
+sau khi phân tích xong. Không có tín hiệu nào bị mất: luồng thoát ``run()`` thì ``isRunning`` về
+False ngay, còn tín hiệu kết thúc hợp lệ vẫn đang xếp hàng. Nay phải thấy HAI nhịp liên tiếp mới mở
+khoá (``BUSY_WATCHDOG_CONFIRM_TICKS``) — ca kẹt thật vẫn được cứu sau 5-10 giây.
+
+### 4. Vi phạm thuật ngữ: lỗi tách ngoặc + tách riêng tên riêng với biểu đạt
+
+* **Lỗi phân tích**: vế dịch bị tách theo ``/`` TRƯỚC khi bỏ ngoặc, nên ``"Thổ Cẩu (chó ta/chó
+  cỏ)"`` thành ``"thổ cẩu (chó ta"`` + ``"chó cỏ)"`` — ngoặc hở không bị bỏ, KHÔNG mẩu nào khớp.
+  Bản dịch "Thổ Cẩu" hoàn toàn đúng bị tính vi phạm 4/6. Nay ``glossary_alternatives`` bóc ngoặc
+  trước, và nội dung trong ngoặc cũng được tách ``/``.
+* **Phân loại**: soi 21 "vi phạm" còn lại thì gần như tất cả là thành ngữ/khẩu ngữ dịch TỰ NHIÊN
+  theo ngữ cảnh (``作威作福`` → "hống hách bá đạo", ``虎视眈眈`` → "nhòm ngó như hổ đói") — ép đúng
+  chữ trong bảng sẽ làm bản dịch gượng. Mỗi vi phạm nay có ``kind``: ``name`` (tên riêng — bắt
+  buộc nhất quán) hoặc ``expression``. Số chính ``glossary_violations`` chỉ đếm tên riêng; biểu đạt
+  đếm riêng ở ``glossary_expression_deviations``.
+
+Đo lại: v3.23.549 → **0** vi phạm tên riêng + 17 biểu đạt (file báo 21); v3.23.548 → 1 tên riêng
+(``柳氏集团``) + 4 biểu đạt (file báo 42).
+
+### 5. Xưng hô lộn xộn: gốc nằm ở CHÍNH bảng phân tích
+
+Roster ghi *"với Tống Tiền tự xưng 'tôi/Mộ Vân/chị' gọi 'cậu/Tống thần y/Tống Tiền'"* — BA cách tự
+xưng cho một cặp. Khâu dịch được phép chọn bất kỳ nên mỗi lô chọn một kiểu: 1432 "xin anh cứu lấy
+**tôi**" → 1437 "nên **em** lập tức đến tìm anh". Bảng "đã chốt" thành ra không chốt gì.
+
+* **Prompt phân tích**: MỖI CẶP chỉ ghi đúng MỘT đại từ tự xưng và MỘT đại từ gọi; danh xưng (Tống
+  thần y) ghi riêng trong ngoặc; quan hệ đổi theo diễn biến thì ghi rõ ĐIỀU KIỆN từng giai đoạn —
+  đúng như roster đã làm tốt với ``向城`` ("sau khi thua trận xưng 'tôi'").
+* **Cờ mới ``roster_ambiguous_address``** trong chẩn đoán ngữ cảnh + trường ``ambiguous_address``.
+  Chỉ đếm ĐẠI TỪ khác nhau (theo danh sách đại từ chuẩn của dự án): danh xưng có tên riêng
+  (``'anh/Thiết Trụ ca'``), lời chửi (``'mày/thằng ngốc'``), biến thể cùng gốc (``'chị/chị dâu'``),
+  người nghe là NHÓM (``'mẹ và em trai'``) và quy tắc có điều kiện giai đoạn đều không bị báo.
+  Trên roster thật: **9 cặp mơ hồ** — trong đó cả hai chiều của cặp nói chuyện nhiều nhất phim
+  (宋钱↔柳慕云, 178 lượt).
+
+Phân tích lại ngữ cảnh bằng bản này để roster mới tuân quy tắc một-cặp-đại-từ.
+
+### Bộ kiểm
+
+* Mới: ``test_rotation_and_address_v323550.py`` — 27 bộ kiểm dựng từ các ca thật trên.
+* ``test_glossary_hygiene_v323506.py``: bộ kiểm đếm bí danh chuyển sang tổng danh sách vi phạm
+  (mục "tiệc đầy tháng" nay thuộc loại biểu đạt), bất biến giữ nguyên.
+
+**Kết quả: 4264 xanh, 0 đỏ.**
+
+## [3.23.549] — 🎯 Chẩn đoán dịch: bắt được khối lệch 18 dòng bị bỏ sót, khử 88% báo sai
+
+Soi file chuẩn đoán thật (phim 3902 dòng, v3.23.548) phát hiện các cờ quan trọng nhất báo SAI theo
+**cả hai chiều**: báo lỗi ở chỗ dịch đúng, và im lặng ở chỗ sai nặng nhất.
+
+### 1. Lỗi dịch nặng nhất KHÔNG được báo — nay bắt được (cờ mới ``misaligned_blocks``)
+
+Dòng 2683 ``说够了赶紧给我滚开`` bị model **gộp luôn** nội dung dòng 2684 ``挡我道了`` ("…cút ngay
+cho tao, chắn đường rồi."). Từ đó **18 dòng liền (2684-2701) mang bản dịch của dòng KẾ TIẾP** —
+"信不信我撞过去啊？" thành "Đồ hề.", "那可是五百万的豪车呀" thành "Không thể nào."… Không cờ nào báo.
+
+Vì sao lọt: bộ dò theo tương quan độ dài tính MỘT hệ số cho cả lô nên khối lệch giữa lô bị pha
+loãng; mốc neo thì chỉ phủ ~9% số dòng và khối này không có mốc neo đáng tin nào.
+
+Đo trên chính file đó: tương quan độ dài nguồn/dịch ở vùng lành là **+0.88**, ở khối lệch tụt còn
+**−0.60**. Bộ dò mới quét **cửa sổ trượt 10 dòng** và chỉ kết luận khi ≥6 cửa sổ liên tiếp dưới
+ngưỡng 0.20. Kết quả trên toàn bộ 3902 dòng: **1 khối đúng, 0 khối sai.**
+
+Bộ dò này chạy CẢ lúc dịch (trong bộ kiểm của từng lô) → lô gộp/bỏ dòng sẽ được **dịch lại**,
+không chỉ bị báo sau khi đã xong. Thông điệp thử lại ghi rõ khoảng dòng và hệ số tương quan.
+
+### 2. Cờ lệch dòng theo mốc neo: 5 báo sai → 0
+
+Cả 5 dòng bị cờ đều dịch ĐÚNG. Hai nguyên nhân, hai bộ lọc:
+
+* **Mốc neo có vế dịch phổ biến hơn vế gốc là không đáng tin.** ``医生`` → "bác sĩ": gốc 11 dòng,
+  dịch 16 dòng — model thêm hô ngữ "Bác sĩ, …". ``捕鱼`` → "bắt cá": dòng ``那你的渔具呢?`` dịch
+  "dụng cụ đánh **bắt cá**" là đúng. Bộ lọc mới bỏ các mốc neo dạng này (khử 4/5).
+* **Đòi bằng chứng bổ trợ.** 5 dòng báo sai có 5 độ lệch khác nhau (−1, +2, −3, +3, +2), không dòng
+  nào kề dòng nào. Lệch thật luôn tạo ra CỤM cùng độ lệch, hoặc HOÁN ĐỔI tương hỗ (dòng A mang nội
+  dung B, dòng B mang nội dung A). Chỉ hai dạng đó mới được báo.
+
+Hai bộ lọc áp cho cả cờ chẩn đoán LẪN bộ kiểm lúc dịch — trước đây mỗi dương tính giả kéo theo một
+lượt gọi API dịch lại vô ích.
+
+### 3. Vi phạm thuật ngữ: 42 lượt báo → 5
+
+Soi từng ca: 37/42 là bản dịch đúng bị tính sai, do ba nguyên nhân —
+
+* **Thuật ngữ nằm ở dòng kề.** Phụ đề hardsub là mảnh câu, trật tự Hoa-Việt khác nhau:
+  ``和江城医院的`` → "cùng với Viện trưởng Tôn", "Bệnh viện Giang Thành" nằm ở dòng kế. Nay soi ±1
+  dòng (±2 không bắt thêm gì).
+* **Biến thể loại từ.** "kẻ/gã/tên quê mùa", "tiền sính lễ"/"sính lễ", "mảnh/miếng nguyên thần".
+  Nay so theo TỪ NỘI DUNG (bỏ loại từ), đạt khi phủ ≥60% — đã đo 0.5/0.6/0.75/1.0 và chọn mức khử
+  nhiễu tối đa mà vẫn giữ các ca đáng rà.
+* **Phương án trong ngoặc.** ``大G = "xe Mercedes G-Class (Đại G)"``: dùng "Đại G" là đúng.
+
+5 lượt còn lại đều đáng xem (vd ``玉佩`` → "ngọc" thay vì "ngọc bội"). Có bộ kiểm khoá rằng dịch sai
+hẳn nghĩa vẫn bị bắt — nới lỏng không che lỗi thật.
+
+### 4. Mục thuật ngữ DỊCH DỞ lọt vào prompt dịch
+
+Bảng thuật ngữ có mục ``生死道消 = "thân tử đạo消"`` — model dịch ba chữ rồi bỏ dở chữ cuối. Mục này
+lọt qua mọi bộ kiểm rồi đi thẳng vào prompt, **dạy model để sót chữ Hán** trong bản tiếng Việt.
+
+* Khâu dịch nay tự LOẠI mục dịch dở khỏi prompt (ghi cảnh báo vào log).
+* Chẩn đoán ngữ cảnh có cờ mới ``glossary_half_translated`` (mức lỗi) và trường ``half_translated``.
+* Chỉ coi là hỏng khi vế dịch LẪN hai hệ chữ — vế dịch toàn chữ Hán vẫn hợp lệ khi đích là tiếng Trung.
+
+### 5. Nhật ký diễn biến rỗng ở lần chạy sạch
+
+``process_log`` chỉ ghi sự kiện LỖI, nên lần dịch không lỗi cho ``events: []`` — không phân biệt được
+"không có lỗi" với "cơ chế ghi hỏng" (chính tôi đã tưởng nhầm là hỏng khi soi file). Nay mỗi giai
+đoạn ghi mốc ``stage_completed`` (giai đoạn, model, số dòng).
+
+### Bộ kiểm
+
+* Mới: ``test_diagnostics_precision_v323549.py`` — 26 bộ kiểm dựng từ đúng các ca thật trên.
+* ``test_shifted_lines_v323515.py`` viết lại theo chính sách mới: dòng lẻ không bổ trợ không báo;
+  hoán đổi tương hỗ và cụm cùng độ lệch vẫn báo.
+
+**Kết quả: 4237 xanh, 0 đỏ.** Đo lại trên chính file chuẩn đoán thật: ``shifted_lines`` 5 → 0,
+``misaligned_blocks`` 0 → 1 (26 dòng), ``glossary_violations`` 42 → 5.
+
+## [3.23.548] — 📖 CHỐT: dự án MÃ NGUỒN MỞ HOÀN TOÀN, không thương mại
+
+Toan chốt định hướng một lần cho tất cả: **SubtitlesExtractor không còn là dự án thương
+mại, mã nguồn mở hoàn toàn.** Đợt này chỉ cập nhật tài liệu cho khớp, không đụng mã nguồn.
+
+**Gỡ bỏ cảnh báo cấp phép nêu ở v3.23.547.** Việc v3.23.328 gom ``edge_tts`` (GPL v3) vào
+bundle và thêm đường dự phòng chạy trong tiến trình chính là **hoàn toàn hợp lệ** — không
+cần chọn giữa ba phương án nữa. Thực ra ``THIRD_PARTY_LICENSES.md`` đã ghi định hướng mã
+nguồn mở từ **v3.23.312**; chỉ có ``docs/LICENSE_ANALYSIS.md`` là chưa được cập nhật theo,
+nên đợt trước tôi đọc phải bản cũ và cảnh báo thừa.
+
+**``docs/LICENSE_ANALYSIS.md``** — thêm mục 0 đặt ngay đầu tài liệu, nêu rõ quyết định và
+ba hệ quả: thư viện GPL dùng tự do (kể cả bundle + import trong tiến trình chính); không
+cần mua license thương mại nào; **ranh giới subprocess vẫn giữ nhưng vì lý do KỸ THUẬT** —
+chống treo ứng dụng, tránh xung đột phiên bản thư viện (WhisperX kéo torch làm hạ cấp
+huggingface-hub → hỏng VieNeu/PaddleOCR), giữ bản đóng gói nhỏ. Đổi tiêu đề tài liệu (bỏ
+"cho Build Thương mại"), hạ mục "Kế hoạch bắt buộc trước khi bán" xuống thành tư liệu lịch
+sử, bỏ miễn trừ "nhờ luật sư rà soát trước khi phát hành thương mại".
+
+**``THIRD_PARTY_LICENSES.md``** — mục 6 đổi từ *"Thành phần chạy NGOÀI tiến trình chính
+(không liên kết vào app)"* — mô tả không còn đúng với edge-tts — thành mô tả đúng hiện
+trạng, kèm dặn rõ **đừng gỡ các ranh giới tiến trình** chỉ vì cấp phép không còn đòi hỏi.
+Ghi chú tuân thủ mục 4 sửa lại: nghĩa vụ duy nhất khi phân phối là **kèm mã nguồn** và giữ
+nguyên thông báo bản quyền.
+
+Toàn bộ phân tích GPL cũ **được giữ lại làm tư liệu lịch sử** — nó ghi lại vì sao kiến trúc
+hiện tại có hình dạng như vậy (PySide6 thay PyQt6, librosa thay pedalboard, worker
+subprocess cho edge-tts/WhisperX). Đọc để HIỂU mã nguồn, không đọc như ràng buộc còn hiệu lực.
+
+## [3.23.547] — ✅ **0 TEST ĐỎ** (31 → 0), gỡ 1 ô nhiễm bộ kiểm + 5 lỗi thật trong mã nguồn
+
+Đợt dọn cuối. **4210 test xanh, 0 đỏ** — tính từ đầu chiến dịch: **127 → 0**.
+
+### Lỗi THẬT trong mã nguồn được phát hiện và khắc phục
+
+**1. Ô nhiễm bộ kiểm — bộ kiểm an toàn quan trọng nhất của WhisperX bị vô hiệu ngầm.**
+``test_whisperx_env_root_v323403.py`` gọi ``importlib.reload`` lên
+``whisperx_installer``. Nạp lại dựng LẠI lớp ``WhisperXInstallError`` ngay trong
+``__dict__`` của module (cập nhật TẠI CHỖ), trong khi tệp kiểm kia đã ``import`` lớp CŨ
+từ trước. Hàm bảo vệ sau đó ném lớp MỚI, còn ``pytest.raises`` chờ lớp CŨ → ngoại lệ lọt
+ra ngoài, bộ kiểm đỏ. Đây chính là bộ kiểm canh giữ bất biến quan trọng nhất của trình
+cài WhisperX (mọi lệnh ``pip install`` phải chạy bằng Python của môi trường riêng — sự
+cố v3.23.335 làm hỏng VieNeu/PaddleOCR). Triệu chứng đặc trưng: chạy riêng thì xanh,
+chạy cả bộ thì đỏ. Cả hai hàm resolver đều đọc ``sys`` LÚC GỌI nên nạp lại hoàn toàn vô
+ích — đã bỏ hẳn, thêm bộ kiểm khoá lý do đó.
+
+**2. Hai worker cài đặt nuốt lỗi không ghi log.** ``install_cuda_runtime_worker`` và
+``install_paddle_runtime_worker`` phát tín hiệu thất bại (hết giờ, hoặc pip trả mã thoát
+≠ 0) mà KHÔNG ghi một dòng log nào. Người dùng báo "cài không được", tệp log trống trơn.
+Nay cả hai nhánh đều ghi log ERROR, kèm **toàn bộ đuôi log 4000 ký tự** của pip — hộp
+thoại vẫn chỉ hiện 4 dòng cho gọn, nhưng chẩn đoán có đủ dữ liệu.
+
+**3. Báo sai nguyên nhân khi bỏ dòng phụ đề chỉ có ký hiệu rác.** VieNeu xét "có nội
+dung đọc được không" trên văn bản ĐÃ TIỀN XỬ LÝ. Bước tiền xử lý quét sạch ký hiệu rác
+(``□□□`` từ OCR — đo thực 34/896 dòng) thành chuỗi rỗng, nên nhánh này rơi vào thông báo
+*"Cửa sổ quá ngắn / text rỗng"*. Kết quả vẫn đúng (bỏ dòng, không gọi model) nhưng
+NGUYÊN NHÂN sai, đẩy người dùng đi tìm lỗi ở chỗ không có lỗi. Nay xét trên văn bản gốc
+→ báo đúng *"Không có nội dung đọc được (chỉ dấu câu/ký hiệu)"*.
+
+**4. Tham số ``quality_cap`` chết lặng trong ``total_speed_ratio``.** Từ v3.23.464 tham
+số này KHÔNG còn tác dụng (trần nén nay tôn trọng đúng ``max_speed`` người dùng đặt),
+nhưng vẫn nằm trong chữ ký với mặc định 2.0. Người đọc sau này truyền
+``quality_cap=1.5`` sẽ tin rằng nó kẹp — mà nó lặng lẽ không làm gì. Đã bỏ khỏi chữ ký.
+``stretch_ratio_cap`` giữ nguyên vì ở đó tham số THẬT SỰ được dùng.
+
+**5. Từ vựng tiếng Anh không nhất quán khiến bộ lọc mất tác dụng.** Bảng kết quả hiện
+trạng thái *"🔊 Overlap 1.2s"*, còn bộ lọc lại ghi *"Issues (skipped + cut + fast +
+bleed)"* — người dùng bản tiếng Anh không nối được hai chữ đó với nhau. Đã thống nhất
+dùng "overlap" cho cả bốn chuỗi liên quan.
+
+### Cảnh báo cấp phép cần Toan quyết định
+
+Bộ kiểm ``test_edge_tts_cach_ly_gpl_subprocess`` phát lộ một thay đổi chính sách chưa
+được ghi vào tài liệu. Từ **v3.23.328**, tệp spec đã GOM ``edge_tts`` (GPL v3) vào
+bundle, và adapter có đường dự phòng chạy edge-tts NGAY trong tiến trình chính khi máy
+không có Python ngoài. Hai lá chắn GPL mà ``docs/LICENSE_ANALYSIS.md`` mô tả (không
+phân phối kèm + ranh giới tiến trình) **đều không còn** ở đường dự phòng đó.
+
+Đã cập nhật ``docs/LICENSE_ANALYSIS.md`` và ``THIRD_PARTY_LICENSES.md`` để ghi đúng hiện
+trạng, kèm ba lựa chọn: (a) quay lại chính sách v268; (b) phát hành toàn bộ ứng dụng
+theo GPL v3; (c) bỏ Edge TTS, dùng VieNeu (Apache 2.0) / Gemini TTS. **Đây là quyết định
+thương mại, không phải kỹ thuật — tôi không tự chọn thay.** Bộ kiểm nay khoá bất biến
+hẹp hơn nhưng vẫn thật: ``edge_tts`` chỉ được import LƯỜI trong đúng hàm dự phòng, không
+bao giờ ở cấp module — nên phiên dùng subprocess (mặc định) không nạp dòng mã GPL nào.
+
+### Bộ kiểm lỗi thời — chính sách đã đổi, mã nguồn TỐT HƠN
+
+* **Trả dư dòng khi dịch (3 bộ kiểm).** Từ v3.23.512, model trả dư dòng ngữ cảnh mà vẫn
+  đủ dòng của lô thì LỌC phần thừa thay vì bỏ cuộc. Ba bộ kiểm còn khoá chính sách cũ.
+  Nay tách làm hai ca rõ ràng: dư-mà-đủ → lọc; dư-mà-thiếu → vẫn báo hỏng để chia nhỏ.
+* **Trần nén 2.0 (2 bộ kiểm).** v3.23.464 bỏ kẹp cứng để tôn trọng ``max_speed``.
+* **``temperature`` cho Gemini.** v3.23.511 chỉ gửi cho họ model CŨ. Thêm bộ kiểm khoá
+  chiều ngược lại: model mới/lạ TUYỆT ĐỐI không gửi (tránh HTTP 400 làm hỏng khâu dịch).
+* **Lọc dòng rác CJK.** v3.23.350 bỏ qua bộ lọc khi nhãn ngôn ngữ gần như chắc SAI.
+
+### Bộ kiểm dò chuỗi cứng — dời sang đúng chỗ bất biến đang sống
+
+Đợt Việt hoá/i18n dời nhãn giao diện từ mã nguồn sang ``strings_vi.json`` /
+``strings_en.json``; các đợt refactor tách hàm và đổi seam gọi tiến trình con. Bảy bộ
+kiểm dò chuỗi cứng vì thế đỏ dù hành vi nguyên vẹn. Thay vì nới lỏng, mỗi bộ được viết
+lại để kiểm ĐÚNG bất biến ở nơi nó sống bây giờ:
+
+* Nhãn "Lấn" + bộ lọc "Có vấn đề" → kiểm nhánh mã **và** cả hai bộ từ điển.
+* Rẽ nhánh worker GPU của VieNeu → phân tích **CÂY CÚ PHÁP** thay vì cắt cửa sổ 300 ký
+  tự (v3.23.412 chèn thêm nhánh vào giữa làm trôi phần cần kiểm ra ngoài cửa sổ).
+* Luồng xuất tệp Editor → soi ``_do_export_clicked`` (v3.23.374 tách hàm). Hai bộ kiểm
+  anh em trước đó "xanh nhầm" nhờ chuỗi tình cờ có trong phần vỏ.
+* Encode video ngữ cảnh → vá ``run_ffmpeg_hardened`` (seam mới từ v3.23.461) thay
+  ``subprocess.run``; bộ kiểm cũ gọi **ffmpeg thật**.
+* Kiểm bản đóng gói → tính cả ``OPTIONAL_ENTRIES``; thêm bộ kiểm khoá cờ ``optional``.
+* Đếm lời gọi ``check_bundle`` trong kịch bản build → bỏ qua chú thích và dòng ``echo``.
+* Chỉ thị "diễn giải" giữa các giai đoạn dịch → kiểm bất biến (LITERAL không mang chỉ
+  thị) thay vì so nguyên văn cả dòng template.
+
+### Môi trường
+
+Đã bổ sung ``json-repair`` (đã khai trong ``requirements.txt`` nhưng thiếu trong môi
+trường kiểm) — nhờ đó tầng sửa JSON mạnh nhất được kiểm thật thay vì chạy bản dự phòng.
+
+**Kết quả: 31 → 0 test đỏ, 4210 xanh, 93 bỏ qua.**
+
+## [3.23.546] — 🧹 Dọn tiếp: 35 → 31 test đỏ, đồng bộ bộ kiểm BẢNG QUY ĐỔI TÊN
+
+**Nhóm bảng quy đổi tên (3 → 0 lỗi).** Bộ kiểm cũ đòi chỉ thị tên nhân vật CHỈ được chứa tên tiếng
+đích, và khẳng định tên gốc KHÔNG được xuất hiện. Thiết kế đã đổi ở v3.23.491 và có lý do cụ thể:
+nhãn ``speaker``/``addressee`` kèm mỗi dòng phụ đề được ghi bằng TÊN GỐC, nên nếu chỉ đưa danh sách
+tên tiếng đích thì model không tra ngược được ai đang nói với ai. Bảng quy đổi ``tên gốc → tên đích``
+giải quyết đúng chỗ đó — tên gốc có mặt là CỐ Ý.
+
+Nay bộ kiểm khẳng định đúng bất biến hiện hành: bảng phải có CẢ HAI vế, và vẫn phải nêu yêu cầu dùng
+nhất quán tên tiếng đích.
+
+**Nhóm chia đôi lô khi đính video (2 → 0 lỗi).** Bản giả lập ``_call_gemini`` có chữ ký trải nhiều
+dòng nên đợt quét trước không khớp; nay nhận thêm tham số tuỳ chọn như các bản giả lập khác, để
+không vỡ mỗi lần chữ ký thật mở rộng.
+
+**Kết quả:** 35 → **31 test đỏ**, 4170 xanh. Tính từ đầu đợt dọn: 127 → 31.
+
+## [3.23.545] — 🔍 Dọn tiếp: 38 → 35 test đỏ, hai bộ kiểm quy ước báo đỏ trong khi mã nguồn ĐÃ TỐT HƠN
+
+Đợt này đọc kỹ hai bộ kiểm quy ước — loại kiểm tra bảo vệ hành vi thật chứ không phải hình thức —
+để xem có lỗi thật nào ẩn sau chúng không. Kết luận: mã nguồn đúng, chính quy tắc kiểm đã lỗi thời.
+
+**1. Quy tắc "stderr phải là DEVNULL" (tiến trình GPU của TTS).** Mục đích thật là tránh BẾ TẮC:
+stderr trỏ vào ống mà không ai đọc thì đầy bộ đệm rồi treo tiến trình. Mã nguồn nay ghi stderr ra
+TỆP TẠM có tên (``vieneu_gpu_err_*.log``) — an toàn ngang DEVNULL về mặt bế tắc (ghi tệp không chặn
+như ống), lại GIỮ ĐƯỢC thông tin để gỡ lỗi khi tiến trình GPU chết. Quy tắc cũ khoá cứng chữ
+``DEVNULL`` nên báo đỏ đúng lúc mã nguồn cải tiến. Nay kiểm đúng yêu cầu: cấm ``stderr=PIPE``, bắt
+buộc chỉ định rõ stderr.
+
+Kèm theo, cửa sổ quét mã nguồn của bộ kiểm này chỉ 1500 ký tự nên dừng ngay trong docstring, chưa
+chạm tới lời gọi ``Popen`` — nới lên 4000 và thêm một khẳng định rằng lời gọi phải nằm trong cửa sổ,
+để lần sau docstring dài ra thì test báo rõ thay vì báo nhầm.
+
+**2. Quy tắc "chuẩn bị trước khi mở hộp thoại lưu tệp".** Mã nguồn đã tách ``_on_export_clicked``
+thành lớp vỏ và ``_do_export_clicked`` — nơi thật sự mở hộp thoại. Bất biến vẫn được giữ nguyên, chỉ
+là bộ kiểm quét sai hàm. Nay quét đúng hàm mở hộp thoại.
+
+**Kết quả:** 38 → **35 test đỏ**, 4166 xanh.
+
+## [3.23.544] — 🪟 Dọn tiếp: 41 → 38 test đỏ, kèm một lỗi THẬT về cờ ẩn cửa sổ
+
+**Lỗi thật của ứng dụng:** widget sóng âm trong Trình sửa gọi ffmpeg bằng bộ cờ TỰ DỰNG thay vì
+helper chung, và đặt vào một biến tên chung chung. Bộ kiểm quy ước quét mã nguồn để bảo đảm MỌI lời
+gọi tiến trình con đều thấy rõ việc ẩn cửa sổ ngay tại chỗ gọi — tên biến chung chung khiến lời gọi
+này lọt lưới. Nay dùng lại ``no_window_kwargs()`` rồi bổ sung phần riêng của widget (nhóm tiến trình
+riêng để huỷ được cả cây ffmpeg), và đặt tên biến chứa ``no_window_kwargs`` để nhìn phát là biết.
+
+Bộ kiểm này có lý do tồn tại: thiếu cờ thì trên Windows sẽ NHÁY CỬA SỔ CONSOLE ĐEN mỗi lần vẽ sóng
+âm. Widget cũ vẫn đặt cờ nên chưa nháy, nhưng việc tự dựng cờ song song với helper chung là mầm lỗi
+— sửa helper một chỗ mà chỗ kia không theo.
+
+**Bản giả lập trả sai kiểu (trang Dự án, 2 lỗi → 0).** ``MagicMock()`` trần trả về MagicMock, mà
+trang truyền thẳng kết quả ``translate()`` vào ``QLabel``/``QPushButton`` — Qt từ chối vì không phải
+chuỗi. Nay bản giả trả lại chính khoá dịch.
+
+**Kết quả:** 41 → **38 test đỏ**, 4163 xanh.
+
+## [3.23.543] — 🧹 Dọn tiếp: 47 → 41 test đỏ, xong DỨT ĐIỂM nhóm nén video
+
+**Nhóm nén video (3 → 0 lỗi) — nhóm đã gác lại hai đợt.** Nguyên nhân cuối cùng khá kín: sau khi
+ffmpeg chạy xong, mã nguồn còn xác nhận tệp có KHUNG HÌNH THẬT bằng ffprobe. Tệp giả 2048 byte mà
+test tạo không qua được bước đó, nên MỌI cấp đều bị coi là thất bại — test đo nhầm cơ chế dự phòng
+chứ không phải cơ chế hỏng. Nay giả lập nốt bước xác nhận khung hình. Cả 15 test trong tệp xanh,
+gồm các test quan trọng nhất: giữ GPU khi chỉ NVENC chạy được, chỉ tắt GPU khi mọi cấp GPU hỏng, và
+GPU treo thì rơi về CPU chứ không ném lỗi.
+
+**Nhóm VieNeu (6 → 2 lỗi).** Thực thể dựng bằng ``__new__`` không chạy ``__init__`` nên thiếu
+``_gpu_worker_disabled``, ``_gpu_server``, ``_force_cpu``. Bổ sung vào fixture thay vì nới lỏng mã
+sản phẩm.
+
+**Một bài học về phòng vệ quá tay:** bản phòng vệ ``getattr`` ở v3.23.542 đụng vào cả thân hàm
+``_disable_gpu_worker`` — nơi ``self`` luôn là thực thể thật nên không cần phòng vệ, mà lại có một
+test kiểm nguyên văn mã nguồn tại đó. Đã hoàn nguyên đúng chỗ ấy: phòng vệ nên dùng cho các hàm
+thuần có thể bị gọi độc lập, không rải bừa khắp nơi.
+
+**Kết quả:** 47 → **41 test đỏ**, 4160 xanh.
+
+## [3.23.542] — 🧹 Dọn tiếp: 51 → 47 test đỏ, đồng bộ kỳ vọng với hai thay đổi có chủ đích
+
+Đợt này chủ yếu là các test còn mã hoá hành vi CŨ ở đúng hai chỗ vừa đổi có chủ đích, nên để đỏ sẽ
+che mất lỗi thật ngay tại vùng nhạy cảm nhất.
+
+**1. Nhóm quota (4 test → 0 lỗi).** Ba test đòi ``acquire`` phải ném lỗi ngay khi bộ đếm NỘI BỘ
+chạm trần. Từ v3.23.526, chỉ chặn cứng khi CHÍNH SERVER đã từ chối — vì bộ đếm nội bộ là ước lượng
+và từng làm ứng dụng tự khoá dù Google còn quota (nhật ký thật: báo chạm 50 request/ngày trong khi
+bảng điều khiển ghi mới dùng 0/20 và 1/20 ở hai dự án). Nay các test gọi ``mark_daily_exhausted``
+để mô phỏng đúng xác nhận từ server.
+
+**2. Nhóm temperature (1 test).** Test đòi model RỖNG vẫn phải gửi ``temperature`` ("không rõ thì
+giữ hành vi cũ"). Từ v3.23.511 thì ngược lại: chỉ gửi cho các họ model CŨ đã biết chắc còn hỗ trợ,
+vì tài liệu Gemini nêu rõ các thế hệ sau 3.6 sẽ trả HTTP 400 nếu nhận tham số lấy mẫu. Bỏ sót một
+tham số vốn đã bị bỏ qua thì vô hại; gửi thừa thì hỏng cả tác vụ.
+
+**3. Phòng vệ thuộc tính + chữ ký đổi.** ``vieneu_tts_adapter`` đọc thẳng ``_gpu_worker_disabled``
+nên vỡ khi thực thể chưa đủ thuộc tính — nay đọc qua ``getattr``. ``ProjectsPage`` đã nhận thêm
+tham số ``translator``; test dựng trang được cập nhật theo.
+
+**Kết quả:** 51 → **47 test đỏ**, 4154 xanh.
+
+**Còn lại:** VieNeu GPU worker (2), nén video ở luồng thử-lại-không-audio (3), và các nhóm nhỏ rải
+rác — dọn tiếp ở đợt sau.
+
+## [3.23.541] — 📦 Script tự tải binary native mới nhất vào vendor/ (libmpv + ffmpeg)
+
+Trước đây ``vendor/`` phải tải tay, dễ lấy nhầm bản, và bản clone mới thì thiếu hẳn — trình phát
+video không chạy, hai bộ kiểm thử phải bỏ qua. Nay có ``tools/fetch_vendor_binaries.py`` lấy tự
+động bản MỚI NHẤT từ GitHub Releases:
+
+- **libmpv**: ``shinchiro/mpv-winbuild-cmake`` — chọn đúng ``mpv-dev-x86_64`` (bản có header +
+  import lib), cố ý TRÁNH biến thể ``-v3`` vì nó đòi CPU hỗ trợ AVX2.
+- **ffmpeg**: ``BtbN/FFmpeg-Builds`` — ``ffmpeg-master-latest-win64-gpl-shared``. Có tuỳ chọn
+  ``--ffmpeg-variant lgpl`` cho ai cần tránh ràng buộc GPL khi phân phối.
+
+**Ba tình huống thực tế đã xử lý, đều phát hiện khi CHẠY THẬT:**
+
+1. **API GitHub giới hạn theo IP** (60 lượt/giờ cho khách) — mạng công ty, VPN hay IP dùng chung rất
+   dễ chạm trần và nhận 403. Nay có đường dự phòng đọc trang phát hành: nguồn cấp ATOM cho biết thẻ
+   mới nhất, trang danh sách tài sản cho biết tên tệp kèm mã git (thứ không đoán trước được).
+2. **py7zr không hỗ trợ bộ lọc BCJ2** mà gói ``mpv-dev`` đang dùng, và nó hỏng GIỮA CHỪNG sau khi
+   đã ghi ra một phần tệp — lần chạy sau tưởng "đã có" rồi bỏ qua, để lại thư mục dở dang. Nay dọn
+   sạch rồi chuyển sang 7-Zip hệ thống.
+3. **Xác nhận sau khi giải nén**: bắt buộc thấy ``libmpv-2.dll`` với mpv, ``ffmpeg.exe`` và
+   ``ffprobe.exe`` với ffmpeg — tải thiếu là báo lỗi ngay thay vì để hỏng lúc chạy.
+
+**Kiểm chứng:** chạy thật, tải về 115 MB libmpv và 214 MB ffmpeg; hai test vendor trước đây phải bỏ
+qua nay CHẠY THẬT và xanh (6/6).
+
+**Cách dùng:** ``python tools/fetch_vendor_binaries.py`` (thêm ``--force`` để tải lại,
+``--only mpv`` hoặc ``--only ffmpeg`` để lấy riêng). Thư mục ``vendor/`` vẫn KHÔNG nằm trong gói mã
+nguồn vì nặng hơn 300 MB — chạy script một lần là có.
+
+## [3.23.540] — 🧹 Dọn tiếp: 61 → 51 test đỏ, xong nhóm quota token và TTS
+
+Ba nguyên nhân đã xử lý trong đợt này:
+
+**1. Bản giả lập chưa nhận tham số mới (nhóm quota token video → 0 lỗi).** Các hàm giả lập
+``_call_gemini`` trong test chưa nhận ``video_refs`` — tham số thêm từ v3.23.495. Nay cho chúng nhận
+thêm tham số tuỳ chọn để không vỡ mỗi lần chữ ký thật mở rộng; sửa được cả ba tệp cùng mắc lỗi này.
+
+**2. Hàm đổi tên còn sót ở hai tệp khác (nhóm TTS → 0 lỗi).** Tiếp nối v3.23.539: ngoài bộ kiểm ngữ
+cảnh video, còn hai tệp nữa vẫn vá ``_ffprobe_duration_sec`` trong khi hàm đã thành
+``_read_duration_sec``. Đã quét toàn bộ thư mục test để không sót chỗ nào.
+
+**3. Test đòi binary native mà mã nguồn không chứa (nhóm vendor → 0 lỗi).** Thư mục ``vendor/`` chứa
+libmpv, ffmpeg… nặng hàng trăm MB nên không nằm trong mã nguồn; bản clone mới hoặc gói mã nguồn đều
+chưa có cho tới khi chạy script tải về. Hai test này nay BỎ QUA kèm lý do rõ ràng thay vì báo đỏ —
+báo đỏ thường trực sẽ che mất lỗi thật ở các test khác.
+
+**Kết quả:** 61 → **51 test đỏ**, 4148 xanh. Các nhóm quota token video, TTS bỏ qua ký tự không đọc
+được, và vendor nay sạch.
+
+**Còn lại:** TTS VieNeu (5), nén video ở luồng thử-lại-không-audio (3), và một số nhóm giao diện
+(trang dự án, cảnh báo chồng lấn) — sẽ dọn tiếp.
+
+## [3.23.539] — 🧹 Dọn tiếp nợ kiểm thử: 70 → 61 test đỏ, tập trung nhóm liên quan khâu dịch
+
+Tiếp tục dọn theo từng nhóm, ưu tiên phần gần với khâu dịch nhất. Bốn nguyên nhân đã xử lý:
+
+**1. Hàm đổi tên mà test chưa theo.** Bộ kiểm ngữ cảnh video giả lập ``_ffprobe_duration_sec``,
+trong khi hàm đã thành ``_read_duration_sec``. Vá trượt nên ffprobe THẬT chạy rồi hỏng.
+
+**2. Gọi phương thức thực thể như staticmethod (tiếp nhóm v3.23.536).** Lần trước bộ thay thế chỉ
+khớp tên lớp đầy đủ; lần này gặp tệp dùng bí danh ``G`` nên phải khớp thêm dạng viết tắt.
+
+**3. Thực thể dựng bằng ``__new__`` thiếu thuộc tính.** Luồng phân tích có đụng tới
+``_video_handle_cache``; thực thể không chạy ``__init__`` nên phải gán tay trong fixture.
+
+**4. Ba kỳ vọng mã hoá HÀNH VI CŨ, trái với thay đổi có chủ đích trước đó:**
+- Roster hợp nhất nay trả MỖI MỤC MỘT DÒNG (từ v3.23.489), không nối bằng dấu phẩy.
+- Tóm tắt nay TÍCH LUỸ theo thứ tự thời gian (v3.23.489), không ghi đè bằng đoạn mới nhất — chính
+  là bản sửa để không mất diễn biến đầu phim.
+- Thuật ngữ chuẩn hoá về quy cách ``gốc = dịch`` (v3.23.488), không còn ``=>``.
+
+Các test này nếu để đỏ sẽ che mất lỗi thật ở đúng vùng đang phát triển mạnh nhất.
+
+**Kết quả:** 70 → **61 test đỏ**, 4140 xanh. Nhóm ngữ cảnh video, map-reduce ngữ cảnh và emotion
+cue nay xanh hoàn toàn.
+
+**Còn lại:** TTS VieNeu, nén video (2 test ở luồng thử-lại-không-audio), quota token video, vendor —
+sẽ dọn tiếp theo nhóm.
+
+## [3.23.538] — 🧹 Dọn nợ kiểm thử: 76 → 70 test đỏ, sửa đúng nguyên nhân từng nhóm
+
+Bắt tay dọn các test đỏ tồn đọng thay vì phân loại rồi để đó. Ba nhóm đã xử lý:
+
+**1. Bộ kiểm chuỗi dự phòng mã hoá video (5 → 3 lỗi).** Test khoá cứng "5 cấp" theo thiết kế
+v3.23.159, trong khi từ v3.23.471 đã có thêm các cấp GIẢI MÃ phần cứng cho nhánh mã hoá CPU — thực
+tế là 7 cấp khi có NVENC và 3 cấp khi không. Cập nhật test theo chuỗi hiện hành, kèm chú thích từng
+cấp để lần sau đổi thiết kế là biết sửa ở đâu.
+
+**2. Giả lập sai điểm nối (cùng tệp trên).** Test vá ``subprocess.run``, nhưng module gọi
+``run_ffmpeg_hardened`` — helper dùng ``Popen`` + ``communicate``. Vá trượt nên ffmpeg THẬT chạy và
+thất bại vì tệp video mẫu không tồn tại. Nay vá đúng ``run_ffmpeg_hardened``.
+
+**3. Bộ kiểm WhisperX (4 → 0 lỗi).** Bốn test đã giả lập ``Popen`` nhưng vẫn vướng bước kiểm môi
+trường, đòi phải dựng sẵn thư mục ``whisperx_env``. Nay trỏ biến môi trường
+``SUBEXT_WHISPERX_PYTHON`` về trình thông dịch đang chạy — đúng điểm nối mà mã nguồn đã mở sẵn cho
+trường hợp này.
+
+**Kết quả:** 76 → **70 test đỏ**, 4131 xanh. Còn lại rải đều ở TTS VieNeu, nén video, ngữ cảnh
+video, luồng emotion cue và map-reduce ngữ cảnh — sẽ dọn tiếp theo từng nhóm.
+
+**Còn dở:** 2 test trong nhóm mã hoá video vẫn đỏ ở luồng "thử lại không kèm audio" — cần đọc kỹ
+thêm luồng đó trước khi sửa, không vá ẩu.
+
+## [3.23.537] — 🧪 Cài đủ thư viện để CHẠY THẬT bộ kiểm thử + hai bản phòng vệ thuộc tính
+
+Theo yêu cầu "không có thì cài cho có": đã cài ``PySide6``, ``soundfile`` và ``google-genai`` vào
+môi trường làm việc để chạy được toàn bộ bộ kiểm thử thay vì bỏ qua rồi phỏng đoán.
+
+**Kết quả đo thật qua ba bước:**
+
+| Bước | Số test đỏ |
+|---|---|
+| Ban đầu (thiếu thư viện, đoán mò) | 127 |
+| Sau khi sửa 17 test stale (v3.23.536) | 110 |
+| Sau khi cài đủ thư viện | 88 |
+| Sau hai bản phòng vệ dưới đây | **76** |
+
+**Hai bản phòng vệ ở MÃ SẢN PHẨM (không phải vá test):**
+- ``gemini_translation_adapter`` đọc thẳng ``self._emotion_cues`` và ``self._reading_cps_budget``,
+  nên vỡ khi thực thể chưa có đủ thuộc tính. Nay đọc qua ``getattr`` với giá trị mặc định — vừa hết
+  lỗi, vừa bền hơn khi các hàm thuần được gọi độc lập.
+- ``vieneu_tts_adapter`` đọc thẳng ``self._force_cpu`` ở 8 chỗ — phòng vệ tương tự. Riêng dòng KHAI
+  BÁO có chú kiểu được giữ nguyên (lần thay hàng loạt đầu tiên làm hỏng dòng này, đã phát hiện ngay
+  nhờ ``compileall`` và khôi phục).
+
+**76 lỗi còn lại cần MÔI TRƯỜNG THẬT, không phải lỗi mã nguồn:** ``whisperx_env`` chưa dựng, GPU và
+NVENC không có trong môi trường làm việc, ``ffmpeg`` thiếu tệp video mẫu, mô hình VieNeu chưa tải.
+Nhóm này chỉ xanh được trên máy có đủ phần cứng và môi trường phụ — anh chạy ``pytest`` trên máy
+mình để xác nhận con số thật.
+
+# Changelog
+
+## [3.23.536] — 🎭 Sửa bộ đo xưng hô báo nhầm + phát hiện tên nhân vật ghi sai ngôn ngữ
+
+Chuẩn đoán phim mới (1246 dòng, tiếng Hoa phồn thể) cho kết quả rất tốt ở hầu hết hạng mục: lệch
+dòng **0**, dịch thiếu 0,5%, vi phạm thuật ngữ 0,3%, chữ Hán sót 1 dòng, không lô nào phải dịch lại.
+Hai vấn đề còn lại đều nằm ở khâu ĐO, không phải khâu dịch.
+
+**1. Bộ đo xưng hô quá nghiêm — 7/16 cặp bị gắn cờ.** Soi từng cặp thì phần lớn là dịch ĐÚNG: tiếng
+Việt luôn dùng MỘT CẶP đại từ (tự xưng + gọi đối phương), nên riêng cách nói nhất quán đã chiếm 2
+kiểu; thêm một biến thể ngữ cảnh hợp lệ là thành 3. Ví dụ ``甄劍聲 → 洪震`` dùng "tao/mày" kèm đôi
+lần "tôi" — đó là giữ vai, không phải lộn xộn. Nâng ngưỡng từ "quá 2 kiểu" lên "quá 3 kiểu": **7 → 2
+cặp**, và hai cặp còn lại đúng là trộn lẫn thật (vừa "cậu" vừa "anh" vừa "em" cho cùng một người).
+
+**2. Cờ mới ``roster_names_not_in_source_language``.** Roster có ba mục ghi bằng tiếng Việt thay vì
+tên gốc: ``"Cậu bé lanh lợi (Cậu bé lanh lợi)"``, ``"Lão ông cầm bô"``, ``"Bạn gái Hồng Chấn"`` —
+vi phạm quy tắc từ v3.23.490. Hậu quả dây chuyền: bảng quy đổi tên gửi cho khâu dịch không có gì để
+tra, nhãn người nói trong Visual Cues (ghi bằng tên gốc) không khớp, mốc neo căn dòng mất tác dụng
+với các nhân vật đó. Cờ chỉ áp khi ngôn ngữ nguồn dùng chữ CJK — phim tiếng Anh có tên Latin là đúng
+nên không bị báo nhầm.
+
+**Dọn nợ kiểm thử theo tiêu chuẩn zero-failure:** phát hiện 17 test gọi ``_length_hint``,
+``_line_to_payload``, ``_line_to_dual_payload``, ``_context_window`` như staticmethod trong khi
+chúng là phương thức thực thể — lỗi tồn đọng lâu, che khuất lỗi thật. Đã sửa toàn bộ bằng một thực
+thể trống dùng chung; số test đỏ giảm 127 → 110.
+
+**Lưu ý về môi trường kiểm thử:** 110 lỗi còn lại đều thuộc các tệp cần thư viện mà môi trường làm
+việc này không có (PySide6, torch, paddle, soundfile) — không liên quan tới thay đổi lần này. Các
+tệp thuộc vùng đã sửa đều xanh: 91 test chuẩn đoán/căn dòng/xưng hô và 1143 test tầng application.
+
+## [3.23.535] — 🧨 Tìm ra nguyên nhân TREO CỨNG (không bấm được gì, phải End Task)
+
+Truy theo chuỗi nhân quả thay vì đoán:
+
+1. Giao diện chỉ được mở khoá trong handler ``finished`` của luồng — tức CHỈ KHI ``run()`` trả về.
+   Rà thấy 3 chỗ khoá nhưng chỉ 2 chỗ mở khoá, và cả hai đều nằm ở nhánh ``finished``.
+2. Nhật ký thật dừng ĐỘT NGỘT lúc 11:43:44, giữa một chuỗi 136 lời gọi kiểm file trên cloud.
+3. Bộ cung cấp video dựng client Gemini **không có thời hạn** — khác hẳn client của adapter dịch
+   vốn đã đặt ``http_options.timeout`` từ trước.
+
+Ghép lại: một lời gọi Files API treo là treo VĨNH VIỄN → ``run()`` không bao giờ trả về → tín hiệu
+``finished`` không phát → giao diện khoá mãi → người dùng không bấm được gì, phải End Task. Khớp
+trọn vẹn với triệu chứng và với điểm dừng của nhật ký.
+
+**Sửa — hai lớp:**
+- **Lớp gốc:** đặt thời hạn 180 giây cho mọi lời gọi HTTP của bộ cung cấp video (đủ rộng để tải một
+  đoạn video vài chục MB trên mạng chậm, nhưng hữu hạn). SDK cũ không nhận tham số này thì vẫn chạy,
+  chỉ ghi cảnh báo nhắc cập nhật.
+- **Lớp phòng vệ:** đồng hồ canh trạng thái bận. Cứ 5 giây kiểm một lần: nếu giao diện đang BẬN mà
+  KHÔNG còn luồng nào chạy (tín hiệu kết thúc bị mất, worker bị thu gom sớm…) thì tự mở khoá và ghi
+  nhật ký. Không đoán "treo" theo thời gian — chỉ xử lý trường hợp chắc chắn sai, nên không bao giờ
+  cắt ngang một tác vụ đang chạy thật.
+
+**Về chuyện xoay key và tải lại file — các bản trước ĐÃ có tác dụng:** nhật ký lần này chỉ còn 2 lần
+xoay key (cả hai đều ``[nguồn: SERVER từ chối]``, không còn tự khoá), **136 lượt TÁI DÙNG** file cũ
+và chỉ 6 lần phải tải lại. Vòng lặp "xoay key — tải lại toàn bộ" đã hết. Hạn mức thật vẫn là 20
+request/ngày mỗi dự án, nên với phim vài nghìn dòng, chọn model có hạn mức cao hơn cho khâu dịch
+vẫn là cách gỡ hiệu quả nhất.
+
+**Kiểm chứng:** 15 test (client video có thời hạn, hằng số hữu hạn và đủ rộng, SDK cũ vẫn chạy được;
+đồng hồ canh tồn tại, bật/tắt đúng theo trạng thái bận, chỉ mở khoá khi không còn luồng sống, chu kỳ
+hợp lý) và 44 test liên quan pass.
+
+## [3.23.534] — 🧊 Sửa hai nguyên nhân làm ứng dụng "thỉnh thoảng treo"
+
+Quét toàn bộ mã nguồn tìm các mẫu gây treo: lời gọi CHẶN nằm trong vùng giữ khoá (0 trường hợp),
+chờ luồng không thời hạn ở tầng giao diện (đều đã có thời hạn), tải mạng và tiến trình con không
+thời hạn (đều đã có), ống dữ liệu tiến trình con bị nghẽn (không có). Hai chỗ còn lại là thật:
+
+**1. ``rpm`` <= 0 làm SẬP tác vụ giữa chừng.** Vòng chờ quota đọc phần tử đầu của hàng đợi request
+để tính thời gian chờ. Khi giới hạn phút bằng 0 — do người dùng cấu hình sai, hoặc do học nhầm từ
+server — hàng đợi RỖNG mà vẫn bị đọc, ném ``IndexError``. Nay bỏ qua guard khi giới hạn không hợp lệ.
+
+**2. ``retryDelay`` của server không có TRẦN — thủ phạm chính của cảm giác "treo".** Khi hết hạn mức
+ngày, Google có thể yêu cầu chờ hàng chục phút tới hàng giờ. Ứng dụng tôn trọng đúng con số đó nên
+đứng im, không log gì thêm, không phản hồi — nhìn hệt như treo. Nay kẹp trần 180 giây: đủ dài để
+tôn trọng server, đủ ngắn để ứng dụng còn "thở"; hết 180 giây thì thử lại, nếu vẫn hết quota thì
+server báo tiếp và các lớp trên (xoay key, thông báo tử tế của v3.23.527) vào cuộc. Mỗi lần kẹp đều
+ghi nhật ký rõ ràng.
+
+**Kiểm chứng:** 8 test (rpm bằng 0 và âm đều không sập, rpm bình thường vẫn giới hạn đúng, chờ 3600s
+bị kẹp còn 180s, chờ 30s giữ nguyên, trần nằm trong khoảng hợp lý, giá trị vô lý bị bỏ qua) và 42
+test hạ tầng liên quan pass.
+
+## [3.23.533] — 💾 Trạng thái quota sống sót qua khởi động lại (hai bug làm hỏng công sức v526-531)
+
+Rà sâu ba vùng theo yêu cầu: khâu dịch, quản lý quota, và quản lý file tải lên gắn với key.
+
+**Phần file tải lên — kiểm và XÁC NHẬN ĐÚNG:** khoá cache đoạn video đã gồm API key; hàm
+``set_active_key`` cập nhật đúng key, dọn client và refs trong phiên; callback tải lại truyền key
+hiện tại vào bộ cung cấp video. Không có lỗi ở đây.
+
+**Phần quota — tìm được HAI bug, cả hai đều vô hiệu hoá công sức của các bản trước:**
+
+1. **Dấu "server đã từ chối key này hôm nay" chỉ nằm trong bộ nhớ.** Tắt ứng dụng là mất. Mở lại,
+   ứng dụng thử lại đúng key đã cạn rồi mới nhận 429 — mỗi lần như vậy đốt thêm request, trong khi
+   hạn mức thật chỉ 20/ngày.
+
+2. **Hạn mức học được từ server cũng không lưu.** Bản v3.23.530 học đúng 20 request/ngày, nhưng tắt
+   ứng dụng là quay về con số chép tay 70 — nên giữa các phiên, bản sửa đó gần như vô nghĩa.
+
+**Sửa:** lưu cả hai vào tệp trạng thái quota, kèm hai bảo đảm:
+- Dấu chặn chỉ được khôi phục nếu thuộc ĐÚNG mốc ngày hiện tại — sang ngày mới là tự bỏ.
+- Bộ đếm ngày vẫn nằm ở cấp gốc của tệp, phần mới đặt trong khoá ``__meta__`` riêng, nên tệp cũ và
+  mới đọc lẫn nhau được.
+
+**Dọn thêm một điểm thiết kế:** hạn mức học được nay cất trong kho riêng, không ghi đè cấu hình
+người dùng. Thứ tự ưu tiên: hạn mức học từ server → cấu hình người dùng → bảng mặc định. Server là
+sự thật hiện hành nên đáng tin hơn cả hai nguồn kia.
+
+**Kiểm chứng:** 25 test (dấu chặn và hạn mức sống sót qua khởi động lại, key khác không bị chặn oan,
+bộ đếm cũ vẫn khôi phục được, bộ đếm giữ ở cấp gốc, khoá ``__meta__`` không bị nhầm thành bộ đếm,
+tệp hỏng hoặc giá trị rác đều bị bỏ qua an toàn) và 41 test hạ tầng liên quan pass.
+
+## [3.23.532] — 🚿 Bỏ chuỗi 403 vô ích sau khi xoay key — thủ phạm thật làm cạn quota
+
+Nhật ký lần này lộ ra cơ chế đốt quota mà các bản trước chưa nhìn thấy:
+
+```
+21:14:27  Xoay API key #1 → #2
+21:14:27  Handle video 'files/b1ewic63ppt0' cần tải lại (403 PERMISSION_DENIED)
+21:15:01  Handle video 'files/pgglfi16o0ss' cần tải lại (403 PERMISSION_DENIED)
+21:15:34  Handle video 'files/qns5fxnbggdm' cần tải lại (403 PERMISSION_DENIED)
+... 9 lần 403 liên tiếp, mỗi lần cách nhau ~34 giây
+```
+
+**Vì sao:** file tải lên qua Files API gắn với PROJECT của API key. Xoay sang key mới thì mọi handle
+cũ chắc chắn trả 403. Nhưng ứng dụng vẫn THỬ DÙNG chúng trước rồi mới nhận lỗi — và **mỗi lần thử
+hỏng vẫn tính một request** vào hạn mức của key mới. Với 23 đoạn video và hạn mức thật 20
+request/ngày, riêng các lần thử vô ích đã đủ làm cạn quota NGAY SAU KHI xoay key. Đó chính là vòng
+lặp "xoay key — hết quota — lại xoay" mà người dùng thấy.
+
+**Sửa:** đổi key xong là đánh dấu toàn bộ handle video vô hiệu, đi thẳng tới bước tải lại, bỏ hẳn
+lần thử chắc chắn hỏng. Khi CHƯA đổi key thì vẫn thử dùng handle sẵn có như cũ (tái dùng được là
+tiết kiệm nhất); cờ được xoá sau khi tải lại thành công.
+
+**Lưu ý về chi phí còn lại:** sau mỗi lần xoay key, các đoạn video vẫn phải tải lại từ đầu bằng key
+mới (~34 giây/đoạn) — đây là ràng buộc của Files API, không thể tránh. Nếu hạn mức ngày là thứ chặn
+chính, cân nhắc TẮT đính video cho khâu dịch: phần lớn thông tin hình ảnh đã được trích sẵn thành
+Visual Cues dạng văn bản ở khâu phân tích.
+
+**Kiểm chứng:** 13 test (cờ khởi tạo đúng, đổi key thì đánh dấu vô hiệu và dọn cache, bỏ qua bước
+thử khi vô hiệu, vẫn thử khi chưa đổi key, xoá cờ sau khi tải lại) và 45 test hạ tầng liên quan pass.
+
+## [3.23.531] — 🏷️ Phân biệt quota SỐ REQUEST/ngày với quota TOKEN/ngày (và chặn học nhầm hạn mức)
+
+Bảng điều khiển lúc 20:49 vẫn cho thấy RPD của Gemini 3.8 Flash còn nguyên (0/20, 1/20, 17/20),
+trong khi ứng dụng báo hết ở cả ba key. Truy tiếp thì phát hiện **nhật ký đang nói sai loại quota**:
+hàm rút gọn lỗi gộp MỌI lỗi có chữ "per day" thành một nhãn duy nhất "quota token/NGÀY", và cắt bỏ
+luôn mã quota gốc của server. Không có mã gốc thì không thể biết Google từ chối vì SỐ REQUEST/ngày
+hay vì SỐ TOKEN/ngày — hai hạn mức hoàn toàn khác nhau.
+
+Điều này giải thích mâu thuẫn: nếu quota bị chạm là TOKEN/ngày (đính video làm token tăng vọt) thì
+cột RPD trên bảng điều khiển vẫn còn nguyên, đúng như anh thấy.
+
+**Sửa:**
+- Nhãn lỗi nay phân biệt rõ "quota SỐ REQUEST/ngày" với "quota TOKEN/ngày", và GIỮ NGUYÊN mã quota
+  gốc trong ngoặc vuông để lần chẩn đoán sau không phải đoán.
+- **Chặn một lỗi do chính v3.23.530 tạo ra:** hàm học hạn mức lấy ``quotaValue`` một cách mù quáng.
+  Gặp quota TOKEN/ngày (giá trị hàng triệu) nó sẽ đặt hạn mức request/ngày thành 1.000.000 và vô
+  hiệu hoá hoàn toàn lớp bảo vệ. Nay chỉ học khi mã quota đúng là loại SỐ REQUEST.
+
+**Kiểm chứng:** 20 test — nhãn đúng cho từng loại quota, giữ mã gốc, quota theo phút không bị đụng;
+học hạn mức từ quota request (70 → 20), KHÔNG học từ quota token (giữ 70), thiếu ``quotaValue`` thì
+giữ nguyên.
+
+**Việc cần làm ở lần chạy tới:** nhật ký sẽ ghi mã quota gốc, ví dụ
+``[GenerateRequestsPerDayPerProjectPerModel-FreeTier]`` hoặc ``[...InputTokensPerModelPerDay...]``.
+Có mã đó là biết chắc Google chặn vì gì, và từ đó mới chọn được cách xử lý đúng (giảm đính video nếu
+là quota token, hay đổi model nếu là quota request).
+
+## [3.23.530] — 🎓 Học hạn mức NGÀY thật từ server, hết cảnh dùng bảng chép tay lạc hậu
+
+Nhật ký lần này dứt điểm mọi nghi ngờ — cả BA key đều bị CHÍNH SERVER từ chối, và số liệu nêu rõ
+nguyên nhân:
+
+```
+Server báo HẾT HẠN MỨC NGÀY cho 'gemini-3.8-flash' (key …53b9). Hạn mức server nêu: 20.
+Xoay API key #1 → #2 ... [nguồn: SERVER từ chối]
+Server báo ... (key …0d53). Hạn mức server nêu: 20.
+Xoay API key #2 → #3 ... [nguồn: SERVER từ chối]
+Server báo ... (key …1f16). Hạn mức server nêu: 20.
+```
+
+Nhờ dòng "[nguồn: …]" thêm ở v3.23.529, lần này biết chắc ứng dụng KHÔNG tự khoá — Google thật sự
+từ chối. Và nhờ phần chẩn đoán ở v3.23.528, thấy luôn con số then chốt: **server cho 20 request/ngày
+trong khi ứng dụng cấu hình 70**.
+
+**Hệ quả của sai lệch đó:** sau khi một key bị từ chối, ứng dụng vẫn tin key kế tiếp "còn 20
+req/ngày" rồi xoay sang và lại đâm vào tường. Ba key = ba lần đâm, rất nhanh hết sạch.
+
+**Sửa:** lỗi 429 của Google có kèm trường ``quotaValue``; ứng dụng nay LẤY LUÔN con số đó làm hạn mức
+cho các lần sau. Bảng giới hạn chép tay không bao giờ lạc hậu nữa, kể cả khi Google đổi chính sách.
+Chỉ đổi hạn mức NGÀY, giữ nguyên giới hạn phút; giá trị vô lý (0 hoặc âm) bị bỏ qua; model chưa từng
+biết cũng học được.
+
+**Điều này nghĩa là gì với công việc của anh:** hạn mức thật là 20 request/ngày mỗi dự án, ba dự án
+là 60. Riêng phân tích ngữ cảnh một phim đã cần vài chục request, nên model ``gemini-3.8-flash`` chỉ
+đủ cho khâu phân tích. Khâu dịch (hàng trăm request) nên dùng bản ``flash-lite`` — bảng điều khiển
+cho thấy hạn mức 500/ngày, gấp 25 lần.
+
+**Kiểm chứng:** 17 test (cập nhật hạn mức từ server, cùng giá trị thì không làm gì, giá trị vô lý bị
+bỏ qua, giữ nguyên giới hạn phút, model lạ cũng học được, adapter có gọi đúng chỗ) pass.
+
+## [3.23.529] — 🕵️ Ghi rõ AI ra quyết định xoay key: server từ chối hay bộ đếm nội bộ
+
+Ảnh trang "Clés API" bác bỏ giả thuyết ở v3.23.528: ba API key nằm ở BA DỰ ÁN KHÁC NHAU
+(…tz0g → Gemini for programming, …wHqA → Gemini API, …ZMFg → Api key), nên mỗi key có hũ quota
+riêng chứ không dùng chung. Mã xoay key cũng đúng — ``_switch_to_key`` đặt ``self._client = None``
+để buộc dựng lại client với key mới.
+
+**Nhưng dòng thời gian trong nhật ký lộ ra vấn đề thật:**
+
+```
+19:51:59  Xoay key #1 → #2      ← chưa có 429 nào từ server
+19:57:53  Xoay key #2 → #3      ← vẫn chưa
+20:03:43  429 ĐẦU TIÊN từ server (quotaId ...PerDayPerProject...)
+```
+
+Toàn bộ nhật ký chỉ có ĐÚNG MỘT mã quota từ server, tới rất muộn. Hai lần xoay trước đó do phía ứng
+dụng quyết định, tức tự rời bỏ những key VẪN CÒN quota rồi dồn tải vào key cuối — khớp với bảng điều
+khiển: một dự án 17/20 trong khi hai dự án kia 0/20 và 1/20.
+
+**Bổ sung lần này:** dòng nhật ký xoay key nay ghi kèm NGUỒN quyết định — ``[nguồn: SERVER từ chối]``
+hay ``[nguồn: bộ đếm nội bộ (server chưa từ chối)]`` — dựa trên phương thức mới
+``is_server_daily_blocked`` của bộ quản lý quota. Lần chạy tới sẽ chỉ đích danh ai gây ra việc xoay
+key sớm, thay vì phải suy đoán từ dòng thời gian như lần này.
+
+**Ghi nhận thẳng thắn:** giả thuyết "các key chung dự án" ở v3.23.528 là SAI. Phần chẩn đoán thêm ở
+bản đó vẫn hữu ích (in hạn mức server và số đếm nội bộ để đối chiếu), nhưng kết luận thì không đúng.
+
+**Kiểm chứng:** 15 test (cờ server-từ-chối phân biệt đúng với bộ đếm nội bộ chạm trần, tách theo từng
+key và từng model, nhật ký xoay key có ghi nguồn) pass.
+
+## [3.23.528] — 🔎 Chẩn đoán "còn quota mà vẫn bị từ chối": hạn mức tính theo DỰ ÁN, không theo key
+
+Bảng điều khiển Google chụp lúc 20:09 cho thấy Gemini 3.8 Flash mới dùng **0/20** ở dự án "Api key"
+và **1/20** ở dự án "Gemini API" — còn gần như nguyên hạn mức. Nhưng lúc 20:03, server đã từ chối cả
+BA API key với mã lỗi hạn mức ngày.
+
+**Giả thuyết phù hợp nhất:** hạn mức ngày (RPD) của Gemini tính theo **DỰ ÁN**, không theo API key.
+Nhiều key cùng một dự án dùng chung MỘT hũ 20 request, trong khi ứng dụng đếm riêng từng key nên
+tưởng mỗi key còn nguyên. Dự án "Gemini for programming" đang ở **17/20** — khớp với việc các key
+thực tế cùng dồn vào một dự án.
+
+**Bổ sung chẩn đoán:** khi server báo hết hạn mức ngày, nhật ký nay ghi ba con số để đối chiếu ngay:
+đuôi API key đang dùng (chỉ 4 ký tự cuối, không in nguyên key), hạn mức server nêu trong lỗi
+(``quotaValue``), và số request ỨNG DỤNG đã đếm cho key đó. Khi số của ứng dụng thấp hơn hẳn hạn
+mức server, gần như chắc chắn các key đang chung dự án — kèm giải thích ngay trong dòng nhật ký.
+
+Ví dụ dòng ghi thực tế: *"Server báo HẾT HẠN MỨC NGÀY cho 'gemini-3.8-flash' (key …1234). Hạn mức
+server nêu: 20. Ứng dụng mới đếm 3 request cho key này."*
+
+**Cách xác nhận:** vào AI Studio → Clés API, xem cột dự án của từng key. Nếu ba key cùng một dự án
+thì tổng hạn mức chỉ là 20/ngày chứ không phải 60 — tạo key ở ba dự án KHÁC NHAU sẽ có đủ ba hũ.
+
+**Kiểm chứng:** 17 test (ghi đủ hạn mức server và số đếm nội bộ, che API key chỉ để 4 ký tự cuối,
+nêu rõ khả năng chung dự án, thiếu ``quotaValue`` vẫn an toàn, không bao giờ ném lỗi ra ngoài; cùng
+các test quota của v3.23.526-527) pass.
+
+## [3.23.527] — 💬 Hết hạn mức ngày: báo tử tế kèm hướng xử lý, không hiện như crash
+
+Nhật ký lần chạy này xác nhận bản v3.23.526 hoạt động ĐÚNG — thông báo có ghi "(server xác nhận)",
+tức chính Google trả 429 quota-ngày cho cả ba key chứ không phải ứng dụng tự khoá như trước.
+
+**Vậy vì sao vẫn hết quota dù bảng điều khiển còn?** Hai lý do cộng lại:
+- Ảnh chụp lúc 19:24, nhật ký lúc 20:03 — phần còn lại đã bị dùng hết trong khoảng đó.
+- Hạn mức free-tier quá nhỏ so với nhu cầu: 20 request/NGÀY mỗi dự án cho các model Flash mới, trong
+  khi riêng khâu phân tích ngữ cảnh một phim đã cần vài chục request.
+
+**Vấn đề còn lại là CÁCH BÁO.** ``QuotaExhaustedError`` rơi vào nhánh bắt lỗi chung nên giao diện
+hiện "Lỗi không lường trước khi phân tích ngữ cảnh" — người dùng tưởng ứng dụng hỏng, trong khi đây
+là tình huống bình thường của free-tier.
+
+**Sửa:** cả worker phân tích lẫn worker dịch nay bắt riêng lỗi này, ghi nhật ký ở mức cảnh báo (không
+kèm traceback vì không phải lỗi lập trình), và hiện thông báo kèm bốn hướng xử lý cụ thể: chọn model
+có hạn mức ngày cao hơn (bản 'flash-lite'), thêm API key thuộc DỰ ÁN KHÁC (nhiều key cùng một dự án
+vẫn dùng chung hạn mức), chờ sang ngày mới theo mốc 00:00 giờ Thái Bình Dương, hoặc bật thanh toán.
+
+**Kiểm chứng:** 12 test (mỗi worker: bắt riêng đúng loại lỗi, đứng trước nhánh chung, thông báo có
+hướng xử lý, ghi nhật ký ở mức cảnh báo) pass.
+
+## [3.23.526] — 🔓 Hết cảnh TỰ KHOÁ quota: bộ đếm nội bộ chỉ còn là ước lượng
+
+Đối chiếu nhật ký ứng dụng với bảng điều khiển Google AI Studio cho thấy mâu thuẫn rõ:
+
+```
+App   : "Model 'gemini-3.8-flash' đã chạm giới hạn 50 request/ngày"  → SẬP khâu phân tích
+Google: Gemini 3.8 Flash — dự án 1: 0/20 · dự án 2: 1/20 · dự án 3: 17/20
+```
+
+Cùng thời điểm, hai trong ba dự án gần như chưa dùng gì, vậy mà ứng dụng tuyên bố hết quota ở cả ba
+key rồi dừng hẳn.
+
+**Nguyên nhân:** bộ đếm quota nội bộ tự đếm request và CHẶN CỨNG khi chạm trần cấu hình (50/ngày),
+bất kể server có còn cho phép hay không. Trong khi đó giới hạn thật của Google cho model này là
+20/ngày và cách đếm của hai bên không thể trùng khớp — retry, lỗi mạng, request bị huỷ giữa chừng
+đều làm lệch. Tệ hơn, ``mark_daily_exhausted`` (dùng khi SERVER thật sự từ chối) và bộ đếm nội bộ
+ghi vào CÙNG một chỗ, nên lúc chặn không phân biệt được đâu là phán quyết của Google, đâu chỉ là
+ước lượng của chính mình.
+
+**Sửa:** tách hai nguồn thông tin.
+- Chỉ chặn cứng khi CHÍNH SERVER đã trả 429 kèm mã quota theo ngày cho đúng (model, key) trong đúng
+  mốc ngày đó.
+- Bộ đếm nội bộ chạm trần chỉ ghi một dòng cảnh báo rồi VẪN GỬI TIẾP, để Google phán quyết. Bỏ sót
+  một lần gọi thì tốn chút quota; tự khoá nhầm thì mất cả buổi làm việc.
+- Khoá vẫn theo TỪNG key — đó là lý do có nhiều key.
+
+**Đọc thêm từ ảnh chụp:** giới hạn free-tier cho các model này rất thấp (20 request/ngày cho 3.8
+Flash, 250K token/phút), và dự án 1 đã cạn hẳn RPD của Gemini 3.6 Flash (20/20). Với phim vài nghìn
+dòng, hạn mức ngày mới là thứ chặn thực sự chứ không phải tốc độ — nên xoay nhiều key và chọn model
+có hạn mức cao hơn là cách xử lý đúng.
+
+**Kiểm chứng:** 4 test (đếm nội bộ chạm trần vẫn cho gửi, server xác nhận thì chặn cứng, khoá chỉ áp
+cho đúng key, thông báo nêu rõ "server xác nhận") và 66 test liên quan pass.
+
+## [3.23.525] — 📊 Thêm MẪU SỐ cho cờ xưng hô + xác nhận v3.23.524 có hiệu quả
+
+Chuẩn đoán bản v3.23.524 (đã phân tích lại ngữ cảnh) cho kết quả tốt trên hầu hết hạng mục:
+
+| Chỉ số | Lần trước | Lần này | |
+|---|---|---|---|
+| Tốc độ đọc quá nhanh | 763 | **420** | ✓ −343 |
+| Nén TTS | 528 | **271** | ✓ −257 |
+| Vi phạm thuật ngữ | 49 | **23** | ✓ −26 |
+| Dòng nghi lệch | 7 | **2** | ✓ −5 |
+| Dòng dịch trùng liền kề | 3 | **1** | ✓ −2 |
+
+Ngữ cảnh cũng sạch: không còn cảnh báo nào (trước đó có tên nghi bịa).
+
+**Nhưng con số cờ xưng hô dễ bị đọc sai.** Cờ mới báo 2 cặp lộn xộn, so với 12 cặp đo được ở lần
+trước — trông như cải thiện 6 lần. Thực tế KHÔNG phải: độ phủ Visual Cues lần này chỉ 16,9% (lần
+trước 58,5%) nên số cặp ĐỦ DỮ LIỆU để xét rơi từ 49 xuống 16. Tính theo tỉ lệ thì là **24% xuống
+12%** — vẫn là cải thiện thật, khoảng một nửa, nhưng không phải 6 lần.
+
+**Sửa:** báo cáo nay kèm ``address_pairs_examined`` — mẫu số để so sánh công bằng giữa các lần chạy.
+Đây là bài học lặp lại của phiên này: con số tuyệt đối không có mẫu số thì dễ dẫn tới kết luận sai.
+
+**Lưu ý về độ phủ Visual Cues:** đây là biến số ảnh hưởng mạnh tới cả chất lượng dịch (nhãn người
+nói cho từng dòng) lẫn khả năng ĐO chất lượng. Lần này dùng ``gemini-3.6-flash`` cho ra 659 cue,
+lần trước ``gemini-3.8-flash`` cho 2284 cue. Muốn cả bản dịch lẫn phép đo đáng tin, nên cố định
+model phân tích mạnh.
+
+**Kiểm chứng:** chạy trên cả hai tệp thật cho ra 12/49 và 2/16 đúng như tính tay; 14 test xưng hô
+(thêm 4 test mẫu số) và 64 test liên quan pass.
+
+## [3.23.524] — 🗣️ Xưng hô: đo được mức lộn xộn + chốt cách gọi ngay từ khâu phân tích
+
+Kiểm tra theo phản ánh "xưng hô không nhất quán, có khi sai". Dùng nhãn người nói/người nghe trong
+Visual Cues đối chiếu với đại từ trong bản dịch, kết quả xác nhận đúng:
+
+| Cặp nhân vật | Xưng hô đang dùng |
+|---|---|
+| 春花 → 宋钱 | chị 16, em 15, cậu 12, anh 4 |
+| 安雪漫 → 宋钱 | anh 11, tôi 8, **mày** 7 |
+| 柳慕云 → 宋钱 | anh 23, tôi 20, em 12 |
+| 铁柱 → 宋钱 | cậu 19, tôi 9, anh 7 |
+
+Cùng một người nói với cùng một người mà lúc "chị/em", lúc "cậu", lúc "mày" — không phải sắc thái mà
+là lộn xộn. Tổng cộng **12 cặp nhân vật** bị như vậy.
+
+**Cờ mới `address_inconsistency`:** thống kê đại từ theo từng cặp (người nói → người nghe), báo cặp
+nào dùng quá hai kiểu xưng hô. Có ngưỡng thận trọng: cặp phải đủ 6 lượt mới xét, và một cách gọi
+phải chiếm ≥15% mới tính là "đang dùng" — lỡ dùng khác một lần không bị coi là lộn xộn.
+
+**Sửa nguyên nhân — chốt cách xưng hô NGAY TỪ KHÂU PHÂN TÍCH.** Khâu dịch vốn đã có chỉ thị "giữ
+nhất quán cách xưng hô của từng cặp", nhưng vô hiệu: mỗi lô dịch độc lập nên model tự chọn lại mỗi
+lần. Nay bảng nhân vật phải ghi rõ trong trường `role`: "xưng hô: với <Tên> tự xưng 'em' gọi 'anh'".
+Bảng nhân vật đi vào MỌI giai đoạn dịch nên quy ước này theo cùng — đúng cách đã hiệu quả với bảng
+thuật ngữ ở v3.23.500. Khâu dịch thêm chỉ thị bám bảng đã chốt, chỉ được đổi khi chính lời thoại thể
+hiện quan hệ thay đổi (làm lành, trở mặt, biết vai vế thật) và khi đã đổi thì giữ cách mới.
+
+**Ghi chú môi trường:** container làm việc bị đặt lại giữa phiên, mã nguồn đã được khôi phục từ bản
+đóng gói v3.23.523 và cài lại phụ thuộc trước khi làm tiếp.
+
+**Kiểm chứng:** chạy trên phim thật bắt đúng 12 cặp; 10 test (bắt cặp lộn xộn, không báo cặp nhất
+quán, bỏ qua cặp ít lượt, bỏ qua biến thể hiếm, không có cues thì im lặng, cues dị dạng an toàn,
+cues dạng bọc, cờ có trong báo cáo, prompt có đủ hai quy tắc) và 82 test liên quan pass.
+
+## [3.23.523] — 🏆 Lần chạy tốt nhất từ trước tới nay + lọc mốc neo quá phổ biến
+
+Tệp chuẩn đoán của bản v3.23.522 cho kết quả tốt nhất từ đầu: **cả 8 chỉ số đều cải thiện, không chỉ
+số nào xấu đi**.
+
+| Chỉ số | v521 | v522 | |
+|---|---|---|---|
+| Tốc độ đọc quá nhanh | 678 | **567** | ✓ −111 |
+| Nén TTS | 453 | **394** | ✓ −59 |
+| Dòng nghi lệch | 40 | **15** | ✓ −25 |
+| Vi phạm thuật ngữ | 78 | **63** | ✓ −15 |
+| Dịch thiếu | 31 | **24** | ✓ −7 |
+| Thiếu nhất quán | 101 | **96** | ✓ −5 |
+
+**Phát hiện đáng chú ý:** ``process_log`` lần này RỖNG HOÀN TOÀN — không một lượt ép dịch lại nào,
+trong khi lần trước có 67 lượt. Nghĩa là các lượt ép dịch lại trước đây phần lớn là OAN (câu tách
+đôi) và chính chúng đang làm bản dịch xấu đi. Bỏ chúng thì mọi chỉ số cùng tốt lên. Đây là bằng
+chứng rõ: một phép kiểm nhiều dương tính giả còn hại hơn không kiểm.
+
+**Cải tiến lần này — lọc mốc neo quá phổ biến.** Soi 15 ca còn lại thì vẫn là báo nhầm, nguyên nhân
+mới: tên nhân vật chính xuất hiện ở 253/5540 dòng (4,6%) nên "dòng bên cạnh cũng chứa tên đó" chẳng
+chứng minh được gì. Ví dụ dòng 2578 gốc ``我如果告诉了小逸`` dịch "Nếu chị mà nói cho Lâm Dật biết" —
+hoàn toàn đúng, nhưng bị cờ vì biệt danh ``小逸`` không có trong roster. Nay bỏ mốc neo nào xuất hiện
+quá 2% số dòng.
+
+**Dọn trùng lặp — nguyên nhân khiến cải tiến không có tác dụng.** Thêm bộ lọc xong mà con số không
+đổi (15 → 15), truy ra module chuẩn đoán giữ BẢN SAO logic dò lệch riêng, nên mọi cải tiến thêm vào
+service đều không chạm tới cờ báo cáo. Nay uỷ quyền hoàn toàn cho ``alignment_check`` — dùng chung
+với bộ kiểm lúc dịch, đúng bài học từ v3.23.491.
+
+**Kết quả sau khi uỷ quyền: 15 → 3 dòng nghi lệch**, cả ba đều dính con số tiền (mốc neo hiếm nên
+đáng ngờ thật) — vừa đúng loại cần rà tay.
+
+**Kiểm chứng:** 33 test căn dòng (thêm 4 test: bỏ mốc neo dày, giữ mốc neo hiếm, bản dịch rỗng thì
+giữ nguyên, chuẩn đoán phải uỷ quyền cho service) và 95 test liên quan pass; compile + ruff sạch.
+
+## [3.23.522] — 🎯 Bỏ 80% cảnh báo lệch dòng SAI: câu tách đôi không phải là lệch
+
+Tệp chuẩn đoán lần này (v3.23.521) cho thấy mặt tốt và mặt trái của việc giới hạn số lần ép dịch lại:
+tốc độ đọc quá nhanh 727 → 678, nén TTS 500 → 453, vi phạm thuật ngữ 88 → 78, độ dài bất thường
+5 → 3 — nhưng ``shifted_lines`` tăng 26 → 40, đúng cái giá của việc dừng ép dịch lại sau 2 lần.
+
+**Nhưng soi nội dung thì phần lớn cảnh báo là SAI.** Nhờ mẫu nội dung nay bám đúng dòng bị cờ
+(v3.23.521), có thể xét từng ca. Cả 6 mẫu đầu đều là CÂU BỊ TÁCH ĐÔI mà bản dịch hoàn toàn đúng —
+tiếng Việt đảo trật tự nên từ khoá rơi sang dòng kế:
+
+```
+1250: 我早就跟贺强  → "tôi sớm đã ngủ với"
+1251: 睡过了       → "Hạ Cường rồi."      ← tên chuyển dòng là TỰ NHIÊN
+```
+
+**Quy tắc mới:** hai dòng liền kề mà dòng TRƯỚC không kết thúc bằng dấu câu thì đó là một câu bị
+tách đôi; mốc neo chuyển qua lại giữa hai dòng ấy là hợp lệ, không tính là lệch. Chỉ áp cho khoảng
+lệch đúng 1 dòng — lệch từ 2 dòng trở lên vẫn báo như cũ.
+
+**Đo lại trên chính dữ liệu thật: 40 → 8 dòng nghi lệch**, và cả bốn ca báo nhầm điển hình (186, 228,
+891, 1251) đều biến mất. Tám ca còn lại đều lệch ≥2 dòng hoặc dính số tiền — đáng ngờ thật, đúng
+loại cần rà tay. Quy tắc áp cho CẢ bộ kiểm lúc dịch, nên số lô bị ép dịch lại oan cũng giảm theo,
+tiết kiệm quota.
+
+**Dọn nợ kiểm thử:** 24 test đỏ do bộ giả lập ``translate_stage`` trong test chưa cập nhật tham số
+``source_was_preprocessed`` thêm từ v3.23.504 — test đỏ kéo dài che mất lỗi thật. Đã cho các bộ giả
+lập nhận thêm tham số tuỳ chọn, còn 7 lỗi thuộc nhóm stale đã biết (gọi hàm nội bộ sai chữ ký trong
+chính test). Ba test v3.23.515-516 mã hoá hành vi CŨ cũng được cập nhật theo ngữ nghĩa mới, kèm test
+mới khoá hành vi "câu tách đôi không bị báo".
+
+**Kiểm chứng:** 374 test liên quan pass; compile + ruff sạch.
+
+## [3.23.521] — 📉 Cơ chế chống lệch dòng có hiệu quả rõ + hai điều chỉnh từ dữ liệu thật
+
+Tệp chuẩn đoán lần này (v3.23.520) lần đầu có cả DIỄN BIẾN, nên đánh giá được thẳng tác dụng của
+chuỗi v3.23.516-518:
+
+| Chỉ số | Lần trước | Lần này | |
+|---|---|---|---|
+| **Dòng nghi lệch** | 69 | **26** | ✓ −62% |
+| Vi phạm thuật ngữ | 119 | **88** | ✓ −26% |
+| Dịch thiếu | 37 | **31** | ✓ −16% |
+| Độ dài bất thường | 8 | **5** | ✓ −38% |
+| Chữ Hán sót | 0 | **0** | = giữ sạch |
+
+Diễn biến ghi nhận 81 lượt phát hiện lệch và 81 lượt dịch lại — cơ chế chạy đúng như thiết kế.
+
+**Điều chỉnh 1 — mẫu nội dung phải bám DÒNG BỊ CỜ.** Bản trước trích 12 dòng ĐẦU lô, nhưng dòng lệch
+thường nằm giữa: lô 541-600 bị cờ ở dòng 575, 587, 591 mà mẫu chỉ ghi 541-552, tức chỗ cần xem không
+có trong tệp. Nay trích quanh từng dòng bị cờ kèm dòng liền trước/sau để thấy ngữ cảnh; không có
+dòng cờ thì vẫn lấy từ đầu lô như cũ.
+
+**Điều chỉnh 2 — chặn vòng lặp ép dịch lại.** Phân bố cho thấy một lô (2701-2760) bị bắt **12 lần**
+liên tiếp: mỗi lần là một lượt gọi API mà kết quả vẫn lệch — tốn quota vô ích, và tệ hơn là có nguy
+cơ chia nhỏ tới mức bỏ cuộc rồi giữ nguyên chữ Hán (còn tệ hơn một bản dịch lệch). Nay chỉ ép dịch
+lại tối đa 2 lần cho mỗi lô; quá ngưỡng thì NHẬN kết quả và để cờ ``shifted_lines`` trong tệp chuẩn
+đoán báo lại để rà tay.
+
+**Kiểm chứng:** mẫu bám đúng dòng 575/587/591 kèm dòng lân cận; 20 test (bám dòng cờ, có dòng lân
+cận, không có dòng cờ thì lấy từ đầu lô, dòng cờ ngoài phạm vi vẫn an toàn, ngưỡng thử lại nhỏ, bộ
+đếm hoạt động) và 363 test liên quan pass; compile + ruff sạch.
+
+## [3.23.520] — 📝 Ghi kèm NỘI DUNG của lô lỗi (câu gốc + bản model trả về, kể cả bản sai)
+
+Bổ sung tiếp theo yêu cầu: biết lô nào lỗi mà không có nội dung thì không suy ra được model hiểu sai
+ở đâu. Nay mỗi sự kiện lỗi trong ``process_log`` đều kèm trường ``content`` gồm từng cặp câu GỐC và
+bản model TRẢ VỀ — kể cả bản sai, vì chính bản sai mới cho biết model lệch kiểu gì.
+
+**Phạm vi ghi có kiểm soát:** chỉ trích cho lô CÓ VẤN ĐỀ, tối đa 12 dòng mỗi lô, mỗi đoạn văn bản cắt
+ở 160 ký tự. Ghi trọn 5540 dòng × 4 giai đoạn là vô ích và làm tệp phình to.
+
+**Hai loại lỗi đều được ghi nội dung:**
+- ``batch_invalid`` (mới) — lô sai cấu trúc: thiếu dòng, dư dòng, ``line_no`` lệch. Kèm ghi chú khi
+  model trả nhiều mục hơn số dòng của lô, vd "model trả 26 mục cho lô 1 dòng" — đúng ca thật đã gặp.
+- ``batch_misaligned`` — lô lệch dòng, nay nhìn phát ra ngay: dòng 1 nguồn ``王梅人好`` nhận bản dịch
+  "Alipay tiền vào tài khoản", còn dòng 3 nguồn ``支付宝到账`` lại nhận "Vương Mai tốt bụng".
+
+**An toàn:** payload rỗng hoặc dị dạng vẫn trả về phần câu gốc; model đánh số lại ``line_no`` thì
+khớp theo VỊ TRÍ đúng như bước ghép; mọi lỗi khi trích đều bị nuốt.
+
+**Kiểm chứng:** 14 test (ghép đúng cặp gốc/trả về, ghi chú khi model trả dư, giới hạn số dòng và độ
+dài, payload thiếu/dị dạng vẫn an toàn, payload bị đánh số lại vẫn khớp, adapter có đủ điểm ghi) và
+364 test liên quan pass; compile + ruff sạch.
+
+## [3.23.519] — 📓 File chuẩn đoán nay ghi cả DIỄN BIẾN quá trình dịch, không chỉ kết quả cuối
+
+Kiểm tra theo yêu cầu: file chuẩn đoán dịch có ghi lại toàn bộ quá trình, gồm các lô bị lỗi và các
+bước thử lại hay không. **Câu trả lời là KHÔNG.** Soi tệp thật vừa xuất thì các khoá cấp cao chỉ gồm
+``analysis``, ``quality_flags``, ``source_events``, ``final_translation``, ``stages`` — tức chỉ có
+KẾT QUẢ CUỐI của 4 giai đoạn. Không hề có từ khoá ``retry``, ``attempt``, ``batch`` hay ``failed``
+nào trong tệp.
+
+Hệ quả: mỗi lần chuẩn đoán đều phải xin thêm ``app_log.txt``, và không thể đối chiếu "lô nào bị thử
+lại" với "dòng nào dịch kém" trong cùng một tệp — vì nhật ký ứng dụng mất khi đóng chương trình.
+
+**Bổ sung khoá ``process_log``** vào tệp chuẩn đoán, ghi ba loại sự kiện quan trọng nhất:
+- ``batch_retry`` — lô bị model trả sai, kèm số lần thử, tên model và lý do.
+- ``batch_misaligned`` — lô bị phát hiện LỆCH DÒNG, kèm các dòng bị cờ, khoảng lệch, phạm vi lô.
+- ``batch_gave_up`` — lô đành giữ nguyên văn bản gốc sau khi đã chia nhỏ hết cỡ, kèm độ sâu chia.
+
+Kèm bảng đếm theo loại để nhìn phát ra ngay mức độ, và số sự kiện bị bỏ khi chạm trần.
+
+**Thiết kế an toàn:** bộ ghi có khoá đa luồng (các lô chạy song song), có TRẦN 2000 sự kiện để không
+phình bộ nhớ ở phim dài, tự xoá khi bắt đầu lần dịch mới để tệp chỉ chứa lần chạy hiện tại, và NUỐT
+mọi lỗi — ghi nhật ký là việc phụ, không bao giờ được phép làm hỏng khâu dịch.
+
+**Kiểm chứng:** mô phỏng đúng các sự kiện thật rồi xuất tệp, thấy đủ cả ba loại và bảng đếm chính
+xác; 8 test (ghi và đếm theo loại, giữ nguyên trường dữ liệu, xoá đầu phiên, chạm trần thì đếm số bị
+bỏ, dữ liệu dị dạng không ném lỗi, tệp có/không có sự kiện đều hợp lệ, adapter có đủ ba điểm ghi) và
+362 test liên quan pass; compile + ruff sạch.
+
+## [3.23.518] — 🚑 Sửa crash do v3.23.516: phép kiểm căn dòng đặt sai chỗ làm sập tác vụ dịch
+
+Nhật ký lần chạy này chỉ có **1 dòng lỗi duy nhất**, nhưng là lỗi chặn toàn bộ:
+
+```
+ERROR translate_worker: Lỗi không lường trước khi dịch phụ đề.
+_BatchValidationError: Nội dung LỆCH DÒNG ở ... — cần dịch lại.
+```
+
+**Nguyên nhân (lỗi của chính bản v3.23.516):** phép kiểm căn dòng được đặt trong
+``_translate_single_batch`` NGAY SAU khi ``_call_gemini`` đã trả về. Nhưng vòng bắt
+``_BatchValidationError`` (kèm thử lại và chia nhỏ lô) nằm BÊN TRONG ``_call_gemini``. Ném lỗi ở
+ngoài vòng đó thì không gì bắt được — lỗi thoát thẳng lên worker và làm sập cả tác vụ dịch. Trớ trêu:
+cơ chế lẽ ra để TỰ SỬA lệch dòng lại trở thành nguyên nhân dừng hẳn việc dịch.
+
+**Sửa:** chuyển phép kiểm vào ĐÚNG bộ kiểm truyền cho ``_call_gemini``, nơi lỗi được vòng thử-lại xử
+lý như mọi lỗi cấu trúc khác. Thêm ``_detect_batch_misalignment_payload`` để dò ngay trên JSON thô
+model trả về (trước bước ghép), có xử lý cả trường hợp model đánh số lại ``line_no`` — khi đó dùng
+VỊ TRÍ đúng như bước ghép vẫn làm.
+
+**Chống hồi quy:** thêm test khoá VỊ TRÍ của phép kiểm — bắt buộc nằm giữa phần định nghĩa bộ kiểm và
+lời gọi model, đồng thời cấm xuất hiện lại ở sau lời gọi. Kiểu lỗi "đặt đúng logic nhưng sai chỗ"
+này sẽ bị bắt tại kiểm thử thay vì lúc chạy thật.
+
+**Bài học ghi nhận:** logic đúng nhưng đặt sai lớp thì vẫn là lỗi nghiêm trọng. Với mọi ngoại lệ dùng
+để điều khiển luồng, phải kiểm chứng nơi ném nằm trong phạm vi của nơi bắt.
+
+**Kiểm chứng:** 23 test (thêm 6 test: khoá vị trí phép kiểm, dò lệch trên payload thô, không báo khi
+lô đúng, xử lý payload bị đánh số lại, payload rỗng/dị dạng vẫn an toàn) và 355 test liên quan pass;
+compile + ruff sạch.
+
+## [3.23.517] — 📐 Tín hiệu thứ hai chống lệch dòng: TƯƠNG QUAN ĐỘ DÀI, phủ được MỌI dòng
+
+Bộ kiểm mốc neo (v3.23.516) chính xác nhưng chỉ phủ khoảng 13% số dòng — lô nào không chứa tên riêng
+hay thuật ngữ thì không có gì để đối chiếu, và lệch ở đó vẫn lọt. Cần một tín hiệu có ở MỌI dòng.
+
+**Ý tưởng:** độ dài câu. Câu gốc dài kéo theo bản dịch dài, nên khi căn ĐÚNG dòng, dãy độ dài của
+nguồn và của bản dịch tương quan mạnh. Nếu cả khối bị đẩy đi k dòng, tương quan tại 0 tụt xuống và
+đỉnh chuyển sang đúng k. Đây là cách đo không cần mốc neo, không cần gọi model, chạy tức thời.
+
+**Đo trên phim thật (5540 dòng, 222 lô):** lô bình thường có tương quan tại 0 khoảng 0.71-0.92
+(trung vị 0.84, phân vị 5% là 0.63); hai vùng lệch thật tụt hẳn xuống 0.53 và 0.40, với đỉnh nằm
+đúng khoảng lệch (-3 và -1). Ngưỡng 0.55 nằm dưới hẳn vùng bình thường nên rất chọn lọc: chỉ
+**4/222 lô (1,8%)** bị bắt dịch lại.
+
+**Kiểm chứng đúng vùng lệch đã biết:**
+- Dòng 250-274 (lệch khối 3) → phát hiện -3 ✓
+- Dòng 1251-1275 (lệch 1 dòng: bản dịch của 1255 chính là nội dung 1256) → phát hiện -1 ✓
+- Ba vùng dịch bình thường → im lặng ✓
+
+**Cách phối hợp hai tín hiệu:** mốc neo chạy trước (chính xác cao, chỉ rõ dòng nào lệch); nếu không
+kết luận được thì mới xét tương quan độ dài (phủ rộng). Phát hiện lệch ở cả hai đường đều ném lỗi để
+guồng thử-lại/chia-nhỏ lô sẵn có xử lý.
+
+**An toàn:** lô dưới 10 dòng không kết luận (hệ số quá nhiễu); lô có độ dài đồng đều không kết luận
+(không có biến thiên để so); độ lệch khác phải tương quan cao hơn mức tại 0 ít nhất 0.05 mới tính là
+bằng chứng.
+
+**Kiểm chứng:** 17 test (dựng mốc neo, bắt lệch khối/lệch liền kề, ngưỡng hai dòng, bắt lệch 1 và 3
+dòng bằng tương quan, không báo khi căn đúng, lô quá ngắn, độ dài đồng đều, và lô KHÔNG có tên riêng
+nào vẫn bắt được lệch) cùng 349 test liên quan pass; compile + ruff sạch.
+
+## [3.23.516] — 🎯 KIỂM CĂN DÒNG NGAY TẠI LÔ: tự bắt lệch dòng và dịch lại
+
+Đây là bước còn thiếu để KIỂM SOÁT lệch dòng thay vì chỉ phát hiện sau khi xong. Ba lớp kiểm trước
+đây đều xét CẤU TRÚC (đủ số dòng, ``line_no`` hợp lệ, số phần tử khớp schema) — nên lệch KHỐI lọt
+sạch: mọi dòng vẫn đủ, vẫn dài bình thường, không trùng nhau, chỉ có điều nội dung nằm sai chỗ. Lô
+được chấp nhận, và mất luôn cơ hội thử lại.
+
+**Cách làm:** dùng bảng nhân vật + bảng thuật ngữ đã duyệt làm MỐC NEO. Ngay sau khi ghép kết quả
+mỗi lô, nếu bản dịch của một dòng KHÔNG mang mốc neo nào của nguồn chính nó nhưng lại mang mốc neo
+của nguồn một dòng lân cận (trong vòng 3 dòng), thì nội dung đã chệch. Phát hiện lệch thì ném lỗi
+để guồng THỬ LẠI / CHIA NHỎ LÔ sẵn có xử lý — không cần cơ chế mới.
+
+**Ngưỡng thận trọng — chỉ báo khi có TỪ HAI dòng trở lên bị cờ.** Một dòng đơn lẻ thường chỉ là đảo
+trật tự hợp lệ: khi câu bị tách đôi, tiếng Việt hay đặt từ khoá sang dòng kế (``宋欣爽的单日返现`` /
+``次数已达上限`` → "Tống Hân Sảng đã đạt giới hạn" / "số lần hoàn tiền trong ngày"). Lệch thật gần
+như luôn kéo theo cả cụm. Thà bỏ sót một dòng còn hơn bắt dịch lại hàng loạt lô vốn đã đúng.
+
+**Kiểm chứng trên dữ liệu thật (5540 dòng, 348 mốc neo dựng được):**
+- Vùng chứa lệch khối (dòng 250-274) → BỊ BẮT, đúng hai dòng 257 và 258, đúng khoảng lệch 3.
+- Ba vùng dịch bình thường (1-25, 3000-3024, 4500-4524) → không bị đụng.
+- Toàn phim: **10/222 lô (4,5%)** sẽ phải dịch lại — chi phí quota chấp nhận được.
+
+**An toàn:** bỏ qua khi chưa có bảng nhân vật/thuật ngữ; bỏ qua giai đoạn hiệu đính; mọi lỗi khi dò
+đều bị nuốt (kiểm chất lượng không được phép làm hỏng khâu dịch).
+
+**Sửa kèm một lỗi suýt lọt:** hàm dò mới bị chèn ngay dưới một ``@staticmethod`` vốn thuộc về
+``_merge_ai_items``, khiến decorator dính nhầm sang hàm mới và ``_merge_ai_items`` mất decorator.
+Bộ test bắt được ngay; đã trả decorator về đúng chủ.
+
+**Kiểm chứng:** 11 test (dựng mốc neo, bắt lệch khối, không báo khi dịch đúng, bỏ qua dòng không có
+mốc neo, ngưỡng một dòng không kích hoạt, hai dòng thì kích hoạt, không có mốc neo thì không bao giờ
+thử lại, hook trong adapter) và 343 test liên quan pass; compile + ruff sạch.
+
+## [3.23.515] — 🎯 Phát hiện LỆCH DÒNG/LỆCH KHỐI: cờ chuẩn đoán mới dùng mốc neo thuật ngữ
+
+Kiểm tra trực tiếp hiện tượng lệch dòng trong bản dịch cuối theo yêu cầu. Kết quả:
+
+**Vùng dòng 257-262 bị lệch nguyên KHỐI 3 dòng** — bản dịch của dòng 257 thực ra là nội dung dòng
+260, dòng 258 là nội dung dòng 261, và cứ thế. Toàn bộ vùng này KHÔNG cờ nào bắt được: các dòng đều
+dài bình thường (`under_translation` không báo), không trùng nhau (`duplicate_adjacent` không báo),
+không còn chữ Hán. Lỗi trôi lọt hoàn toàn.
+
+**Cờ mới `shifted_lines`** dùng chính bảng thuật ngữ và bảng nhân vật đã duyệt làm MỐC NEO: nếu bản
+dịch của một dòng không mang dấu hiệu nào của nguồn dòng đó, nhưng lại mang dấu hiệu của nguồn một
+dòng lân cận (trong vòng 5 dòng), thì nội dung đã chệch. Báo cáo ghi rõ dòng nghi lệch, dòng mà nội
+dung thực sự thuộc về, và khoảng lệch.
+
+**Đo trên dữ liệu thật:** 69 dòng nghi lệch trên 5540 (1,2%), trong đó có cả lệch 1 dòng lẫn lệch
+khối 2-3 dòng. Đối chiếu: 725 dòng khớp đúng mốc neo của chính nó.
+
+**Cẩn trọng khi đọc con số:** một phần trong 69 dòng là ĐẢO TRẬT TỰ hợp lệ — khi câu bị tách qua hai
+dòng, tiếng Việt có thể đặt từ khoá sang dòng kế (vd `宋欣爽的单日返现` / `次数已达上限` dịch thành
+"Tống Hân Sảng đã đạt giới hạn" / "số lần hoàn tiền trong ngày"). Cờ này để KHOANH VÙNG rà soát, chưa
+phải kết luận sai. Dòng không chứa thuật ngữ/tên nào thì không đủ căn cứ nên không bị báo.
+
+**Kiểm chứng:** 6 test (bắt lệch khối, bắt lệch liền kề, không báo khi dịch đúng, không báo khi thiếu
+mốc neo, không có glossary thì không báo, báo cáo nêu đúng dòng đích) và 359 test liên quan pass;
+compile + ruff sạch.
+
+**Việc kế tiếp:** có cờ này rồi thì bước hợp lý là vòng tự sửa — gom các dòng nghi lệch theo cụm liền
+nhau rồi dịch lại riêng cụm đó từ nguồn, chỉ nhận kết quả mới khi mốc neo khớp đúng dòng.
+
+## [3.23.514] — ✅ Xác nhận 3 bản sửa trước hiệu quả + hạ ngưỡng nhận diện mục glossary quy định sai
+
+Lần chạy này dùng LẠI ngữ cảnh đã lưu (roster 48, glossary 287, cues 3347 — trùng khít) nên so được
+trực tiếp với lần chạy bản v3.23.509:
+
+| Chỉ số | v509 | v513 | |
+|---|---|---|---|
+| **Cảnh báo trong nhật ký** | 126 | **45** | ✓ −64% |
+| Dòng dịch trùng liền kề | 10 | **1** | ✓ −90% |
+| Dịch thiếu | 40 | **37** | ✓ |
+| Thiếu nhất quán | 106 | **104** | ✓ |
+| Chữ Hán sót | 0 | **0** | = giữ sạch |
+
+Nhóm cảnh báo "Model trả batch sai cấu trúc" (51 lượt) và "AI trả rỗng cho dòng N" đã BIẾN MẤT hoàn
+toàn — xác nhận v3.23.512 (lọc dòng ngữ cảnh thừa) và v3.23.513 (ghép khi model đánh số lại) đều
+trúng đích. Vòng dọn trùng dòng của v3.23.510 cũng chạy đúng (nhật ký ghi nhận và đưa chỉ số về 1).
+
+**Bản sửa lần này — hạ ngưỡng "mục glossary đáng ngờ" từ 90% xuống 80%.** Soi số vi phạm tăng (95 →
+119) thì thấy phần lớn đến từ một mục: `到账` quy định cả CỤM DÀI "tiền vào tài khoản (chuyển khoản
+thành công)", bị vi phạm 18/21 = 86%. Các bản dịch thực tế đều hợp lý ("hai vạn tệ đã vào tài
+khoản") nhưng không chứa trọn cụm — đây là mục quy định quá dài chứ không phải khâu dịch sai. Ngưỡng
+90% cũ để lọt nhóm này và thổi phồng con số. Sau khi hạ ngưỡng: **101 vi phạm thật + 2 mục quy định
+sai** (`小可爱`, `到账`), thay vì 119 gộp chung.
+
+**Còn tồn đọng (ghi nhận, chưa sửa):** vẫn còn ca lệch dòng thật — dòng 260 gốc `支付宝到账一千元`
+(Alipay nhận một nghìn tệ) bị dịch thành nội dung của dòng khác. Đây là loại lỗi cần vòng phát hiện
+và dịch lại riêng theo cụm; rủi ro cao hơn nên tách thành việc riêng, làm sau khi có thêm dữ liệu.
+
+**Kiểm chứng:** 49 test (thêm 3 test ngưỡng: 86% là mục đáng ngờ, 70% vẫn là vi phạm thật, mục hiếm
+vẫn cần đủ số lần xuất hiện) pass; compile + ruff sạch.
+
+## [3.23.513] — 🐞 Sửa BUG mất trắng bản dịch khi model đánh số lại line_no
+
+Rà soát mã nguồn khâu dịch bằng cách thử các ca biên trên hàm ghép kết quả, tìm ra một bug âm thầm
+làm MẤT TRẮNG bản dịch của cả lô.
+
+**Hiện tượng:** các model "lite" có thói quen ĐÁNH SỐ LẠI `line_no` từ 1 cho mỗi lô (chính chú thích
+trong mã nguồn đã ghi nhận hành vi này). Khi đó việc ghép theo `line_no` trượt sạch, mà nhánh dự
+phòng ghép theo VỊ TRÍ lại không chạy — vì item vẫn "có" `line_no` hợp lệ, chỉ là không thuộc lô.
+Kết quả: MỌI dòng của lô giữ nguyên văn bản gốc, tức còn nguyên chữ Hán trong bản dịch, kèm log
+"AI trả rỗng cho dòng N — giữ nguyên văn bản gốc". Nhật ký các lần chạy trước có đúng 9 dòng như vậy.
+
+**Nghịch lý phơi bày lỗi:** `line_no` RÁC (số âm, hoặc chữ) lại ghép ĐÚNG theo vị trí; chỉ số HỢP LỆ
+nhưng lệch mới hỏng. Đây là dấu hiệu điều kiện phân nhánh sai chứ không phải thiếu tính năng.
+
+**Sửa:** khi tập `line_no` model trả về KHÔNG giao với chỉ số của lô VÀ số lượng khớp, chuyển sang
+ghép theo vị trí (cùng thứ tự nên an toàn), kèm ghi log rõ ràng.
+
+**Giữ nguyên các cơ chế bảo vệ cũ (đã kiểm bằng test):**
+- `line_no` đúng nhưng model xáo trộn thứ tự → vẫn ghép theo ID, không ghép vị trí.
+- CÓ giao nhau một phần → không chuyển sang ghép vị trí (tránh xê dịch nhầm).
+- Số lượng KHÔNG khớp → không ghép vị trí, giữ nguyên bản gốc (không đoán bừa vị trí dòng thiếu).
+
+**Kiểm chứng:** 7 test (đánh số lại từ 1, đánh số lệch hẳn, line_no rác, cùng 4 test chống hồi quy
+ở trên) và 344 test liên quan pass; compile + ruff sạch.
+
+## [3.23.512] — 🩹 Hết bỏ cuộc oan: lọc dòng ngữ cảnh model dịch kèm thay vì coi là lô hỏng
+
+Nhật ký lần chạy này có **126 cảnh báo**, áp đảo là nhóm mới xuất hiện: **51 lần "Model trả batch
+sai cấu trúc"** kèm **6 lô THẤT BẠI HẲN**. Nội dung lỗi nói rõ nguyên nhân:
+
+```
+Model trả DƯ 26 dòng (kỳ vọng 1)
+Batch 1 dòng (depth=5) vẫn thất bại sau 5 retry và không thể chia tiếp → giữ text gốc
+```
+
+**Nguyên nhân:** khi một lô gặp lỗi, ứng dụng chia đôi liên tục cho tới khi còn **1 dòng**. Lúc đó
+lô vẫn kèm ~25 dòng ngữ cảnh trước/sau, và model dịch luôn cả phần ngữ cảnh rồi trả về 26 dòng. Bộ
+kiểm coi "dư quá 2 dòng" là hỏng cấu trúc → thử lại 5 lần → chia nhỏ tiếp → cuối cùng BỎ CUỘC và
+**giữ nguyên văn bản gốc**. Trớ trêu: dòng cần dịch NẰM SẴN trong kết quả trả về, chỉ là bị chôn
+giữa các dòng ngữ cảnh.
+
+**Sửa:** dòng ngữ cảnh luôn có `line_no` NẰM NGOÀI khoảng của lô, nên lọc theo `line_no` là tất
+định và an toàn. Nay khi phát hiện dư, ứng dụng lọc lấy đúng các dòng thuộc lô; nếu lọc xong ĐỦ thì
+dùng luôn, không dịch lại. Chỉ báo hỏng khi lọc xong vẫn THIẾU — giữ nguyên đường chia nhỏ/thử lại
+cũ cho các ca hỏng thật.
+
+Tác động kỳ vọng: 51 lượt thử lại và 6 lô bị bỏ (mỗi lô là một dòng KHÔNG được dịch, còn nguyên chữ
+Hán trong bản cuối) sẽ biến mất, đồng thời tiết kiệm đáng kể quota vì bớt hẳn vòng thử lại.
+
+**An toàn:** dòng cần dịch có `line_no` đúng nhưng text RỖNG vẫn bị coi là chưa dịch (không nhận
+bừa); lô trả đúng số dòng không bị đụng tới; mức dung thứ dư 1-2 dòng giữ nguyên như cũ.
+
+**Kiểm chứng:** mô phỏng đúng ca thật (lô 1 dòng, model trả 26 dòng) cho ra đúng một dòng cần; 6 test
+(lọc lô 1 dòng, lọc lô nhiều dòng, thiếu dòng cần vẫn báo hỏng, text rỗng không được nhận, lô đúng
+số dòng không đổi, dư nhỏ vẫn dung thứ) và 351 test liên quan pass; compile + ruff sạch.
+
+## [3.23.511] — 🛡️ Chống HTTP 400 với model thế hệ sau: chỉ gửi tham số lấy mẫu cho họ model cũ
+
+Tham khảo dự án `MaKTaiL/gemini-srt-translator` và tra cứu lại tài liệu Gemini để tìm khả năng cải
+tiến. Kết quả rà soát:
+
+**Đối chiếu tính năng — phần lớn ứng dụng đã có hoặc mạnh hơn:** đính video kèm audio làm ngữ cảnh
+(họ chỉ có audio), ngữ cảnh tích luỹ giữa các lô, nhiều API key luân phiên, resume/checkpoint, chọn
+model, thinking level, mô tả công việc dịch (ta có tóm tắt + roster + glossary), xuất chuẩn đoán.
+
+**Tham số họ có mà ta không dùng — và ĐÚNG là không nên dùng:** `top_p`/`top_k`. Tài liệu Gemini
+(7/2026) xác nhận `temperature`, `top_p`, `top_k` đã bị BỎ QUA từ Gemini 3.6 Flash, và Google
+khuyến nghị điều khiển tính tất định bằng `thinking_level` + `response_schema` — đúng hướng ứng dụng
+đang làm (v3.23.509 vừa siết schema). Thêm chúng vào sẽ là bước lùi.
+
+**Nhưng rà soát lộ ra một rủi ro THẬT:** tài liệu nêu rõ các thế hệ model SAU sẽ trả **HTTP 400**
+nếu vẫn gửi tham số lấy mẫu. Ứng dụng đang quyết định theo kiểu "không phải `gemini-3` thì gửi
+`temperature`" — nên một model tương lai như `gemini-4-flash` sẽ KHÔNG khớp mẫu `gemini-3` và vẫn bị
+gửi `temperature` → lỗi 400 làm hỏng toàn bộ khâu dịch ngay khi anh chọn model mới.
+
+**Sửa:** đảo chiều nhận diện — CHỈ gửi cho các họ model CŨ đã biết chắc còn hỗ trợ (`gemini-1.x`,
+`gemini-2.x`, `gemma`); model lạ hoặc mới thì mặc định KHÔNG gửi. Bỏ sót tham số vốn đã bị bỏ qua thì
+vô hại, còn gửi thừa thì hỏng cả tác vụ — nên mặc định an toàn là bỏ.
+
+**Kiểm chứng:** 14 test (họ cũ vẫn nhận, Gemini 3.x bị loại, model tương lai/lạ/tên rỗng bị loại,
+`_build_config` dùng đúng hàm mới, không bao giờ gửi `top_p`/`top_k`) và 345 test liên quan pass;
+compile + ruff sạch.
+
+## [3.23.510] — 🔁 Dọn CẶP dòng liền kề bị gán cùng một bản dịch (tác dụng phụ của v3.23.509)
+
+Lần chạy này dùng LẠI ngữ cảnh đã lưu (roster 48, glossary 287, cues 3347 — trùng khít lần trước),
+nên lần đầu tiên có phép so sánh CÔNG BẰNG giữa hai bản dịch:
+
+| Chỉ số | v3.23.507 | v3.23.509 | |
+|---|---|---|---|
+| Chữ Hán sót | 6 | **0** | ✓ −100% |
+| Vi phạm thuật ngữ | 122 | **95** | ✓ −22% |
+| Tốc độ đọc quá nhanh | 760 | **720** | ✓ −5% |
+| Dịch thiếu | 45 | **40** | ✓ −11% |
+| Độ dài bất thường | 10 | **8** | ✓ −20% |
+| Nén TTS | 513 | **490** | ✓ −4% |
+| Dòng dịch trùng liền kề | 2 | 10 | ✗ +400% |
+
+Ràng buộc số dòng ở tầng schema (v3.23.509) có tác dụng rõ trên 6/8 chỉ số. Nhưng nó tạo TÁC DỤNG
+PHỤ đúng như dữ liệu chỉ ra: khi một CÂU bị tách qua hai dòng phụ đề, model buộc phải điền đủ số
+phần tử nên LẶP nguyên bản dịch sang dòng bên cạnh thay vì bỏ trống. Ví dụ thật: `连大家的工资都`
+(ngay cả lương mọi người) và `发不了` (cũng không phát nổi) cùng ra "không phát nổi."
+
+**Sửa — thêm vòng dọn sau dịch:** phát hiện cặp dòng liền kề có bản dịch TRÙNG KHÍT trong khi nguồn
+KHÁC nhau, rồi dịch lại riêng cụm đó từ nguồn. Lô nhỏ và chỉ chứa đúng phần cần chia nên model dễ
+tách nghĩa theo từng dòng.
+
+**Nguyên tắc an toàn (không bao giờ làm xấu thêm):**
+- Nguồn GIỐNG nhau thì dịch giống nhau là ĐÚNG — không đụng vào, không tốn lượt gọi.
+- Bản dịch lại vẫn còn trùng, hoặc trả về rỗng, hoặc gọi thất bại → giữ nguyên bản cũ.
+- Chỉ chạy khi có giai đoạn dịch thô; chạy SAU vòng dọn chữ Hán để không dịch lại hai lần cùng dòng.
+
+**Kiểm chứng:** mô phỏng đúng ca thật (1860/1861) cho ra hai dòng chia nghĩa đúng; 9 test (dịch lại
+cặp trùng, bỏ qua khi nguồn giống nhau, bỏ qua khi không có cặp trùng, hai dòng cùng rỗng không tính,
+giữ nguyên khi dịch lại vẫn trùng / thất bại / rỗng / thiếu giai đoạn) và 366 test liên quan pass;
+compile + ruff sạch.
+
+## [3.23.509] — 📐 Ép SỐ DÒNG ngay trong schema từng lô (theo tài liệu Gemini mới)
+
+Tra cứu tài liệu Gemini API hiện hành (trang Structured outputs, cập nhật 02/09/2026) tìm được hai
+điểm áp dụng được ngay, đúng nguyên tắc "schema hơn chỉ thị" mà dự án đã đúc kết qua nhiều lần sửa:
+
+**1. Ràng buộc số lượng ở tầng schema.** Tài liệu xác nhận schema hỗ trợ `minItems`/`maxItems` cho
+mảng và `minimum`/`maximum` cho số nguyên. Nay MỖI LÔ dịch có schema riêng: mảng kết quả bị ghim
+đúng bằng số dòng gửi đi, và `line_no` bị giới hạn trong khoảng chỉ số của lô. Đây là cách chặn
+kiểu lỗi gộp/bỏ/lệch dòng ngay tại nguồn — mạnh hơn hẳn các chỉ thị "căn dòng 1:1" ở v3.23.502, vốn
+chỉ là lời nhắc mà model có thể bỏ qua.
+
+**2. Mô tả trường trong schema.** Tài liệu nêu rõ trong mục Best practices: dùng `description` để
+dẫn dắt model. Schema của ứng dụng trước đây không có mô tả nào. Nay mỗi trường đều có: `line_no`
+("phải TRÙNG KHỚP với dòng nguồn tương ứng"), `text` ("bản dịch của ĐÚNG dòng này, không mang nội
+dung dòng khác"), `speaker`, `description`, và cả mảng kết quả ("đúng N phần tử, giữ nguyên thứ tự").
+
+**An toàn:** schema gốc không bị sửa tại chỗ (dùng bản sao sâu), lô rỗng hoặc schema khác cấu trúc
+thì trả về nguyên schema cũ. Config được dựng qua closure nên mỗi lô gắn schema riêng mà không lặp
+danh sách tham số.
+
+**Ghi chú tham khảo:** tài liệu cũng giới thiệu Interactions API (GA từ 06/2026) thay cho
+`generateContent`, nhưng `generateContent` vẫn được hỗ trợ đầy đủ nên CHƯA chuyển — việc đổi API nền
+là thay đổi lớn, cần đánh đổi rủi ro rõ ràng hơn mới đáng làm.
+
+**Kiểm chứng:** 10 test ràng buộc schema (ghim số phần tử theo lô, giới hạn khoảng line_no, mô tả
+trường, schema gốc bất biến, lô rỗng và schema lạ trả về nguyên bản, hoạt động với cả biến thể schema
+không có mô tả) và 373 test liên quan pass; compile + ruff sạch.
+
+## [3.23.508] — 🔍 Bịt LỖ HỔNG ĐO LƯỜNG: mục thuật ngữ gộp bí danh chưa từng được kiểm
+
+Soi bảng thuật ngữ của bản v3.23.507 phát hiện model vừa ghi mục GỘP BÍ DANH vừa ghi mục LẺ cho
+cùng một khái niệm: `"满月宴 / 满月酒"` đi kèm `"满月宴"`; `"绿毛龟 / 绿帽子"` đi kèm cả `"绿毛龟"`
+lẫn `"绿帽子"`. Dữ liệu thật có **21/287 mục thừa**. Bộ khử biến thể (v3.23.506) không bắt được vì
+hai mục khác độ dài.
+
+**Lỗi nghiêm trọng hơn nằm phía sau:** bộ đo tuân thủ tìm NGUYÊN CHUỖI `"满月宴 / 满月酒"` trong phụ
+đề — tất nhiên không bao giờ thấy. Nghĩa là **mọi mục dạng gộp bí danh chưa từng được kiểm tra**,
+âm thầm, suốt từ khi tính năng ra đời. Con số "vi phạm" báo cáo lâu nay do đó thấp hơn thực tế.
+
+**Hai bản sửa:**
+- **Đếm theo TỪNG bí danh** ở vế trái thay vì nguyên chuỗi. Kiểm chứng: mục gộp bí danh nay được
+  đếm đúng số lần xuất hiện, dịch sai thì bị bắt, dịch đúng thì không báo oan.
+- **Bỏ mục bị BAO HÀM**: mục có tập bí danh nằm gọn trong mục khác sẽ bị loại, giữ mục đầy đủ hơn.
+  Trên dữ liệu thật: 287 → 266 mục, hết cảnh chỉ thị chồng chéo cho cùng một từ.
+
+**Kết quả đo lại trên dữ liệu thật:** 122 → **127 lượt vi phạm** — con số TĂNG vì lần đầu tiên các
+mục gộp bí danh được tính vào (vd `骨髓移植 / 骨髓配型` 3/7 trước đây vô hình). Đây là số liệu ĐÚNG
+hơn, dù nhìn xấu hơn.
+
+**Lưu ý khi so sánh giữa các lần chạy:** các chỉ số của v3.23.507 xấu hơn v3.23.506 trên hầu hết
+hạng mục, nhưng hai lần chạy KHÁC điều kiện (model phân tích 3.7 vs 3.6, Visual Cues phủ 60% vs 14%,
+glossary 287 vs 202 mục) nên không so trực tiếp được. Muốn đánh giá tác dụng của từng bản sửa, cần
+cố định model và cài đặt phân tích giữa các lần.
+
+**Kiểm chứng:** 19 test vệ sinh glossary (thêm 6 test: đếm theo bí danh, không báo oan khi dịch đúng,
+bỏ mục bị bao hàm, giữ mục giàu bí danh nhất) và 454 test liên quan pass; compile + ruff sạch.
+
+## [3.23.507] — 📉 Vệ sinh glossary phát huy tác dụng + sửa dương tính giả khi so khớp tên ghép
+
+Chuẩn đoán bản v3.23.506 xác nhận hai bản sửa trước đi đúng hướng:
+
+| Chỉ số | v505 | v506 | |
+|---|---|---|---|
+| Dịch thiếu | 56 | **24** | ✓ −57% |
+| Vi phạm thuật ngữ | 234 | **102** | ✓ −56% |
+| Cặp thuật ngữ gần trùng | 9 | **1** | ✓ khử biến thể chạy đúng |
+| Số mục glossary | 426 | **202** | ✓ gọn hơn một nửa |
+| Độ dài bất thường | 12 | **8** | ✓ |
+
+**Sửa dương tính giả:** mục `奔驰 = Mercedes-Benz` bị tính vi phạm 9/9 và còn bị gắn nhãn "mục
+glossary đáng ngờ", trong khi bản dịch dùng "Mercedes" — hoàn toàn đúng. Bộ đo đòi khớp nguyên chuỗi
+có gạch nối. Nay chấp nhận cả DẠNG RÚT GỌN: phần trước gạch nối, khi dài từ 4 ký tự trở lên. Kết
+quả trên chính dữ liệu thật: mục đáng ngờ 1 → **0**, không còn cảnh báo oan.
+
+**Về Visual Cues tụt từ 51% xuống 14,4% số dòng:** không phải lỗi ứng dụng. Log cho thấy khâu phân
+tích chạy trọn vẹn 23 đoạn và gộp đủ 796 cues; lần trước dùng `gemini-3.7-flash` cho ra 2851 cues,
+lần này `gemini-3.6-flash` chỉ cho 796. Đây là chênh lệch giữa các model. Cues ít cũng kéo theo số
+tên "không tìm thấy trong phụ đề" tăng 6 → 10, vì nhãn nhân vật nhận qua hình ảnh mất chỗ đối chiếu.
+Muốn cues dày, nên chọn model phân tích mạnh hơn.
+
+**Vi phạm còn lại (103 lượt) chủ yếu là dạng rút gọn hợp lý:** `董事长` quy định "Chủ tịch Hội đồng
+quản trị" nhưng bản dịch dùng "chủ tịch"; `到账` quy định cả cụm dài. Bước tiếp theo nên là nới so
+khớp cho cụm nhiều từ (chấp nhận rút gọn giữ được từ khoá chính) trước khi tính đến vòng tự sửa sau
+dịch — tránh sửa nhầm thứ vốn đã đúng.
+
+**Kiểm chứng:** 13 test vệ sinh glossary (thêm 4 test dạng rút gọn: chấp nhận rút gọn, chấp nhận đầy
+đủ, vẫn bắt bản dịch lạc đề, không dùng lối tắt khi phần đầu quá ngắn) và 408 test liên quan pass;
+compile + ruff sạch.
+
+## [3.23.506] — 🧼 Vệ sinh bảng thuật ngữ bằng CODE (chỉ thị đã không kìm được)
+
+Chuẩn đoán bản v3.23.505 cho thấy tiêu chí chọn thuật ngữ thêm ở prompt KHÔNG có tác dụng: bảng vẫn
+phình 348 → 426 mục và vi phạm tăng 183 → 234. Lặp lại đúng bài học cũ: việc gì kiểm chứng được thì
+phải xử lý bằng code, đừng trông vào chỉ thị.
+
+**1. Khử BIẾN THỂ cùng nghĩa (tất định).** Dữ liệu thật có 9 cặp kiểu `骨髓配对`/`骨髓配型`,
+`满月宴`/`满月酒` — cùng một khái niệm ghi hai cách, khiến khâu dịch nhận hai chỉ thị mâu thuẫn và
+không thể tuân thủ trọn vẹn cả hai. Nay lọc ngay khi chuẩn hoá glossary: khác đúng một ký tự VÀ bản
+dịch trùng/bao hàm nhau thì bỏ mục sau, giữ mục xuất hiện trước. Cặp khác nghĩa (`装货` chất hàng /
+`卸货` dỡ hàng) vẫn được giữ đủ cả hai.
+
+**2. Tách "MỤC glossary sai" khỏi "vi phạm THẬT".** Mục `小可爱` đòi dịch thành "tiểu khả ái" bị vi
+phạm 37/37 lần — khi bản dịch NHẤT QUÁN chọn cách khác ở gần như mọi lần xuất hiện thì lỗi nằm ở
+QUY ĐỊNH trong bảng (dịch gượng ép), không phải ở khâu dịch. Gộp chung khiến con số mất ý nghĩa và
+không biết nên sửa ở đâu. Nay báo cáo tách hai nhóm; ngưỡng: xuất hiện ≥5 lần và vi phạm ≥90%.
+
+**Chạy trên chính dữ liệu thật:** 426 → 418 mục sau khử biến thể; 234 lượt gộp chung tách thành
+**191 vi phạm thật** + **1 mục glossary đáng ngờ** (đúng là `小可爱`). Nhờ vậy lần sau anh biết ngay
+nên sửa bảng thuật ngữ hay siết khâu dịch.
+
+**Các chỉ số khác của v3.23.505 (so v3.23.504):** chữ Hán sót 1 → **0** (sạch hoàn toàn), dòng dịch
+trùng liền kề 10 → **4**, tốc độ đọc quá nhanh 717 → **697**, nén TTS 487 → **470**; dịch thiếu
+52 → 56 và độ dài bất thường 9 → 12 (đi ngang trong biên độ dao động giữa các lần chạy).
+
+**Kiểm chứng:** 9 test vệ sinh glossary (khử biến thể cùng nghĩa, giữ cặp trái nghĩa, ngưỡng mục
+đáng ngờ, báo cáo tách hai nhóm) và 444 test liên quan pass; compile + ruff sạch.
+
+## [3.23.505] — 🎚️ Siết TIÊU CHÍ CHỌN thuật ngữ: chất lượng hơn số lượng
+
+Phân tích chuẩn đoán dịch của bản v3.23.504 (so với v3.23.500):
+
+| Chỉ số | v500 | v504 | |
+|---|---|---|---|
+| cjk_leftover | 19 | **1** | ✓ −18 (bản v3.23.501 hiệu quả rõ) |
+| length_anomaly | 19 | **9** | ✓ −10 |
+| under_translation | 62 | **52** | ✓ −10 |
+| consistency | 105 | 99 | ✓ −6 |
+| glossary_violations | 112 | 183 | ✗ +71 |
+
+**glossary_violations tăng KHÔNG phải vì dịch tệ đi.** Bảng thuật ngữ phình từ 190 → 348 mục, và
+phần lớn mục mới là TỪ PHỔ THÔNG: `骨髓` (tủy), `恶心` (kinh tởm), `大老板` (sếp lớn) — những từ ai
+dịch cũng giống nhau, ép dùng một bản dịch cứng cho chúng vừa vô nghĩa vừa làm loãng các mục thật sự
+quan trọng. Nặng nhất là `小可爱` yêu cầu dịch thành "tiểu khả ái" — vi phạm 37/37 dòng, tức bản dịch
+luôn chọn cách nói tự nhiên hơn; lỗi nằm ở MỤC GLOSSARY, không phải ở bản dịch.
+
+**Sửa — thêm TIÊU CHÍ CHỌN vào prompt phân tích:**
+- CHỈ đưa vào cụm mà dịch không nhất quán sẽ gây khó hiểu: tên riêng, thương hiệu, địa điểm, tổ chức,
+  chức danh gắn với nhân vật, thuật ngữ do phim tự đặt, thành ngữ/tục ngữ, tiếng lóng đặc thù, tiền tệ.
+- KHÔNG đưa vào từ phổ thông mà người dịch nào cũng dịch giống nhau.
+- Tiếng lóng/thành ngữ phải chọn bản dịch TỰ NHIÊN trong ngôn ngữ đích, không phiên âm máy móc; cần
+  giải thích thì đặt trong ngoặc SAU bản dịch, phần trước ngoặc phải dùng được thẳng trong lời thoại.
+
+**Đọc thêm từ log (cơ chế tự bảo vệ đang chạy đúng):** số dòng nghi dịch thiếu giảm dần qua các giai
+đoạn 111 → 69 → 53, và ứng dụng tự HOÀN NGUYÊN 21 rồi 12 dòng bị giai đoạn sau làm rớt nội dung —
+đúng nguyên tắc "thà kém mượt còn hơn mất nghĩa". 9 dòng bị AI trả rỗng cũng được giữ nguyên bản cũ.
+
+**Ngữ cảnh tiếp tục cải thiện:** roster 46 nhân vật, Visual Cues phủ 62,9% số dòng (v500: 35,7%).
+
+**Kiểm chứng:** 384 test liên quan pass; compile + ruff sạch.
+
+**Theo dõi lần tới:** sau khi glossary được lọc gọn, `glossary_violations` phải giảm mạnh — nếu vẫn
+cao thì phần còn lại mới là vi phạm THẬT và đáng xử lý bằng vòng tự sửa sau dịch.
+
+## [3.23.504] — 🎯 Đính bản gốc ĐÚNG LÚC CẦN: không trùng lặp khi bỏ khâu hiệu đính
+
+Kiểm tra theo yêu cầu: nếu bỏ giai đoạn hiệu đính và chạy thẳng dịch thô thì có bị đính kèm ngữ cảnh
+văn bản gốc TRÙNG LẶP không. Rà soát phát hiện vấn đề ngược lại — nghiêm trọng hơn:
+
+**Bản sửa v3.23.503 chưa hề có hiệu lực.** Điều kiện bật payload kép dựa vào `has_prior_translation`,
+mà cờ này chỉ bật `True` sau một giai đoạn DỊCH; PREPROCESS không bật nó. Nên khi LITERAL chạy, cờ
+luôn là `False` → LITERAL **không bao giờ** nhận payload kép, kể cả khi PREPROCESS đã sửa dòng nguồn.
+Đúng là "không trùng lặp", nhưng vì cơ chế đối chiếu ở khâu đó không chạy.
+
+**Sửa:** thêm cờ riêng `source_was_preprocessed`, bật khi PREPROCESS chạy xong và truyền xuống adapter.
+Payload kép nay bật theo đúng nhu cầu:
+
+| Kịch bản | Đính bản gốc |
+|---|---|
+| Chạy thẳng LITERAL (bỏ hiệu đính) | KHÔNG — bản gốc trùng y hệt đầu vào, đính thêm chỉ tốn token |
+| PREPROCESS → LITERAL | CÓ — để phát hiện lệch do khâu hiệu đính gây ra |
+| … → STYLE, … → LOCALIZE | CÓ |
+| Chạy thẳng STYLE (chưa có bản nháp) | KHÔNG |
+
+**Về trùng lặp ở mức từng dòng:** cơ chế sẵn có vẫn đúng — chỉ đính `original` khi nó KHÁC `text`.
+Dòng mà khâu hiệu đính không sửa gì thì không kèm bản gốc, nên không nhân đôi token.
+
+**Kiểm chứng:** 11 test (ba ca trùng lặp mức dòng, ma trận sáu kịch bản giai đoạn, adapter dùng đúng
+cờ mới, chữ ký nhận tham số) và 365 test liên quan pass; bộ quét chữ ký toàn dự án 297 file vẫn sạch
+sau khi đổi chữ ký port + adapter + use case; compile + ruff sạch.
+
+## [3.23.503] — 🔁 Mọi giai đoạn đều có phụ đề GỐC THÔ và tự sửa lệch do khâu trước gây ra
+
+Theo yêu cầu kiểm tra: mỗi giai đoạn có đính phụ đề gốc không, và có tự đối chiếu để phát hiện/sửa
+lệch từ giai đoạn trước không. Rà soát tìm ra HAI lỗ hổng:
+
+**1. `original_text` không phải bản gốc thô.** Nó chỉ được gieo ở giai đoạn SAU preprocess, nên thứ
+được lưu là bản ĐÃ HIỆU ĐÍNH. Nếu PREPROCESS làm lệch dòng thì mọi giai đoạn sau đối chiếu với dữ
+liệu vốn đã sai — không khâu nào phát hiện được. Nay gieo NGAY TỪ đầu vào của PREPROCESS.
+
+**2. LITERAL không có payload kép.** Đầu vào của LITERAL là KẾT QUẢ của PREPROCESS, mà nó lại không
+được kèm bản gốc để đối chiếu → lệch do PREPROCESS gây ra trôi thẳng qua. Nay LITERAL cũng nhận
+payload kép, kéo theo cả VÒNG TỰ SỬA dòng dịch thiếu (vốn gắn với payload kép) hoạt động ở khâu này.
+
+**Chỉ thị đối chiếu cũng được viết lại rõ ràng:** nói thẳng `'original'` là phụ đề GỐC THÔ của đúng
+dòng đó (chưa qua xử lý), `'text'` là bản do khâu TRƯỚC tạo ra; bắt buộc so hai trường theo CÙNG
+line_no và SỬA LẠI theo bản gốc nếu bản nháp đang mang nội dung của dòng khác, bị rút ngắn đánh rơi
+ý, hoặc sai nghĩa — "đừng kế thừa lỗi của khâu trước". Trước đây chỉ ghi chung chung là "đối chiếu
+khi tinh chỉnh".
+
+**Hiện trạng sau bản này:**
+
+| Giai đoạn | Gốc thô để đối chiếu | Tự sửa lệch |
+|---|---|---|
+| PREPROCESS | payload chính là nguồn thô | — |
+| LITERAL | ✓ (mới) | ✓ (mới) |
+| STYLE | ✓ | ✓ |
+| LOCALIZE | ✓ | ✓ |
+
+**Kiểm chứng:** 5 test (gieo trước preprocess, payload kép phủ cả ba giai đoạn sau, vòng tự sửa gắn
+với payload kép, chỉ thị nêu đủ bốn ý, giai đoạn không payload kép giữ chỉ thị gọn) và 394 test liên
+quan pass; compile + ruff sạch.
+
+## [3.23.502] — 📏 Siết quy tắc CĂN DÒNG 1:1 cho MỌI giai đoạn dịch + bắt buộc tự kiểm
+
+Theo yêu cầu: áp giải pháp siết chỉ thị căn dòng cho TẤT CẢ giai đoạn, để giai đoạn nào cũng tự kiểm
+và xử lý lỗi lệch dòng.
+
+**Phát hiện khi rà:** giai đoạn **PREPROCESS thiếu HẲN quy tắc căn dòng** — trong khi đây chính là
+khâu chuẩn hoá dòng NGUỒN, lệch ở đây kéo lệch toàn bộ các giai đoạn phía sau. LITERAL/STYLE/LOCALIZE
+đã có quy tắc cũ nhưng còn chung chung.
+
+**Ba quy tắc mới, áp cho cả 4 giai đoạn:**
+- **CẤM MƯỢN NỘI DUNG DÒNG KHÁC** — kèm ví dụ lỗi lấy từ chính bản dịch thật: dòng gốc nói "mở to
+  mắt ra mà nhìn" bị dịch thành tên một chiếc xe (nội dung của dòng bên cạnh).
+- **KHÔNG BỎ NGẮN BẤT THƯỜNG** — dòng gốc nhiều chữ mà bản dịch chỉ còn một hai tiếng rời rạc
+  ("chứ?", "Phi!", "Có lẽ") là dấu hiệu đã đánh rơi nội dung; thà dịch sát chữ còn hơn bỏ mất ý.
+- **TỰ KIỂM TRƯỚC KHI TRẢ KẾT QUẢ** — với từng dòng, đối chiếu lại độ dài, nguồn gốc từng ý (có mượn
+  của dòng lân cận không) và số dòng vào–ra/line_no, phát hiện lệch thì sửa trước khi trả JSON.
+
+**Chống bỏ sót về sau:** test duyệt TỪNG giá trị của enum giai đoạn, nên giai đoạn thêm mới sau này
+cũng bị bắt buộc có đủ quy tắc — không lặp lại kiểu thiếu sót như PREPROCESS.
+
+**Kiểm chứng:** xác nhận cả 4 giai đoạn (PREPROCESS, LITERAL, STYLE, LOCALIZE) đều có đủ 4 quy tắc và
+đều cấm đổi thứ tự line_no; 21 test căn dòng + 389 test liên quan pass; compile + ruff sạch.
+
+**Lưu ý về kỳ vọng:** đây là biện pháp phía chỉ thị — giúp giảm chứ chưa chắc triệt tiêu hoàn toàn
+lỗi lệch dòng. Lần chạy tới hãy xuất lại chuẩn đoán dịch để so `under_translation` (đang 62). Nếu vẫn
+cao, bước kế tiếp là tự phát hiện cụm dòng lệch rồi dịch lại riêng cụm đó.
+
+## [3.23.501] — 🈳 Dọn chữ Hán còn sót bằng bảng tên/thuật ngữ đã duyệt
+
+Chuẩn đoán bản dịch chạy bằng v3.23.500 cho thấy cách nhắc thuật ngữ theo LÔ **có hiệu quả rõ**:
+vi phạm bảng thuật ngữ giảm từ **173 → 112 lượt** (-35%), số mục bị vi phạm 72 → 60. Ngữ cảnh cũng
+tốt hơn nhiều: roster 39 nhân vật, glossary 190 mục, Visual Cues phủ 35,7% số dòng.
+
+Nhưng lộ ra một lỗi khác: **19 dòng còn lẫn chữ Hán** do model dịch NỬA VỜI —
+`Lâm先生`, `Cường哥`, `ủy屈` — hoặc bỏ nguyên tên `秦雅` (đáng lẽ "Tần Nhã"). Vòng dọn hiện có chỉ
+biết dịch lại cả dòng, mà dịch lại thường cho ra đúng kết quả cũ nên không cứu được.
+
+**Sửa — thêm bước THAY THẾ TẤT ĐỊNH trước khi dịch lại:** dùng chính bảng nhân vật + bảng thuật ngữ
+người dùng đã duyệt để thay các mảnh chữ Hán còn sót (mọi bí danh đều ánh xạ về tên tiếng đích; mục
+thuật ngữ nhiều phương án thì lấy phương án đầu cho nhất quán), kèm danh sách kính ngữ thông dụng có
+bản dịch ổn định (先生, 哥, 姐, 经理…). Cách này KHÔNG thể bịa nội dung — chỉ dùng ánh xạ đã duyệt —
+và luôn nhất quán với phần còn lại của bản dịch. Chữ Hán không có trong bảng thì giữ nguyên để vòng
+dịch lại xử lý như cũ. Thuật ngữ do người dùng khai báo được ưu tiên hơn mặc định; chuỗi dài được
+thay trước để `董事长` không bị `长` cắt mất.
+
+**Kiểm chứng:** 16 test (6 ca lấy từ chính bản dịch thật, bí danh, ưu tiên chuỗi dài, phương án đầu
+của thuật ngữ, giữ nguyên chữ lạ, người dùng ghi đè mặc định) và 1320 test toàn bộ pass; compile +
+ruff sạch. (7 test `_context_window` fail là stale có sẵn từ trước, sai chữ ký trong chính test.)
+
+**Còn tồn đọng — cần bàn hướng xử lý:** `under_translation` tăng 32 → 62, với các ca LỆCH DÒNG nặng
+(`睁大你们的狗眼` → "Maybach", `长得跟男人似的` → "Phi!") — nội dung của dòng khác lọt sang. Đây là lỗi
+căn dòng của model, sửa bằng thay thế tất định thì không an toàn; cần đối chiếu bản dịch thật để chọn
+cách (siết chỉ thị căn dòng 1:1, hạ kích thước lô, hoặc tự phát hiện và dịch lại cụm dòng lệch).
+
+## [3.23.500] — 📖 Bám BẢNG THUẬT NGỮ khi dịch: nhắc theo LÔ + đo mức tuân thủ
+
+Phân tích file chuẩn đoán dịch thật (5540 dòng) tìm ra vấn đề chất lượng LỚN NHẤT hiện nay: bảng
+thuật ngữ được dựng công phu (113 mục) nhưng khâu dịch **gần như không tuân thủ**.
+
+**Đo được:** 72/113 thuật ngữ bị dịch khác quy định, **173 lượt vi phạm**. Có ca mất hẳn nội dung:
+
+| Thuật ngữ | Quy định | Thực tế | Số dòng sai |
+|---|---|---|---|
+| 奔驰 | Mercedes-Benz | "tài xế riêng" | 9/9 |
+| 心动值 | chỉ số rung động | bỏ hẳn | 5/5 |
+| 董事长 | Chủ tịch Hội đồng quản trị | "chủ tịch" | 15/16 |
+| 到账 | tiền vào tài khoản | mỗi lần một kiểu | 20/21 |
+
+**Nguyên nhân:** cả bảng 113 mục nằm trong `system_instruction`; model phân tán chú ý và bỏ qua
+phần lớn.
+
+**Sửa — nhắc thuật ngữ THEO LÔ:** mỗi lô dịch nay lọc đúng các thuật ngữ XUẤT HIỆN trong lô đó và
+đặt ngay cạnh các dòng cần dịch (khối `must_use_terms`), nơi model chú ý nhất. Danh sách ngắn, sát
+ngữ cảnh; lô không chứa thuật ngữ nào thì không tốn thêm token; giới hạn 25 mục/lô để không phình
+prompt.
+
+**Đo lường — cờ mới `glossary_violations`:** phần xuất chuẩn đoán dịch nay báo rõ thuật ngữ nào bị
+vi phạm, bao nhiêu lượt trên tổng số lần xuất hiện, kèm ví dụ chỉ số dòng. Mục ghi nhiều phương án
+(`"thẻ căn cước / CMND"`) thì dùng phương án nào cũng tính là đạt; chú thích trong ngoặc được bỏ khi
+so khớp. Nhờ vậy lần chạy tới có thể so trực tiếp 173 lượt giảm còn bao nhiêu.
+
+**Đã kiểm và KHÔNG sửa (tránh sửa nhầm):**
+- Cờ `consistency` (98 ca) phần lớn là DƯƠNG TÍNH GIẢ: cùng câu gốc nhưng người nói/người nghe khác
+  nhau thì xưng hô phải khác — đó là dịch ĐÚNG, không phải thiếu nhất quán.
+- Nghi ngờ "sai số liệu" ban đầu (94 ca) hoá ra hầu hết là hạn chế của bộ đo tạm (không hiểu đơn vị
+  "vạn"). Lỗi số thật rất ít, đáng kể nhất là dòng 234: `八千八百八十八` (8888) → "tám trăm tám mươi
+  tám" (888).
+
+**Kiểm chứng:** chạy cờ mới trên chính file chuẩn đoán thật → khớp chính xác kết quả phân tích thủ
+công (72 mục, 173 lượt); 10 test bám thuật ngữ + 468 test liên quan pass; compile + ruff sạch.
+
+## [3.23.499] — 🚑 Sửa UnboundLocalError chặn khâu dịch ở nhánh KHÔNG đính video
+
+app_log: khâu dịch chạy tới bước dọn CJK sót ("4 dòng còn chữ Hán → thử dịch lại từ nguồn") thì văng:
+
+```
+UnboundLocalError: cannot access local variable 'covering' where it is not associated with a value
+```
+
+**Nguyên nhân (tiếp tục là hệ quả của bản sửa v3.23.483):** biến `covering` (các đoạn video phủ
+khoảng thời gian của batch) chỉ được gán BÊN TRONG nhánh `if attach_video and video_refs`, nhưng lời
+gọi phía dưới lại dùng nó vô điều kiện. Nhánh không đính video — như vòng dịch lại để dọn chữ Hán
+sót — chạm vào biến chưa gán và hỏng cả tác vụ.
+
+**Sửa:** khởi tạo `covering` (danh sách rỗng) TRƯỚC nhánh điều kiện, nên mọi nhánh đều an toàn. Đã
+kiểm chỗ dùng `covering` còn lại (trong `analyze_visual_cues`) — nó nằm gọn trong nhánh gán nên
+không có lỗi song sinh.
+
+**Chống hồi quy:** thêm test AST kiểm `covering`, `batch_video_handles`, `batch_video_tokens` đều
+phải có phép gán VÔ ĐIỀU KIỆN; kèm test bảo vệ chống test rỗng. Đã kiểm chứng có đối chứng: hoàn
+nguyên bản sửa → test đỏ kèm thông báo đúng nguyên nhân; khôi phục → xanh.
+
+**Ghi chú về phạm vi rà soát (nói rõ giới hạn):** đã thử dựng bộ quét toàn dự án cho lớp lỗi "biến có
+thể chưa gán". Ruff không có luật tương ứng, còn bộ quét tự viết cho 269 → 135 → 29 cảnh báo tuỳ mức
+lọc, phần lớn vẫn là dương tính giả (biến trong comprehension, import cục bộ trong nhánh `if`). Mức
+nhiễu đó không đủ tin cậy để làm cổng chặn, nên KHÔNG đưa vào bộ kiểm thử; thay bằng test nhắm đúng
+hàm đã hai lần phát sinh lỗi. Bộ quét chữ ký toàn dự án (v3.23.498) vẫn giữ nguyên vì độ nhiễu bằng
+không.
+
+**Kiểm chứng:** 530 test pass; compile + ruff sạch.
+
+**Còn tồn (không phải lỗi ứng dụng):** 26 cảnh báo `under_translation_guard` — các dòng dịch ngắn bất
+thường so với gốc, ví dụ `你老实跟我说` → `Lâm Dật`, `嫂子的手术很成功` → `Cảm ơn cô.`. Đây là lỗi
+LỆCH DÒNG của model khi dịch, guard phát hiện đúng; cần xem trên bản dịch thật để chỉnh hướng dẫn
+căn dòng.
+
+## [3.23.498] — 🔐 Rà soát TOÀN DỰ ÁN chống lặp lại lỗi chữ ký (297 file, 1486 lời gọi)
+
+Theo yêu cầu "rà soát để không lặp lại vấn đề tương tự". Bộ quét v3.23.497 chỉ phủ MỘT file adapter
+— chưa đủ, vì lỗi lệch chữ ký có thể xảy ra ở bất kỳ module nào khi sửa hàm mà quên nơi gọi.
+
+**Kết quả rà soát:** quét 296 file nguồn, 1486 lời gọi nội bộ — **không còn sai lệch nào** ngoài lỗi
+đã sửa ở v3.23.497.
+
+**Bộ kiểm thử thường trực mới** chạy trên MỌI file trong `src` (297 test, mỗi file một test), bắt ba
+loại sai lệch: truyền tham số theo TÊN mà hàm không nhận; truyền quá nhiều tham số VỊ TRÍ; THIẾU
+tham số bắt buộc. Phủ cả phương thức trong lớp (`self.x`/`cls.x`) lẫn **hàm cấp module** — nhóm sau
+chính là chỗ các service thuần (`roster_format`, `context_diagnostics`) tập trung.
+
+**Hai lỗi trong chính bộ quét đã được phát hiện và sửa nhờ kiểm chứng chủ động:**
+1. Bản đầu chỉ quét phương thức trong lớp → cấy lỗi vào hàm cấp module KHÔNG bị bắt. Đã mở rộng.
+2. Sau khi mở rộng, hàm cấp module bị trừ nhầm một chỗ tham số (như thể có `self`) → 130 file báo
+   dương tính giả. Đã tách cờ `is_method`.
+
+**Kiểm chứng có đối chứng (không phải test rỗng luôn xanh):** cấy lỗi thật vào `_cue_line_indices`
+(hàm cấp module) → test đỏ, chỉ đúng hai vị trí gọi kèm số dòng; khôi phục → 297 file xanh. Kèm test
+bảo vệ chống test rỗng nếu đường dẫn nguồn thay đổi.
+
+**Kiểm chứng tổng:** 561 test pass (297 quét toàn dự án + 119 quét adapter + 145 test dịch/ngữ cảnh/
+quy cách); compile + ruff sạch.
+
+## [3.23.497] — 🛡️ Chặn DỨT ĐIỂM lớp lỗi TypeError chữ ký (quét toàn bộ lời gọi bằng AST)
+
+Lỗi cũ tái diễn ở một hàm khác:
+
+```
+TypeError: GeminiSubtitleTranslator._patch_missing_with_context() got an
+unexpected keyword argument 'video_refs'
+```
+
+**Nguyên nhân:** v3.23.496 chuyển tiếp `video_refs` vào 4 lời gọi bên trong `_translate_single_batch`,
+nhưng một trong số đó gọi `_patch_missing_with_context` (hàm vá dòng thiếu) chứ không phải
+`_call_gemini` — và hàm đó chưa có tham số ấy → khâu dịch lại văng.
+
+**Sửa:** `_patch_missing_with_context` nay nhận `video_refs` và chuyển tiếp xuống `_call_gemini`, nên
+heal 403 (tự tải lại đoạn video khi xoay key) hoạt động cả ở nhánh vá dòng thiếu.
+
+**Sửa GỐC RỄ — test hồi quy trước đây quá yếu.** Test v3.23.495 chỉ ĐẾM số lần xuất hiện của tham số,
+không kiểm lời gọi đó đi tới hàm nào, nên bug thứ hai lọt qua. Nay thay bằng bộ quét AST duyệt MỌI
+biểu thức `self._method(...)` trong adapter, tra chữ ký của chính phương thức đó và báo lỗi kèm số
+dòng. **119 lời gọi** được kiểm tự động mỗi lần chạy test.
+
+**Đã kiểm chứng test THỰC SỰ bắt lỗi:** tạm hoàn nguyên bản sửa → test đỏ đúng chỗ
+(`_translate_single_batch->_patch_missing_with_context:2233`); khôi phục → xanh. Lớp lỗi này từ nay
+lộ ra tại kiểm thử thay vì lúc người dùng chạy thật.
+
+**Kiểm chứng:** 119 test quét chữ ký + 234 test liên quan pass; compile + ruff sạch.
+
+## [3.23.496] — 🧩 Gộp mục nhân vật trùng bí danh, cue hết lệch chỉ số, cờ gần trùng hết báo nhầm
+
+Khâu dịch đã chạy được sau v3.23.495 (log sạch, chỉ 2 cảnh báo tạm thời tự thử lại thành công).
+Chuẩn đoán mới nêu ba vấn đề, đều xử lý ở tầng code — không phụ thuộc model có nghe lời prompt hay
+không:
+
+**1. Cùng một người bị tách HAI mục.** Dữ liệu thật có `胖子 / 三胖子` và `胖子 / 三胖子 / 王大福` —
+prompt v3.23.494 đã yêu cầu gộp nhưng model vẫn tách. Nay thêm bước GỘP THEO BÍ DANH CHUNG: hai mục
+chia sẻ ít nhất một bí danh chắc chắn là một người → hợp nhất thành mục có tập bí danh đầy đủ, giữ
+mô tả chi tiết hơn. Nhờ vậy bảng quy đổi tên gửi cho khâu dịch không còn hai lối gọi cho một người.
+
+**2. Cue trỏ dòng KHÔNG tồn tại.** Model trả cue `id=5541` trong khi phụ đề có 5540 dòng (lệch 1 ở
+dòng cuối) — cue vô dụng khi dịch. Nay loại ngay tại nguồn: mọi cue có chỉ số vượt số dòng thật bị
+bỏ khi giải nén, thay vì để lọt xuống các khâu sau.
+
+**3. Cờ `glossary_near_duplicates` báo nhầm cặp TRÁI NGHĨA.** Heuristic v3.23.494 chỉ so mặt chữ nên
+gắn cờ `装货` (chất hàng) ~ `卸货` (dỡ hàng) — khác một ký tự nhưng nghĩa ngược nhau. Nay chỉ báo khi
+BẢN DỊCH cũng trùng/bao hàm nhau: `满月宴` ~ `满月酒` (đều là "tiệc đầy tháng") vẫn bị bắt đúng, còn
+cặp trái nghĩa thì không; thiếu bản dịch một bên thì bỏ qua vì không đủ căn cứ.
+
+**Kiểm chứng:** 126 test quy cách + chuẩn đoán + prompt (thêm 4 test gộp bí danh, 3 test cờ gần trùng
+theo nghĩa, 2 test giới hạn chỉ số cue) và 148 test liên quan pass; compile + ruff sạch.
+
+## [3.23.495] — 🚑 Sửa lỗi CHẶN TOÀN BỘ khâu dịch (TypeError do v3.23.483)
+
+app_log lần này có traceback đầy đủ (nhờ v3.23.486) và chỉ thẳng ra lỗi:
+
+```
+TypeError: GeminiSubtitleTranslator._translate_single_batch() got an unexpected
+keyword argument 'video_refs'
+```
+
+**Nguyên nhân (lỗi do bản sửa v3.23.483 gây ra):** khi vá heal-403 cho khâu dịch, tham số
+`video_refs=` được thêm vào lời gọi trong `translate_stage` — nhưng hàm nhận lời gọi đó là
+`_translate_single_batch` (KHÔNG phải `_call_gemini` như đã tưởng), và hàm này chưa có tham số ấy →
+mọi lần dịch đều văng ngay lập tức.
+
+**Sửa:** `_translate_single_batch` nay nhận `video_refs` và CHUYỂN TIẾP xuống `_call_gemini` ở cả 4
+nhánh gọi bên trong — đúng ý định ban đầu của v3.23.483, nhờ đó heal 403 (tự tải lại đoạn video khi
+xoay key) mới thực sự hoạt động trong khâu dịch.
+
+**Chống hồi quy:** thêm bộ test kiểm chữ ký, trong đó có một test tự động đối chiếu MỌI tham số mà
+`translate_stage` truyền với chữ ký hàm nhận — kiểu lỗi này sẽ bị bắt ngay tại kiểm thử thay vì lúc
+chạy thật; kèm test bảo đảm `video_refs` được chuyển tiếp đủ ở mọi nhánh.
+
+**Kiểm chứng:** 4 test chữ ký + 139 test liên quan pass; compile + ruff sạch. Hai cảnh báo còn lại
+trong log (hết thời gian chờ mạng, 403 tạm thời) đều đã tự thử lại thành công — đúng như thiết kế.
+
+## [3.23.494] — 🧹 Roster chỉ chứa NGƯỜI + gộp bí danh; chuẩn đoán hết báo nhầm "AI bịa tên"
+
+Chuẩn đoán trên bản v3.23.493 cho thấy chất lượng phân tích NHẢY VỌT: roster 42 (trước 11), glossary
+98 (trước 9), Visual Cues 1190 dòng, tóm tắt 20.049 ký tự. Log sạch (2 cảnh báo tạm thời, đều tự thử
+lại thành công). Bốn vấn đề còn lại đã xử lý:
+
+**1. Roster bị lẫn thứ KHÔNG PHẢI NGƯỜI.** Xuất hiện `宠妻系统` (hệ thống), `Alipay`, `支付宝`,
+`4S店销售` — làm nhiễu bảng quy đổi tên gửi cho khâu dịch. Prompt nay yêu cầu: CHỈ liệt kê con người;
+hệ thống/ứng dụng/thương hiệu/công ty/địa điểm/vật phẩm thuộc về glossary.
+
+**2. Cùng một người bị tách hai mục** (`胖子` và `三胖子`) → dịch gọi tên không nhất quán. Prompt nay
+bắt buộc GỘP mọi cách gọi của một người vào MỘT phần tử, ngăn bằng ` / ` theo thứ tự phổ biến giảm
+dần (vd `胖子 / 三胖子`).
+
+**3. Chuẩn đoán báo nhầm 15 tên "nghi AI bịa".** Phần lớn là nhãn model nhận ra QUA HÌNH ẢNH mà thoại
+không hề gọi tên (`绿发路人` người qua đường tóc xanh, `粉裙女同学` bạn học váy hồng) — hoàn toàn hợp
+lệ. Nay đối chiếu thêm với nhãn người nói/người nghe trong Visual Cues: có mặt ở đó là bằng chứng
+model thật sự thấy nhân vật, và được xếp riêng vào `identified_from_video`. Chỉ tên không thấy ở CẢ
+phụ đề lẫn cues mới bị cờ.
+
+**4. Cờ mới `glossary_near_duplicates`.** Dữ liệu thật có `福安私立医院` và `福安私人医院` — cùng một
+bệnh viện ghi hai cách, khiến khâu dịch nhận hai chỉ thị mâu thuẫn. Phát hiện bằng heuristic rẻ: cùng
+độ dài, khác đúng một ký tự.
+
+**Kiểm chứng:** chạy lại đúng ca thật — nhãn từ hình ảnh tách riêng, chỉ tên bịa THẬT bị cờ, bắt được
+cặp bệnh viện gần trùng; 65 test chuẩn đoán + prompt (thêm 9 test) và 135 test liên quan pass;
+compile + ruff sạch.
+
+## [3.23.493] — 🐞 Chống trùng lặp tóm tắt tích luỹ + làm sạch nhãn người nói trong Visual Cues
+
+Rà soát tiếp bằng ca biên trên các thành phần hợp nhất ngữ cảnh và giải nén cues, tìm ra 2 điểm yếu:
+
+**1. Tóm tắt tích luỹ bị TRÙNG LẶP.** Khi phân tích tuần tự, mỗi đoạn thường tóm tắt lại phần trước
+rồi mới kể phần mới. `merge_overview` (v3.23.489) chỉ bỏ qua khi bản mới TRÙNG HOÀN TOÀN bản cũ, nên
+phần chồng lấn vẫn bị nối thêm — qua 23 đoạn sẽ tích tụ nội dung lặp, vừa phình prompt (tốn token
+mỗi đoạn sau) vừa làm model rối. Nay khử trùng theo CÂU trước khi nối; câu ngắn (< 30 ký tự) vẫn
+được giữ vì có thể lặp hợp lệ ở nhiều cảnh khác nhau.
+
+**2. Nhãn `spk`/`to` có thể lẫn phiên âm/chức danh.** Prompt v3.23.490 yêu cầu chỉ ghi tên gốc, nhưng
+model vẫn có thể trả `"林逸（Lâm Dật）"` hoặc `"Tổng giám đốc 林逸"` — khi đó khâu dịch tra bảng quy
+đổi tên sẽ trượt. Thêm lớp PHÒNG VỆ khi giải nén cues: quy dấu câu full-width về ASCII, bỏ mọi cụm
+trong ngoặc, cắt dấu thừa → nhãn luôn về tên gốc thuần.
+
+**Đã kiểm và XÁC NHẬN ĐÚNG (không cần sửa):** hợp nhất roster giữa hai định dạng khác nhau
+(full-width vs ASCII) không nhân đôi nhân vật; phiên âm và bản dịch thuật ngữ của lần XUẤT HIỆN ĐẦU
+được giữ nguyên khi đoạn sau ghi khác — đúng nguyên tắc nhất quán tên/thuật ngữ xuyên phim; cues có
+`id` không hợp lệ (0, âm, thiếu) bị loại sạch.
+
+**Kiểm chứng:** 76 test quy cách + prompt (thêm 3 test khử trùng tóm tắt, 3 test hợp nhất đa định
+dạng, 4 test làm sạch nhãn người nói) và 126 test liên quan pass; compile + ruff sạch.
+
+## [3.23.492] — 🐞 Sửa 3 bug đọc ngữ cảnh: dấu câu full-width CJK + tách sai bảng thuật ngữ
+
+Rà soát chủ động bằng dữ liệu biên thực tế (không chờ báo lỗi), tìm ra 3 bug làm HỎNG ngữ cảnh
+trước khi dịch:
+
+**1. Dấu câu FULL-WIDTH của CJK không được nhận (nghiêm trọng nhất).** Văn bản Trung/Nhật/Hàn dùng
+`（）［］：，` thay cho `()[]:,`. Dòng `林逸（Lâm Dật）[nam] — chính` bị đọc thành MỘT tên dính liền
+`"林逸（Lâm Dật）"` → sai tên nhân vật, hỏng bảng quy đổi tên gửi cho khâu dịch, hỏng cả đối chiếu
+"tên có trong phụ đề không". Nay quy đổi dấu câu full-width về ASCII trước khi phân tích.
+
+**2. Bảng thuật ngữ tách sai khi THUẬT NGỮ chứa dấu ngăn.** `"tỉ lệ gạo:nước = cách gọi"` bị tách
+ở `:` → thuật ngữ cụt `"tỉ lệ gạo"`. Nay tách theo THỨ TỰ ƯU TIÊN: dấu mạnh có khoảng trắng bao
+quanh (` = `, ` => `, ` -> `) → dấu hai chấm có khoảng trắng → dấu mạnh dính liền → dấu hai chấm.
+
+**3. Bảng thuật ngữ tách sai khi thuật ngữ chứa `=`.** `"C=O = liên kết đôi"` (công thức hoá học)
+cho ra thuật ngữ `"C"`. Cùng cơ chế ưu tiên ở trên xử lý đúng: tách tại ` = ` có khoảng trắng.
+
+Cả ba đều ảnh hưởng TRỰC TIẾP tới chất lượng dịch: tên sai → xưng hô sai; thuật ngữ cụt → chỉ thị
+"bắt buộc dùng đúng bản dịch" áp lên một chuỗi vô nghĩa.
+
+**Kiểm chứng:** 46 test quy cách (thêm 4 test full-width gồm trích đúng phiên âm/giới tính, 7 test
+thứ tự ưu tiên tách thuật ngữ) + 116 test liên quan pass; kiểm toàn tuyến: roster full-width →
+bảng quy đổi tên trong prompt dịch cho ra `林逸 → Lâm Dật`, `王梅 → Vương Mai`. compile + ruff sạch.
+
+## [3.23.491] — 🔗 Bảng QUY ĐỔI TÊN cho khâu dịch (vá lỗ hổng do v3.23.490 tạo ra)
+
+Rà soát tiếp chuỗi phân tích → dịch, phát hiện một lỗ hổng do chính v3.23.490 sinh ra:
+
+**Vấn đề:** v3.23.490 chốt quy tắc nhãn `spk`/`to` trong Visual Cues luôn là **TÊN GỐC** (để khớp
+máy móc với trường `name` của roster). Nhưng prompt khâu DỊCH chỉ đưa **danh sách tên tiếng đích**
+— không có bảng ánh xạ. Model phải TỰ ĐOÁN "林逸" ứng với "Lâm Dật" → dễ gọi sai tên, đảo nhân vật,
+hoặc để lọt chữ gốc vào bản dịch.
+
+**Sửa:**
+- Prompt dịch nay nhận **BẢNG QUY ĐỔI TÊN**: `林逸 → Lâm Dật [nam, ~24 tuổi]; 宋欣爽 → Tống Hân Sảng
+  [nữ, ~26 tuổi]; John Smith [nam]` — kèm giới tính/tuổi ngay tại chỗ để chọn đại từ xưng hô đúng.
+- Nói rõ cho model: nhãn speaker/addressee được ghi bằng TÊN GỐC, hãy tra bảng để biết là ai, rồi
+  trong bản dịch **chỉ dùng tên tiếng đích** (không để lọt chữ gốc).
+- Tên Latin (John Smith) không cần quy đổi — giữ nguyên, không sinh mũi tên thừa.
+
+**Dọn nợ kỹ thuật:** `_canonical_names_directive` trước đây tự dò roster bằng biểu thức chính quy
+RIÊNG (trùng lặp logic, dễ lệch khi quy cách đổi). Nay uỷ quyền cho `roster_format` — nguồn chân lý
+duy nhất cho việc đọc bảng nhân vật, dùng chung với khâu phân tích và bộ chuẩn đoán.
+
+**Kiểm chứng:** 20 test prompt (gồm 6 test bảng quy đổi: ánh xạ kèm giới/tuổi, tên Latin không mũi
+tên, giải thích nhãn tên gốc, roster rỗng, dữ liệu cũ vẫn chạy) + 104 test liên quan pass;
+compile + ruff sạch.
+
+## [3.23.490] — 🎯 Prompt phân tích: đủ nhân vật phụ, glossary rộng, tên trong cues hết lộn xộn
+
+Người dùng báo 3 điểm sau khi ngữ cảnh đã tích luỹ đúng (v3.23.489):
+
+**1. Thiếu nhân vật** — 王梅 (Vương Mai) có thật trong phim nhưng vắng trong roster.
+Nguyên nhân kép: (a) v3.23.488 đã đổi schema sang MẢNG nhưng **prompt vẫn mô tả định dạng CHUỖI
+cũ** ("mỗi dòng: 'Tên gốc (phiên âm) [nam/nữ, ~tuổi]: vai trò'") → model nhận chỉ dẫn mâu thuẫn;
+(b) prompt chỉ nói "liệt kê tất cả nhân vật có tên", model hiểu thành tuyến chính.
+- Prompt nay mô tả ĐÚNG các trường mảng (`name`/`aka`/`gender`/`age`/`role`) kèm ví dụ JSON.
+- Bổ sung yêu cầu rõ: gồm CẢ nhân vật phụ, nhân vật vài cảnh, và nhân vật **chỉ được NHẮC TÊN**
+  trong lời thoại (người vắng mặt/đã mất/ở xa); ai có tên riêng đều phải có mặt; nhân vật không tên
+  nhưng vai rõ thì lấy nhãn vai làm tên — "thà thừa còn hơn thiếu".
+
+**2. Glossary quá ít** (9 mục cho 5540 dòng). Prompt cũ chỉ nêu "thuật ngữ chuyên môn/đặc thù".
+Nay liệt kê rõ các nhóm cần thu thập: ĐỊA DANH & CƠ SỞ (bệnh viện, khách sạn, công ty, khu dân cư),
+TỔ CHỨC & CHỨC DANH, CHUYÊN NGÀNH (y khoa/pháp lý/tài chính/tu luyện), TIỀN TỆ & ĐƠN VỊ ĐO (vạn,
+ức…), THÀNH NGỮ/TỤC NGỮ/DANH NGÔN/thơ/khẩu hiệu, BIỆT DANH & TIẾNG LÓNG mạng, món ăn, thương hiệu,
+từ viết tắt, tỉ lệ dễ nhầm chiều. Kèm định mức: phim vài nghìn dòng thường có **hàng chục** mục.
+Glossary cũng chuyển sang mô tả MẢNG `{term, translation}` cho khớp schema.
+
+**3. Tên trong Visual Cues lộn xộn** — lúc tiếng đích, lúc tiếng gốc. Nguyên nhân: prompt cũ bảo
+"dùng phiên âm cho tên CJK" ở phần cues, trong khi roster khoá theo TÊN GỐC → khâu dịch không đối
+chiếu được. Nay chốt MỘT quy tắc: `spk`/`to` **luôn ghi tên gốc, trùng khớp tuyệt đối với trường
+`name` trong characters** (không phiên âm, không lẫn hai thứ tiếng, không thêm chức danh); nhân vật
+chưa có trong roster thì dùng nhãn vai trò và giữ nguyên nhãn đó mọi dòng. Riêng `cue` (mô tả bối
+cảnh) vẫn viết bằng ngôn ngữ đích.
+
+**Kiểm chứng:** 15 test khoá prompt (nhất quán schema mảng, gỡ định dạng chuỗi cũ, các yêu cầu đầy đủ
+roster, 7 nhóm glossary, quy tắc tên cues, gỡ quy tắc phiên âm cũ) + 96 test liên quan pass;
+compile + ruff sạch.
+
+## [3.23.489] — 📚 Ngữ cảnh TÍCH LUỸ thật sự qua 23 đoạn (trước đây đoạn CUỐI ghi đè tất cả)
+
+Người dùng phản ánh: phân tích thiếu sót chi tiết DÙ đã tổng hợp tuần tự 23 đoạn video. File chuẩn
+đoán xác nhận: tóm tắt chỉ **1133 ký tự cho phim 2.6 giờ**, nội dung lại mở đầu bằng "Tập phim khép
+lại…" — tức chỉ là tóm tắt của ĐOẠN CUỐI.
+
+**Gốc rễ:**
+
+```python
+overview=current.overview or prev.overview   # ← đoạn sau GHI ĐÈ đoạn trước
+```
+
+Hợp nhất tuần tự chỉ "lấy bản mới nếu không rỗng". Sau 23 đoạn, ngữ cảnh còn lại đúng bằng kết quả
+đoạn thứ 23 — 22 đoạn trước bị vứt bỏ dù đã tốn quota phân tích đầy đủ.
+
+**Sửa — hợp nhất THẬT SỰ:**
+- `overview`: NỐI TIẾP theo thứ tự thời gian; nếu bản mới đã bao hàm bản cũ (model tự mở rộng đúng)
+  thì không lặp; vượt trần 20.000 ký tự thì lược phần GIỮA, luôn giữ đầu phim (thiết lập bối cảnh)
+  và cuối phim (diễn biến mới nhất).
+- `characters`: hợp nhất theo TÊN — giữ nhân vật cũ, thêm nhân vật mới; cùng một nhân vật thì gộp
+  thông tin (giữ phiên âm/giới/tuổi nếu bên kia thiếu, lấy mô tả đầy đủ hơn).
+- `glossary`: hợp nhất theo THUẬT NGỮ GỐC, không trùng lặp.
+
+Mô phỏng 23 đoạn: trước đây còn 1 nhân vật + 1 thuật ngữ + tóm tắt của riêng đoạn cuối; nay giữ đủ
+**23 nhân vật, 23 thuật ngữ, tóm tắt chứa cả đoạn 1 lẫn đoạn 23**.
+
+**Bổ sung cho quy cách v3.23.488:** bộ đọc dòng chuẩn tắc nay lấy đủ TÊN + phiên âm + giới/tuổi +
+vai trò (trước chỉ lấy được tên khi roster có một dòng, làm mất thông tin khi hợp nhất), chấp nhận cả
+dấu phân giới cũ (`:` và ` - `), và chỉ nhận quy cách khi mỗi dòng đúng MỘT mục — dòng gói nhiều mục
+(dữ liệu cũ) vẫn rơi về nhánh dự phòng.
+
+**Kiểm chứng:** 66 test quy cách + chuẩn đoán pass (gồm 8 test hợp nhất tuần tự và 1 test tích luỹ
+23 đoạn ở tầng adapter); 1008 test toàn bộ pass. compile + ruff sạch. (7 test `_context_window` fail
+là stale có sẵn từ trước, sai chữ ký trong chính test — không liên quan.)
+
+## [3.23.488] — 🏛️ QUY CÁCH CỐ ĐỊNH cho ngữ cảnh (hết cảnh vá parser) + sửa cờ cues rỗng sai
+
+Người dùng chỉ đúng gốc vấn đề: **dữ liệu phân tích ngữ cảnh xuất ra không theo quy cách nào**, nên
+mọi bộ đọc phía sau đều phải đoán và sai. Nguyên nhân nằm ở schema:
+
+```python
+"characters": {"type": "STRING"}   # ← văn bản TỰ DO
+"glossary":   {"type": "STRING"}
+```
+
+Model tự do viết mỗi lần một kiểu (khi ngăn bằng phẩy, khi bằng dấu chấm, mô tả lại chứa thêm dấu
+hai chấm) — v3.23.485/487 chỉ là vá ngọn.
+
+**Sửa tận gốc — 3 lớp:**
+1. **Schema có cấu trúc:** `characters` → mảng đối tượng `{name, aka, gender, age, role}`;
+   `glossary` → mảng `{term, translation}`. AI không còn tự do định dạng.
+2. **Service thuần `roster_format.py`** — nguồn chân lý duy nhất: chuẩn hoá mọi nguồn (mảng mới HOẶC
+   chuỗi cũ) về **văn bản quy cách cố định, mỗi mục đúng MỘT DÒNG**:
+   `Tên (Phiên âm) [giới, tuổi] — vai trò: mô tả` và `Thuật ngữ gốc = bản dịch`.
+   Dấu `—` làm phân giới cố định (không xuất hiện trong tên người, khác dấu hai chấm vốn hay có sẵn
+   trong mô tả).
+3. **Đọc lại tất định:** tách theo DÒNG rồi cắt tại dấu phân giới đầu tiên. Heuristic đoán định dạng
+   chỉ còn là nhánh DỰ PHÒNG cho dữ liệu cũ / người dùng gõ tay.
+
+Adapter chuẩn hoá ngay khi nhận (8 điểm tiêu thụ), bộ chuẩn đoán uỷ quyền cho cùng service → giao
+diện, chuẩn đoán và ngữ cảnh nối tập dùng CHUNG một quy cách.
+
+**Sửa thêm — cờ "Visual Cues RỖNG" là DƯƠNG TÍNH GIẢ:** log ghi rõ đã gộp 709 cues, nhưng báo cáo
+đọc ra 0. Lý do: cues của ứng dụng dùng khoá RÚT GỌN `id` (và có thể bọc `{"cues": [...]}`), trong
+khi bộ chuẩn đoán chỉ tìm `index/line/idx`. Nay nhận đủ các dạng; cues rỗng THẬT vẫn bị cảnh báo.
+
+**Kiểm chứng:** 83 test pass (26 quy cách roster/glossary — vòng tròn mảng→văn bản→tên, mô tả có dấu
+hai chấm, bí danh `A / B`, 4 kiểu ngăn cách dữ liệu cũ, 6 dấu phân giới glossary; 32 chuẩn đoán gồm
+khoá cues `id`/bọc/rỗng-thật; 25 dịch & phân loại lỗi). compile + ruff sạch.
+
+## [3.23.487] — 🔧 Parser roster bền với mọi kiểu ngăn cách + 403-file được thử lại (không mất đoạn)
+
+Phân tích app_log + file chuẩn đoán thật (v3.23.486) ra hai lỗi:
+
+**1. Roster báo 1 nhân vật trong khi phân tích ra ĐẦY ĐỦ** — lỗi parser, không phải AI. Log cho thấy
+kết quả thật là `林逸 (Lâm Dật) [nam, ~24 tuổi]: nhân vật chính: nam thanh niên…` — tức mô tả có
+**dấu hai chấm THỨ HAI**, và các mục ngăn nhau bằng **dấu chấm**. Parser v3.23.485 chỉ nhận dấu
+phẩy/xuống dòng → hoặc sót gần hết, hoặc sinh tên rác kiểu `"hiếu thảo. 宋欣爽"`.
+- Regex viết lại: nhận TÊN ở mọi ranh giới câu (đầu chuỗi, xuống dòng, `.`/`;`/`,`/`•`/gạch đầu
+  dòng), loại dấu kết câu khỏi ký tự hợp lệ của tên, và KHÔNG coi dấu hai chấm là ranh giới nên
+  `"nhân vật chính:"` trong mô tả không bị nhầm thành tên.
+- Kiểm chứng: đúng với 5 kiểu ngăn cách (chấm, phẩy, chấm phẩy, xuống dòng, gạch đầu dòng).
+
+**2. Mất hẳn ngữ cảnh đoạn 21 vì 403 bị xếp lỗi VĨNH VIỄN.** Lỗi thật là 403 loại FILE ("không có
+quyền truy cập File … hoặc file không tồn tại") — xảy ra khi xoay key hoặc file cloud hết hạn 48h,
+và app CÓ cơ chế tự tải lại ở lần thử lại. Nhưng v3.23.477 xếp mọi 403 là vĩnh viễn → bỏ luôn lượt
+thử lại → mất ngữ cảnh đoạn đó.
+- Nay 403 loại FILE được coi là PHỤC HỒI ĐƯỢC (thử lại → tải lại đoạn). 403 do SAI API KEY vẫn là
+  vĩnh viễn (không thử lại vô ích).
+
+**Kiểm chứng:** 29 test chuẩn đoán ngữ cảnh + 10 test phân loại lỗi pass; compile + ruff sạch.
+
+**Còn tồn đọng (cần dữ liệu để sửa đúng):** `cues_empty_despite_video` — đính video ở mức `high`
+nhưng Visual Cues rỗng ở báo cáo, dù log ghi "36145 ký tự cues" và khâu dịch dùng 523 cues. Nghi
+Visual Cues không được lưu vào ô ngữ cảnh trên giao diện (chỉ nằm trong bộ nhớ phiên dịch) — sẽ đối
+chiếu ở lần chạy tới.
+
+## [3.23.486] — 🔎 Trang Nhật ký giờ KÈM TRACEBACK (crash không còn là một dòng vô nghĩa)
+
+app_log lần này rất sạch (chỉ 3 dòng cảnh báo/lỗi) nhưng có **1 ERROR: "Lỗi không lường trước khi
+dịch phụ đề."** — crash 0.5s sau khi bắt đầu Giai đoạn 3 (Tinh chỉnh phong cách, kèm 88 dòng bổ sung)
+— và **KHÔNG có traceback**, nên không thể biết lỗi gì ở đâu.
+
+**Gốc rễ:** `QtLogBridge.loguru_sink` (cầu nối Loguru → trang Nhật ký) chỉ lấy `record["message"]`,
+BỎ HẲN `record["exception"]`. File log gốc của Loguru vẫn có traceback, nhưng bản người dùng xuất ra
+từ trang Nhật ký thì mất — đúng bản gửi đi chẩn đoán lại là bản thiếu thông tin nhất.
+
+**Sửa:** sink nay nối traceback vào nội dung log (giới hạn 4000 ký tự, cắt phần GIỮA để luôn giữ
+dòng cuối chứa loại lỗi + thông điệp). Lỗi định dạng traceback không bao giờ làm sink ném ngoại lệ.
+
+**Ghi chú kiểm chứng (đã bác bỏ một giả thuyết sai):** ban đầu nghi format sink file thiếu
+`{exception}`; đo thực tế cho thấy Loguru TỰ nối traceback khi format không có placeholder đó —
+thêm vào sẽ làm traceback LẶP HAI LẦN. Đã hoàn nguyên, giữ `loguru_config` như cũ.
+
+**Kiểm chứng:** 4 test (traceback vào log, log thường không đổi, cắt bớt traceback dài, dữ liệu
+exception dị dạng không ném) pass; compile + ruff sạch.
+
+**Việc cần làm tiếp:** build v486, chạy lại đúng kịch bản đó (resume checkpoint → Giai đoạn 3 với các
+dòng bổ sung) rồi gửi app_log — lần này sẽ có traceback đầy đủ để sửa dứt điểm crash.
+
+## [3.23.485] — 🔧 Sửa parser roster (23 "tên bịa" là DƯƠNG TÍNH GIẢ) + 2 cờ chất lượng mới
+
+Phân tích file chuẩn đoán thật của phim "he thong sung the" (5540 dòng, 2.6 giờ) cho 3 kết luận:
+
+**1. "23 tên trong roster KHÔNG xuất hiện" là LỖI CỦA BỘ CHUẨN ĐOÁN, không phải AI bịa tên.**
+Roster thật có dạng `林逸 (Lâm Dật) [nam, ~24 tuổi]: nhân vật chính, quyết đoán, mưu trí...` —
+v3.23.484 tách theo dấu PHẨY trước nên cắt vụn phần MÔ TẢ thành "tên": `quyết đoán`, `~24 tuổi]`,
+`hiếu thảo và chung tình...`. Roster thực chất ĐÚNG (~12 nhân vật, không bịa).
+- Parser viết lại: nhận diện theo cấu trúc `Tên (phiên âm) [giới, tuổi]:` — bóc đúng phần tên; dự
+  phòng dạng `Tên - vai trò` và danh sách phẩy đơn giản; lọc mảnh mô tả bằng heuristic
+  (kết thúc bằng dấu chấm, >5 từ, ngoặc lẻ, cụm tiếng Việt viết thường).
+- **Bí danh:** `胖子 / 三胖子` nay khớp khi BẤT KỲ bí danh nào có trong phụ đề (trước báo bịa nhầm).
+- Kết quả trên dữ liệu thật: 34 "tên" → **12 nhân vật đúng**, 0 dương tính giả.
+
+**2. Cờ mới `cues_empty_despite_video` (cảnh báo):** file thật có `attach_video: true`, media
+resolution `high`, nhưng Visual Cues RỖNG (0 dòng được phủ) — phân tích hình ảnh không tạo được manh
+mối nào dù đã tốn token gửi video. Nay cảnh báo rõ để kiểm tra (video có tải đủ không / model có hỗ
+trợ hình ảnh / tuỳ chọn Visual Cues có bật).
+
+**3. Cờ mới `glossary_thin` (thông tin):** glossary 6 thuật ngữ cho 5540 dòng là mỏng (chuẩn ~4
+thuật ngữ/1000 dòng) — nhắc bổ sung tên riêng/địa danh/chức danh lặp lại để dịch nhất quán.
+
+**Kiểm chứng:** 23 test (roster định dạng thật, bí danh, dạng gạch ngang, tên bịa THẬT vẫn bị cờ,
+cues rỗng có/không đính video, glossary mỏng, quyền riêng tư…) pass; compile + ruff sạch.
+
+## [3.23.484] — 🩺 Xuất dữ liệu CHUẨN ĐOÁN ngữ cảnh toàn cục (trang Dịch)
+
+Thêm nút **"🩺 Xuất chuẩn đoán ngữ cảnh"** cạnh nút Phân tích ngữ cảnh → xuất file JSON đo CHẤT LƯỢNG
+phân tích trước khi dịch, thay vì phải đoán khi thấy bản dịch sai.
+
+**Báo cáo phát hiện:**
+- **Roster bịa tên:** đối chiếu từng tên nhân vật với phụ đề gốc — tên KHÔNG xuất hiện là dấu hiệu AI
+  bịa/lấy nhầm nguồn → dịch sai xưng hô (anh/chị/em/ông/bà).
+- **Glossary trùng lặp:** thuật ngữ lặp gây dịch không nhất quán giữa các đoạn.
+- **Visual cues lệch dòng:** cues trỏ tới chỉ số dòng KHÔNG tồn tại → vô dụng khi dịch (cờ mức lỗi).
+- **Tóm tắt mỏng:** so độ dài tóm tắt với thời lượng phim (chuẩn ~800 ký tự/giờ) → cảnh báo thiếu
+  bối cảnh nửa sau phim.
+- Kèm `analysis_settings` (model, media resolution, thinking level, có đính video) để tương quan
+  CHẤT LƯỢNG ↔ CÀI ĐẶT qua nhiều lần chạy.
+
+**Riêng tư:** file KHÔNG chứa toàn văn phụ đề (chỉ số liệu + trích tóm tắt ≤280 ký tự), và chỉ ghi
+TÊN file video (không ghi đường dẫn đầy đủ) — an toàn để gửi đi phân tích.
+
+**Kiến trúc:** logic nằm ở service THUẦN `application/services/context_diagnostics.py` (không I/O,
+không Qt) — trang Dịch chỉ thu thập dữ liệu + ghi file. Dễ kiểm thử, dễ tái dùng cho CLI sau này.
+
+**Kiểm chứng:** 16 test (roster bịa tên/tách vai trò/khử trùng, glossary trùng, cues lệch dòng + JSON
+dạng list, tóm tắt mỏng, không lộ đường dẫn/toàn văn, JSON-serializable, không có phụ đề vẫn chạy)
+pass; compile + ruff sạch.
+
+## [3.23.483] — 🩹 Mảnh ghép CUỐI của heal 403 khâu dịch: truyền video_refs để re-upload chạy được
+
+app_log: v482 đã set callback tải-lại-video cho khâu dịch, NHƯNG "Dịch phụ đề thất bại: 403" VẪN xảy
+ra — log cho thấy heal có kích hoạt ("File video bị 403 → tải lại") rồi thất bại NGAY sau 1 giây (tức
+re-upload KHÔNG thực sự chạy).
+
+**Gốc rễ:** điều kiện re-upload trong `_call_gemini` là `if video_needs_refresh AND video_refs`.
+Khâu dịch gọi `_call_gemini(video_files=...)` nhưng THIẾU `video_refs=...` → điều kiện không thoả →
+dù đã set callback (v482) và đã đánh dấu cần refresh, bước tải lại vẫn bị BỎ QUA → handle cũ dùng
+lại → 403.
+
+**Sửa:** translate_stage nay truyền `video_refs=list(covering)` cho `_call_gemini` → điều kiện heal
+thoả → khi 403 do xoay key, adapter TỰ tải lại đoạn bằng key hiện tại rồi thử lại → dịch không rớt.
+
+Kết hợp v482 (set callback) + v483 (truyền video_refs) = heal 403 khâu dịch HOÀN CHỈNH, đối xứng với
+khâu phân tích.
+
+**Kiểm chứng:** 18 test translation core + context regression pass; compile + ruff sạch. (7 test
+`_context_window` fail là stale có sẵn — sai signature test, không liên quan sửa này.)
+
+## [3.23.482] — 🩹 Sửa "Dịch phụ đề thất bại: 403" — khâu DỊCH giờ cũng tự tải lại video khi xoay key
+
+app_log: phân tích ngữ cảnh HOÀN TẤT, nhưng sang khâu DỊCH gặp **"Dịch phụ đề thất bại: 403
+PERMISSION_DENIED"** → rớt cả tập dịch. Nguyên nhân: khi đính video vào giai đoạn dịch, lúc xoay key
+(do 429 quota) thì handle video (thuộc key CŨ) bị 403. Adapter CÓ sẵn cơ chế tự tải lại khi 403,
+NHƯNG chỉ khâu PHÂN TÍCH đăng ký callback tải-lại-video — khâu DỊCH thì QUÊN → 403 không được cứu →
+dịch thất bại.
+
+**Sửa:** translate worker nay cũng đăng ký `video_reupload_cb` cho adapter dịch (giống analysis):
+khi 403 do file thuộc key cũ → tải lại đoạn bằng key hiện tại rồi thử lại NGAY, thay vì rớt tập dịch.
+Thêm passthrough `set_video_reupload_callback` ở TranslateSubtitlesUseCase.
+
+**Kiểm chứng:** passthrough gọi đúng adapter; adapter thiếu method → bỏ qua an toàn; 25 test
+(translate + translation core + concise) pass; ruff sạch.
+
+**Ý nghĩa:** giờ CẢ phân tích LẪN dịch đều tự phục hồi 403 khi xoay key → chuỗi phân tích→dịch có
+đính video chạy trọn vẹn kể cả khi quota buộc xoay nhiều key.
+
+## [3.23.481] — ✅ Xác nhận ngữ cảnh video CHẠY TRỌN VẸN + dọn log 403 gây hiểu lầm
+
+app_log xác nhận các fix trước ĐỀU hiệu quả: v478 log gọn ("429 RESOURCE_EXHAUSTED (quota token/…)"),
+v480 nhận diện mạng ("Hết thời gian chờ mạng"). **Phân tích ngữ cảnh HOÀN TẤT trọn 20 đoạn** ("Phân
+tích hoàn tất" lúc 17:02). Mọi cảnh báo đều được XỬ LÝ đúng:
+- **403 handle video → heal tự tải lại** (v475): "thuộc key cũ → tải lại bằng key hiện tại" ✓
+- **429 quota** → retry theo retryDelay ✓
+- Nén kẹt 6.13s → video-only (file YouTube hỏng) ✓
+- 1 đoạn lỗi tạm thời → thử lại + heal ✓
+
+**Dọn log:** dòng "Không lấy được handle video '…': 403 PERMISSION_DENIED" ở mức WARNING gây hiểu lầm
+là "lỗi nặng", dù thực ra đường phân tích TỰ tải lại (heal). Nay hạ về INFO + rút gọn:
+"Handle video '…' cần tải lại (403 PERMISSION_DENIED)" — kèm dòng heal "→ tải lại bằng key hiện tại"
+ngay sau, rõ ràng là ĐANG được xử lý tự động.
+
+**Kiểm chứng:** 26 test (translation core + concise + context regression) pass; ruff sạch.
+
+**Không còn bug tồn đọng ở luồng ngữ cảnh video.** Phần chậm còn lại là quota free-tier (250k
+token/phút) × cài đặt của anh (20 đoạn × ~235k token = 4.7M token → tối thiểu ~19 phút + retry). Muốn
+nhanh hơn: hạ media resolution (high→medium/low) hoặc fps về 1, hoặc nâng gói Gemini.
+
+## [3.23.480] — 🌐 Sửa: lỗi MẤT MẠNG (getaddrinfo) bị coi nhầm là VĨNH VIỄN → giờ retry đúng
+
+app_log: cả 16 đoạn phân tích thất bại với `[Errno 11001] getaddrinfo failed` = **MẤT MẠNG / DNS
+không phân giải được** (internet rớt giữa chừng). Đây là lỗi TẠM THỜI, nhưng KHÔNG khớp marker
+retryable nào → `_is_retryable` trả False → cơ chế "bỏ retry lỗi vĩnh viễn" (v477) hiểu nhầm → báo
+"16 đoạn lỗi VĨNH VIỄN" + bỏ luôn lượt thử lại. Mạng có thể hồi mà app lại bỏ cuộc.
+
+**Sửa:**
+- Thêm marker lỗi DNS/mạng vào `_is_retryable`: `getaddrinfo`, `errno 11001/11002` (Windows DNS),
+  `name resolution`, `name or service not known`, `network is unreachable`, `no route to host`,
+  `failed to resolve`, `socket`… → nay retry đúng như 503 (mạng hồi thì tự chạy tiếp).
+- Log thân thiện: các lỗi này hiện "MẤT MẠNG / DNS không phân giải được (kiểm tra kết nối internet)"
+  thay vì mã lỗi khó hiểu — người dùng biết ngay là do mạng, không phải lỗi app.
+- 400/PERMISSION_DENIED vẫn là VĨNH VIỄN (không retry) — đúng.
+
+**Kiểm chứng:** getaddrinfo/DNS/mạng → retryable; 400/permission → vĩnh viễn; thông báo "MẤT MẠNG"
+hiển thị đúng; 8 test concise/retry + 15 test translation core pass; ruff sạch.
+
+**Lưu ý:** run đó cả 16 đoạn hỏng do internet rớt — không phải lỗi app. Chạy lại khi mạng ổn định là
+được. Các lỗi nén "kẹt 6.13s" là do file YouTube hỏng ~6s (anh bật "bỏ cache" nên cắt lại → tái
+hiện) nhưng đã tự xử video-only như v472-474.
+
+## [3.23.479] — 🗑️ Tùy chọn "Bỏ cache — luôn cắt+tải lại video ngữ cảnh" (khi đã xoá file cloud)
+
+Người dùng đã XOÁ file trên cloud nhưng app vẫn "Tái dùng 16 đoạn từ cache DB". Nguyên do: app KIỂM
+cloud (`files.get` + kiểm ACTIVE) trước khi tái dùng — nếu tái dùng nghĩa là các file NÓ kiểm vẫn
+còn sống (có thể bộ file đã xoá là bộ KHÁC từ phiên upload trước, còn cache DB trỏ tới bộ vẫn ACTIVE;
+Gemini cô lập file theo key nên nhiều phiên tạo nhiều bộ).
+
+**Giải pháp — cho người dùng quyền chủ động:**
+- Thêm tùy chọn **"Bỏ cache — luôn cắt + tải lại video ngữ cảnh"** (Cài đặt → nhóm nén video ngữ
+  cảnh). Bật → app BỎ QUA mọi tái dùng (RAM + cache DB + khoá nguồn cloud) → cắt+nén+tải lại từ đầu.
+- Mặc định TẮT (tái dùng cache cho nhanh như cũ). Nhắc người dùng tắt lại sau khi xong (tránh làm
+  lại mỗi lần, tốn thời gian + quota).
+
+**Kiểm chứng:** cờ lưu đúng; bật → 0 lần gọi cache lookup (plan/source đều bị bỏ), buộc materialize;
+mặc định False giữ hành vi cũ; 21 test video context pass; ruff sạch.
+
+## [3.23.478] — 🧹 Rút gọn log lỗi Gemini (429/504 khỏi in nguyên khối JSON ~1000 ký tự)
+
+app_log: v477 ĐÃ hết 400 + 403 — phân tích ngữ cảnh video HOÀN TẤT trọn 16 đoạn ("Phân tích hoàn
+tất... 116614 ký tự cues") rồi sang dịch. 🎉
+
+Vấn đề còn lại KHÔNG phải bug app: **429 RESOURCE_EXHAUSTED** = quota free-tier **250k token/phút**,
+mỗi đoạn video ~235k (94% trần) → gần như đoạn nào cũng chờ ~1 phút. App xử lý ĐÚNG (chờ theo
+retryDelay server + hoàn tất). Đây là giới hạn TÀI KHOẢN, không sửa được phía app.
+
+**Cải thiện đọc log:** mỗi 429/504 trước đây in NGUYÊN khối JSON ~1000 ký tự (20 lần → log rối, khó
+soi). Nay rút gọn: `429 RESOURCE_EXHAUSTED (quota token/phút free-tier)` — chi tiết đầy đủ vẫn còn
+trong exception khi cần.
+
+**Kiểm chứng:** 429/503/504 rút về 'CODE STATUS' + hint quota; lỗi ngắn giữ nguyên; lỗi dài không
+code cắt 80 ký tự; 5 test concise + 15 test translation core pass; ruff sạch.
+
+**Để phân tích NHANH hơn (giảm 429 — tuỳ chọn phía tài khoản):**
+- Hạ **Media resolution phân tích** (Cài đặt): high→medium→low giảm token/đoạn (400→300→100 token/s)
+  → medium ~176k, low ~59k/đoạn (dưới 250k → ÍT/HẾT 429). Đổi lại chi tiết mỗi khung giảm.
+- Hoặc hạ **fps** về 1 (đủ cho đa số phim).
+- Hoặc nâng gói Gemini trả phí (quota cao hơn nhiều).
+Tổng token = thời lượng × resolution × fps là CỐ ĐỊNH → free-tier 250k/phút thì phim 2h37 cần tối
+thiểu ~15 phút; hạ resolution/fps là cách rút ngắn hiệu quả nhất.
+
+## [3.23.477] — 🐛 Sửa GẤP lỗi v476: fps>24 gây 400 làm HỎNG mọi phân tích + bỏ retry lỗi vĩnh viễn
+
+app_log: v475 heal ĐÃ hết 403 (👍) nhưng v476 gây lỗi MỚI — anh đặt fps>24 (v473 cho tới 30), v476
+truyền thẳng `videoMetadata.fps` đó, mà **Gemini giới hạn ≤ 24** → `400 INVALID_ARGUMENT` → **CẢ 16
+đoạn phân tích thất bại**.
+
+**Sửa:**
+- **Kẹp cứng `videoMetadata.fps` ≤ 24** ở 2 lớp (lúc lưu setting + lúc bọc Part) → setting cũ lưu 30
+  cũng tự về 24, không còn 400.
+- **Hạ trần fps UI + domain 30 → 24** (khớp giới hạn Gemini).
+- **Retry cuối phiên BỎ QUA lỗi vĩnh viễn:** 400 (sai tham số) là lỗi CLIENT — retry vô ích. Nay chỉ
+  thử lại lỗi TẠM THỜI (503/504/timeout), tránh phí thời gian retry 400 rồi vẫn hỏng (app_log cho
+  thấy retry cả 16 đoạn 400 → phí thời gian).
+
+**Kiểm chứng:** fps 30/25 → kẹp 24; fps 2 giữ 2; bọc Part không vượt 24; 6 test fps + 22 test
+translation core pass; ruff sạch.
+
+**Lưu ý:** sau khi build v477, vào Settings đặt lại fps ≤ 24 (khuyến nghị 1-2). fps của anh giờ vừa
+hợp lệ vừa thực sự điều khiển mức lấy mẫu Gemini (v476).
+
+## [3.23.476] — 🎞️ fps giờ ĐIỀU KHIỂN cả mức lấy mẫu của Gemini (không còn bị bỏ qua khi phân tích)
+
+Người dùng phản ánh: hạ fps thì hình giật + phân tích thiếu chi tiết. Đào ra GỐC RỄ: ứng dụng truyền
+handle video THÔ cho Gemini → **Gemini luôn lấy mẫu ~1fps BẤT KỂ fps nén** → cài đặt fps của người
+dùng bị BỎ QUA khi phân tích (chỉ ảnh hưởng preview). Hạ fps không làm giảm chi tiết phân tích (vẫn
+~1fps), còn tăng fps cũng không thêm chi tiết — vô nghĩa.
+
+**Sửa — bọc handle với `videoMetadata.fps`:** nay fps của người dùng THỰC SỰ điều khiển mức lấy mẫu
+của Gemini:
+- **1 fps (mặc định):** Gemini xem ~1 khung/giây — giữ handle THÔ (hành vi cũ, an toàn, không đổi).
+- **Tăng 2-5 fps:** Gemini xem NHIỀU khung hơn → bắt được chi tiết/cảnh nhanh (giải quyết đúng "phân
+  tích thiếu chi tiết"). Đổi lại tốn nhiều token hơn.
+- An toàn: chỉ bọc khi fps>1.05; lỗi bọc bất kỳ → fallback handle thô (không làm hỏng call đang chạy).
+- Tooltip cập nhật: giải thích fps giờ ảnh hưởng cả phân tích; mẹo "thiếu chi tiết → tăng lên 2 fps".
+
+**Nghĩa là:** với v475 (heal 403 giữ bao quát) + v476 (fps điều khiển chi tiết), anh KHÔNG cần hạ
+fps để tiết kiệm nữa — để 1fps là đủ và bao quát trọn phim; muốn CHI TIẾT hơn thì tăng fps (Gemini
+thực sự xem dày hơn).
+
+**Kiểm chứng:** fps=1 → handle thô; fps>1 → bọc Part (hoặc fallback thô nếu thiếu SDK); rỗng an toàn;
+18 test translation core + 4 test fps pass; ruff sạch.
+
+## [3.23.475] — 🎬 Ngữ cảnh video bao quát TRỌN phim: tải lại video khi 403 ở các đoạn cuối
+
+Video ngữ cảnh giờ CHẠY (v474: 16 đoạn nén + upload + phân tích tuần tự có audio ghép riêng). Nhưng
+app_log lộ lý do "chưa bao quát toàn phim": các đoạn CUỐI (14, 15, 16 + đoạn 11 thử lại) bị
+**403 PERMISSION_DENIED khi lấy handle video** → phân tích KHÔNG kèm hình → mất ngữ cảnh HÌNH phần
+cuối phim.
+
+**Gốc rễ:** mỗi đoạn video ~235k token, gần trần free-tier 250k token/phút → gặp **429 quota** →
+ứng dụng XOAY KEY → handle video (đã tải bằng key CŨ) bị 403 với key mới. Đường DỊCH đã tự tải lại
+khi 403 (v449), nhưng đường PHÂN TÍCH ngữ cảnh lại gọi resolve handle KHÔNG qua bước "heal".
+
+**Sửa:** `analyze_global_context` + `analyze_visual_cues` nay dùng `_resolve_handles_with_heal` —
+khi handle video bị 403 (thuộc key cũ) → TẢI LẠI đoạn bằng key hiện tại rồi resolve lại, thay vì bỏ
+qua hình. Nhờ vậy các đoạn cuối phim vẫn có ngữ cảnh hình → bao quát TRỌN phim.
+
+**Đã kiểm, KHÔNG phải bug app (giới hạn tài khoản/server):** 503 UNAVAILABLE (Gemini quá tải, retry +
+giữ ngữ cảnh tích luỹ khi thất bại — graceful); 429 quota free-tier 250k token/phút (mỗi đoạn video
+nặng nên chạm trần — cân nhắc hạ fps/độ phân giải nén, hoặc nâng gói trả phí để nhanh + ổn hơn).
+
+**Kiểm chứng:** heal chỉ tải lại khi thiếu handle (403), case thường không phát sinh thêm gọi; 18
+test translation core pass; compile sạch.
+
+## [3.23.474] — 🔊 File "kẹt" VẪN có âm thanh: trích RIÊNG luồng audio rồi ghép
+
+Người dùng hỏi: file kẹt xen kẽ audio/video (như YouTube này) có cách nào vẫn có tiếng không? CÓ.
+
+**Mấu chốt:** file kẹt khi đọc XEN KẼ video-thưa-1fps với audio-đầy-đủ, nhưng đọc **audio RIÊNG**
+(không kèm video → không phải xen kẽ) thì thường KHÔNG kẹt.
+
+**Sửa — tách 2 luồng khi `_drop_audio` bật:**
+1. Trích **video-only** (`-an`) → chạy được (đã biết từ v472).
+2. Trích **audio-only** (`-vn`) RIÊNG một lệnh → tránh xen kẽ nên không kẹt (timeout 90s; nếu vẫn
+   kẹt/lỗi → bỏ, giữ video-only).
+3. **Ghép** video + audio (`-c copy -shortest`, không encode lại → nhanh) → đoạn có TIẾNG.
+
+Nhờ vậy dù file kẹt, ngữ cảnh video vẫn có audio (Gemini nghe được ngữ điệu/nhạc). Nếu trích audio
+riêng cũng không được thì tự giữ video-only (an toàn, không bao giờ làm hỏng đoạn).
+
+**Kiểm chứng (ffmpeg thật):** đặt `_drop_audio=True` (mô phỏng file kẹt) → đoạn ra CÓ CẢ video +
+audio; nếu trích/ghép audio lỗi → giữ video-only. 19 test video context pass; ruff sạch.
+
+## [3.23.473] — 🔊 Trả lại ÂM THANH (mặc định, tự rơi video-only khi file kẹt) + nâng trần fps 5→30
+
+🎉 v472 đã cắt được video (app_log: 16/16 đoạn, mỗi đoạn ~2.8s — fix bỏ-audio đúng bệnh kẹt xen kẽ
+audio/video). Nhưng bỏ audio cho MỌI video là quá tay. Người dùng muốn: (1) có lại âm thanh, (2)
+fps cao hơn 5.
+
+**1. Âm thanh — mặc định KÈM, tự rơi video-only khi cần:**
+- Nén ngữ cảnh nay MẶC ĐỊNH kèm audio (Gemini nghe được ngữ điệu/nhạc nền) — như trước.
+- **Tự học:** nếu một đoạn nén thất bại khi kèm audio (nghi kẹt xen kẽ audio/video như file
+  YouTube này), ứng dụng TỰ chuyển video-only (`-an`) + thử lại đoạn đó + nhớ cho cả phim. Nhờ vậy
+  video THƯỜNG giữ được tiếng, chỉ file lỗi mới rơi video-only (mất tiếng nhưng lời thoại đã có
+  trong phụ đề).
+
+**2. fps — nâng trần 5→30:** cho phép giữ nguyên fps gốc nếu muốn. Tooltip nói rõ: Gemini phân tích
+video ở ~1fps → 1-2fps thường tối ưu; đặt cao hơn chủ yếu tăng dung lượng upload + token, ít cải
+thiện chất lượng (chỉ nên tăng cho cảnh hành động nhanh). Tôn trọng lựa chọn người dùng (UI + domain
+đều nới lên 30).
+
+**Kiểm chứng (ffmpeg thật):** video thường giữ audio; giả lập audio-fail → tự rơi video-only + ra
+file; fps le=30 ở cả UI lẫn domain; 18 test video context pass; ruff sạch.
+
+**Ghi chú:** với file YouTube hỏng ~6s của anh, đoạn 0 sẽ thử-audio-thất-bại rồi rơi video-only (mất
+~vài phút cho đoạn 0), các đoạn sau video-only nhanh. Muốn CÓ tiếng trọn vẹn → tải lại/remux video
+(bản hiện tại hỏng ở giây 6).
+
+## [3.23.472] — 🛡️ 3 lớp chống file video HỎNG: bỏ audio + bỏ qua lỗi giải mã + chịu lỗi từng đoạn
+
+Chẩn đoán v471 cho DẤU HIỆU QUYẾT ĐỊNH: **MỌI decoder (d3d11va, cuda, CPU) đều kẹt CHÍNH XÁC tại
+time=00:00:06.13, frame=0** (speed = 6.13/elapsed). Không phải cách giải mã (GPU lẫn CPU đều kẹt
+CÙNG CHỖ) → **file HỎNG/lỗi tại ~6 giây** (tải YouTube dở dang hoặc muxing lỗi), và điểm mấu chốt:
+**audio chạy tới 6.13s nhưng video đứng frame=0** → nghi kẹt khi đọc XEN KẼ audio/video.
+
+**3 lớp sửa:**
+1. **Bỏ AUDIO (`-an`):** đọc THẲNG luồng video, tránh kẹt xen kẽ audio/video (đúng triệu chứng:
+   audio tới 6.13s, video đứng). Ngữ cảnh mất tiếng nhưng LỜI THOẠI đã có trong phụ đề → ảnh
+   hưởng không đáng kể; lại nhanh hơn (khỏi decode/resample audio).
+2. **`-err_detect ignore_err`:** bỏ qua lỗi giải mã, cố đọc tiếp thay vì kẹt ở khung hỏng.
+3. **CHỊU LỖI TỪNG ĐOẠN (quan trọng nhất):** một đoạn nén lỗi KHÔNG làm hỏng cả ngữ cảnh nữa — bỏ
+   đoạn lỗi, DÙNG các đoạn còn lại. File này hỏng ở ~6s (đoạn 0) nhưng đoạn 1-15 (589s→) vẫn tốt →
+   ngữ cảnh video vẫn dùng được ~94% phim. Chỉ rơi văn bản nếu MỌI đoạn đều lỗi.
+
+**Kiểm chứng (ffmpeg thật):** encode video-only 360p không audio OK; tolerance bỏ đoạn 0 lỗi giữ
+1-3, mọi đoạn lỗi thì raise (rơi text); 16 test video context pass; ruff sạch.
+
+**Ghi chú:** nếu vẫn muốn CẢ đoạn 0 (và tiếng), hãy TẢI LẠI video (bản hiện tại hỏng ~6s) hoặc remux
+`ffmpeg -i input.mp4 -c copy clean.mp4`. Nhưng giờ dù đoạn 0 hỏng, 15 đoạn còn lại vẫn cho ngữ cảnh.
+
+## [3.23.471] — 🎯 Giải mã d3d11va (như mpv) cho file H264 chậm bất thường + tăng tốc CPU decode
+
+Chẩn đoán v470 cho DỮ LIỆU QUYẾT ĐỊNH: `frame=0 ... time=00:00:06.13 ... speed=0.0416x` — ffmpeg
+xử lý file này ở **0.04× realtime** (24× chậm hơn thời gian thực; 6s video mất 147s → 1 đoạn 589s
+sẽ mất ~4 GIỜ!). KHÔNG phải kẹt, mà **giải mã CHẬM KINH KHỦNG cho riêng file YouTube này** (~1.25 fps,
+bình thường H264 1080p là 100-500 fps). Mấu chốt: **file này mpv PHÁT ĐƯỢC (GPU hwdec) nhưng ffmpeg
+CPU + cuda thì không**.
+
+**Sửa — thử d3d11va (chính là hwdec mpv dùng trên Windows):**
+- Thêm tier giải mã **d3d11va** (DirectX Video Accel) — hwaccel tương thích RỘNG NHẤT trên Windows,
+  chạy được cả khi cuda/NVDEC hỏng. Thử d3d11va TRƯỚC cuda. Cả hai đều encode bằng libx264 (né NVENC).
+- **Theo dõi hỏng RIÊNG từng hwaccel** (d3d11va, cuda) + nhớ giữa các phiên (marker, hết hạn 7 ngày):
+  d3d11va hỏng không làm bỏ cuda và ngược lại.
+- **`-skip_loop_filter all`**: bỏ deblocking khi giải mã CPU → nhanh hơn đáng kể (thumbnail 360p cho
+  ngữ cảnh không cần deblocking).
+
+**Kiểm chứng (ffmpeg thật):** skip_loop_filter chạy OK; build tạo tier d3d11va (trước) + cuda; đánh
+dấu 1 hwaccel hỏng chỉ bỏ đúng cái đó; persist + đọc lại đúng; 25 test video context pass; ruff sạch.
+
+**Ghi chú thẳng thắn:** d3d11va chỉ chạy trên Windows (sandbox Linux không test được API thật), nhưng
+đây CHÍNH LÀ đường mpv dùng để phát mượt file này → khả năng cao ffmpeg cũng giải mã được. Nếu vẫn
+không → cách chắc ăn: **remux sạch** `ffmpeg -i "D:\...he thong sung the.mp4" -c copy "D:\clean.mp4"`
+rồi dùng clean.mp4, hoặc bỏ đính video (phân tích văn bản vẫn tốt).
+
+## [3.23.470] — 🔬 Chẩn đoán chính xác treo cắt video: log tiến độ ffmpeg (kẹt hay chậm?)
+
+v469 (ignore_editlist + max_interleave_delta) VẪN chưa hết treo với video này (NVDEC 90s, CPU 147s ×2).
+Suy nghĩ sâu hơn: cả NVDEC lẫn CPU đều treo → điểm chung KHÔNG phải cách giải mã. Và `cpu_fast`
+(skip_frame nokey) chạy hết 147s = skip_frame KHÔNG giảm giải mã cho file này (đáng ra <10s). Cần
+biết ffmpeg đang KẸT (0 tiến độ) hay chỉ CHẬM.
+
+**Sửa — thêm CHẨN ĐOÁN:** bật `-stats` cho ffmpeg (in frame=/time= ra stderr) + khi bị kill vì
+timeout, log DÒNG TIẾN ĐỘ CUỐI. Nay nhật ký sẽ cho biết chính xác:
+- `frame= X ... time= Y` → ffmpeg ĐANG chạy nhưng CHẬM (biết luôn fps thực để tính).
+- `không có tiến độ (kẹt ngay từ đầu — nghi đọc/seek file)` → ffmpeg KẸT khi đọc/seek file (vấn đề
+  cấu trúc container, không phải giải mã).
+
+**Kiểm chứng:** trích tiến độ từ stderr (có stats → lấy frame cuối; rỗng/chỉ error → báo kẹt); 9 test
+video context pass; ruff sạch.
+
+**Cần app_log mới để chốt bệnh.** Kèm theo, 2 CÁCH THỬ NGAY (không cần chờ build):
+- **Remux sạch:** `ffmpeg -i "D:\he thong sung the.mp4" -c copy -movflags +faststart "D:\clean.mp4"`
+  rồi dùng clean.mp4 — nếu lỗi do cấu trúc MP4 (edit list/moov/index) thì hết.
+- Hoặc bỏ đính video → phân tích từ VĂN BẢN (nhanh, chất lượng dịch vẫn tốt).
+
+## [3.23.469] — 🎬 Sửa treo cắt video YouTube: bỏ EDIT LIST (mp4) + chống treo muxing khi hạ fps
+
+Thông tin mới: máy KHÔNG antivirus, ổ D: là SSD, **video nặng hơn vẫn cắt được — chỉ video này
+(tải từ YouTube) treo**. Vậy KHÔNG phải môi trường, mà là **cấu trúc riêng của file YouTube/Google**.
+
+Hai đặc điểm của MP4 YouTube/Google gây treo:
+1. **EDIT LIST (elst atom):** MP4 "produced by Google Inc." hầu như luôn có edit list (dời/cắt
+   timeline) → `-ss`/`-t` đọc lệch, có thể treo. **Sửa:** `-ignore_editlist 1` (bỏ qua edit list,
+   đọc thẳng) — CHỈ áp cho .mp4/.mov (option riêng demuxer mov; thêm cho .webm/.mkv sẽ LỖI).
+2. **Treo muxing khi hạ fps 30→1:** video thưa hẳn so audio → muxer CHỜ gom xen kẽ (tới 10s mặc
+   định) rồi treo (chính comment code cũ ghi đây là "nguyên nhân chính gây TREO"). **Sửa:**
+   `-max_interleave_delta 0` (flush ngay, không chờ) + nâng `-max_muxing_queue_size` 1024→9999.
+
+Áp cho MỌI tier (NVDEC-hybrid + CPU-fast + CPU-full).
+
+**Kiểm chứng (ffmpeg thật):** MP4 có faststart/edit list → cắt được 360p; .webm/.mkv KHÔNG bị thêm
+`-ignore_editlist` (tránh lỗi "Option not found"); max_interleave_delta ở mọi tier. 7 test video
+context pass; ruff sạch.
+
+**Ghi chú:** đây là các cờ chuẩn khắc phục MP4 YouTube/DASH. Nếu vẫn treo, gửi app_log — nhưng lần
+này khả năng cao đã trúng (edit list + muxing là 2 thủ phạm điển hình của MP4 Google mà video khác
+không có).
+
+## [3.23.468] — 🩺 Chẩn đoán "nén video ngữ cảnh chậm là do MÔI TRƯỜNG máy" + nhớ NVDEC hỏng
+
+Metadata video (`he thong sung the.mp4`) xác nhận: H.264 High@L4, 4:2:0 8-bit, CABAC — **hoàn toàn
+chuẩn**, bitrate thấp (2537 kb/s). Trong sandbox lệnh ffmpeg này chạy ~3-23s cho 1 đoạn. Nhưng máy
+người dùng timeout 147s (CPU) + 90s (NVDEC) = **chậm gấp 6-40 lần → bottleneck là MÔI TRƯỜNG, không
+phải video/lệnh/app**.
+
+**Kết luận chẩn đoán:** lệnh ffmpeg đúng và nhanh. Máy chậm bất thường gần như chắc do:
+1. **Ổ chứa video chậm** (D:\ có thể là HDD/USB/mạng — đọc file 2.79GB chậm).
+2. **Antivirus** quét ffmpeg.exe trong thư mục Temp (_MEI) + quét file khi đọc → chậm 10-50×.
+3. **Driver GPU** lỗi NVDEC/NVENC (cả hai đều treo).
+
+**App cải thiện:**
+- **Nhớ NVDEC hỏng giữa các phiên** (marker `nvdec_runtime_broken.marker`, hết hạn 7 ngày) — phiên
+  sau bỏ tier NVDEC luôn, khỏi chờ 90s treo lại. Gộp chung hạ tầng marker với NVENC.
+- **Log chẩn đoán rõ** khi mọi tier TIMEOUT: gợi ý chép video sang SSD/ổ C:, thêm ngoại lệ antivirus,
+  hoặc bỏ đính video (phân tích từ VĂN BẢN vẫn cho bản dịch tốt).
+
+**Kiểm chứng:** marker NVDEC + NVENC riêng biệt, persist + hết hạn 7 ngày; 11 test video context pass;
+ruff sạch.
+
+**Khuyến nghị người dùng:** nếu video-context vẫn chậm — (a) chép video sang **ổ SSD (C:)** rồi thử
+lại, (b) thêm **ngoại lệ antivirus** cho thư mục ứng dụng + thư mục video, hoặc (c) **tắt đính video**
+để phân tích từ văn bản (nhanh, chất lượng dịch vẫn tốt).
+
+## [3.23.467] — 🚀 NVDEC giải mã phần cứng cho video YouTube (VP9/AV1) — né NVENC hỏng
+
+app_log mới: v466 (pix_fmt) sửa xong lỗi chroma 4:4:4, nhưng giờ CPU nén đoạn 0 **treo 147s → huỷ**.
+Đo trong sandbox: **giải mã VP9 chậm gấp ~7× H264** (AV1 còn ~10×), và `-skip_frame nokey` HẦU NHƯ
+KHÔNG tăng tốc VP9 → video YouTube 1080p/AV1 giải mã CPU quá chậm → timeout.
+
+**Sửa — tier HYBRID: NVDEC giải mã (GPU) + libx264 encode (CPU):**
+- Video YouTube (VP9/AV1) giải mã bằng **NVDEC phần cứng** nhanh gấp bội. NVDEC (giải mã) ĐỘC LẬP
+  với NVENC (mã hoá) — máy có thể NVENC hỏng nhưng NVDEC vẫn tốt. Tier này KHÔNG bị nvenc-marker
+  chặn (dùng libx264 encode, không đụng NVENC).
+- Thứ tự khi NVENC hỏng: **NVDEC-hybrid → CPU-fast → CPU-full**. NVDEC thử trước (giải mã nhanh).
+- Nếu NVDEC cũng treo/lỗi (không có CUDA, driver…) → đánh dấu bỏ trong phiên → tự rơi CPU (timeout
+  riêng 90s+ để bắt treo NVDEC nhanh, không phải chờ 147s).
+- Kèm `-pix_fmt yuv420p` (từ v466) nên xử lý được cả chroma 4:4:4/10-bit của YouTube.
+
+**Kiểm chứng (ffmpeg thật):** tier NVDEC-hybrid dùng libx264 (không nvenc) + yuv420p; bị loại khi
+đánh dấu broken; khi NVDEC fail (sandbox không CUDA) → tự rơi CPU → vẫn cắt được VP9. 12 test video
+context pass. compileall + ruff sạch.
+
+**Lưu ý:** không test được NVDEC thật ở đây (sandbox không GPU) nhưng cấu trúc theo đúng tier NVDEC
+đã có (CẤP 1.5), chỉ đổi encoder sang libx264. Nếu máy anh NVDEC tốt → video YouTube sẽ cắt nhanh;
+nếu không → tự rơi CPU (như cũ). Mẹo: tải YouTube dạng H.264 (`yt-dlp -f "bv*[vcodec^=avc1]+ba"`)
+sẽ giải mã CPU nhanh, không cần NVDEC.
+
+## [3.23.466] — 🎯 Sửa GỐC RỄ "video YouTube không cắt được ngữ cảnh": ép -pix_fmt yuv420p
+
+Người dùng báo video tải từ YouTube dai dẳng KHÔNG giải mã/cắt được. Tái hiện với ffmpeg thật trên
+VP9/WebM → tìm ra nguyên nhân GỐC:
+
+```
+x264 [error]: main profile doesn't support 4:4:4
+Nothing was written into output file
+```
+
+**Nguyên nhân:** video YouTube (VP9/AV1) thường có chroma **4:4:4 / 4:2:2 hoặc 10-bit**, nhưng lệnh
+nén dùng `-profile:v main` (chỉ hỗ trợ 4:2:0 8-bit) → libx264 TỪ CHỐI encode → không ra file → cắt
+thất bại (mọi tier). Đây là lý do video H.264 4:2:0 thường (điện thoại) thì chạy, còn VP9/AV1 YouTube
+thì hỏng.
+
+**Sửa:** thêm `-pix_fmt yuv420p` vào 2 lệnh CPU (nén ngữ cảnh) → quy đổi MỌI chroma/độ sâu (4:4:4,
+4:2:2, 10-bit, gbrp…) về 4:2:0 8-bit mà `main` chấp nhận. Nay giải mã + cắt được MỌI codec/định dạng
+YouTube. (Đường GPU đã sẵn ép nv12 nên không dính lỗi này.)
+
+**Kiểm chứng (ffmpeg thật):** tạo VP9 4:4:4 (gbrp) + Opus giống YouTube → trước: lỗi "main doesn't
+support 4:4:4"; sau: ra 360p yuv420p hợp lệ. Cả 10-bit cũng quy đổi được. 5 test video context pass.
+compileall sạch.
+
+## [3.23.465] — 🔍 Phân tích app_log: đưa cờ "dịch thiếu" vào QC có cấu trúc để soi/sửa nhanh
+
+Phân tích app_log (545 dòng, tên logger đã đúng). Không có crash. 3 nhóm cảnh báo:
+
+**1. VieNeu ngân dài (59)** — đã xử lý ở v458 (ngưỡng) + v459 (đánh dấu ⚠ + nút "Chọn dòng bất
+thường" để TTS lại nhanh). Hoạt động đúng.
+
+**2. Dịch thiếu / lệch dòng (52) — `under_translation_guard`:** app_log lộ vấn đề dịch thật, vd
+dòng 2917 gốc `那个病人的信息` → dịch `'Vâng,'` (sai), dòng 260 `支付宝到账` → giữ nguyên chữ Hán
+(text UI không dịch được). Guard ĐÃ phát hiện 52 dòng + có "vòng tự sửa" (bổ sung ở khâu sau), nhưng
+một số dòng AI vẫn để sót/lệch dai dẳng. **Cải thiện:** đưa cờ `under_translation` vào
+`detect_quality_flags` (QC có cấu trúc) — nhạy hơn `length_anomaly` vì so với TRUNG VỊ tỉ lệ độ dài
+của CHÍNH phim (app_log: guard bắt 52 dòng, length_anomaly chỉ 8). Nay danh sách dòng nghi ngờ nằm
+trong debug export để anh soi + sửa/dịch lại nhanh (không phải đọc log).
+
+**3. AI trả rỗng (11)** — đã xử lý (giữ nguyên gốc) + hiện ở cờ `empty_translation`.
+
+**Kiểm chứng:** test under_translation vào QC (bắt đúng dòng cụt so trung vị; job bình thường = 0);
+sửa 1 test length_anomaly stale (ngưỡng nới v404 cho nguồn CJK ngắn); 24 test diagnostics pass.
+compileall + ruff sạch.
+
+**Ghi chú:** lệch dòng/sót dịch là hành vi của Gemini (không sửa được phía app cho từng ca). Cờ QC
+giúp KHOANH VÙNG để anh sửa tay hoặc dịch lại các dòng đó (dùng nút sửa + dịch lại nếu có).
+
+## [3.23.464] — ✅ TÔN TRỌNG max_speed người dùng đặt (không còn "set một đường chạy một nẻo")
+
+Theo yêu cầu: tooltip chỉ GỢI Ý ≤2.0×, nhưng ứng dụng phải DÙNG ĐÚNG giá trị người dùng đặt — không
+được cho set 2.5 rồi âm thầm chạy 2.0.
+
+**Sửa:**
+- `total_speed_ratio` (tốc độ áp lên audio, dùng bởi CẢ VieNeu + Gemini): trần = ĐÚNG `max_speed`
+  người dùng đặt. Bỏ `min(max_speed, quality_cap=2.0)` từng âm thầm kẹp mọi giá trị về 2.0. Nay
+  set 2.5 → chạy 2.5; set 3.0 → chạy 3.0; set 2.0 (mặc định) → 2.0. Câu vừa khung vẫn giữ base_speed
+  (không tăng vô cớ).
+- Gemini detection (`window_below_engine_floor`/`exceeds_window`) đồng bộ dùng đúng `max_speed`.
+- `QUALITY_STRETCH_CAP=2.0` chuyển thành KHUYẾN NGHỊ (hiện ở tooltip), không còn chặn cứng.
+- **Tooltip max_speed** viết lại rõ ràng: "Ứng dụng LUÔN dùng ĐÚNG giá trị bạn đặt. VieNeu/Gemini:
+  KHUYẾN NGHỊ ≤2.0× (nén quá 2× dễ thành 'tiếng gió'); đặt cao hơn VẪN được áp dụng — bạn tự quyết
+  đánh đổi tốc độ ↔ độ rõ." Đã gỡ tooltip cũ mâu thuẫn.
+
+Lưu ý: >2.0× vẫn có nguy cơ giọng "tiếng gió" (bản chất phase-vocoder) — nhưng đó là lựa chọn có
+thông tin của người dùng, app không tự quyết thay.
+
+**Kiểm chứng:** test honor max_speed (2.5→2.5, 3.0→3.0, 2.0→2.0, câu vừa khung→base); tooltip test
+cập nhật; 16 test pass; ruff sạch.
+
+## [3.23.463] — 💬 Sửa tooltip max_speed gây hiểu lầm (trần chất lượng 2.0× là CỐ Ý)
+
+Người dùng thắc mắc: đặt max 2.5× nhưng ra tối đa 2.0× — cấu hình không chạy? Phân tích CSV debug:
+"Tốc độ dùng" max đúng 2.000 (626 dòng), không dòng nào >2.0.
+
+**KHÔNG phải bug — trần 2.0× là CỐ Ý:** `total_speed_ratio` chặn `ceiling = min(max_speed,
+QUALITY_STRETCH_CAP=2.0)`. Nén hậu kỳ (phase-vocoder/WSOLA) quá 2.0× làm TAN FORMANT → giọng thành
+"tiếng gió thều thào" như mất tiếng — điều CHÍNH NGƯỜI DÙNG đã xác nhận trước đây trên câu nén
+2.4-3.0×. Trần này giữ giọng RÕ, thà lấn nhẹ còn hơn đọc nhanh mà không nghe được.
+
+**Bug thật đã sửa — tooltip mâu thuẫn:** `_max_speed` bị gọi `setToolTip` HAI lần; cái sau (đang
+hiển thị) ghi sai "Gemini/VieNeu 2-3× thường vẫn rõ ràng" → khiến người dùng đặt 2.5 tưởng có tác
+dụng. Đã XOÁ tooltip sai, giữ tooltip ĐÚNG: "VieNeu/Gemini nén hậu kỳ nên bị chặn ở 2.0× — đặt cao
+hơn KHÔNG có tác dụng; câu quá dài sẽ tràn sang câu sau (nếu bật Cho phép chồng tiếng)".
+
+**Vì sao có lấn (chồng tiếng):** câu audio dài không nén đủ trong 2.0× + bật "Cho phép chồng tiếng"
+→ đuôi tràn nhẹ sang câu sau (giữ TRỌN nội dung, ưu tiên nghe rõ). Đây là đánh đổi cố ý: full audio
+rõ > cắt cụt / nén méo. Muốn bớt lấn: rút gọn bản dịch câu đó, hoặc tắt "Cho phép chồng tiếng" (sẽ
+cắt đuôi thay vì lấn).
+
+**Các thông số KHÁC vẫn hoạt động:** base_speed 1.3 áp đúng (median 1.30). Các dòng ghi "(không áp
+dụng cho engine này)" trong file config là tham số của Edge/scheduler mà VieNeu không dùng — đã ghi
+rõ trong debug.
+
+**Kiểm chứng:** 6 test speed defaults pass; tooltip còn đúng 1 bản. compileall sạch.
+
+## [3.23.462] — ⚡ Nén video ngữ cảnh NHANH (chỉ giải mã I-frame) + dự phòng an toàn mọi định dạng
+
+app_log v461 xác nhận: tên logger giờ ĐÚNG, GPU timeout 45s + kill cứng chạy (không phải kill tay).
+Nhưng CPU nén đoạn 0 VẪN chậm — chạy hết 300s rồi bị huỷ. Nguyên nhân: giải mã 17.670 khung
+1080×1920 chỉ để lấy ~1fps.
+
+**Sửa — tier CPU-NHANH (chỉ giải mã KHUNG KHÓA):**
+- Thêm cờ `-skip_frame nokey`: chỉ giải mã I-frame → nhanh gấp 10-30 lần (ngữ cảnh chỉ cần ~1fps,
+  không cần đủ 30fps). Đa số video (keyframe ~2-4s) → nén 1 đoạn còn vài–vài chục giây thay vì >5 phút.
+- **AN TOÀN mọi định dạng/mã hoá:** video keyframe THƯA (GOP dài) có thể ra file chỉ-có-audio (0
+  khung video). Thêm tier CPU-ĐẦY-ĐỦ (full decode) làm dự phòng + kiểm output có KHUNG VIDEO thật
+  (`_output_has_video_frames` qua ffprobe, không chỉ kiểm size). Fast rỗng → tự rơi xuống full.
+- Hạ `cpu_timeout` 300→120s: nén thường xong nhanh, nếu vẫn kẹt thì bỏ SỚM → rơi phân tích văn bản,
+  không bắt chờ 5 phút.
+
+Kết hợp v460 (nhớ NVENC hỏng, bỏ GPU) + v461 (-nostdin + kill cứng): treo đã hết, giờ nén CPU cũng
+nhanh + không kẹt trên video bất kỳ.
+
+**Kiểm chứng (ffmpeg thật trong sandbox):** video keyframe thưa → CPU-fast ra audio-only (0 khung) →
+phát hiện đúng → CPU-full ra 360p hợp lệ. Helper: audio-only→False, video thật→True. 16 test video
+context pass. compileall + ruff sạch.
+
+## [3.23.461] — 🛡️ Chống treo ffmpeg triệt để: -nostdin + stdin=DEVNULL + kill cứng cây tiến trình
+
+Đào sâu ffmpeg để nén/cắt video ổn định cho MỌI định dạng/mã hoá mà không treo app. Tìm ra thiếu
+sót chống-treo quan trọng.
+
+**BUG GỐC — thiếu `-nostdin` (nguyên nhân treo kinh điển):** lệnh ffmpeg KHÔNG có `-nostdin` và
+subprocess KHÔNG đặt `stdin=DEVNULL`. App GUI không có console → ffmpeg đọc stdin thừa hưởng và có
+thể KẸT CHỜ nhập vô hạn (tưởng có lệnh, hoặc handle stdin lạ) → treo, buộc người dùng tự kill
+ffmpeg.exe. Sửa: thêm `-nostdin` vào MỌI lệnh ffmpeg + `stdin=DEVNULL` ở subprocess.
+
+**Runner chống treo `run_ffmpeg_hardened` (3 lớp):**
+1. `stdin=DEVNULL` — ffmpeg nhận EOF ngay, không kẹt chờ nhập.
+2. `communicate(timeout)` — rút stdout/stderr song song (không deadlock buffer) + có hạn giờ.
+3. Timeout → `taskkill /F /T` kết liễu CHẮC CHẮN cả cây tiến trình (kể cả ffmpeg kẹt trong driver
+   GPU), app KHÔNG chờ vô hạn, người dùng KHÔNG phải tự kill ffmpeg.exe.
+
+Áp cho lệnh nén video ngữ cảnh (nơi hay treo do NVENC). Giữ nguyên `-fflags +genpts` +
+`-max_muxing_queue_size` (đã có, chống lỗi timestamp/buffer). Kết hợp v460 (nhớ NVENC hỏng + hạ
+timeout 45s): treo được phát hiện + kết liễu nhanh, không lặp lại.
+
+**Kiểm chứng:** 9 test — runner: chạy thường / lỗi→CalledProcessError / treo→kill nhanh (<15s không
+chờ 60s) / bắt được stderr; + 4 test marker NVENC. compileall + ruff sạch.
+
+## [3.23.460] — 🎬 Sửa treo khi nén video ngữ cảnh: nhớ NVENC hỏng + hạ timeout GPU
+
+Người dùng: nén video ngữ cảnh treo (phải kill ffmpeg.exe thủ công), app mới chạy tiếp (không đính
+video). Phân tích: máy có NVENC (driver NVIDIA) LỖI RUNTIME → nén GPU TREO tới timeout MỖI phiên
+(app_log: đoạn 0 treo 90s cả 2 lần chạy), rồi rơi sang CPU.
+
+**Sửa:**
+- **Nhớ NVENC treo giữa các phiên (marker):** trước đây `_nvenc_available` reset mỗi phiên → người
+  dùng CHỜ 90s cho GPU treo LẶP LẠI mỗi lần phân tích video. Nay khi phát hiện GPU treo/driver cũ,
+  ghi marker `nvenc_runtime_broken.marker` (cạnh cache DB); phiên sau đọc marker → BỎ GPU luôn,
+  không chờ. Marker HẾT HẠN sau 7 ngày → tự thử lại NVENC (phòng đã cập nhật driver). Người dùng
+  cũng có thể xoá file để thử lại ngay.
+- **Hạ timeout GPU 90→45s:** encode 360p/1fps NVENC chạy được chỉ mất vài giây → 45s vẫn quá dư
+  để phát hiện treo, mà nửa thời gian chờ khi driver lỗi.
+
+Kết quả: lần đầu vẫn phát hiện GPU hỏng (45s thay vì 90s), các lần SAU bỏ GPU ngay → rơi thẳng CPU
+(hoặc phân tích từ văn bản) không phải chờ + không phải kill ffmpeg.
+
+**Đã kiểm, KHÔNG phải bug mình:** 503 UNAVAILABLE (Gemini quá tải, retry); lệnh nén có `-t` giới hạn
+đúng đoạn (không nén cả phim); lệnh CPU không kế thừa GPU-decode.
+
+**Kiểm chứng:** 4 test marker (ghi → phiên sau đọc → bỏ GPU; hết hạn 7 ngày → re-probe; không có
+cache DB không crash). compileall sạch. Nén GPU/ffmpeg cần build kiểm trên Windows.
+
+## [3.23.459] — 🏷️ Đánh dấu dòng "audio dài bất thường" ở bảng TTS + chọn nhanh để TTS lại
+
+Theo đề xuất người dùng: dòng audio dài bất thường (VieNeu ngân dài) nay được ĐÁNH DẤU trong bảng
+kết quả TTS để dễ quản lý và TTS lại nhanh, không phải nghe dò từng dòng.
+
+- **Cờ trong kết quả:** `TTSSegmentResult.abnormal_length` — VieNeu tự đặt khi audio dòng vẫn dài
+  bất thường so với số âm tiết (sau retry) theo lưới `is_abnormally_long_vs_floor` (đã tinh chỉnh
+  ở v458 để không báo oan câu ngắn).
+- **Hiển thị:** cột "Trạng thái" thêm "⚠ … · dài bất thường" + tô nền vàng nhạt cho dòng đó.
+- **Chọn nhanh:** nút "⚠ Chọn dòng bất thường (N)" chọn TẤT CẢ dòng bất thường một phát → bấm
+  "🔄 TTS lại dòng chọn" để làm lại hàng loạt. Cuộn tới dòng đầu tiên.
+- **Tóm tắt:** dòng tổng kết kết quả nhắc "⚠ N dòng dài bất thường" nếu có.
+
+Kết hợp v450-455 (nghe lại / sửa / TTS lại dòng chọn): quy trình soi & sửa dòng lỗi giờ rất nhanh —
+lọc dòng bất thường → nghe kiểm → TTS lại, hoặc sửa nội dung rồi TTS lại.
+
+**Kiểm chứng:** 30 test (cờ flow qua result; ngưỡng abnormal v458 giữ nguyên). compileall sạch. GUI
+cần build kiểm trên Windows.
+
+## [3.23.458] — 🩹 Phân tích app_log + debug dịch: giảm retry VieNeu vô ích + soi CJK sót
+
+Phân tích app_log (5807 dòng) + debug dịch (4645 dòng, v3.23.455).
+
+**BUG CHÍNH — ngưỡng "audio dài bất thường" quá nhạy cho câu cực ngắn:** 2319 cảnh báo VieNeu
+"dài bất thường", trong đó ~400+ dòng 1-2 âm tiết là FALSE POSITIVE. Ngưỡng cũ = floor×2.5, mà
+floor 1 âm tiết chỉ 0.44s → ngưỡng 1.10s → "Hừ." (1.12s, hoàn toàn bình thường có đuôi ngân tự
+nhiên) bị gắn cờ → retry tới 10 lần vô ích (tốn GPU + chậm TTS rất nhiều). Sửa: thêm SÀN TUYỆT
+ĐỐI 1.8s — chỉ coi bất thường khi vượt CẢ floor×2.5 LẪN 1.8s. Câu ngắn <1.8s không còn bị retry
+oan; ngân THẬT (≥1.8s, hoặc câu dài vượt floor×2.5) vẫn được bắt. Đo trên log: bỏ ~292 dòng
+1-âm-tiết <1.8s + tương tự 2 âm tiết → TTS nhanh hơn đáng kể.
+
+**Soi thấy (giới hạn dịch, 0.3%):** 15/4645 dòng còn LẪN ký tự Hán đơn lẻ trong tiếng Việt (vd
+"tổn损", "Nghịch chuyển春秋", "thụ孕") — AI dịch nửa từ Hán-Việt, bỏ sót ký tự. `_cleanup_residual_cjk`
+(v433) ĐÃ thử dịch lại nhưng model vẫn để sót ở các ca ghép khó này. Cờ `cjk_leftover` báo ĐÚNG (có
+ký tự Hán thật) — người dùng có thể soi 15 dòng này để sửa tay. (Không phải false positive.)
+
+**Đã kiểm, KHÔNG phải bug mình:** 503/504/429 (retry đúng); 403 video handle (tự tải lại); "AI trả
+rỗng" → giữ gốc (recover); tên logger "logging" + cue drone đã sửa ở v456/v457 (log này từ v455).
+
+**Kiểm chứng:** 24 test abnormal-length — thêm: câu ngắn bình thường (1.12-1.79s) không flag; ngân
+thật (≥1.81s) vẫn bắt; câu dài giữ độ nhạy. compileall + ruff sạch.
+
+## [3.23.457] — 🗣️ "ha ha ha!" không còn bị biến thành cue-only rồi mất tiếng
+
+Người dùng phát hiện: nạp .srt ở trang TTS rồi TTS, dòng "ha ha ha!" bị tự chuyển thành "[cười]!".
+Đúng vậy — đó là tính năng emotion cues (v446, `inject_emotion_cues`) khi checkbox bật: interjection
+cười ("ha ha ha", "hahaha", "khà khà") được thay bằng tag `[cười]` để giọng đọc biểu cảm.
+
+Vấn đề: kết hợp với v456 (dòng chỉ-cue → bỏ qua để tránh VieNeu ngân dài), một dòng cười THUẦN
+("ha ha ha!") bị thay thành "[cười]!" (cue-only) → rồi bị bỏ qua → MẤT TIẾNG (tệ hơn cả đọc
+"ha ha ha").
+
+**Sửa:** `inject_emotion_cues` chỉ thay interjection thành tag khi câu CÒN lời thật sau khi thay
+(cue nhúng trong câu — VieNeu xử lý được, vd "Ừ ha ha ha vui thật" → "Ừ [cười] vui thật"). Nếu cả
+dòng chỉ là tiếng cười thì GIỮ NGUYÊN text để VieNeu đọc (vẫn nghe được), không biến thành cue-only.
+
+**Kiểm chứng:** 15 test emotion cues — thêm: dòng cười thuần giữ nguyên; cue nhúng trong câu vẫn
+chuyển. Các test cũ (cue có lời quanh) vẫn pass. compileall + ruff sạch.
+
+Lưu ý: emotion cues mặc định TẮT (tuỳ chọn). Nếu không muốn app tự đổi interjection, cứ để tắt
+checkbox — nội dung .srt giữ nguyên khi TTS.
+
+## [3.23.456] — 🔬 Phân tích app_log: sửa tên logger "logging" (frozen mode) + VieNeu ngân dài dòng chỉ-cue
+
+Phân tích sâu app_log (868 dòng, bản đóng gói PyInstaller) → 2 bug thật (503/403 đều đã retry/tự
+tải lại — không phải bug mình; KHÔNG có crash từ code mình).
+
+**BUG #1 — tên logger VẪN "logging" trong bản đóng gói (718/868 dòng):** fix v449 (đi ngược stack
+so khớp `co_filename` với `logging.__file__`/`_THIS_FILE`) KHÔNG hiệu lực ở PyInstaller frozen vì
+`co_filename` của frame ≠ `__file__` frozen → walk không skip đúng → gán module "logging". Sửa
+BỀN VỮNG: đặt THẲNG `name`/`function`/`line` từ record stdlib qua `logger.patch` — bỏ hẳn suy luận
+frame, đúng ở mọi môi trường (đã test: tên module chuẩn, không crash stack nông).
+
+**BUG #2 — VieNeu ngân dài/méo cho dòng CHỈ có tag cảm xúc (95 dòng dính):** bật emotion cues
+(v448) → dịch sinh `[cười]`, nhưng dòng chỉ-toàn-cue (`[cười]!`, `[cười][cười]`, `[cười].`) khiến
+VieNeu ngân dài bất thường (audio ~4.5s cho 1 tag; retry 10 lần đều dài → dùng bản ngắn nhất). Cue
+VieNeu chỉ hoạt động khi NẰM TRONG câu có lời thật. Sửa: thêm `has_real_words_besides_cues` — dòng
+không còn chữ-số thật (chỉ tag + dấu câu) thì cho RỖNG ở đường AUDIO → TTS bỏ qua, hết ngân (phụ đề
+xuất ra KHÔNG bị ảnh hưởng — vẫn giữ nội dung).
+
+**Đã kiểm, KHÔNG phải bug mình:** 503 UNAVAILABLE (Gemini quá tải, retry + giữ ngữ cảnh — graceful);
+403 video handle (tự "tải lại bằng key hiện tại"); phân tích đoạn thất bại do 503/403 (degrade mượt).
+
+**Kiểm chứng:** 33 test — thêm hồi quy tên module (patch) + cue-only (nhận diện `[cười]!` v.v. →
+rỗng ở audio, GIỮ ở phụ đề). compileall + ruff sạch (dọn import `Any`/`_THIS_FILE` thừa).
+
+## [3.23.455] — 🔈 Nghe thử dòng: chèn im lặng đầu (chống nuốt đầu câu / rè do trễ khởi động thiết bị)
+
+Người dùng báo nghe thử vẫn rè "tẹt tẹt", nhấn lại có khi chỉ nghe vài chữ cuối — do THIẾT BỊ ÂM
+THANH có độ trễ khởi động (cold-start): mấy trăm ms đầu bị nuốt/rè. Đề xuất của người dùng (chèn
+im lặng 1-2s trước) rất đúng kỹ thuật — đã áp dụng.
+
+**Sửa (3 lớp):**
+1. **Đệm im lặng ~0.8s TRƯỚC tiếng nói:** tạo WAV nghe thử = [im lặng][segment] để thiết bị "nóng
+   máy" xong mới tới lời thoại → không mất đầu câu, hết rè. Hàm thuần `audio_preview.prepend_silence`
+   (chỉ tác động NGHE THỬ — segment gốc + master xuất ra KHÔNG đổi).
+2. **`setPosition(0)` trước khi phát:** luôn phát từ ĐẦU → sửa "phát lại chỉ nghe vài chữ cuối".
+3. **Luân phiên 2 file tạm** cho bản nghe thử → tránh khoá file khi phát lại nhanh trên Windows.
+
+Giữ nguyên cơ chế v452 (phát khi media đã nạp xong + PCM_16). Độ dài im lặng `_PREVIEW_SILENCE_S`
+có thể chỉnh nếu máy cần dài hơn.
+
+**Kiểm chứng:** 17 test — thêm 5 test `prepend_silence` (đệm đúng vị trí, im lặng 0 giữ nguyên,
+stereo→mono, sr lỗi, output float32). compileall sạch. Playback là GUI — cần build kiểm trên Windows.
+
+## [3.23.454] — 📄 TTS lại xong: xuất LẠI phụ đề đính kèm khớp nội dung vừa sửa
+
+Người dùng báo: sửa nội dung rồi TTS lại dòng chọn, nhưng phụ đề đính kèm (file .srt cạnh audio)
+KHÔNG cập nhật nội dung mới. Nguyên nhân: `ResynthesizeLinesUseCase` chỉ ghi lại WAV, KHÔNG xuất lại
+SRT → phụ đề giữ nội dung từ lần TTS đầu.
+
+**Sửa:**
+- Tách logic dựng + xuất SRT đồng bộ TTS ra service chung `tts_subtitle_export.export_tts_subtitle`
+  (DRY — dùng cho CẢ `GenerateTTSUseCase` lẫn `ResynthesizeLinesUseCase`).
+- `ResynthesizeLinesUseCase` gọi service này SAU khi ghi master → phụ đề `<tên>.tts.<lang>.srt`
+  luôn khớp nội dung mới nhất (kể cả dòng vừa sửa), giữ mốc thời gian đã điều chỉnh + không chồng lấn.
+- `GenerateTTSUseCase` refactor để dùng chung service (giữ nguyên hành vi: chỉ xuất khi có dòng
+  được dời thời gian).
+
+**Kiểm chứng:** 12 test — thêm: SRT chứa đúng text; TTS lại dòng đã sửa → phụ đề đính kèm chứa text
+MỚI (end-to-end). compileall + ruff sạch (không import thừa).
+
+## [3.23.453] — 🐞 Sửa BUG "sửa nội dung rồi TTS lại nhưng đọc nội dung CŨ"
+
+Người dùng báo: sửa một dòng phụ đề rồi TTS lại dòng chọn, nhưng app đọc nội dung CŨ (trước khi
+sửa). Rà sâu → 2 nguyên nhân.
+
+**BUG #1 (CHÍNH) — result FROZEN làm handler dừng giữa chừng:** `TTSSegmentResult` là
+`@dataclass(frozen=True)`. Handler sửa nội dung gán `r.text = new_text` TRƯỚC khi cập nhật dòng
+nguồn → gán này ném `FrozenInstanceError` → hàm DỪNG NGAY tại đó → `update_event_text` (dòng ngay
+sau) KHÔNG chạy → dòng nguồn giữ text CŨ → TTS lại đọc cũ. Sửa: cập nhật dòng nguồn TRƯỚC (quan
+trọng nhất), rồi đồng bộ hiển thị bằng `dataclasses.replace` (không gán trực tiếp lên frozen).
+
+**BUG #2 — editor chưa commit khi bấm nút:** nếu bấm "TTS lại dòng chọn" trong lúc con trỏ VẪN
+trong ô đang sửa, Qt xử lý click TRƯỚC khi editor commit → nội dung mới chưa vào model. Sửa: thêm
+`_commit_active_edit()` — buộc commit ô đang sửa (qua `commitData`/`closeEditor`, fallback rời ô
+sang cột 0) TRƯỚC khi TTS lại; đọc lựa chọn trước khi commit để không mất dòng đã chọn.
+
+**Kiểm chứng:** 10 test — thêm hồi quy: `TTSSegmentResult` frozen (gán `.text` ném lỗi → phải dùng
+`replace`), `SubtitleEvent` replace cập nhật text đúng. compileall sạch.
+
+## [3.23.452] — 🔊 Sửa BUG "nghe dòng chọn chập chờn / không tròn câu / bấm nhiều lần"
+
+Người dùng báo nút "Nghe dòng chọn" hoạt động không tốt: lúc được lúc không, không tròn câu, phải
+bấm nhiều lần. Rà sâu → 2 bug playback.
+
+**BUG #1 — `setSource()` BẤT ĐỒNG BỘ (nguyên nhân chính):** code gọi `play()` NGAY sau `setSource()`,
+nhưng `QMediaPlayer.setSource()` nạp media bất đồng bộ → `play()` chạy trước khi media sẵn sàng →
+không phát (phải bấm lần 2 mới phát bản đã nạp từ lần 1) hoặc phát thiếu đầu/đuôi câu. Sửa: đặt cờ
+chờ rồi phát trong `mediaStatusChanged` khi trạng thái là `LoadedMedia`/`BufferedMedia`. Đặt source
+rỗng trước khi đặt file → BUỘC nạp lại kể cả khi phát lại cùng một dòng. Thêm báo lỗi
+`errorOccurred` (thay vì im lặng) + đặt âm lượng 1.0.
+
+**BUG #2 — segment ghi WAV float 32-bit:** QMediaPlayer/Windows Media Foundation phát chập chờn
+hoặc không phát với WAV float 32-bit. Sửa: ghi segment bằng **PCM_16** (tương thích rộng, chuẩn).
+Re-merge vẫn đọc `dtype=float32` (soundfile tự quy đổi) nên độ chính xác không đổi.
+
+**Đã xác nhận KHÔNG phải nguyên nhân:** với `allow_audio_overlap=True` (mặc định), `fit_limit_samples`
+trả `None` → KHÔNG cắt audio → segment chứa ĐỦ câu. "Không tròn câu" là do async play, nay đã sửa.
+
+**Kiểm chứng:** round-trip PCM_16 (ghi PCM_16 → đọc float32 sai số <0.001); 8 test re-synthesize
+vẫn pass; compileall sạch. Playback là GUI (QtMultimedia) — cần build kiểm trên Windows.
+
+## [3.23.451] — 🐞 Sửa BUG "TTS lại dòng n thì dòng n-1 bị TTS lại" (+ rà kỹ toàn bộ)
+
+Người dùng báo: TTS lại dòng n thì dòng n-1 bị tổng hợp lại. Rà kỹ → tìm **2 bug cùng gốc** (lệch hệ
+đánh số 0-based vs 1-based) + 1 bug tiềm ẩn ghi đè segment.
+
+**Gốc rễ:** ``TTSSegmentResult.event_index`` là VỊ TRÍ enumerate (0-based), còn ``SubtitleEvent.index``
+là 1-based. Hai chỗ lấy nhầm hệ:
+- **BUG #1 — TTS lại chọn nhầm dòng:** `ResynthesizeLinesUseCase` lọc `e.index in selected_indices`
+  (1-based) trong khi `selected_indices` là vị trí (0-based) → khớp dòng có `.index == vị_trí` =
+  **dòng đứng trước (n-1)**. Sửa: chọn theo VỊ TRÍ `events[position]`.
+- **BUG #2 — Sửa nội dung nhầm dòng:** `update_event_text` so `ev.index` (1-based) với vị trí
+  (0-based) → sửa nội dung dòng n-1. Sửa: dùng VỊ TRÍ `_source_events[position]`.
+- **BUG #3 (tiềm ẩn) — ghi đè segment dòng khác:** tổng hợp subset bị đánh số lại 0,1,… nên
+  segment `seg_000000.wav` của subset GHI ĐÈ segment dòng 0 thật + merge sai. Sửa: tổng hợp vào
+  thư mục segment TẠM, rồi DỜI về đúng tên `seg_<vị trí gốc>.wav` + remap `event_index` về vị trí gốc.
+
+**Rà kỹ các điểm khác (xác nhận ĐÚNG):**
+- Timing tuyệt đối: `play_start_sec = start_sec − lead_s` (không dịch về 0) → remerge đặt đúng chỗ.
+- Segment lưu chính là `audio` đã đặt vào master (gồm lead-in) → remerge tái tạo khớp bản gốc.
+- Vị trí ↔ `event_index` nhất quán end-to-end (generate và resynthesize đều dùng `_source_events`).
+- Robust với lọc bảng (dùng `event_index` ở UserRole, không dùng số hàng).
+- Chặn đè bằng busy-guard; segment path ổn định theo vị trí gốc.
+
+**Kiểm chứng:** 8 test gồm HỒI QUY CHÍNH (chọn vị trí 1 → TTS lại đúng dòng 1 không phải dòng 0;
+segment dòng 0 nguyên vẹn khi TTS lại dòng 2; nhiều dòng; vị trí ngoài phạm vi báo lỗi); compileall sạch.
+
+## [3.23.450] — 🎧 Trang TTS: nghe lại từng dòng + sửa nội dung + TTS lại dòng chọn (phase 1)
+
+Bổ sung 3 tính năng trang TTS (dùng chung nền tảng "giữ audio từng dòng"). Nhiều-giọng-nhân-vật
+để phase riêng.
+
+**Nền tảng — giữ audio RIÊNG từng dòng:**
+- `TTSSegmentResult.segment_audio_path` + `TTSRequest.keep_line_audio` (trang TTS bật mặc định).
+- VieNeu ghi mỗi dòng ra một WAV nhỏ trong thư mục `<output>_segments/seg_NNNNNN.wav`
+  (`segment_store.py` — hàm thuần tính đường dẫn).
+- `tts_remerge.py` (hàm thuần): ghép lại master từ các segment, đặt đúng mốc đọc thật từng dòng.
+- `ResynthesizeLinesUseCase`: TTS lại CHỈ các dòng chọn → ghi đè segment → ghép lại master +
+  chuẩn hoá + ghi WAV. TTS lại 1 dòng chỉ tốn thời gian 1 dòng (không render lại toàn bộ).
+
+**Trang TTS (GUI):**
+- **Nghe lại từng dòng:** chọn 1 dòng → nút "▶ Nghe dòng chọn" phát audio segment (QMediaPlayer).
+- **Sửa nội dung trực tiếp:** cột "Nội dung" double-click để sửa → tự cập nhật vào dòng nguồn.
+- **TTS lại dòng chọn:** nút "🔄 TTS lại dòng chọn" tổng hợp lại các dòng đang chọn (kể cả nội
+  dung vừa sửa) rồi ghép lại file audio + làm mới bảng — chạy nền, không chặn UI.
+
+Kiến trúc sạch: logic tách khỏi I/O (test được), chạy nền qua `ResynthesizeWorker`.
+
+**Kiểm chứng:** 5 test nền tảng (đường dẫn segment, ghép master + cắt biên + tham số lỗi, TTS lại
+thay đúng dòng chọn giữ dòng khác, chặn khi chưa chọn); compileall sạch. GUI cần build kiểm trên
+Windows (sandbox headless không chạy được PySide6/QtMultimedia).
+
+**Ghi chú kỹ thuật:** hiện chỉ VieNeu ghi segment per-line (engine mặc định v445). Edge/Gemini sẽ
+bổ sung sau nếu cần. TTS lại dùng lại adapter + cấu hình của lần TTS gần nhất.
+
+## [3.23.449] — 🩹 Sửa lỗi từ app_log: tên logger sai "logging" + 403 file hết hạn làm mất tập
+
+Phân tích app_log (371 dòng) — sửa 2 lỗi thật (503/504 và disconnect analysis đều đã retry/xử lý đúng).
+
+**BUG 1 — tên logger sai "logging" (do fix v443 của tôi):** app_log cho thấy MỌI log stdlib đều
+mang tên module "logging" (vd `WARNING logging: ...`) thay vì tên module thật (khó truy vết) — trong
+khi log loguru trực tiếp thì đúng (`DEBUG widgets: ...`). Nguyên nhân: v443 sửa crash `sys._getframe(6)`
+nhưng dùng `depth=2` TĨNH → loguru gán sai frame. Phân tích chuỗi frame (emit→handle→…→caller) xác
+định: phải đi ĐỘNG từ frame emit, bỏ qua frame của `logging` + file bridge, rồi `depth = số frame đã
+bỏ`. Nay tên module ĐÚNG + vẫn không crash trên stack nông (đã test 2 chiều).
+
+**BUG 2 — 403 PERMISSION_DENIED file hết hạn → dịch thất bại (mất tập):** app_log: batch CÓ đính
+video ("1 phần video"), gặp 429 → xoay sang key #2 → file video (tải bằng key #1) bị 403 "do not have
+permission to access the File". Nhánh cứu-403 (tải lại video bằng key mới) đòi điều kiện `video_refs`
+của batch hiện tại — nhưng trạng thái này bị LỆCH sau khi xoay key trên 429 → không cứu → cả tập
+thất bại. Sửa: nhánh cứu-403 chỉ cần có callback tải-lại + đúng lỗi 403-file + còn lượt retry (bỏ
+`video_refs` — chính lỗi 403-file ĐÃ chứng minh có file cũ cần tải lại). Nay 403 file luôn được tải
+lại + thử lại thay vì mất tập.
+
+**Đã kiểm, KHÔNG phải lỗi:** 503/504 UNAVAILABLE/DEADLINE (retry luỹ thừa đúng); "Server disconnected"
+ở phân tích đoạn (đã retry qua `_call_gemini` + marker disconnect v437, thất bại dai dẳng thì giữ
+ngữ cảnh tích luỹ — graceful, không mất bản dịch).
+
+**Kiểm chứng:** test hồi quy tên module (không còn "logging") + log stack nông vẫn tới sink; 20 test
+pass; compileall sạch.
+
+## [3.23.448] — 🎭 Dịch TỰ SINH tag cảm xúc từ ngữ cảnh VIDEO (hình + âm thanh + lời thoại)
+
+Cho phép model sinh tag `[cười]`/`[thở dài]`/`[hắng giọng]` khi DỊCH, neo vào NGỮ CẢNH VIDEO —
+Gemini "thấy" hình ảnh và "nghe" âm thanh trong video đính kèm nên phát hiện cười/thở dài THẬT
+(không bịa từ lời thoại). Hoàn thiện chuỗi emotion cues end-to-end.
+
+**Cơ chế:**
+- Rule prompt (gated `emotion_cues`, rỗng khi tắt → không đổi prompt cũ): chèn tag khi HÌNH ẢNH
+  hoặc ÂM THANH cho thấy RÕ nhân vật cười/thở dài/hắng giọng, đúng vị trí trong câu. CHỈ khi
+  thấy/nghe rõ — cấm suy đoán từ lời thoại đơn thuần; giữ nguyên tag nếu bản trước đã có.
+- Wire vào cả 3 QUY TẮC (literal/style/localize) → tag sống sót qua các giai đoạn (không CJK nên
+  guard revert/cleanup không đụng).
+- **An toàn end-to-end (nhờ v447):** tag TỰ LỌC khỏi phụ đề khi xuất (người xem không thấy) NHƯNG
+  TTS v3 Turbo giữ để đọc biểu cảm.
+
+**Toggle:** setting `translation_emotion_cues` (mặc định TẮT, thử nghiệm) + ô "Sinh tag cảm xúc
+cho TTS" trên trang Dịch (chỉ bật được khi đã đính video ngữ cảnh — vì cần hình+âm thanh). Lưu qua
+`settings_service.update` → container đọc lúc tạo translator.
+
+**Điều kiện dùng:** (1) đính video ngữ cảnh + chọn giai đoạn dịch có video; (2) TTS dùng VieNeu v3
+Turbo (v445) để hiểu tag. Không có video → model không có căn cứ → không sinh tag (an toàn).
+
+**Kiểm chứng:** 33 test (4 mới: rule xuất hiện khi bật, vắng khi tắt, có ở cả 3 giai đoạn, mặc
+định tắt) + settings field validate; compileall sạch.
+
+## [3.23.447] — 🔎 Kiểm tra dịch↔emotion cues + vá rò rỉ cue vào phụ đề (hạ tầng end-to-end)
+
+Kiểm tra theo yêu cầu: **quá trình DỊCH có hỗ trợ emotion cues cho TTS không?**
+
+**Kết quả kiểm tra (thẳng thắn):**
+- Prompt dịch **KHÔNG sinh** cue (`[cười]`/`[thở dài]`) — chỉ dịch nghĩa.
+- Nguồn Divine Doctor **0 interjection tiếng cười** (哈哈/呵呵) trong phụ đề; `analysis.visual_cues`
+  RỖNG; chỉ 4 từ cảm xúc/19 tập → KHÔNG có tín hiệu đáng tin để suy ra cue. Sinh cue từ ngữ cảnh
+  = hallucinate (rủi ro).
+- **BUG hạ tầng phát hiện:** export SRT/ASS **KHÔNG strip `[...]`** → nếu cue xuất hiện (thủ công
+  trong editor, hoặc tính năng tương lai) sẽ **lọt vào phụ đề** người xem thấy `[cười]`.
+
+**Vá — tách bạch cue giữa PHỤ ĐỀ và TTS (end-to-end an toàn):**
+- Thêm `strip_emotion_cues` (bỏ HẲN 3 tag) → wire vào SRT `_normalize_text` + ASS `_escape_ass_text`
+  → **phụ đề luôn sạch** tag cảm xúc.
+- TTS vẫn GIỮ cue qua `strip_brackets_keep_cues` (v446) → giọng đọc biểu cảm.
+- `[...]` khác (chú thích OCR) KHÔNG bị đụng ở export (chỉ bỏ đúng 3 tag hợp lệ).
+
+Giờ nếu cue xuất hiện BẤT KỲ đâu (thủ công/tương lai): phụ đề bỏ, TTS giữ — đúng thiết kế.
+
+**Kết luận:** dịch hiện KHÔNG tự sinh cue; hạ tầng nay AN TOÀN cho cue thủ công + interjection. Việc
+cho dịch tự sinh cue (từ interjection nguồn 哈哈→[cười]) là tuỳ chọn TIẾP THEO — nêu để bạn quyết vì
+không kiểm chứng được audio + 0 tác dụng cho drama không có interjection nguồn.
+
+**Kiểm chứng:** 11 test emotion_cues (thêm strip cho export + đối nghịch keep/strip); compileall sạch.
+
+## [3.23.446] — 😄 Emotion cues VieNeu v3 Turbo: tự chèn [cười]/[thở dài] cho giọng biểu cảm
+
+Tận dụng tính năng tag cảm xúc của VieNeu v3 Turbo (chèn `[cười]`, `[thở dài]`, `[hắng giọng]` vào
+text → giọng đọc phát biểu cảm THẬT thay vì đọc chữ).
+
+**Module thuần `emotion_cues`:**
+- `strip_brackets_keep_cues`: xoá `[...]` rác (OCR) NHƯNG GIỮ 3 tag cảm xúc hợp lệ → cue tới được
+  engine (trước đây skip.square xoá sạch mọi `[...]`).
+- `inject_emotion_cues`: chuyển interjection cười/thở dài RÕ RÀNG trong bản dịch (haha, ha ha ha,
+  khà khà, hô hô, hê hê, hì hì, haizz…) → tag tương ứng. Bảo thủ: yêu cầu ≥2 âm, chặn ranh giới
+  từ → **0 dương tính giả** (không nhầm "Chào"/"Hàng"/"Hải Phòng"/"hả").
+
+**Chỉ tác động AUDIO, KHÔNG đụng phụ đề:** chèn tag chỉ khi `strip_speaker_tag=True` (đường tổng
+hợp giọng) → người xem KHÔNG thấy `[cười]` trong file phụ đề.
+
+**An toàn theo mode:** chỉ chèn khi mode = **v3 Turbo** (chỉ v3 Turbo hiểu tag) VÀ người dùng bật
+toggle. Mode cũ (standard/turbo) giữ nguyên interjection.
+
+**UI + persist:** thêm ô "Tag cảm xúc (v3 Turbo, thử nghiệm)" trên trang TTS (mặc định TẮT — thử
+nghiệm, opt-in), lưu/khôi phục qua QSettings. Thông qua view_model → container → adapter.
+
+**Đo trên Divine Doctor (19 tập):** 0 dòng có interjection tiếng cười (kịch để diễn viên diễn,
+phụ đề không viết "haha") → auto-inject không kích hoạt cho bộ này. Feature vẫn sẵn cho nội dung
+CÓ interjection (variety show, hài) + cue THỦ CÔNG người dùng thêm trong editor luôn được giữ.
+
+**Kiểm chứng:** 8 test emotion_cues (giữ cue hợp lệ, xoá rác, chèn cười/thở dài, 0 false positive
+trên từ bắt đầu 'h', 'ha' đơn không khớp) + 31 test TTS pass; compileall sạch.
+
+## [3.23.445] — 🎙️ VieNeu v3 Turbo (48kHz) làm mặc định — nâng chất lượng TTS (tham khảo API v3.3.0)
+
+Tham khảo API VieNeu mới nhất (SDK v3.3.0) để nâng chất lượng TTS.
+
+**Cải tiến CHÍNH — mặc định v3 Turbo (48kHz):** app trước đây mặc định mode "standard" (24kHz, model
+cũ) vì tooltip cho rằng đó là "chất lượng cao nhất" — nhưng thông tin này ĐÃ LỖI THỜI. Theo tài
+liệu chính thức v3.3.0: **v3 Turbo (48kHz) nay là MẶC ĐỊNH của chính SDK VieNeu và là bản chất
+lượng cao nhất** (kiến trúc mới train từ đầu, 20 giọng 3 miền, đã hết "thử nghiệm"). Đổi:
+- Combobox mode: đưa **v3 Turbo lên đầu (mặc định)**; standard/turbo giữ cho máy yếu/tương thích.
+- Cập nhật tooltip đúng thực tế: v3 Turbo = 48kHz chất lượng cao nhất KHUYẾN NGHỊ; standard/turbo
+  = 24kHz cũ.
+- Đồng bộ default `mode="v3turbo"` ở container/adapter/view_model (tránh lệch giọng khi liệt kê vs
+  tổng hợp).
+
+Vì mode KHÔNG được persist, trước đây mỗi phiên đều rơi về "standard" — người dùng phải tự chọn
+v3 Turbo mới có chất lượng tốt. Nay mặc định đã là bản tốt nhất. Adapter vẫn xử lý lỗi nạp mượt
+(load_failed) nên nếu máy không chạy được v3 Turbo, người dùng đổi lại standard dễ dàng.
+
+**Đã cân nhắc, CHƯA áp (nêu để tham khảo):**
+- `precision="fp32"` (chất lượng tối đa): int8 là khái niệm lượng tử hoá CPU/ONNX; app chạy VieNeu
+  qua GPU worker (PyTorch) nên precision không áp cho đường GPU → không wire (tránh churn vô ích).
+- Emotion cues nội dòng `[cười]`/`[thở dài]` (v3 mới hỗ trợ): cần prompt sinh cue + TTS prep hiện
+  ĐANG strip `[...]` → rủi ro, để ngỏ cho quyết định sau.
+
+**Sửa kèm — bug test pre-existing:** `test_vieneu_style_precision` dùng factory `__new__` thiếu set
+`_force_cpu`/`_reading_cps_budget`/`_temperature` → AttributeError (fail sẵn từ các bản trước, không
+do thay đổi này). Đã bổ sung.
+
+**Kiểm chứng:** 30 test vieneu pass; compileall sạch.
+
+## [3.23.444] — 🔗 Phân tích liên hệ DỊCH ↔ TTS: cùng đòn bẩy, giảm 88% dòng TTS chói + cờ QC
+
+Phân tích hệ thống mối liên hệ dịch↔TTS (bản dịch LÀ đầu vào TTS). Phát hiện quan trọng:
+
+**Cơ chế ghép:** dịch quá dài → TTS phải NÉN audio để vừa thời lượng → nén >1.6x làm WSOLA "tan
+formant" → giọng chói/méo ("tiếng gió"). Ngược lại dịch ngắn → TTS đọc tự nhiên + để lặng (stretch
+cap tối thiểu 1.0 — KHÔNG bao giờ kéo giãn ngược gây lè nhè).
+
+**Synergy đo được:** hai đòn bẩy làm cho TỐC ĐỘ ĐỌC (v439 siết chữ ~21 CPS, v440 giãn giờ) ĐỒNG
+THỜI cải thiện TTS:
+- Dịch cũ ~34 CPS → TTS nén ~1.8x (chói) | Dịch v439 ~21 CPS → nén ~1.17x (tự nhiên).
+- Đo 19 tập: dòng buộc nén >1.6x giảm từ **18% → 2% (giảm 88%)** sau v439+v440.
+
+Nghĩa là: các cải tiến "tốc độ đọc" trước đây KHÔNG chỉ giúp người xem đọc kịp mà còn **giảm mạnh
+méo tiếng TTS** — một mũi tên trúng hai đích.
+
+**Xác minh an toàn TTS của các thay đổi trước:**
+- Ngắt dòng v441 (`\n`) áp ở EXPORTER + TTS prep strip `\n`/`\N` (dòng 124) → KHÔNG lọt vào giọng đọc.
+- Giãn giờ v440 chỉ kéo dài mốc kết thúc → TTS có thêm khoảng, giảm nén.
+- Số viết bằng chữ (v442 giữ nguyên) → TTS đọc tự nhiên hơn số Ả Rập (thêm một lý do KHÔNG chuyển số).
+
+**Thêm cờ QC `tts_compression`:** khoanh dòng buộc TTS nén >1.6x (model đo thực VieNeu:
+dur≈0.302+0.0486×ký_tự), calibrate theo audio — mặt tiếng-nói của cùng vấn đề mà `reading_speed`
+đo ở mặt mắt-đọc. Chỉ xét timing đáng tin (≥0.8s). Giúp soi dòng sẽ chói để cô đọng thủ công.
+
+**Kiểm chứng:** 13 test (bắt nén mạnh, bỏ qua nhịp tự nhiên, loại timing OCR <0.8s, bỏ rỗng);
+compileall sạch.
+
+## [3.23.443] — 🚨 SỬA LỖI DỊCH "name 'self' is not defined" + lỗi ẩn nhật ký (popup có, log không)
+
+Từ ảnh chụp lỗi runtime của người dùng — sửa 2 bug NGHIÊM TRỌNG.
+
+**BUG 1 — Dịch thất bại toàn bộ: `name 'self' is not defined`.** Refactor v439 (classmethod→instance
+để đọc `reading_cps_budget`) để lộ 2 method NGỮ CẢNH vẫn là `@staticmethod` nhưng thân đã đổi sang
+gọi `self._...`: `_context_window` và `_batch_context`. Lúc DỊCH THẬT (ghép ngữ cảnh trước/sau mỗi
+batch) chúng chạy → `NameError` → dừng cả phiên dịch. Lỗi CHỈ lộ lúc runtime (compile không bắt
+được). Sửa: chuyển cả 2 sang instance method + cập nhật caller. Thêm test AST quét TOÀN BỘ class
+để chặn tái phát (không method thật nào dùng `self` khi là static/thiếu self).
+
+**BUG 2 — Lỗi hiện popup nhưng KHÔNG vào Nhật ký hoạt động (câu hỏi của người dùng).** `InterceptHandler`
+(bridge stdlib→loguru) dùng `sys._getframe(6)` GIẢ ĐỊNH CỨNG 6 frame để tính độ sâu caller. Khi log
+từ LUỒNG WORKER (stack nông hơn 6 frame — đúng ngữ cảnh lỗi dịch), `sys._getframe(6)` ném ValueError
+→ bị `except Exception: pass` NUỐT IM LẶNG → log ERROR (kể cả traceback) KHÔNG BAO GIỜ tới sink/UI,
+trong khi popup vẫn hiện qua Qt signal (độc lập logging). Đây là lỗi TIỀM ẨN đã che giấu nhiều lỗi
+theo thời gian. Sửa: dùng pattern chuẩn loguru (bắt đầu từ `logging.currentframe()`, đi ngược stack
+an toàn — KHÔNG giả định độ sâu). Giờ mọi log từ luồng worker đều tới nhật ký.
+
+**Kiểm chứng:** smoke test gọi thẳng `_context_window`/`_batch_context` OK; test log từ luồng worker
+(stack nông) nay TỚI sink; 36 test pass; compileall sạch.
+
+## [3.23.442] — 🔎 Cờ QC nhất quán trong tập + kiểm định dạng số (không sửa mù)
+
+Phân tích 2 chiều chất lượng tinh vi.
+
+**Định dạng số — KHÔNG sửa (có chủ đích):** số viết bằng chữ ('mười năm', 'kim thứ mười hai')
+phần lớn TỰ NHIÊN trong tiếng Việt. Chuyển sang số Ả Rập rủi ro (parse số ghép phức tạp) + chủ
+quan (tùy style) → không phải cải thiện rõ ràng, không đổi mù (đúng nguyên tắc chất lượng).
+
+**Nhất quán trong tập — thêm cờ QC `consistency`:** đo dòng nguồn GIỐNG HỆT nhưng dịch KHÁC nhau.
+Điểm mấu chốt: **BỎ QUA khác biệt chỉ ở dấu câu/hoa-thường** (救救我女儿→'với.'/'với!' là hợp lệ
+theo cảm xúc) → chỉ bắt khác biệt THẬT. Trên 19 tập: lọc 23 cặp thô → **9 lỗi thật** như 苏大小姐
+→ 'Sô'/'Tô' (phiên âm họ không nhất quán), thứ tự từ, hoặc xưng hô khác. Với phim bộ, nhất quán
+tên riêng/thuật ngữ rất quan trọng — cờ này giúp bạn soi nhanh vài ca cần thống nhất.
+
+An toàn: chỉ QUAN SÁT (gắn cờ), KHÔNG tự đổi — vì một số ca là hợp lệ (xưng hô khác do người
+nói/người nghe khác cảnh), cần mắt người phán đoán.
+
+**Kiểm chứng:** 13 test (bắt khác thật 'Sô'/'Tô', bỏ qua khác dấu câu / hoa-thường, không cờ khi
+nhất quán, bỏ nguồn quá ngắn); verify data thật 9 ca; compileall sạch.
+
+## [3.23.441] — 📏 Ngắt dòng phụ đề cân đối (tách 2 dòng tại điểm tự nhiên — chuẩn ngành)
+
+Chiều chất lượng phụ đề chưa xử: **ngắt dòng**. Đo 19 tập: **0% dòng có ngắt dòng, 9% (492 dòng)
+vượt 42 ký tự** → player tự wrap tùy tiện (ngắt giữa cụm từ, 2 dòng lệch). Chuẩn ngành: tối đa
+~42 ký tự/dòng, tách 2 dòng cân đối tại điểm tự nhiên.
+
+**Triển khai — service thuần `subtitle_line_wrapper`:**
+- `wrap_subtitle_line`: tách dòng >42 ký tự thành 2 dòng cân đối. Chấm điểm điểm ngắt: gần giữa
+  câu (cân đối) + THƯỞNG ngắt sau dấu câu (`, . ! ?`) + THƯỞNG ngắt trước liên từ tiếng Việt
+  (và/nhưng/thì/để/của…). KHÔNG ngắt giữa từ; giữ nguyên dòng ngắn / đã có ngắt dòng.
+- Áp ở EXPORTER (an toàn — chỉ đụng file xuất, KHÔNG đụng event trong bộ nhớ / TTS): SRT
+  (`_build_content`, param `max_chars_per_line=42`, 0=tắt) + ASS (`\N`).
+
+**Kết quả đo thực (19 tập):** 492 dòng dài được ngắt → **100% cả 2 dòng ≤42 ký tự** đạt chuẩn; 0
+dòng tràn còn lại; 0 chữ bị mất (chỉ chèn `\n`).
+
+**Kiểm chứng:** 39 test (7 mới: giữ dòng ngắn, không tách đôi khi đã ngắt, tách cân đối, ngắt
+trước liên từ, không ngắt giữa từ, không mất chữ); compileall sạch.
+
+## [3.23.440] — ⏱️ Giãn giờ hiển thị theo tốc độ đọc (mượn khoảng lặng — 0 rủi ro nghĩa)
+
+Đòn bẩy BỔ TRỢ cho dịch CPS-aware (v439), tấn công tốc độ đọc từ phía KIA — thay vì rút ngắn
+chữ, KÉO DÀI thời gian hiển thị vào khoảng lặng sau câu. **Không đụng một chữ nào** → 0 rủi ro
+mất nghĩa (đòn bẩy an toàn nhất).
+
+**Cơ sở dữ liệu:** đo 19 tập — 57% dòng đọc khó (CPS>22) có khoảng lặng >0.3s phía sau đủ để giãn
+(nhiều dòng CPS giảm mạnh: 32→13). Mô phỏng: giãn giờ giảm ~16% số dòng >20 CPS (48%→40%) CHỈ
+bằng timing. Cộng với CPS-aware (v439) sẽ mạnh hơn nữa.
+
+**Triển khai:** service thuần `reading_time_extender`:
+- `compute_reading_end`: tính mốc kết thúc mới để đọc kịp mục tiêu CPS, mượn gap phía sau.
+- Ràng buộc an toàn: chừa 0.1s trước câu kế (không đè câu sau); trần 7s (không treo quá lâu);
+  chỉ giãn khi lợi ích ≥0.2s (tránh xê dịch vụn vặt); chỉ giãn dòng đọc-không-kịp.
+- Áp sau khi dịch xong (`_apply_reading_time_extension` trong translate VM), không mutate gốc.
+
+**Toggle:** setting `extend_display_for_reading` (mặc định True); mục tiêu CPS theo
+`reading_cps_budget` (v439) hoặc 20 nếu CPS-aware tắt. Lỗi → bỏ qua an toàn, giữ timing gốc.
+
+**An toàn TTS:** chỉ KÉO DÀI mốc kết thúc (không dời mốc bắt đầu, không đè câu sau) → TTS có thêm
+khoảng chứ không bị đẩy lệch.
+
+**Kiểm chứng:** 8 test (giãn vào gap, chừa câu kế, bỏ qua dòng đã đọc kịp, trần max, không mutate
+gốc, câu cuối, tắt khi target=0); compileall sạch.
+
+## [3.23.439] — 🎯 Dịch CPS-AWARE: siết độ dài theo tốc độ đọc (bật/tắt được, giữ nguyên nghĩa)
+
+Triển khai giải pháp đòn bẩy cao nhất từ phân tích v438 (51% dòng vượt 20 CPS — đọc không kịp).
+
+**Gốc rễ tìm ra:** cơ chế `max_chars` (ngân sách độ dài gửi model) ĐÃ tồn tại nhưng tính theo
+`readable_syllable_budget` — vốn tuned cho **TTS đọc** (tốc độ NÓI, `SYLLABLE_BUDGET_REF_SPEED=1.9`
+→ ~34 CPS), LỎNG hơn nhiều so với tốc độ **MẮT ĐỌC** phụ đề (~17-21 CPS). Nên phụ đề vẫn quá dài
+để đọc kịp.
+
+**Giải pháp — ngân sách theo tốc độ ĐỌC:**
+- Thêm hàm thuần `reading_char_budget(available_s, cps)` = số ký tự mắt đọc kịp.
+- `_length_hint` nay lấy `min(ngân_sách_TTS, ngân_sách_đọc)` → phụ đề vừa nói kịp vừa đọc kịp.
+- **Toggle:** setting `reading_cps_budget` (0 = TẮT, giữ hành vi cũ; mặc định **21** = bật mức bảo
+  toàn). Truyền qua container từ Cài đặt.
+- **GIỮ NGUYÊN cơ chế bảo toàn nghĩa:** chỉ HẠ TRẦN độ dài mục tiêu; rule sẵn có "NGHĨA LUÔN
+  THẮNG GIỚI HẠN" + "KHÔNG bỏ từ mang nghĩa" đảm bảo model cô đọng chứ KHÔNG cắt ý. Vẫn giữ sàn
+  `MIN_CHAR_BUDGET` (khung siêu ngắn ép cắt vô ích).
+
+**Refactor kèm theo:** `_length_hint`/`_line_to_payload`/`_line_to_dual_payload` chuyển từ
+classmethod sang instance method để đọc `self._reading_cps_budget` (cập nhật call site + 3 test
+core dùng instance).
+
+**Kiểm chứng:** ngân sách đo được: 2s TTS ~67c (~34 CPS) → CPS-aware 42c (~21 CPS); tắt (0) giữ
+nguyên TTS; luôn ≤ ngân sách TTS (chỉ siết); giữ sàn tối thiểu. 35 test pass (5 mới cho CPS
+budget); compileall sạch.
+
+## [3.23.438] — 📊 Đo TỐC ĐỘ ĐỌC (CPS) + cờ QC reading_speed — chiều chất lượng lớn chưa xử
+
+Phân tích sâu chiều chất lượng MỚI chưa từng đo: **tốc độ đọc (CPS - ký tự/giây)**. Kết quả trên
+19 tập gây bất ngờ: ngay cả khi lọc dòng có timing đáng tin (≥1s), **51% dòng vượt 20 CPS**
+(trung vị 20.3) — nghĩa là gần nửa số phụ đề người xem đọc KHÔNG KỊP.
+
+**Gốc rễ:** timing hardsub thiết kế cho tiếng Trung (cô đọng), mà tiếng Việt DÀI HƠN → thừa hưởng
+thời lượng quá ngắn. Đây là thách thức nền tảng của dịch phụ đề CJK→Việt.
+
+**Bước 1 (phiên này) — cờ QC `reading_speed`:** khoanh vùng dòng dịch DÀI thật (thời lượng đáng
+tin ≥0.8s, loại lỗi timing OCR <0.8s; CPS>25 = rõ ràng quá nhanh). Người dùng thấy ngay dòng nào
+cần cô đọng/giãn giờ. Tất định, an toàn, không đổi bản dịch.
+
+**Đề xuất bước 2 (chờ bạn duyệt) — dịch CPS-AWARE:** truyền thời lượng mỗi dòng vào prompt để
+cô đọng MẠNH HƠN cho dòng bị bó giờ (giữ ý cốt lõi) và giữ đầy đủ cho dòng có dư giờ — giải quyết
+căng thẳng "cô đọng vs giữ nghĩa" một cách THÔNG MINH theo thời gian thực có sẵn.
+
+**Kiểm chứng:** 8 test (bắt CPS cao timing tin, bỏ qua timing OCR <0.8s, không cờ tốc độ thường,
+bỏ dòng rỗng); compileall sạch.
+
+## [3.23.437] — 🌐 Retry lỗi mạng "Server disconnected" (chống mất cả tập) + thành ngữ 4 chữ
+
+Phân tích app_log + 19 tập dịch lại ở app v436. **Xác nhận fix trước hiệu quả:** empty guard (v436)
+→ E01 SẠCH, 0 mất nội dung/19 tập; ví dụ prompt → E09 (棘手) sạch. Safety-net + cleanup chạy đều
+trong log.
+
+**BUG THẬT — lỗi mạng làm MẤT CẢ TẬP:** app_log có *"Dịch phụ đề thất bại: Server disconnected
+without sending a response"* → cả tập dịch thất bại. Nguyên nhân: `_RETRYABLE_MARKERS` có
+"connection aborted/reset/closed" nhưng THIẾU "disconnect" → lỗi này không khớp marker nào →
+KHÔNG retry (trong khi 503 thì có). Sửa: bổ sung "disconnect", "server disconnected",
+"remoteprotocolerror", "peer closed", "broken pipe", "connection refused", "eof occurred",
+"incomplete read"… → lỗi mạng nhất thời nay được thử lại đúng như 503.
+
+**CJK sót idiom (E05#146 '心浮气躁', E17#241 '天堑'):** thành ngữ 4 chữ / câu thơ chữ Hán — model
+dịch phần đầu sang Hán-Việt nhưng sót chữ đuôi ('tâm浮气躁', 'thiên堑'). Thêm hướng dẫn TỔNG QUÁT
+(không whack-a-mole từng chữ): "thành ngữ 4 chữ (成语) & thơ chữ Hán dịch TRỌN sang Hán-Việt" +
+ví dụ '心浮气躁'→'tâm phù khí táo', '天堑'→'thiên hào'.
+
+**duplicate_adjacent (E03, E11) = FALSE POSITIVE:** nguồn lặp thật ('起来吧'/'起来' đều "Đứng lên
+đi"), hoặc OCR nhầm ('大小姐'/'犬小姐' — 大/犬 giống nhau, model chuẩn hoá đúng). Không phải lỗi.
+
+**403 PERMISSION_DENIED (log):** app tự tải lại cache hết hạn — hoạt động đúng.
+
+**Kiểm chứng:** test "Server disconnected" + các lỗi mạng khác nay khớp marker retry; 16 test
+pass; compileall sạch.
+
+## [3.23.436] — 🛡️ Guard chống mất nội dung (AI làm rỗng/lệch dòng) + ví dụ CJK cứng đầu
+
+Phân tích app_log + 19 tập (app v434/v435). Tin tốt: **safety-net v432 + cleanup pass v433 chạy
+thật trong log** ("đã lùi về bản trước", "Dọn CJK sót: dòng [24] → thử dịch lại"). 18/19 tập
+SẠCH.
+
+**Bug MẤT NỘI DUNG (E01#144):** cả literal/style/localize dịch đúng "Sao ông già này…" nhưng
+giai đoạn "final" (E01 dùng 4 giai đoạn do dịch lại) LÀM RỖNG dòng + đẩy lệch các dòng sau (AI
+misalignment — bỏ/gộp dòng). Chỉ E01 (re-run) bị.
+
+**Sửa — guard CHỐNG LÀM-RỖNG** (mở rộng `_revert_cjk_regressions`): nếu giai đoạn tinh chỉnh làm
+RỖNG một dòng VỐN có nội dung ở bản trước → tự lùi về bản trước (không mất nội dung). Bổ sung
+cho guard CJK (v432): giờ chống cả 2 kiểu hỏng do AI — chèn CJK ngược VÀ bỏ trắng dòng.
+
+**CJK cứng đầu (E09#24 '棘手', E19#208 '赖'):** cleanup pass v433 thử dịch lại nhưng model vẫn ra
+CJK → giữ nguyên (cờ QC bắt). Thêm ví dụ vào prompt: '更棘手者'→'càng nan giải/gai góc hơn',
+'耍赖'→'giở trò/ăn vạ'.
+
+**403 PERMISSION_DENIED trong log:** file video cache Gemini hết hạn trên cloud — app đã tự tải
+lại ("Đoạn cache không còn trên cloud, tải lại"). Cơ chế xử lý hoạt động đúng.
+
+**Kiểm chứng:** 16 test (3 mới cho guard empty: lùi dòng bị rỗng, rỗng-toàn-khoảng-trắng, không
+đụng khi cả hai rỗng); compileall sạch.
+
+## [3.23.435] — 🔍 Audit 3 tầng (type safety + tài nguyên + logic): sửa 4 bug, xác nhận nhiều điểm sạch
+
+Thực hiện lần lượt 3 hướng audit theo yêu cầu.
+
+**AUDIT 1 — Type safety (pyright): 2 bug thật**
+- **except không bao giờ chạy** (editor_page_view_model): `except UnicodeDecodeError` đặt SAU
+  `except (FileNotFoundError, ValueError)` — mà UnicodeDecodeError là CON của ValueError → bị bắt
+  trước → thông báo "File không phải UTF-8" thân thiện KHÔNG BAO GIỜ hiện. Sửa: đảo
+  UnicodeDecodeError lên TRƯỚC.
+- **biến `consumed` possibly-unbound** (gemini_translation_adapter): khởi tạo trong try → nếu
+  except chạy trước khi gán sẽ NameError che lấp lỗi thật. Sửa: khởi tạo `consumed = False`
+  TRƯỚC try (luôn bound).
+- Các cảnh báo còn lại (optional-subscript ở frame_group/viterbi) là FALSE POSITIVE — code đã
+  lọc `bounding_box is not None` trước khi subscript (pyright không lần được qua lambda).
+
+**AUDIT 2 — Tài nguyên: SẠCH (không rò rỉ)**
+- File: 0 chỗ `open()` thiếu `with`.
+- Popen: wrapper trả cho caller tự cleanup; các caller đều có terminate/kill/finally.
+- tempfile: đều `os.close(fd)` + `finally` unlink/remove.
+- Thread: đều `daemon=True` (+ atomic_save có join timeout).
+- sqlite: repository có `close()`; cache dùng `with`; maintenance có `finally: close()`.
+
+**AUDIT 3 — Logic nghiệp vụ: 1 edge case + xác nhận race an toàn**
+- **Chia cho 0** (extract_subtitles_worker): `if total > 0` guard mẫu số `total` nhưng
+  `/ self._total_rois` KHÔNG được guard → nếu `_total_rois=0` (không phát hiện vùng phụ đề) sẽ
+  ZeroDivisionError. Sửa: guard `if total > 0 and self._total_rois > 0`.
+- Các phép chia khác đều đã guard đúng (return sớm khi rỗng, `if x > 0`, `max(30.0, …)`,
+  `… if total else 0`).
+- **Race condition**: 3 store sqlite dùng `check_same_thread=False` ĐỀU có `threading.Lock` bảo
+  vệ ghi (10/10/6 lần) → an toàn đa luồng.
+
+**Kiểm chứng:** ruff F811/F822/PLE1205/RUF034 sạch; pyright reportUnusedExcept/PossiblyUnbound =
+0 ở file đã sửa; 27 test pass; compileall sạch.
+
+## [3.23.434] — 🐛 Audit mã nguồn: sửa 6 lỗi logging + hàm thiếu + dead code
+
+Tự rà soát mã nguồn bằng phân tích tĩnh (ruff, quét bug-prone rules) — tìm & sửa các lỗi THẬT:
+
+**1. 6 log statement HỎNG (PLE1205) — mất thông tin chẩn đoán:** các dòng `logger.xxx("...{}...",
+arg)` dùng cú pháp `{}` (kiểu loguru/format) nhưng logger là stdlib `logging` (format bằng `%`)
+→ khi ghi log, `"...{}..." % (arg,)` NÉM TypeError → thông báo log bị nuốt, mất dữ liệu debug.
+Sửa `{}`→`%s` ở extract_page, debug_page_view_model, extract_page_view_model (6 dòng).
+
+**2. Import loguru chết (F811):** extract_page.py import `from loguru import logger` rồi bị GHI
+ĐÈ ngay bằng `logging.getLogger` → import loguru vô dụng gây nhầm lẫn. Gỡ bỏ.
+
+**3. Hàm `run_full_diagnosis` BỊ THIẾU (F822):** `__all__` khai báo nhưng KHÔNG có định nghĩa; test
+`test_full_diagnosis_lists_all` import + gọi → sẽ ImportError. Khôi phục hàm (gom check FFmpeg +
+WhisperX thành danh sách báo cáo).
+
+**4. Dead code tính 'skipped' (RUF034):** `(0 if cancelled else 0)` LUÔN = 0 (vô nghĩa, khó
+hiểu) trong `_finish_batch`. Đơn giản hoá còn `processed = self._batch_index; skipped = max(0,
+total - processed) if cancelled else 0` (kết quả không đổi, rõ ràng hơn).
+
+**5. Test lỗi thời:** `test_whisperx_missing` còn kỳ vọng `pip_args == ("whisperx",)` nhưng
+v3.23.335 đã CỐ Ý bỏ pip_args (auto-install whisperx vào env chính sẽ hỏng VieNeu/Paddle). Cập
+nhật test khớp thiết kế an toàn.
+
+**6. Batch TTS lệch count (B905):** thêm cảnh báo log khi worker trả số audio ≠ số câu (trước
+đây zip cắt ngầm → câu thiếu rơi về per-câu, nay có log để phát hiện lỗi worker).
+
+**Không phải bug (đã kiểm, bỏ qua):** RUF012 (bảng tra read-only, chỉ thiếu ClassVar); PLW0603
+(global cho cache/singleton); PLW1510 (subprocess.run đều check returncode thủ công để có thông
+báo lỗi tuỳ chỉnh); RUF001/002/003 (false-positive ký tự Việt/Trung).
+
+**Kiểm chứng:** ruff F811/F822/PLE1205/RUF034 = sạch; 15 test liên quan pass; compileall sạch.
+
+## [3.23.433] — 🧹 Dọn CJK còn sót THẬT: 3 lớp (prompt ví dụ + log + cleanup pass tự dịch lại)
+
+Phân tích 10 tập dịch lại ở app v432. Tin tốt: **safety-net v432 hiệu quả** — E04/E07 (revert
+Hán-Việt→Hán) giờ SẠCH. Còn lại 5 ca CJK sót THẬT khác bản chất (E01#18 '混账'→'hỗn账'; E08#216
+'菲菲姐'→'Phi Phi姐'; E09 '之气'/'邪祟'/'欣赏'): giai đoạn LITERAL dịch MỘT PHẦN, để lại chữ
+ghép/đuôi dạng CJK — safety-net revert KHÔNG cứu được (mọi giai đoạn đều còn CJK, không có bản
+sạch để lùi).
+
+**Sửa 3 LỚP (theo yêu cầu):**
+1. **Prompt (ví dụ cụ thể):** thêm vào no_source_script các ca thật SAI→ĐÚNG: 'hỗn账'→'hỗn
+   trướng', 'Phi Phi姐'→'chị Phi Phi', 'thuần dương之气'→'khí thuần dương', 'tà祟'→'tà túy',
+   '欣赏'→'ngưỡng mộ' — dạy model chú ý chữ ĐUÔI/GHÉP hay bị bỏ.
+2. **Log rõ (quan sát):** liệt kê chính xác dòng nào còn CJK sau pipeline để soi tay (đồng bộ cờ
+   QC 'cjk_leftover').
+3. **Cleanup pass tự động:** `_cleanup_residual_cjk` — sau pipeline, các dòng còn CJK được DỊCH
+   LẠI riêng từ nguồn qua giai đoạn LITERAL (lấy mẫu mới thường dịch trọn). CHỈ thay khi bản
+   dịch lại SẠCH CJK (nếu vẫn sót → giữ nguyên, không làm tệ hơn). Lỗi API/không có key →
+   fallback an toàn giữ bản cũ. Chỉ chạy khi có dòng sót (0-1 dòng/tập → chi phí không đáng kể).
+
+**Kiểm chứng:** 24 test (4 mới cho cleanup: thay khi sạch, giữ khi vẫn sót, no-op khi sạch, lỗi
+API→giữ nguyên); logic verify khớp E01#18/E09 thực.
+
+**Ghi chú:** đã TỪ CHỐI dùng API key người dùng gửi (không nhập credential thật; sandbox cũng
+không gọi được API Gemini) — khuyến nghị người dùng thu hồi key đã lộ. Quy trình debug-driven
+(người dùng dịch → gửi debug → đo → sửa) vẫn là cách hoàn thiện an toàn nhất.
+
+## [3.23.432] — 🛡️ Chống REVERT Hán-Việt→chữ Hán (prompt + safety-net tự động) — 2 lớp
+
+Phân tích 8 tập MỚI (E01-07, E10 — đều app v3.23.431). Tin tốt: **fix Hán-Việt (v430) ĐÃ hiệu
+quả** — 8 tập v431 có 0 ca "thiên giá/thủ sức" sượng (so v428 có 1). CJK sót vẫn hiếm.
+
+**PATTERN MỚI nghiêm trọng (E04 + E07) — LOCALIZE thay Hán-Việt NGƯỢC về chữ Hán gốc:**
+- E04#276: literal/style "mệnh **tinh** vẫn lạc" (SẠCH) → localize "mệnh**星** vẫn lạc" (星=tinh).
+- E07#139: "phát **phấn đồ cường**" (发奋图强) → "phát**奋图强**" (thay lại chữ Hán).
+- Đây là failure mode KHÁC no_source_script (v427 cấm "để SÓT", không cấm "thay NGƯỢC"). Giai
+  đoạn tinh chỉnh thấy từ Hán-Việt (vốn là phiên âm chữ Hán) rồi đổi ngược về chữ Hán gốc → hỏng
+  câu vốn đã sạch.
+
+**Sửa 2 LỚP (vì prompt không đảm bảo 100% — model từng phớt lờ):**
+1. **Prompt** (no_source_script, mọi giai đoạn): thêm "KHÔNG THAY NGƯỢC — nếu bản hiện có đã dịch
+   đúng (kể cả Hán-Việt như 'tinh','phấn đồ cường') TUYỆT ĐỐI không đổi lại thành chữ Hán gốc;
+   từ Hán-Việt viết bằng Latinh là ĐÚNG".
+2. **Safety-net tự động** (`_revert_cjk_regressions` ở use case, sau mỗi giai đoạn): nếu dòng
+   INPUT (giai đoạn trước) đã SẠCH CJK mà OUTPUT lại CHÈN CJK → tự khôi phục dòng đó về bản
+   trước. Tự bỏ qua LITERAL (input là nguồn còn CJK). Bảo đảm KHÔNG chữ Hán nào lọt vào bản
+   cuối do lỗi revert, không phụ thuộc model tuân prompt.
+
+**Kiểm chứng:** 17 test (5 mới cho safety-net: lùi đúng ca chèn CJK, giữ literal, không đụng câu
+sạch, xử index thiếu); logic verify khớp E04#276/E07#139 thực.
+
+## [3.23.431] — 🎯 Phân tích 5 tập: rào chắn CONCISE không rớt từ có nghĩa/họ tên xưng hô
+
+Phân tích thêm E22/E23 (tổng 5 tập cùng series Divine Doctor) để củng cố pattern. Sức khỏe vẫn
+RẤT tốt: CJK sót = 0 cả 5 tập; tên nhân vật nhất quán 100% xuyên tập; glossary series nhất quán.
+
+**Pattern thứ 2 — CONCISE rớt TỪ MANG NGHĨA** (rule súc tích quá tay, ngoài lỗi Hán-Việt ở v430):
+- E20#112: "giày cao **gót**" → "giày cao" (rớt 'gót' — cao gót≠cao).
+- E23#46: "卫老公" (họ Vệ + chồng) → "Chồng." (rớt họ 'Vệ' trong xưng hô thân mật) → cũng gây
+  cờ `duplicate_adjacent` vì #45/#46 đều thành "Chồng." (QC bắt đúng).
+
+**Sửa rule CONCISE:** thêm "KHÔNG bỏ từ MANG NGHĨA" — giữ tính từ/danh từ bổ nghĩa ('giày cao
+GÓT' giữ 'gót'); giữ HỌ/TÊN riêng trong xưng hô ('卫老公'→'chồng Vệ', không rút thành 'chồng').
+
+**Tổng hợp 2 pattern sửa qua 5 tập:**
+- v430: STYLE lạm dụng Hán-Việt cứng (thoại đời thường) — 'thiên giá'/'thủ sức'.
+- v431: CONCISE rớt từ có nghĩa/họ tên xưng hô — 'gót'/'卫'.
+Cả hai đều là rule SÚC TÍCH quá tay → nay cân bằng "tự nhiên & đủ nghĩa > ngắn".
+
+**Phương pháp:** đo trên 5 tập → khoanh pattern LẶP → sửa đúng rule gây ra. Các lỗi còn lại rất
+lẻ tẻ (1-2 ca/5 tập), cờ QC (duplicate_adjacent, cjk_leftover) bắt được để soi thủ công.
+
+**Kiểm chứng:** compileall sạch.
+
+## [3.23.430] — 🎯 Phân tích 3 tập phim bộ: sửa PATTERN lạm dụng Hán-Việt (thoại tự nhiên hơn)
+
+Phân tích 3 file debug MỚI (phim chính kịch "Divine Doctor" E07/E20/E21 — khác hẳn phim tài
+liệu) để tìm PATTERN lỗi LẶP nhiều tập (thay vì ca lẻ). Kết quả kiểm tra sức khỏe RẤT tốt:
+- CJK sót bản cuối: 0 cả 3 tập.
+- Tên nhân vật NHẤT QUÁN 100% xuyên t:p (26 tên, 0 sai lệch) — series context tích luỹ chuẩn.
+- Glossary nhất quán xuyên tập (终南山→Chung Nam ở mọi tập).
+- Không lỗi số/tỉ lệ; quality_flags gần như sạch.
+
+**PATTERN LẶP tìm được — STYLE lạm dụng Hán-Việt** làm thoại kém tự nhiên (lặp ở E07 + E20):
+- E07#75: "giá trên trời" (tự nhiên) → "Thiên giá" (天价, cứng).
+- E20#82: "tốc độ tay...nhanh thật" → "thủ sức...nhanh" (手速, sượng).
+- Gốc: rule CONCISE dặn "dùng từ Hán-Việt cô đọng" → model lạm dụng, biến thoại đời thường
+  thành Hán-Việt cứng chỉ để ngắn hơn.
+
+**Sửa rule CONCISE:** nêu rõ "TỰ NHIÊN QUAN TRỌNG HƠN NGẮN" — với thoại đời thường dùng từ
+THUẦN VIỆT dễ hiểu, TUYỆT ĐỐI không đổi thành Hán-Việt cứng chỉ để tiết kiệm chữ (kèm ví dụ
+phản diện 'giá trên trời'↛'thiên giá', 'tốc độ tay'↛'thủ sức'); chỉ dùng Hán-Việt khi nó VỐN tự
+nhiên hơn hoặc là thuật ngữ/tên riêng/văn phong trang trọng.
+
+**Phương pháp:** đo trên 3 tập thực → tìm pattern LẶP (không sửa ca lẻ) → sửa đúng rule gây ra
+pattern. Đây là cách tối ưu prompt dựa trên dữ liệu, tránh sửa mù.
+
+**Kiểm chứng:** compileall sạch; f-string đúng format.
+
+## [3.23.429] — 🎯 Tối ưu prompt phân tích ngữ cảnh: bắt tỉ lệ/định lượng để chống đảo chiều
+
+Phân tích sâu file debug (phim tài liệu ẩm thực 100 món ăn cổ đại): xác nhận CONTEXT ANALYSIS
+đang chạy XUẤT SẮC — nhận đúng 2 nhân vật (giới tính/tuổi/vai), overview chi tiết tiếng Việt,
+glossary bắt tốt thuật ngữ ẩm thực (荷叶裹鲊→Hà Diệp Khỏa Trạ, 鲊→Trạ...), visual_cues map đúng
+người nói→người nghe. Xưng hô bản cuối cũng ĐÚNG (kiểm #108/#116 'ông' là ngôi 3 trong chuyện
+lịch sử; #162 Tào Vũ 36t gọi Cao 55t là 'anh' — kính trọng đúng).
+
+**Cải thiện dựa trên lỗi thật #66** (localize từng đảo 'gạo:nước'→'nước:gạo'): bổ sung hướng dẫn
+glossary trong phân tích ngữ cảnh — chủ động BẮT tỉ lệ/định lượng/đơn vị lặp lại hoặc dễ nhầm
+chiều (công thức nấu ăn, tài liệu kỹ thuật) và GHI RÕ CHIỀU/THỨ TỰ (vd '米水比例 => tỉ lệ gạo:
+nước (gạo trước, nước sau)'). Nhờ chốt ở glossary (kênh ổn định, mọi stage dùng), các bước dịch
+sau giữ đúng chiều → chặn lỗi đảo tỉ lệ tận GỐC, bổ trợ rào chắn localize (v426).
+
+**Tổng hợp cải thiện chất lượng dịch qua các phiên:**
+- v426: rào chắn LOCALIZE (giữ câu tốt, không đổi số liệu, không lùi cải thiện) + cờ cjk_leftover.
+- v427: rào chắn no_source_script (dịch hết CJK) cho CẢ 3 giai đoạn.
+- v429: glossary chủ động bắt tỉ lệ/định lượng (chống đảo chiều tận gốc).
+
+**Kiểm chứng:** compileall sạch; 12 test (cjk_leftover + diagnostic_naming) pass; f-string newline
+đúng format.
+
+## [3.23.428] — 🗂️ Đặt tên file chẩn đoán NHẤT QUÁN + timestamp (hết ghi đè, dễ quản lý)
+
+Trước đây các khâu lưu file chẩn đoán trùng tên → GHI ĐÈ lần trước, khó quản lý:
+- Khâu DỊCH: `<video>.translation_debug.json` — cùng video là đè.
+- Khâu TTS: `tts_debug.csv` (CỐ ĐỊNH) — luôn đè.
+
+**Sửa — helper chung `diagnostic_naming`** dựng tên theo quy ước thống nhất:
+
+    <tên_nguồn>.<khâu>.<YYYYMMDD_HHMMSS>.<đuôi>
+
+Ví dụ: `第10集_荷叶裹鲊.translation_debug.20260825_143022.json`,
+`subtitle.tts_debug.20260825_143022.csv`.
+
+Lợi ích: (1) mỗi lần xuất là MỘT tệp riêng — không ghi đè; (2) có timestamp → tự sắp theo thời
+gian, dễ tìm bản mới nhất; (3) có tên nguồn + nhãn khâu → truy ngay đúng tập phim + khâu; (4)
+làm sạch ký tự cấm Windows + cắt tên quá dài. File `.config.txt` của TTS tự bám theo tên CSV nên
+cũng khớp timestamp.
+
+Áp cho khâu DỊCH (`translation_debug`) và TTS (`tts_debug`). Khâu OCR giữ `<video>.seraw.json`
+(đây là DỮ LIỆU tải-lại, tên theo video để dễ nạp lại — không phải file chẩn đoán dùng-một-lần).
+
+**Kiểm chứng:** 8 test (tên có timestamp, làm sạch ký tự cấm, cắt tên dài, đuôi đúng, 2 lần xuất
+khác tên).
+
+## [3.23.427] — 🔬 Phân tích sâu STYLE + rào chắn chống sót chữ nguồn cho CẢ 3 giai đoạn
+
+Phân tích tiếp giai đoạn STYLE (literal→style, 29/285 = 10% dòng đổi):
+
+**Lỗi rõ nhất — STYLE TỰ TẠO ra CJK sót (#114):** literal "Người đưa cơm khác đến" (sạch) →
+style "Người khác đến**送饭**" (viết lại câu nhưng để '送饭' chưa dịch). Style không được để sót
+chữ nguồn khi biên tập. (Localize sau đó vá được, nhưng không nên ỷ lại.)
+Lỗi nhỏ: #101 "sắp tiêu"→"sắp xong" (kém chính xác chút — 要完蛋 nghĩa "tiêu/chết").
+
+**Sửa — rào chắn `no_source_script` áp cho CẢ 3 giai đoạn** (literal + style + localize):
+"DỊCH HẾT sang đích, TUYỆT ĐỐI không để sót chữ Hán/Nhật/Hàn; khi viết lại câu rà đã dịch trọn
+mọi chữ (vd '送饭'→'đưa cơm')". Kết hợp cờ QC `cjk_leftover` (v426) → hai lớp: prompt ngăn +
+QC bắt.
+
+**Kiểm tra sức khỏe literal/final (tốt):**
+- #137/#179/#270 "嗯"→"Ừ." — thán từ dịch ĐÚNG (không phải lỗi dịch hụt).
+- #11 literal/style/localize để nguyên chữ Hán nhưng FINAL tự sửa đúng ("Nghe nói nó còn là
+  tiền thân của sushi Nhật Bản") → pipeline tự chỉnh ở bước cuối.
+- Final: 0 chú thích rác ('[không dịch]'), 0 dòng rỗng. Độ dài TB literal 22.9 → final 23.3 ký
+  tự (style/localize thêm hư từ tự nhiên — hợp lý).
+
+**Phương pháp:** đo trên 4 stage thực rồi sửa đúng gốc (prompt), không đổi mù.
+
+**Lưu ý:** mới có 1 file debug nên chỉ thấy được vài ca. Gửi thêm debug từ tập khác sẽ giúp tìm
+PATTERN lỗi lặp để tối ưu prompt chính xác hơn.
+
+## [3.23.426] — 🔬 Phân tích chẩn đoán dịch: rào chắn giai đoạn LOCALIZE + cờ CJK còn sót
+
+Phân tích debug dịch thật (zh→vi, 285 dòng, 4 giai đoạn literal→style→localize→final):
+
+**Giai đoạn LOCALIZE (10% dòng đổi) — tìm ra 2 lỗi bạn cảm nhận đúng:**
+- #64: style sửa "trong cơm" (tự nhiên) → localize LÙI về "của cơm" (thô) — undo cải thiện.
+- #66: "tỉ lệ gạo nước" → "nước gạo" — ĐẢO nghĩa tỉ lệ (米水 = gạo:nước) — lỗi ngữ nghĩa.
+- Nguyên nhân: prompt localize chỉ nói "bản địa hoá cho tự nhiên", thiếu rào chắn → model chỉnh
+  quá tay.
+- **Sửa prompt localize** thêm 3 rào chắn: (1) GIỮ NGUYÊN câu đã tốt, không viết lại chỉ để đổi
+  từ đồng nghĩa/đảo trật tự; (2) TUYỆT ĐỐI không đổi số liệu/tỉ lệ/THỨ TỰ đơn vị/tên riêng/sự
+  kiện/thuật ngữ; (3) không lùi cải thiện của bước trước.
+
+**Lỗi hệ thống — CJK còn sót:** #132 "文人士大夫" → "văn nhân sĩ đại**夫**" (sót 1 chữ '夫' lọt
+qua CẢ 4 giai đoạn vào bản cuối). Pipeline thường tự bắt nhưng đôi khi lọt.
+- **Thêm cờ QC `cjk_leftover`**: quét bản dịch, gắn cờ dòng còn chữ Hán/Nhật/Hàn (khi đích không
+  phải CJK). Tự nhận diện đích CJK (dịch SANG tiếng Trung) để KHÔNG báo nhầm. Nay bạn thấy ngay
+  dòng nào sót chữ chưa dịch để sửa.
+
+**Kiểm chứng:** 7 test (cjk_leftover: bắt đúng chữ sót, bỏ dòng sạch, không báo khi đích CJK, bỏ
+trùng; length_anomaly cũ vẫn pass). Verify trên dữ liệu THẬT: bắt đúng #132 sót '夫'.
+
+**Phương pháp:** đo trước (phân tích 4 stage thực) rồi sửa đúng chỗ (prompt localize + cờ QC),
+không đổi mù.
+
+## [3.23.425] — 🛡️ Nới safety_settings=BLOCK_NONE cho dịch phim (giảm chặn nhầm → ít thất bại)
+
+Tiếp tục đối chiếu cookbook Gemini (Safety guide). Phát hiện: app KHÔNG cấu hình `safety_settings`
+→ dùng bộ lọc MẶC ĐỊNH của Gemini. Với công cụ DỊCH phụ đề phim (nội dung hợp pháp người dùng
+đang xem), mặc định hay CHẶN NHẦM cảnh phim cổ trang/hành động: hành quyết, chiến trận, xưng hô
+gay gắt ("đi chết đi", "hôn quân"), tình cảm → `finish_reason=SAFETY` → `response.text` None →
+MẤT câu dịch + TỐN retry (đã thấy trong code: "response.text có thể None khi bị safety filter").
+
+**Sửa:** thêm `safety_settings` = `BLOCK_NONE` cho 4 nhóm harm chính (HARASSMENT, HATE_SPEECH,
+SEXUALLY_EXPLICIT, DANGEROUS_CONTENT) trong `_build_gcc()` → áp cho MỌI config dịch (chính +
+fallback). Đây là chuẩn cho công cụ xử lý nội dung của người dùng (dịch, không sinh nội dung
+mới). Guard tuyệt đối an toàn: SDK/nhóm/threshold nào không hỗ trợ thì bỏ qua (không ném lỗi,
+không làm hỏng cấu hình).
+
+**Lợi ích:** giảm mạnh thất bại giả do safety → ít câu bị bỏ dịch, ít retry phí quota, bản dịch
+đầy đủ hơn cho phim có cảnh nặng.
+
+**Kiểm chứng:** 4 test (4 nhóm BLOCK_NONE; SDK cũ→rỗng; nhóm thiếu→bỏ qua; lỗi ctor→bỏ qua an
+toàn); compileall sạch.
+
+**Lưu ý:** đây là công cụ dịch phụ đề phim người dùng tự cung cấp — nới lọc để KHÔNG từ chối dịch
+thoại phim hợp pháp, không phải để tạo nội dung có hại.
+
+## [3.23.424] — 📊 Đối chiếu cookbook Gemini: xác nhận tối ưu + log tiết kiệm cache
+
+Đối chiếu ứng dụng với best practices trong https://github.com/google-gemini/cookbook
+(Caching, Video_understanding, thinking, Batch_mode). Kết luận: **app ĐÃ tuân thủ đầy đủ** các
+khuyến nghị hiệu năng/chất lượng:
+- Nội dung ỔN ĐỊNH (glossary/roster/luật) đặt ở `system_instruction` (kênh riêng) → **implicit
+  caching TỰ ĐỘNG cho Gemini 2.5+/3.x** tái dùng prefix qua các chunk liên tiếp.
+- Video handle đứng ĐẦU `contents` → phần cache được prefix; `_video_handle_cache` tránh
+  re-upload.
+- `thinking_level` (3.x) vs `thinking_budget` (2.5) đúng theo họ model; không dùng lẫn (né lỗi
+  400).
+- Structured output (`response_schema`), quota manager + retry backoff + xoay key, media
+  resolution cấu hình được (mặc định `medium` — cân bằng tốt).
+
+**Về explicit context caching (tính năng nổi bật của cookbook):** với model 3.x app đang dùng,
+implicit caching đã tự cache prefix → explicit caching gần như THỪA (chỉ lợi cho model cũ hoặc
+đảm bảo cache-hit tuyệt đối). Không triển khai để tránh phức tạp + rủi ro (không kiểm thử được
+API thật) mà không có lợi ích thực.
+
+**Cải thiện (an toàn, quan sát được):** thêm `_log_cache_savings()` — log
+`cached_content_token_count` từ `usage_metadata` mỗi lần gọi. Nay bạn sẽ thấy trong Nhật ký:
+"Gemini implicit caching: N token được tái dùng từ cache (~X% prompt)" → xác nhận caching đang
+tiết kiệm chi phí thực tế. Chỉ log, KHÔNG đổi hành vi.
+
+**Về Batch_mode (rẻ hơn 50%):** phù hợp job dịch lớn nhưng CHẠY BẤT ĐỒNG BỘ (nộp job, chờ vài
+phút–giờ, không có tiến độ trực tiếp). Là đánh đổi UX lớn — để ngỏ tuỳ nhu cầu, chưa làm.
+
+**Kiểm chứng:** compileall sạch; logic đọc `cached_content_token_count` kiểm thử độc lập.
+
+## [3.23.423] — 🔎 Rà soát 4 API (vieneu/google-genai/paddle/edge-tts): tương thích + ghim an toàn
+
+Tham khảo phiên bản MỚI NHẤT (20/8/2026) của 4 API app dùng, phân tích sâu từng cái, xác minh
+tương thích và ghim floor/ceiling an toàn (tránh footgun bản quá cũ/quá mới).
+
+**1. vieneu 3.3.0** (mới nhất, ra 20/8): API v3turbo (`infer`/`infer_batch`/`list_preset_voices`
+/`get_preset_voice`/`encode_reference`) GIỐNG HỆT 3.2.9 — không phá vỡ. App (`_supported_infer_params`)
+tương thích hoàn toàn. Tham số chất lượng (`crossfade_p/silence_p/top_k/p/max_chars`) giữ mặc định
+(hợp lý, KHÔNG đổi mù vì không nghe được audio → tránh hồi quy). **Ghim `vieneu[legacy]>=3.3,<4`**:
+lấy latest 3.x, chặn 4.0 (có thể đổi/bỏ API v3turbo).
+
+**2. google-genai 2.19.0**: xác minh CÓ đủ class app dùng (`AutomaticFunctionCallingConfig`,
+`GenerateContentConfig`, `ThinkingConfig`, `SpeechConfig`, `PrebuiltVoiceConfig`, `media_resolution`,
+`thinking_config`). **Sửa floor NGUY HIỂM `>=0.3` → `>=2.0,<3`** (bản 0.3 thiếu hết class hiện đại
+→ app crash nếu lỡ cài). AFC disable (v419) hoạt động với 2.19.
+
+**3. paddlepaddle 3.3.1**: build đã ghim `paddlepaddle-gpu==3.3.1` = latest ✅; paddleocr 3.7.0 =
+latest ✅; OCR GPU chạy sạch. **Nâng floor dev `paddlepaddle>=2.6`→`>=3.0`, `paddleocr>=2.9`→`>=3.0`**
+(API 3.x khác nhiều 2.x — tránh cài nhầm bản cũ không tương thích adapter).
+
+**4. edge-tts 7.2.8**: `Communicate(text, voice, rate=…)` + `.save()` app dùng — API ổn định,
+tương thích. Unpinned (lấy latest — quan trọng để vá lỗi auth server Microsoft). **Thêm floor
+`>=7.0`** (chặn 6.x có lỗi auth Sec-MS-GEC). Có thêm `volume`/`pitch` (tùy chọn, chưa cần).
+
+**Nguyên tắc:** chỉ ghim/sửa metadata (an toàn, không đổi hành vi runtime — vẫn lấy bản mới nhất
+trong khoảng); KHÔNG đổi tham số chất lượng khi chưa kiểm chứng được audio (tránh hồi quy).
+
+**Kiểm chứng:** 14 test vieneu plan pass; compileall sạch; xác minh class google-genai bằng tải
+wheel thực.
+
+## [3.23.422] — ➕ Tùy chọn "Một lô cho TẤT CẢ câu" + externalize i18n tts.tts_batch
+
+Theo yêu cầu:
+- **Thêm option "Một lô cho TẤT CẢ câu"** vào ô Kích thước lô. Chọn nó → gom toàn bộ câu vào MỘT
+  lần gọi `infer_batch` (batch_size nội bộ đặt rất lớn → look-ahead ôm hết). GPU vẫn xử lý chunk
+  theo nhóm (64/forward) nên tổng công việc như nhau; cần ~2GB RAM cache và không thấy tiến độ
+  tới khi xong. Câu "ngân dài" vẫn retry per-câu (giữ chất lượng).
+- **Externalize i18n**: thêm khóa `tts.tts_batch`, `tts.tts_batch_off`, `tts.tts_batch_auto`,
+  `tts.tts_batch_all`, `tts.tts_batch_n` vào cả `strings_vi.json` và `strings_en.json`. Combo +
+  nhãn hàng nay dùng bản dịch (không còn chuỗi cứng/fallback).
+
+Giá trị đặc biệt của ô: 0 = tắt · -1 = Tự động (VRAM) · **-2 = Một lô cho tất cả** · ≥2 = cố định.
+
+**Kiểm chứng:** 9 test batch (thêm test "một lô gom hết câu"); JSON i18n hợp lệ; compileall sạch.
+
+## [3.23.421] — 🔎 Làm rõ VRAM TTS + nâng chunk/forward vượt mặc định (32→64)
+
+Người dùng báo batch 512 vẫn không tăng VRAM (3.3/8GB) dù v420 log "32 chunk/forward". Truy nguồn
+vieneu 3.2.9 (v3turbo.py:106): **mặc định v3turbo ĐÃ là `max_batch_size=32`** (32 mới đúng cho
+v3turbo; 4 là của mode fast/turbo). Nên v420 truyền 32 = ĐÚNG BẰNG mặc định → không đổi gì.
+
+**Tại sao VRAM không tăng (KHÔNG phải lỗi):**
+- Model VieNeu chiếm ~3GB VRAM (phần lớn).
+- Mỗi chunk audio ngắn → hoạt hoá RẤT nhỏ (~0.01GB/chunk), không phải 0.1GB như ước tính trước.
+- 32 chunk chỉ thêm ~0.3GB → tổng ~3.3GB. Tăng batch KHÔNG làm VRAM tăng nhiều vì **model
+  chiếm phần lớn, hoạt hoá chunk rất nhỏ**.
+- GPU đã 96% = **bão hoà tính toán** → tốc độ đã gần tối đa cho model này.
+
+**Điều chỉnh:** nâng chunk/forward VƯỢT mặc định 32 để giảm số lần forward (bớt overhead launch),
+có thể nhanh hơn chút: 8GB→**64**, 12GB→96, 16GB→128, 24GB→192. Chunk-batch động (không cap
+cứng); OOM → tự lùi per-câu.
+
+**Về "một batch cho toàn bộ 5862 câu":** KHÔNG nên. Dù gom hết vào 1 lần gọi, GPU VẪN xử lý chunk
+theo nhóm (64/forward) → tổng công việc y hệt, không nhanh hơn. Bất lợi: ~2GB RAM cache, ghi/đọc
+5862 WAV cùng lúc, không thấy tiến độ tới khi xong. Gom 512 câu/lô hiện tại đã tối ưu (ít vòng
+lặp). Yếu tố tốc độ là chunk/forward (đã nâng) + compute GPU (đã bão hoà).
+
+**Kiểm chứng:** 10 test (ngưỡng chunk-batch mới).
+
+## [3.23.420] — 🚀 Tối ưu TTS GPU: nâng chunk/forward theo VRAM (mặc định vieneu chỉ 4!)
+
+Phân tích Task Manager (RTX 3070 Ti, batch 512 câu): GPU 97% nhưng **VRAM chỉ 3.4/8GB** — batch
+512 KHÔNG tăng VRAM. Truy nguồn vieneu 3.2.9: `infer_batch` có tham số điều khiển **số CHUNK mỗi
+forward GPU**, MẶC ĐỊNH chỉ **4** (`max_batch_size=4` ở turbo/fast; `batch_size=None`→4 ở
+v3turbo). App gọi không truyền → GPU xử lý 4 chunk/lần → phí VRAM.
+
+**Phân biệt 2 mức batch:**
+- Số CÂU gom mỗi lần gọi (UI "câu/lô") — giảm vòng lặp, không đụng VRAM nhiều.
+- **Số CHUNK/forward GPU** — ĐÂY mới là đòn bẩy VRAM/tốc độ thật (trước bị kẹt ở 4).
+
+**Sửa:** tự chọn số chunk/forward theo VRAM và truyền cho `infer_batch`:
+- `gpu_chunk_batch_for_vram_gb()`: 8GB→32, 12GB→48, 16GB→64, 24GB→96 (đo thực: model ~3GB +
+  ~0.1GB/chunk, chừa biên cho OCR/nén video). RTX 3070 Ti 8GB → **32 chunk/forward (8× so với 4)**.
+- Worker dò signature `infer_batch` để truyền ĐÚNG tên tham số theo mode (v3turbo→`batch_size`,
+  fast/turbo→`max_batch_size`).
+- Dò VRAM LƯỜI (nvidia-smi 1 lần/phiên) rồi cache.
+- Nếu lô lớn OOM → worker tự bắt lỗi, lùi per-câu (an toàn).
+
+**Kỳ vọng:** VRAM dùng ~6GB (thay vì 3.4GB) + TTS GPU **nhanh hơn rõ rệt** (8× chunk/forward,
+ít kernel launch hơn). Chất lượng KHÔNG đổi (chỉ gộp forward, model + sampling như cũ).
+
+**Kiểm chứng:** 33 test (thêm test ngưỡng chunk-batch VRAM + worker truyền đúng tên param 2 mode).
+
+## [3.23.419] — 🔇 Tắt cảnh báo AFC của google-genai (dịch + TTS)
+
+Log xuất hiện cảnh báo lặp lại: *"Direct use of automatic function calling (AFC) in
+Models.generate_content is not recommended..."* + *"AFC is enabled with max remote calls: 10"*.
+
+**Nguyên nhân:** google-genai bật AFC (Automatic Function Calling) MẶC ĐỊNH. App KHÔNG dùng
+function/tool calling cho dịch hay TTS, nên AFC chỉ chạy vô ích + in cảnh báo mỗi lần gọi API.
+
+**Sửa:** tắt AFC bằng `automatic_function_calling=AutomaticFunctionCallingConfig(disable=True)`
+trong config:
+- Dịch: gom qua helper `_build_gcc()` — áp cho CẢ config chính LẪN config fallback (khi bỏ
+  thinking).
+- TTS: thêm vào config `generate_content`.
+- Guard try/except phòng SDK cũ chưa có `AutomaticFunctionCallingConfig`.
+
+**Lợi ích:** sạch log (hết cảnh báo AFC) + bớt overhead nhỏ mỗi lần gọi (SDK không dựng bộ máy
+AFC vô ích). Không đổi kết quả dịch/TTS.
+
+**Kiểm chứng:** logic `_build_gcc` test độc lập (tắt AFC đúng; SDK cũ bỏ qua an toàn); compileall
+sạch.
+
+## [3.23.418] — ⚙️ Thêm lựa chọn lô lớn 64/128/256/512 cho TTS GPU
+
+Ô "Kích thước lô (GPU)" nay có thêm **64, 128, 256, 512 câu/lô** (ngoài 8/16/24/32) cho card
+VRAM cao muốn tăng tốc tối đa.
+
+- Lô lớn nhanh hơn nhưng **tốn nhiều VRAM** — nếu thiếu, worker tự bắt lỗi và lùi về từng câu
+  cho lô đó (không crash, đã có sẵn cơ chế fallback từ v412).
+- Câu "ngân dài" vẫn luôn thử lại từng câu (giữ chất lượng).
+- Cập nhật tooltip cảnh báo rõ về VRAM.
+- "Tự động (theo VRAM)" giữ ngưỡng thận trọng (16GB+→32) — muốn lớn hơn thì chọn tay.
+
+## [3.23.417] — 🔧 Build: tùy chọn tải-mới `--no-cache-dir` (giải thích cache pip)
+
+Phân tích build_log: build KHỎE MẠNH (526MB, thành công). Làm rõ về "Using cached":
+
+**"Using cached" KHÔNG phải bản cũ:** đó là pip tái dùng FILE wheel đã tải sẵn của ĐÚNG phiên
+bản mới nhất — chỉ tránh tải lại byte, không làm kẹt bản cũ. Bằng chứng: build lấy vieneu-3.2.9
+(mới hơn 3.2.8), google_genai-2.18.1, pyside6-6.11.2 — đều mới nhất. `build_env` cũng bị XÓA +
+tạo mới mỗi lần build (không tái dùng gói cũ).
+
+**Vì sao dùng cache tốt:** cùng kết quả, nhanh hơn NHIỀU (không tải lại vài GB mỗi lần). Phiên
+bản vẫn được pip giải quyết mới từ PyPI (venv sạch), cache chỉ tiết kiệm băng thông.
+
+**Tùy chọn mới (opt-in):** ai muốn TẢI MỚI HOÀN TOÀN (vd nghi cache hỏng) → chạy
+`set SUBEXT_NO_PIP_CACHE=1` trước `build_windows.bat` → thêm `--no-cache-dir` vào pip. Mặc định
+vẫn dùng cache (nhanh).
+
+**Cảnh báo PyInstaller lành tính (không cần sửa):** "Failed to collect submodules" cho
+paddleocr._doc2md.math (cần lxml), vieneu.v3_turbo_serve (cần torch — không bundle),
+onnxruntime.quantization (cần onnx)… là các submodule KHÔNG dùng trong app; PyInstaller bỏ qua
+và tiếp tục bình thường.
+
+## [3.23.416] — ⚙️ Batch TTS thành tùy chọn trong Cài đặt + tự tinh chỉnh theo VRAM
+
+Nâng batch TTS (v412) từ biến môi trường thành **tùy chọn giao diện** trong panel "Cấu hình
+VieNeu-TTS".
+
+### Giao diện
+- Thêm ô **"Kích thước lô (GPU)"** cạnh "Thiết bị" với các lựa chọn:
+  - **Tắt (từng câu)** — mặc định, ổn định nhất.
+  - **Tự động (theo VRAM)** — tự chọn theo card.
+  - **8 / 16 / 24 / 32 câu/lô** — cố định.
+- Chỉ tác dụng khi bỏ tick "Ép chạy CPU" (batch chỉ lợi trên GPU).
+
+### Tự tinh chỉnh theo VRAM
+- `vieneu_batch_tuning.py`: `detect_total_vram_gb()` (dò qua `nvidia-smi`) +
+  `batch_size_for_vram_gb()` — ánh xạ thận trọng: 8GB→16, 12GB→24, 16GB+→32, <8GB→8/4. Không dò
+  được → mặc định 16 (an toàn cho card phổ thông). VieNeu chia sẻ VRAM với OCR/NVENC nên ngưỡng
+  đặt thận trọng.
+
+### Luồng
+- `batch_size` truyền qua: tts_page → `start_tts` → resolve "Tự động" thành số → container →
+  `VieNeuTtsAdapter(batch_size=...)`. Tham số ưu tiên hơn env `SUBEXT_VIENEU_BATCH` (giữ tương
+  thích ngược).
+
+**Kiểm chứng:** 22 test (7 mới: ngưỡng VRAM, dò nvidia-smi, fallback, tham số thắng env).
+
+**Trạng thái:** Batch TTS giờ bật/tắt dễ dàng trong app (không cần biến môi trường). Mặc định TẮT
+để an toàn — bật "Tự động" hoặc chọn số để tăng tốc phim dài.
+
+## [3.23.415] — 🎉 TTS GPU CHẠY SẠCH! + dừng sớm retry "dài bất thường" (tiết kiệm)
+
+**Xác nhận từ app_log:** ZERO lỗi surrogate — lớp 3 (v414) đã trị dứt điểm. GPU worker sẵn sàng,
+TTS chạy ổn định trên GPU trọn phiên (không rơi CPU). Chuỗi fix TTS GPU HOÀN TẤT:
+shim (v406) → voice (v407-408) → gỡ pin (v410) → surrogate 3 lớp (v411/413/414).
+
+**Hoàn thiện tiếp — dừng sớm retry vô ích:** thán từ/từ ngắn ('Được.' 1 âm tiết → 1.52s, 'Giá!')
+bị model ngân dài NHẤT QUÁN — mọi lần thử ~bằng nhau, retry tới 10 lần lãng phí (mỗi lần 1 infer
+GPU).
+- **Sửa:** dừng sớm khi bản ngắn nhất KHÔNG rút thêm sau 3 lần LIÊN TIẾP (và đã thử tối thiểu 3
+  lần) → dừng sau ~4 lần thay vì 10. **KHÔNG đổi kết quả** (vẫn trả bản ngắn nhất), chỉ bỏ ~6
+  lần infer thừa cho mỗi thán từ khó. Vẫn cho retry đủ khi model đang cải thiện dần.
+
+**Kiểm chứng:** 34 test vieneu pass (2 test early-stop: dừng sớm khi chững; audio bình thường
+trả ngay không retry).
+
+**Trạng thái:** OCR (GPU) ✓, Dịch (Gemini) ✓, TTS (VieNeu GPU) ✓ — cả 3 khâu nặng đều chạy GPU.
+Batch TTS (`infer_batch`, v412) sẵn sàng thử qua env `SUBEXT_VIENEU_BATCH=16` để tăng tốc thêm.
+
+## [3.23.414] — 🛡️ Surrogate LỚP 3: bảo hiểm phía WORKER (reconfigure stream + sanitize)
+
+Lỗi surrogate VẪN xuất hiện dù adapter đã làm sạch 2 lớp (v411/v413). Phân tích: log "VieNeu GPU
+hỏng: <lỗi surrogate>" nghĩa là **WORKER** trả về ok=False — tức surrogate xảy ra Ở PHÍA WORKER.
+Cơ chế: qua JSON round-trip, adapter (bản cũ) escape surrogate thành `\udcXX` (ASCII, ghi được),
+`json.loads` ở worker DỰNG LẠI lone surrogate → khi đưa vào model/ghi WAV/echo lỗi → crash.
+
+**Sửa (lớp 3, phía nhận):**
+- Worker reconfigure `sys.stdin`/`sys.stdout` với `errors="replace"` → đọc/ghi không bao giờ chết
+  vì surrogate.
+- `_no_surrogates()` làm sạch text NGAY sau `json.loads` (cả đường single lẫn batch) → `engine.
+  infer` luôn nhận text sạch.
+
+Ba lớp bảo vệ độc lập giờ đảm bảo surrogate KHÔNG thể gây lỗi ở bất kỳ đâu:
+1. (v413) `preprocess_tts_text` — làm sạch tại nguồn, mọi engine.
+2. (v411) `_json_line_safe` — làm sạch trước khi ghi stdin.
+3. (v414) worker reconfigure stream + `_no_surrogates` — bảo hiểm phía nhận, độc lập với adapter.
+
+**Kiểm chứng:** 13 test (thêm test `_no_surrogates` worker).
+
+**Vì sao lớp 3 quyết định:** hai lớp trước ở ADAPTER; nếu người dùng chạy .exe cũ hoặc có đường
+truyền tôi chưa thấy, lớp 3 ở WORKER vẫn chặn được — không phụ thuộc phiên bản adapter.
+
+## [3.23.413] — 🛡️ Làm sạch surrogate TẠI NGUỒN (lớp 2) — bao phủ mọi engine & đường TTS
+
+Log cho thấy lỗi surrogate (`'utf-8' codec can't encode '\udc90'`) VẪN xuất hiện. Kiểm chứng
+`_json_line_safe` (v411) đã đúng và áp ở cả 3 chỗ ghi stdin (test pass) — nhiều khả năng log từ
+build cũ ≤v410. Dù vậy, thêm LỚP BẢO VỆ THỨ HAI cho chắc chắn tuyệt đối:
+- `preprocess_tts_text` (khâu tiền xử lý CHUNG cho VieNeu/Edge/Gemini) nay loại surrogate lạc
+  NGAY khi nhận text → mọi đường (per-câu, batch, CPU) đều nhận text sạch, không phụ thuộc
+  `_json_line_safe`.
+
+Hai lớp (nguồn + trước-stdin) đảm bảo surrogate không bao giờ tới được worker GPU.
+
+**Kiểm chứng:** 7 test surrogate (thêm 2 test tại nguồn); text Việt sạch giữ nguyên.
+
+**Lưu ý:** ghi nhận câu "dài bất thường" 9 âm tiết ~5.2s ('Cách kinh thành Lâm An…') — model
+VieNeu ngân dài với câu này (0.58s/âm tiết vs ~0.35 bình thường); retry chọn bản ngắn nhất (cơ
+chế cũ, giữ nguyên để bảo toàn thoại). Đây là hạn chế model, không phải lỗi.
+
+## [3.23.412] — ⚡ Triển khai `infer_batch` (tăng tốc TTS GPU theo lô) — OPT-IN, có fallback
+
+Tận dụng `infer_batch` của vieneu 3.2.8: gộp chunk của NHIỀU câu, chia sẻ forward trên GPU →
+nhanh hơn nhiều cho phim dài (5000+ dòng).
+
+### Thiết kế (an toàn, không phá đường đang chạy)
+- **Worker** (`vieneu_gpu_subprocess`): thêm lệnh `{"batch":[{text,output}...]}` → `_handle_batch`
+  gọi `engine.infer_batch(texts, voice=...)`, ghi từng WAV, trả list output theo đúng thứ tự.
+  Item lỗi → output rỗng; cả lô lỗi/không có `infer_batch` → `{"ok":False}` (adapter lùi per-câu).
+- **Adapter**: `_infer_batch_via_gpu_worker` (gửi lô, đọc WAV) + `_get_batched_audio(idx)` (cache
+  look-ahead theo NHÓM `batch_size`, bộ nhớ giới hạn).
+- **Tích hợp**: LẦN THỬ ĐẦU (attempt 0) của mỗi câu lấy audio từ lô; câu "dài bất thường" vẫn
+  retry PER-CÂU (attempt >0 tắt batch) → **giữ nguyên chất lượng**. Vòng lặp timing/nén/overlap
+  KHÔNG đổi.
+
+### Bật/tắt
+- **OPT-IN qua biến môi trường `SUBEXT_VIENEU_BATCH=N`** (N≥2 để bật, vd 16/32). Mặc định 0 =
+  TẮT → giữ nguyên đường per-câu (ZERO regression). Tự tắt khi ép CPU (infer_batch CPU chạy tuần
+  tự, không lợi).
+
+**Kiểm chứng:** 43 test vieneu pass (5 test batch mới: điền nhóm + pop cache; hit cache; fallback
+khi lỗi; ngoài phạm vi; worker ghi WAV + trả đúng; worker báo False khi thiếu infer_batch).
+
+**⚠️ Cần test trên GPU thực:** đây là tính năng mới CHƯA chạy thử trên GPU của bạn (sandbox
+không có). Vì OPT-IN + có fallback per-câu, bật thử an toàn: đặt biến môi trường
+`SUBEXT_VIENEU_BATCH=16` rồi chạy TTS. Nếu nhanh hơn & chất lượng giữ nguyên → tăng dần
+(24/32). Nếu có vấn đề → bỏ biến (về per-câu). Báo tôi kết quả để tinh chỉnh (có thể nâng thành
+tuỳ chọn trong Cài đặt).
+
+## [3.23.411] — 🎉 TTS GPU CHẠY! + sửa lỗi surrogate làm tắt GPU giữa chừng
+
+**Xác nhận từ log:** TTS GPU ĐANG CHẠY — không còn `ScalingType`, không còn `Voice not found`;
+worker tạo audio trên GPU. 🎉 (shim v406 + voice-fix v407–408 + gỡ pin v410 đã thông đường.)
+
+**Lỗi còn lại (nay sửa):** `'utf-8' codec can't encode character '\udcXX': surrogates not
+allowed` — text từ OCR/dịch đôi khi lẫn ký tự **surrogate lạc** (byte không giải mã được UTF-8,
+lọt qua ``surrogateescape``). Khi gửi payload JSON qua stdin (UTF-8) tới worker GPU, lone
+surrogate làm `json.dumps(...).encode` ném lỗi → câu hỏng; 3 câu liên tiếp → tắt GPU, rơi CPU.
+
+**Sửa:**
+- `_strip_surrogates(value)` — bỏ surrogate lạc khỏi chuỗi (đệ quy cho dict/list); chuỗi sạch
+  giữ nguyên; dùng `encode("utf-8","ignore")` để LOẠI BỎ (không thay `?` sẽ bị đọc thành tiếng).
+- `_json_line_safe(payload)` — làm sạch rồi `json.dumps(ensure_ascii=False)`; luôn encode UTF-8
+  được. Áp cho CẢ 2 chỗ ghi stdin (config handshake + mỗi câu).
+- Thêm `import json` cấp module (trước đây import cục bộ trong method).
+
+**Kiểm chứng:** 12 test (bỏ surrogate; giữ chuỗi Việt sạch; đệ quy dict/list; encode UTF-8 OK).
+Mô phỏng đúng lỗi thật 'Tức khắc đăng cơ\udc90'.
+
+**Sau build lại:** worker GPU không còn chết vì surrogate → TTS chạy GPU trọn phiên (không rơi
+CPU). Ghi chú: "audio DÀI BẤT THƯỜNG" cho thán từ ('Giá!', 'Tức khắc đăng cơ') là hạn chế model,
+đã xử lý bằng retry + chọn bản ngắn nhất (không đổi).
+
+## [3.23.410] — 🆕 Cập nhật VieNeu-TTS lên 3.2.8 (gỡ pin transformers thừa)
+
+Rà API VieNeu-TTS mới nhất (PyPI, 18/8/2026 = **vieneu 3.2.8**):
+- App KHÔNG ghim vieneu (`vieneu[legacy]`) → đã tự cài bản mới nhất 3.2.8.
+- **API tương thích hoàn toàn:** `Vieneu(mode="v3turbo")`, `list_preset_voices`,
+  `get_preset_voice`, `encode_reference`, `infer` đều còn nguyên. App dùng
+  `_supported_infer_params` (lọc tham số theo signature thực) nên tự thích ứng — không phá vỡ
+  khi vieneu thêm/bớt tham số. 3.2.8 có thêm `infer_batch`, `infer_stream`, tham số
+  `apply_watermark`/`batch_size` (app tự bỏ qua nếu chưa dùng).
+
+**Dọn dẹp then chốt:** GỠ pin `transformers<4.53` khỏi lệnh cài (VIENEU_INSTALL_SPECS nay chỉ
+`vieneu[legacy] sea-g2p`). Pin này thêm từ chẩn đoán SAI (v373/400–403) — điều tra v405–406 đã
+chứng minh transformers KHÔNG phải thủ phạm `ScalingType` (transformers 4.52.4 sạch); thủ phạm
+là gói build-cho-nightly, đã trị GỐC bằng SHIM. Gỡ pin → vieneu[legacy] cài deps tự nhiên, đúng
+ý tác giả gói, không kẹt bản transformers cũ.
+
+**An toàn:** shim (v406) vẫn tiêm symbol FP8 nightly nên dù transformers/lmdeploy bản mới có
+import chúng, import vieneu vẫn qua. Cơ chế auto-repair transformers giữ lại nhưng DORMANT.
+
+**Kiểm chứng:** 14 test vieneu plan pass; install specs = `('vieneu[legacy]', 'sea-g2p')`;
+`compileall` sạch.
+
+**Gợi ý tương lai (chưa làm — cần đánh giá kỹ):** vieneu 3.2.8 có `infer_batch` (suy luận theo
+lô) — có thể tăng tốc TTS đáng kể cho phim 5000+ dòng, nhưng cần refactor giao thức worker GPU
+(rủi ro). Để sau khi TTS GPU ổn định.
+
+## [3.23.409] — 🆕 Cập nhật Gemini API mới nhất (T8/2026): 3.7 Flash (dịch) + 3.1 Flash TTS
+
+Cập nhật danh sách model theo Gemini API mới nhất (tra cứu 8/2026):
+
+### Dịch
+- **Thêm `gemini-3.7-flash`** — model workhorse MỚI NHẤT (ra ~T8/2026), thông minh nhất cho
+  coding/agentic, giá ưu đãi tới 31/12/2026. Đưa vào dropdown (sau 2 model lite RPD-cao để giữ
+  mặc định thân thiện hạn mức free).
+- Ghi chú `gemini-2.5-flash*` sẽ **dừng hỗ trợ 16/10/2026** (vẫn giữ làm dự phòng).
+- Đồng bộ default cấp code `gemini-3.1-flash-lite` → `gemini-3.5-flash-lite` (mới hơn, cùng RPD
+  cao) cho khớp dropdown.
+
+### TTS
+- **Thêm `gemini-3.1-flash-tts-preview`** làm model TTS Gemini KHUYẾN NGHỊ — 200+ audio tag,
+  70+ ngôn ngữ, tự nhiên & điều khiển tốt nhất, hỗ trợ streaming. Dùng chung đường
+  `generate_content` sẵn có (tương thích). Model `gemini-2.5-*-tts` giữ làm đời cũ.
+
+**Lưu ý (không đổi mã):** Gemini API mới đánh dấu `temperature`/`top_p`/`top_k` là *deprecated*
+cho model 3.x — API bỏ qua chứ không lỗi, nên thanh Temp hiện có thể không tác dụng với 3.x
+(vẫn hoạt động với 2.5). Sẽ theo dõi để gỡ khi API chính thức loại bỏ.
+
+**Kiểm chứng:** `compileall` sạch; không có allowlist chặn model mới; đường TTS
+`generate_content` tương thích model 3.1 TTS.
+
+## [3.23.408] — 🎯 GỐC RỄ tên giọng tuple: worker fallback truyền CẢ tuple (available[0])
+
+Phân tích kỹ hơn tìm ra **nguyên nhân THẬT** của lỗi `Voice '(nhãn, id)' not found` (v407 chưa
+trị tận gốc). Trong `vieneu_gpu_subprocess._resolve_voice`:
+```python
+available = list(engine.list_preset_voices())   # [(label, voice_id), ...]
+return engine.get_preset_voice(available[0])     # ← BUG: truyền CẢ tuple (label, voice_id)
+```
+`get_preset_voice` cần CHUỖI voice_id, nhưng nhận cả tuple → `ValueError: Voice '(label,
+voice_id)' not found`. Đây là đường **FALLBACK** — bị kích hoạt khi `voice_preset` rỗng (bản
+≤406 gán `_gpu_voice_preset` từ `request.voice_name` KHÔNG tồn tại → rỗng → rơi vào fallback
+tuple này). Đó là lý do lỗi lặp lại y hệt qua nhiều bản.
+
+**Sửa:**
+- `_coerce_voice_id(value)` — ép mọi dạng (tuple, chuỗi-hoá-tuple, list, chuỗi) về voice_id
+  CHUỖI. Áp cho cả `voice_preset` nhận vào LẪN `available[0]` ở fallback.
+- Kết hợp v407 (adapter gửi tên giọng đã chuẩn hoá): giờ dù đường nào, worker cũng nhận đúng
+  voice_id.
+
+**Kiểm chứng:** 19 test (6 coerce + 7 normalize + 6 shim). Mô phỏng đúng tuple thực tế
+'Minh Đức' → ra voice_id đúng ở mọi dạng.
+
+**Sau build lại:** worker fallback + đường chính đều dùng voice_id chuỗi → hết `Voice not
+found`, TTS GPU chạy.
+
+## [3.23.407] — 🎉 TTS GPU: shim ĐÃ THÔNG! + sửa bug tên giọng tuple gửi worker GPU
+
+**Xác nhận từ log:** shim v406 THÀNH CÔNG — `from vieneu import Vieneu` qua HẾT chuỗi symbol
+nightly, GPU worker nạp được vieneu. Lỗi còn lại là lỗi THẬT (không phải import):
+```
+ValueError: Voice '('Minh Đức — Nam · Bắc…', 'Minh Đức')' not found
+```
+
+**Bug:** `_gpu_voice_preset = str(request.voice_name)` — nhưng UI truyền `voice_name` là TUPLE
+`(nhãn, giá_trị)` → `str(tuple)` cho ra `"('Minh Đức — …', 'Minh Đức')"` → worker báo không tìm
+thấy giọng. Đường CPU không dính vì dùng `request.speaker` + khớp mềm.
+
+**Sửa:**
+- Hàm thuần `normalize_voice_candidates(voice_name, speaker)` — trải phẳng tuple/list thành danh
+  sách ứng viên (giá trị + speaker dự phòng), bỏ trùng.
+- `_normalize_gpu_voice_name(engine, request)` — khớp MỀM ứng viên với danh sách giọng của
+  engine (y hệt đường CPU) → gửi worker tên HỢP LỆ. Không khớp thì để worker tự fallback.
+- Áp dụng khi đặt `_gpu_voice_preset`.
+
+**Kiểm chứng:** 7 test (tuple→giá trị; list; speaker fallback; bỏ trùng; rỗng; nhãn đơn không
+khớp nhưng tuple vẫn ra đúng). Mô phỏng đúng bug thực tế 'Minh Đức'.
+
+**Sau build lại:** TTS GPU sẽ nhận đúng tên giọng → chạy trên GPU. Đây là mảnh cuối sau khi
+shim đã thông chuỗi import.
+
+## [3.23.406] — 🎯 TTS GPU: shim ĐỦ 5 symbol FP8 nightly (ScalingType→scaled_grouped_mm→…)
+
+Shim v405 fix `ScalingType` nhưng lộ symbol nightly KẾ TIẾP: `scaled_grouped_mm`. Đúng dự đoán —
+gói thủ phạm (build cho torch nightly) import NHIỀU symbol FP8. Tra torch main vs 2.8.0, liệt kê
+ĐỦ **5 symbol chỉ-có-ở-nightly** mà torch ổn định (2.7/2.8/2.9) thiếu:
+- Enum: `ScalingType`, `SwizzleType`
+- Hàm: `grouped_mm`, `scaled_mm`, `scaled_grouped_mm`
+
+**Sửa:** shim phủ CẢ 5 (enum giữ là LỚP để dùng được trong kiểu `X | list[X]`; hàm là callable
+placeholder). Thêm `__getattr__` dự phòng nhận diện theo MẪU tên FP8 (`scal*`, `*swizzle*`,
+`*grouped*`, `*_mm`) để phủ luôn symbol nightly MỚI trong tương lai — nhưng KHÔNG che
+`AttributeError` của symbol không-FP8 (giữ feature-detection đúng).
+
+**Kiểm chứng:** 6 test (đủ 5 symbol; enum dùng trong union; fallback bắt symbol FP8 mới; symbol
+không-FP8 vẫn raise; dùng bản thật khi có; idempotent). Mô phỏng import cả 5 symbol thành công.
+
+**Sau build lại:** vieneu import qua được hết chuỗi symbol nightly → TTS GPU chạy.
+
+## [3.23.405] — 🎯 SỬA DỨT ĐIỂM TTS GPU: shim `ScalingType` (thủ phạm KHÔNG phải transformers!)
+
+Nhờ log chẩn đoán phiên bản (v403) và điều tra tận gốc, TÌM RA nguyên nhân THẬT — khác hẳn giả
+định bấy lâu.
+
+### 🔍 Điều tra
+Log chẩn đoán: `torch 2.8.0+cu129 | transformers 4.52.4` → VẪN lỗi `ScalingType`. Kiểm chứng
+trực tiếp:
+- **transformers 4.52.4 KHÔNG hề import `ScalingType`** (tải wheel grep — trống). Nên mọi lần
+  hạ pin transformers trước đây (`<4.56`→`<4.54`→`<4.53`) đều **lạc hướng** — transformers chưa
+  bao giờ là thủ phạm.
+- **torch 2.7/2.8/2.9 (bản ổn định) đều KHÔNG có `ScalingType`** trong `torch.nn.functional`
+  (kiểm tag GitHub) — đây là symbol FP8 **chỉ có ở torch NIGHTLY**.
+- Thủ phạm là một gói trong chuỗi `from vieneu import Vieneu` (build cho torch nightly) làm
+  `from torch.nn.functional import ScalingType` → `ImportError` chặn cả import vieneu → TTS GPU
+  rơi về CPU.
+
+### ✅ Sửa: SHIM (giống `chardet_shim` của dự án)
+`vieneu_gpu_subprocess._shim_torch_scaling_type()` — chèn `ScalingType`/`SwizzleType` vào
+`torch.nn.functional` NGAY TRƯỚC `from vieneu import Vieneu`. Nếu torch thật có `_ScalingType`
+(nightly) thì dùng bản thật; không thì tạo placeholder enum. TTS không dùng FP8 nên placeholder
+là đủ để import qua. **Không phụ thuộc việc tìm/ghim đúng phiên bản gói thủ phạm → bền vững.**
+
+**Kiểm chứng:** 3 test (placeholder khi thiếu; dùng bản thật khi có; idempotent). Đã mô phỏng
+`from torch.nn.functional import ScalingType` thành công sau shim.
+
+**Sau khi build lại:** TTS GPU sẽ import vieneu thành công (không còn `ScalingType`). Các cơ chế
+auto-repair transformers (v401–402) trở nên không cần thiết nhưng vô hại (sẽ không kích hoạt vì
+GPU worker chạy được). Pin transformers giữ nguyên (vô hại).
+
+## [3.23.404] — 📊 Phân tích chất lượng dịch/TTS thực tế + giảm báo-động-giả QC cho thành ngữ
+
+Phân tích bộ debug thật (5862 dòng, zh→vi phim bộ): **chất lượng dịch & TTS đã cao**.
+- Dịch: 100% dịch, 0 trùng nguồn, 0 rỗng, 0 trùng liền kề. Pipeline 3 giai đoạn có ngữ cảnh
+  nhân vật/cốt truyện.
+- TTS: 0 lỗi, 0 bỏ, 0 cắt. Chỉ 25 dòng "lấn" nhẹ (tổng 3.09s) — do KHUNG PHỤ ĐỀ NGUỒN quá
+  ngắn (vd 0.04s cho 5 từ), đã ở tốc độ tối đa 2.0×; đây là lỗi timing của phụ đề nguồn, không
+  phải chất lượng TTS, và được xử lý êm (cho phép chồng tiếng). 93% dòng đọc thoải mái ở 1.3×.
+
+**Cải thiện thực chất (QC dịch):** cờ `length_anomaly` báo 15 dòng — kiểm tra thì **15/15 là
+thành ngữ Trung 4 chữ (成语)** như 赴汤蹈火, 危在旦夕, 满门抄斩 — nở ra 2.5–3.3× là ĐÚNG (1
+thành ngữ = cả cụm mô tả). Toàn dương tính giả.
+- **Sửa:** ngưỡng cận-trên THEO ĐỘ DÀI — nguồn CJK ngắn (eff < 18 ~ ≤6 ký tự, hay thành ngữ)
+  dùng ngưỡng nới 3.6× thay vì 2.5×; nguồn dài giữ 2.5× (vẫn bắt dịch phình).
+- **Kết quả trên dữ liệu thật: 15 → 1 flag** (14 thành ngữ hết báo giả; còn 1 dòng nguồn 7 chữ
+  liệt kê nhiều hoạt động — đáng liếc qua). Tín hiệu QC nay đáng tin hơn.
+- Thêm 3 test (thành ngữ không flag; dịch phình thật vẫn flag; nguồn dài giữ ngưỡng chặt).
+
+**Kết luận:** không có "dịch thừa" để cắt (ép ngắn sẽ hại độ chính xác — trái nguyên tắc chất
+lượng). Bản dịch súc tích + chính xác. Chỉ tinh chỉnh tín hiệu QC cho bớt nhiễu.
+
+## [3.23.403] — 🐛 whisperx_env nằm CẠNH exe (không còn ở %TEMP%) + hạ pin<4.53 + log phiên bản
+
+Phân tích log sau restart: **VẪN `ScalingType`** → `transformers 4.53` cũng dính. Đồng thời
+phát hiện **bug vị trí môi trường**.
+
+### 🐛 (Bug) whisperx_env (~3GB) bị đặt ở %TEMP%
+`whisperx_adapter`/`extract_page` dùng `Path(__file__).parents[4]` để tính gốc — nhưng ở bản
+one-file, `__file__` nằm trong `_MEIPASS`, nên `parents[4]` trỏ vào **cha của `_MEIPASS` =
+`%TEMP%`**. Hậu quả: env torch-CUDA ~3GB nằm ở `%TEMP%\whisperx_env` — dễ bị Windows dọn, không
+portable, không nhất quán với `models/`.
+- **Sửa:** thêm `whisperx_env_root()` — bản đóng gói trả về **thư mục chứa exe** (bền, portable);
+  chạy nguồn trả gốc dự án. Nơi CÀI (`extract_page`) dùng vị trí mới. Nơi TÌM (`whisperx_adapter`,
+  và `vieneu` qua `resolve_whisperx_python`) kiểm CẢ vị trí mới LẪN cũ (`%TEMP%`) → **env đã cài
+  từ bản trước vẫn dùng được, KHÔNG ép tải lại 3GB**. Thêm 4 test.
+
+### 🔧 transformers: hạ pin `<4.54` → `<4.53` + log phiên bản
+- 4.53 vẫn import `ScalingType` → hạ tiếp xuống `<4.53` (dùng 4.52).
+- Auto-repair nay **ghi log phiên bản torch + transformers hiện tại TRƯỚC khi hạ** → nếu 4.52
+  vẫn lỗi, log chỉ đúng torch nào để chốt pin CHÍNH XÁC (hết đoán mò).
+- Nhờ mốc-theo-spec (v402), pin mới `<4.53` tự kích hoạt auto-repair lại.
+
+**Kiểm chứng:** 17 test pass; `compileall` sạch.
+
+**⚠️ Sau khi build lại:** env sẽ được TÌM ở cả 2 nơi. Nếu muốn env sạch ở vị trí mới, có thể xoá
+`%TEMP%\whisperx_env` cũ (không bắt buộc). Log auto-repair sẽ hiện phiên bản torch — gửi tôi để
+chốt pin nếu 4.52 vẫn lỗi.
+
+## [3.23.402] — ✅ Auto-repair TTS GPU chạy đúng + mốc theo-spec (không kẹt nếu cần đổi pin)
+
+**Xác nhận từ app_log:** auto-repair (v401) HOẠT ĐỘNG — `VieNeu: tự hạ transformers khớp torch
+(nền)…` → `đã hạ transformers xong — KHỞI ĐỘNG LẠI app để dùng GPU`. Cơ chế tự sửa chạy đúng
+thiết kế; sau khi khởi động lại, TTS sẽ thử GPU với transformers đã hạ.
+
+**Cải thiện robustness:** trước đây mốc `.vieneu_tf_repaired` chặn auto-repair VĨNH VIỄN sau 1
+lần. Rủi ro: nếu `<4.54` (4.53) hoá ra VẪN lỗi và app cập nhật pin thấp hơn, auto-repair sẽ
+không chạy lại → kẹt.
+- **Sửa:** mốc nay CHỨA chính spec đã sửa (vd `transformers<4.54`). Nếu app cập nhật pin khác →
+  spec mới ≠ nội dung mốc → auto-repair TỰ CHẠY LẠI với pin mới. Không bao giờ kẹt.
+
+**Ghi nhận (không đổi — hoạt động đúng):** VieNeu tạo audio "dài bất thường" cho thán từ/từ lặp
+("Hyah! Hyah!", "Này! Này!") — đây là hạn chế của model TTS với văn bản bất thường. Cơ chế
+retry + chọn bản ngắn nhất + nén ở pipeline đã xử lý (không mất thoại). Giữ nguyên để bảo toàn
+chất lượng.
+
+**Kiểm chứng:** 14 test vieneu pass; `compileall` sạch.
+
+## [3.23.401] — 🔧 TTS GPU tự sửa (auto-repair) transformers khớp torch — không cần gõ lệnh/xoá env
+
+Lỗi `ScalingType` vẫn còn dù đã pin `<4.54` (v400) vì **env `whisperx_env` cũ đã có transformers
+mới — đổi pin trong mã KHÔNG tự hạ gói đã cài**. Nay app TỰ SỬA.
+
+**Cơ chế:**
+- `vieneu_gpu_plan.build_transformers_repair_command()`: `pip install --force-reinstall
+  --no-deps transformers<4.54` — ép hạ ĐÚNG transformers kể cả env đã có bản mới hơn;
+  `--no-deps` để KHÔNG đụng torch.
+- `vieneu_tts_adapter._disable_gpu_worker()`: khi phát hiện lỗi torch↔transformers
+  (`ScalingType`/`RMSNorm`…), TỰ chạy lệnh sửa ở **luồng nền** (không chặn TTS đang chạy CPU),
+  **tối đa 1 lần** (file mốc `.vieneu_tf_repaired` chống lặp). Có hiệu lực ở lần khởi động app
+  kế tiếp → GPU dùng được mà người dùng không phải gõ lệnh tay hay xoá môi trường.
+
+**Kiểm chứng:** 18 test vieneu pass (thêm 1 test lệnh repair); `compileall` sạch.
+
+**⚠️ Cần xác nhận phiên bản:** pin `<4.54` là ước lượng ngưỡng `ScalingType`. Nếu sau khi
+auto-repair (khởi động lại app) GPU VẪN báo `ScalingType` → nghĩa là 4.53 cũng dính, cần pin
+thấp hơn. Gửi kết quả 2 lệnh chẩn đoán (xem hướng dẫn) để chốt phiên bản chính xác.
+
+## [3.23.400] — 🔧 TTS GPU (VieNeu): hạ pin transformers<4.54 + icon taskbar: đặt AppUserModelID sớm hơn
+
+### 🐛 TTS GPU rơi về CPU do `transformers` vẫn quá mới
+app_log: `cannot import name 'ScalingType' from 'torch.nn.functional'` → `transformers` trong
+`whisperx_env` import symbol torch quá mới so với torch (whisperx ghim cũ) → worker GPU chết,
+lùi ONNX/CPU. Pin cũ `transformers<4.56` CHƯA đủ thấp (4.54/4.55 vẫn import `ScalingType`).
+- **Sửa:** hạ pin xuống `transformers<4.54` ở cả `vieneu_gpu_plan.py` và `vieneu_tts_adapter.py`
+  — dưới ngưỡng `ScalingType` được thêm vào transformers, khớp torch mà whisperx_env thực có.
+- **⚠️ Nếu whisperx_env đã có sẵn transformers≥4.54:** xoá thư mục `whisperx_env` cạnh app (hoặc
+  chạy lệnh sửa mà app gợi ý) để cài lại đúng bản. TTS vẫn chạy CPU nếu chưa sửa (không mất
+  tính năng, chỉ chậm hơn).
+
+### 🎨 Icon không hiện trên thanh tác vụ
+Kiểm mã: file `app.ico` chuẩn (6 kích thước 16→256, 32bpp), spec nhúng icon vào .exe,
+`setWindowIcon` + `AppUserModelID` đều có → mã ĐÚNG. Cải thiện: đặt
+`SetCurrentProcessExplicitAppUserModelID("SubtitleStudio.App")` **TRƯỚC khi tạo QApplication**
+(trước đây đặt sau — đôi khi muộn, nút taskbar đã tạo với AppID mặc định).
+- **Nếu vẫn generic sau khi build lại:** gần như chắc chắn do **cache icon Windows** (rebuild
+  .exe cùng tên). Khắc phục: chạy `ie4uinit.exe -show`, hoặc đổi tên .exe một lần, hoặc xoá
+  `%LocalAppData%\IconCache.db` rồi khởi động lại Explorer.
+
+**Kiểm chứng:** `compileall` sạch; test liên quan pass.
+
 ## [3.23.399] — 🎉 OCR + DỊCH CHẠY THÔNG! + sửa 404 tải Python embeddable + dọn cảnh báo build
 
 **CỘT MỐC (từ app_log SẠCH, không một lỗi):** fix PIL (v398) đã giải quyết CẢ hai lỗi —

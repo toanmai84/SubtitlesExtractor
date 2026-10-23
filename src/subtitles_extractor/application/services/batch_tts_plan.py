@@ -25,6 +25,7 @@ from pathlib import Path
 from subtitles_extractor.application.services.batch_publish_plan import (
     find_episode_videos,
 )
+from subtitles_extractor.application.services.output_variants import find_output_variants
 from subtitles_extractor.domain.value_objects.output_naming import (
     tts_audio_path,
     translated_subtitle_path,
@@ -97,7 +98,7 @@ def find_translated_subtitle(
         pass
 
     try:
-        matches = sorted(preferred.parent.glob(f"{video_path.stem}.translate.*.srt"))
+        matches = find_output_variants(preferred.parent, video_path.stem, "translate")
     except OSError as exc:
         logger.debug("Không quét được thư mục %s: %s", preferred.parent, exc)
         return None

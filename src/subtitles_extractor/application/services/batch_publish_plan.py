@@ -23,6 +23,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
+from subtitles_extractor.application.services.output_variants import find_output_variants
 from subtitles_extractor.domain.value_objects.output_naming import (
     tts_audio_path,
     tts_subtitle_path,
@@ -148,7 +149,7 @@ def find_tts_subtitle(video_path: Path, target_language: str = "") -> Path | Non
     reference = tts_subtitle_path(video_path, "")
     stem = reference.name[: -len(".tts.srt")]
     try:
-        matches = sorted(reference.parent.glob(f"{stem}.tts.*.srt"))
+        matches = find_output_variants(reference.parent, stem, "tts")
     except OSError:
         return None
     return matches[0] if matches else None

@@ -36,6 +36,7 @@ def test_halving_preserves_video_token_estimate() -> None:
     def fake_call_gemini(
         model_name: str, prompt: str, config: Any, validator: Any,
         *, cancel_cb: Any = None, video_files: Any = None, est_tokens: int = 0,
+        **_extra: Any,
     ) -> dict[str, Any]:
         recorded_est.append(est_tokens)
         call_count["n"] += 1
@@ -87,6 +88,7 @@ def test_no_video_estimate_stays_text_only() -> None:
     def fake_call_gemini(
         model_name: str, prompt: str, config: Any, validator: Any,
         *, cancel_cb: Any = None, video_files: Any = None, est_tokens: int = 0,
+        **_extra: Any,
     ) -> dict[str, Any]:
         recorded_est.append(est_tokens)
         return {

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from subtitles_extractor.application.services.output_variants import find_output_variants
 from subtitles_extractor.domain.value_objects.output_naming import tts_subtitle_path
 
 logger = logging.getLogger(__name__)
@@ -91,7 +92,7 @@ def find_tts_synced_subtitle(
     reference = tts_subtitle_path(tts_audio_path, "")
     stem = reference.name[: -len(".tts.srt")]
     try:
-        matches = sorted(reference.parent.glob(f"{stem}.tts.*.srt"))
+        matches = find_output_variants(reference.parent, stem, "tts")
     except OSError as exc:
         logger.debug("Không quét được thư mục %s: %s.", reference.parent, exc)
         return None

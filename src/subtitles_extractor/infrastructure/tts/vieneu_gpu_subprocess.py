@@ -49,6 +49,84 @@ def _eprint(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def _shim_torch_scaling_type() -> None:
+    """Tiêm các symbol FP8 CHỈ-CÓ-Ở-NIGHTLY vào ``torch.nn.functional`` nếu thiếu.
+
+    Bối cảnh (điều tra v3.23.405–406): một gói trong chuỗi ``from vieneu import Vieneu`` (build
+    cho torch NIGHTLY) import các symbol FP8 như ``ScalingType``, ``SwizzleType``,
+    ``scaled_grouped_mm``, ``scaled_mm``, ``grouped_mm`` từ ``torch.nn.functional``. Các symbol
+    này CHỈ có ở torch nightly; torch ỔN ĐỊNH (2.7/2.8/2.9) CHƯA có → ``ImportError`` chặn cả
+    việc import vieneu, khiến TTS GPU rơi về CPU. Đã kiểm chứng: torch 2.8.0 + transformers
+    4.52.4 đều KHÔNG có các symbol này (không phải lỗi phiên bản transformers).
+
+    Giải pháp SHIM (giống ``chardet_shim`` của dự án): chèn placeholder để ``from
+    torch.nn.functional import <symbol>`` thành công — TTS KHÔNG dùng FP8 nên placeholder chỉ
+    cần TỒN TẠI (không bao giờ bị gọi thật). Enum giữ là lớp enum (để dùng được trong kiểu
+    ``X | list[X]``); hàm là callable. Có ``__getattr__`` dự phòng theo MẪU tên FP8 để phủ luôn
+    symbol nightly mới (chống whack-a-mole), nhưng KHÔNG che symbol thiếu khác (giữ AttributeError
+    để feature-detection vẫn đúng).
+    """
+    import enum
+
+    import torch.nn.functional as functional
+
+    def _make_enum(symbol: str) -> type[enum.Enum]:
+        # Thử symbol THẬT từ torch._C trước (torch nightly), không thì tạo enum placeholder.
+        try:
+            import torch._C as _torch_c
+
+            real = getattr(_torch_c, f"_{symbol}", None)
+            if real is not None:
+                return real
+        except ImportError:
+            pass
+        return enum.Enum(
+            symbol, {"TensorWise": 0, "RowWise": 1, "BlockWise": 2, "Default": 3}
+        )
+
+    def _make_func(symbol: str):
+        def _placeholder(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError(
+                f"torch.nn.functional.{symbol} chỉ có ở torch nightly — "
+                "không khả dụng trên torch ổn định (TTS không dùng FP8)."
+            )
+
+        _placeholder.__name__ = symbol
+        return _placeholder
+
+    for symbol in ("ScalingType", "SwizzleType"):
+        if not hasattr(functional, symbol):
+            setattr(functional, symbol, _make_enum(symbol))
+    for symbol in ("grouped_mm", "scaled_mm", "scaled_grouped_mm"):
+        if not hasattr(functional, symbol):
+            setattr(functional, symbol, _make_func(symbol))
+
+    # Dự phòng: symbol FP8 nightly MỚI (chưa liệt kê) — chỉ nhận diện theo mẫu tên để KHÔNG
+    # che các AttributeError hợp lệ khác.
+    _original_getattr = getattr(functional, "__getattr__", None)
+
+    def _fp8_fallback(symbol: str) -> Any:
+        if _original_getattr is not None:
+            try:
+                return _original_getattr(symbol)
+            except AttributeError:
+                pass
+        lowered = symbol.lower()
+        is_fp8 = (
+            "scal" in lowered
+            or "swizzle" in lowered
+            or "grouped" in lowered
+            or lowered.endswith("_mm")
+        )
+        if is_fp8:
+            return _make_func(symbol)
+        raise AttributeError(
+            f"module 'torch.nn.functional' has no attribute {symbol!r}"
+        )
+
+    functional.__getattr__ = _fp8_fallback  # type: ignore[attr-defined]
+
+
 def _load_engine(mode: str) -> Any:
     """Nạp engine VieNeu ở chế độ PyTorch/CUDA.
 
@@ -72,6 +150,8 @@ def _load_engine(mode: str) -> Any:
             "VIENEU_GPU_UNAVAILABLE: torch có nhưng không thấy GPU CUDA dùng được."
         )
         raise SystemExit(EXIT_NO_GPU)
+
+    _shim_torch_scaling_type()
 
     try:
         from vieneu import Vieneu
@@ -101,6 +181,39 @@ def _load_engine(mode: str) -> Any:
     raise SystemExit(EXIT_LIBRARY_MISSING)
 
 
+def _coerce_voice_id(value: Any) -> str:
+    """[v3.23.408] Ép giá trị giọng về voice_id CHUỖI, chịu được tuple/list và chuỗi-tuple.
+
+    ``engine.get_preset_voice`` chỉ nhận CHUỖI voice_id. Nhưng qua nhiều đường, giá trị có thể
+    tới dưới dạng:
+    * ``(label, voice_id)`` — tuple từ ``list_preset_voices()``.
+    * ``"('label', 'voice_id')"`` — chuỗi hoá của tuple đó (bản cũ str(tuple)).
+    * ``"voice_id"`` — chuỗi đúng (giữ nguyên).
+
+    Trả về phần voice_id hợp lý nhất (phần tử cuối của tuple), hoặc chuỗi đã strip.
+
+    Args:
+        value: Giá trị giọng thô.
+
+    Returns:
+        Chuỗi voice_id (có thể rỗng nếu không suy ra được).
+    """
+    if isinstance(value, (tuple, list)):
+        return str(value[-1]).strip() if value else ""
+    text = str(value or "").strip()
+    # Chuỗi hoá của tuple: "('Minh Đức — …', 'Minh Đức')" → lấy cụm trong dấu nháy cuối cùng.
+    if text.startswith("(") and text.endswith(")") and "," in text:
+        import ast
+
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, (tuple, list)) and parsed:
+                return str(parsed[-1]).strip()
+        except (ValueError, SyntaxError):
+            pass
+    return text
+
+
 def _resolve_voice(engine: Any, job: dict[str, Any]) -> Any:
     """Lấy dữ liệu giọng, ưu tiên tệp nhân bản nếu có.
 
@@ -122,6 +235,9 @@ def _resolve_voice(engine: Any, job: dict[str, Any]) -> Any:
         return engine.encode_reference(reference)
 
     preset = job.get("voice_preset") or ""
+    # [v3.23.408] preset có thể là chuỗi HOẶC (do bản cũ) chuỗi tuple/tuple thật → chuẩn hoá
+    # về voice_id chuỗi trước khi tra.
+    preset = _coerce_voice_id(preset)
     if preset:
         try:
             return engine.get_preset_voice(preset)
@@ -136,7 +252,10 @@ def _resolve_voice(engine: Any, job: dict[str, Any]) -> Any:
     if not available:
         _eprint("VIENEU_GPU_NO_VOICE: engine không có giọng preset nào.")
         raise SystemExit(EXIT_RUNTIME_ERROR)
-    return engine.get_preset_voice(available[0])
+    # [v3.23.408] BUG: list_preset_voices() trả [(label, voice_id), ...]; trước đây truyền CẢ
+    # tuple available[0] vào get_preset_voice (cần chuỗi voice_id) → "Voice '(label, id)' not
+    # found". Lấy đúng voice_id (phần tử [1] của tuple, hoặc chính nó nếu đã là chuỗi).
+    return engine.get_preset_voice(_coerce_voice_id(available[0]))
 
 
 def _supported_infer_params(engine: Any) -> frozenset[str]:
@@ -147,6 +266,20 @@ def _supported_infer_params(engine: Any) -> frozenset[str]:
         return frozenset(inspect.signature(engine.infer).parameters)
     except (AttributeError, TypeError, ValueError):
         return frozenset()
+
+
+def _no_surrogates(text: str) -> str:
+    """[v3.23.414] Loại lone surrogate khỏi chuỗi (an toàn cho encode UTF-8).
+
+    JSON round-trip qua stdin có thể tái tạo lone surrogate: adapter (bản cũ) escape thành
+    ``\\udcXX`` (ASCII, ghi được), ``json.loads`` ở worker dựng lại lone surrogate → khi đưa vào
+    model/ghi WAV/echo lỗi sẽ ném ``surrogates not allowed``. Làm sạch NGAY sau khi nhận text.
+    """
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "ignore").decode("utf-8")
 
 
 def _write_wav(path: str, samples: Any, sample_rate: int) -> None:
@@ -192,14 +325,17 @@ def run_job(job_path: Path) -> int:
     sample_rate = int(job.get("sample_rate") or 48000)
 
     results: list[dict[str, Any]] = []
+    role_voices: dict[str, Any] = {}
     for index, item in enumerate(items):
-        text = str(item.get("text") or "").strip()
+        text = _no_surrogates(str(item.get("text") or "").strip())
         output = str(item.get("output") or "")
         if not text or not output:
             results.append({"index": index, "ok": False, "error": "thiếu text/output"})
             continue
 
-        kwargs: dict[str, Any] = {"text": text, "voice": voice}
+        kwargs: dict[str, Any] = {
+            "text": text, "voice": _voice_for_item(engine, item, voice, role_voices),
+        }
         # Chỉ truyền tham số mà bản SDK này thực sự nhận — bản cũ không có 'style'.
         for name in ("max_new_frames", "style", "repetition_penalty", "temperature"):
             if name in item and item[name] is not None and name in supported:
@@ -217,6 +353,39 @@ def run_job(job_path: Path) -> int:
     return EXIT_OK
 
 
+def _voice_for_item(
+    engine: Any, item: dict[str, Any], default_voice: Any, cache: dict[str, Any]
+) -> Any:
+    """[v3.23.593] Giọng của một câu/lô: ``voice_preset`` của vai, hoặc giọng chung.
+
+    Lồng tiếng nhiều vai gửi kèm ID preset của vai trong từng yêu cầu. Giọng được giải
+    quyết MỘT lần cho mỗi ID rồi giữ lại (``cache``) — phim có vài chục vai, mỗi vai hàng
+    trăm câu.
+
+    Args:
+        engine: Engine đã nạp.
+        item: Yêu cầu (câu đơn hoặc lô).
+        default_voice: Giọng chung từ dòng cấu hình đầu tiên.
+        cache: Bộ nhớ giọng theo ID preset (sửa tại chỗ).
+
+    Returns:
+        Dữ liệu giọng truyền vào ``infer``/``infer_batch``.
+    """
+    preset = _coerce_voice_id(item.get("voice_preset") or "")
+    if not preset:
+        return default_voice
+    if preset not in cache:
+        # [v3.23.594] Gọi thẳng get_preset_voice: _resolve_voice lùi về giọng preset ĐẦU
+        # TIÊN khi không có giọng — vai thiếu giọng sẽ mượn giọng của vai khác. Lùi về
+        # giọng chung như đường CPU (_resolve_line_voice) thì dễ nhận ra hơn.
+        try:
+            cache[preset] = engine.get_preset_voice(preset)
+        except (KeyError, ValueError, RuntimeError, OSError, TypeError) as exc:
+            _eprint(f"VIENEU_GPU_VOICE_FALLBACK: {preset} -> giọng chung ({exc})")
+            cache[preset] = default_voice
+    return cache[preset]
+
+
 def serve() -> int:
     """Chế độ THƯỜNG TRÚ: nạp model một lần rồi phục vụ nhiều câu.
 
@@ -231,6 +400,7 @@ def serve() -> int:
     Giao thức (mỗi bên một dòng JSON)::
 
         vào : {"text": "…", "output": "…/1.wav", "max_new_frames": 350}
+              (tuỳ chọn "voice_preset": "<ID>" — giọng riêng của vai khi lồng tiếng)
         ra  : {"ok": true, "output": "…/1.wav"}   hoặc   {"ok": false, "error": "…"}
         vào : {"quit": true}      -> thoát
 
@@ -239,6 +409,15 @@ def serve() -> int:
     Returns:
         Mã thoát.
     """
+    # [v3.23.414] Bảo hiểm cấp STREAM: đọc/ghi UTF-8 với errors="replace" để lone surrogate
+    # (nếu lọt qua JSON round-trip: escape "\udcXX" → json.loads tái tạo lone surrogate) KHÔNG
+    # làm chết worker khi ghi reply. Kết hợp làm sạch text sau json.loads bên dưới.
+    for _stream in (sys.stdin, sys.stdout):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, OSError, ValueError):
+            pass
+
     first = sys.stdin.readline()
     if not first.strip():
         _eprint("VIENEU_GPU_BAD_JOB: thiếu dòng cấu hình đầu tiên.")
@@ -279,6 +458,7 @@ def serve() -> int:
 
     # Báo cho phía gọi biết đã sẵn sàng — nó đợi dòng này trước khi gửi câu đầu tiên.
     print(json.dumps({"ready": True}), flush=True)
+    role_voices: dict[str, Any] = {}
 
     for raw in sys.stdin:
         raw = raw.strip()
@@ -292,7 +472,15 @@ def serve() -> int:
         if item.get("quit"):
             break
 
-        text = str(item.get("text") or "").strip()
+        # [v3.23.412] Lệnh BATCH: {"batch":[{"text","output"},...]} → infer_batch (GPU gộp
+        # chunk mọi câu, chia sẻ forward → nhanh hơn nhiều). Chung MỘT giọng (đã resolve).
+        item_voice = _voice_for_item(engine, item, voice, role_voices)
+        batch = item.get("batch")
+        if isinstance(batch, list) and batch:
+            _handle_batch(engine, batch, item_voice, supported, sample_rate, item)
+            continue
+
+        text = _no_surrogates(str(item.get("text") or "").strip())
         output = str(item.get("output") or "")
         if not text or not output:
             print(
@@ -300,7 +488,7 @@ def serve() -> int:
             )
             continue
 
-        kwargs: dict[str, Any] = {"text": text, "voice": voice}
+        kwargs: dict[str, Any] = {"text": text, "voice": item_voice}
         for name in ("max_new_frames", "style", "repetition_penalty", "temperature"):
             if name in item and item[name] is not None and name in supported:
                 kwargs[name] = item[name]
@@ -314,6 +502,77 @@ def serve() -> int:
             print(json.dumps({"ok": False, "error": str(exc)}), flush=True)
 
     return EXIT_OK
+
+
+def _handle_batch(
+    engine: Any,
+    batch: list[dict[str, Any]],
+    voice: Any,
+    supported: frozenset[str],
+    sample_rate: int,
+    item: dict[str, Any],
+) -> None:
+    """[v3.23.412] Xử lý một LÔ câu bằng ``engine.infer_batch`` rồi ghi từng WAV.
+
+    Trả về ``{"ok": True, "batch": [output,...]}`` theo ĐÚNG thứ tự đầu vào; câu nào lỗi thì
+    ``output`` là chuỗi rỗng (adapter sẽ tự làm lại per-câu). Nếu SDK không có ``infer_batch``
+    hoặc lỗi toàn lô → ``{"ok": False}`` để adapter lùi về per-câu.
+
+    Args:
+        engine: Instance VieNeu.
+        batch: Danh sách ``{"text","output"}``.
+        voice: Dữ liệu giọng đã resolve.
+        supported: Tham số ``infer`` hỗ trợ (để lọc kwargs chung).
+        sample_rate: SR ghi WAV.
+        item: Job gốc (để lấy tham số chung như temperature).
+    """
+    if not hasattr(engine, "infer_batch"):
+        print(json.dumps({"ok": False, "error": "SDK không có infer_batch"}), flush=True)
+        return
+
+    texts = [_no_surrogates(str(entry.get("text") or "").strip()) for entry in batch]
+    outputs = [str(entry.get("output") or "") for entry in batch]
+
+    kwargs: dict[str, Any] = {"voice": voice}
+    for name in ("max_new_frames", "repetition_penalty", "temperature"):
+        if name in item and item[name] is not None and name in supported:
+            kwargs[name] = item[name]
+    # [v3.23.420] Số chunk/forward GPU (đòn bẩy VRAM/tốc độ). Mặc định vieneu = 4 (phí VRAM);
+    # adapter gửi giá trị theo VRAM (8GB→32…). Tên tham số KHÁC nhau theo mode: v3turbo dùng
+    # ``batch_size``, fast/turbo dùng ``max_batch_size`` → dò signature để truyền đúng tên.
+    gpu_subbatch = item.get("gpu_subbatch")
+    if gpu_subbatch:
+        try:
+            import inspect
+
+            batch_params = inspect.signature(engine.infer_batch).parameters
+            value = max(1, int(gpu_subbatch))
+            if "batch_size" in batch_params:
+                kwargs["batch_size"] = value
+            elif "max_batch_size" in batch_params:
+                kwargs["max_batch_size"] = value
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+    try:
+        audios = engine.infer_batch(texts, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — lỗi cả lô → để adapter lùi per-câu
+        _eprint(f"VIENEU_GPU_BATCH_ERROR: {exc}")
+        print(json.dumps({"ok": False, "error": str(exc)}), flush=True)
+        return
+
+    written: list[str] = []
+    for audio, output in zip(audios, outputs):
+        try:
+            if output and audio is not None and getattr(audio, "size", 0) > 0:
+                _write_wav(output, audio, sample_rate)
+                written.append(output)
+            else:
+                written.append("")  # câu rỗng → adapter làm lại per-câu
+        except Exception as exc:  # noqa: BLE001
+            _eprint(f"VIENEU_GPU_BATCH_WRITE_ERROR: {exc}")
+            written.append("")
+    print(json.dumps({"ok": True, "batch": written}), flush=True)
 
 
 def main() -> int:

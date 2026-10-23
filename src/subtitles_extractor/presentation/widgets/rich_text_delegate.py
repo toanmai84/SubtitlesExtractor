@@ -21,6 +21,10 @@ from subtitles_extractor.presentation.widgets.subtitle_table_model import SEARCH
 
 _ASS_TAG_REGEX = re.compile(r"\{.*?\}")
 _HTML_COLOR_REGEX = re.compile(r'color\s*=\s*[\'"]?[^\s>]*[\'"]?', re.IGNORECASE)
+_HTML_TAG_SPLIT_REGEX = re.compile(r"(<[^<>]*>)")
+_HIGHLIGHT_SPAN = (
+    r"<span style='background-color: #ffeb3b; color: #000000; font-weight: bold;'>\1</span>"
+)
 
 @lru_cache(maxsize=2048)
 def _compile_html_string(raw_text: str, is_selected: bool, text_color_hex: str, search_query: str) -> str:
@@ -32,12 +36,12 @@ def _compile_html_string(raw_text: str, is_selected: bool, text_color_hex: str, 
         html_content = _HTML_COLOR_REGEX.sub("", html_content)
 
     if search_query:
-        escaped_query = re.escape(search_query)
-        html_content = re.sub(
-            f"({escaped_query})",
-            r"<span style='background-color: #ffeb3b; color: #000000; font-weight: bold;'>\1</span>",
-            html_content,
-            flags=re.IGNORECASE
+        # [v3.23.614] Chỉ tô sáng phần CHỮ, không đụng vào thẻ: tìm "i" từng biến "<i>"
+        # thành "<<span…>i</span>>" và dòng in nghiêng hiện ra lẫn mã HTML vỡ.
+        query_pattern = re.compile(f"({re.escape(search_query)})", re.IGNORECASE)
+        html_content = "".join(
+            part if part.startswith("<") else query_pattern.sub(_HIGHLIGHT_SPAN, part)
+            for part in _HTML_TAG_SPLIT_REGEX.split(html_content)
         )
 
     return f"<div style='color: {text_color_hex}; margin: 0; padding: 0;'>{html_content}</div>"
@@ -137,8 +141,8 @@ class RichTextSubtitleDelegate(QStyledItemDelegate):
         if index.column() != self._text_column or not isinstance(editor, QPlainTextEdit):
             super().setModelData(editor, model, index)
             return
-        new_text = editor.toPlainText()
-        model.setData(index, new_text, Qt.ItemDataRole.EditRole)
-        model.setData(index, new_text, Qt.ItemDataRole.UserRole)
+        # [v3.23.650] CHỈ một lệnh setData: lệnh thứ hai (UserRole) dùng lại QModelIndex của proxy sau khi lệnh
+        # đầu đã làm model reset (use-after-free → SIGSEGV, app biến mất không log); model vốn bỏ qua UserRole.
+        model.setData(index, editor.toPlainText(), Qt.ItemDataRole.EditRole)
 
 __all__ = ["RichTextSubtitleDelegate"]

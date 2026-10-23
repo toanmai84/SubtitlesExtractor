@@ -60,9 +60,39 @@ def test_controls_disabled_for_non_edge_engines() -> None:
 
 
 def test_tooltip_hint_applied() -> None:
+    """[v3.23.547] Hậu tố tooltip nay lấy từ bộ từ điển i18n, không viết cứng nữa.
+
+    Bất biến giữ nguyên: engine ≠ Edge thì NỐI hậu tố vào tooltip; engine = Edge thì
+    CẮT hậu tố đi (nếu không, đổi qua đổi lại sẽ nối chồng nhiều lần).
+    """
     assert _EDGE_ONLY_HINT.strip().startswith("—")
     assert "chỉ áp dụng cho Edge TTS" in _EDGE_ONLY_HINT
-    assert "tip + _EDGE_ONLY_HINT" in _SRC  # thêm hậu tố khi không phải Edge
+
+    assert 'edge_hint = self._translator.translate("tts.edge_only_hint")' in _SRC
+    assert "tip = widget.toolTip().split(edge_hint)[0]" in _SRC  # cắt hậu tố cũ
+    assert "widget.setToolTip(tip if is_edge else tip + edge_hint)" in _SRC
+
+
+def test_edge_only_hint_catalogue_matches_module_constant() -> None:
+    """Chuỗi trong từ điển tiếng Việt phải KHỚP hằng số của module.
+
+    Hai nơi lệch nhau thì bước ``split(edge_hint)`` cắt trượt, tooltip sẽ nối chồng hậu
+    tố mỗi lần người dùng đổi engine.
+    """
+    import json
+
+    strings_vi = json.loads(
+        pathlib.Path("src/subtitles_extractor/data/strings_vi.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    strings_en = json.loads(
+        pathlib.Path("src/subtitles_extractor/data/strings_en.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert strings_vi["tts"]["edge_only_hint"] == _EDGE_ONLY_HINT
+    assert strings_en["tts"]["edge_only_hint"].strip().startswith("—")
 
 
 def test_debug_config_marks_inapplicable_fields() -> None:
@@ -71,9 +101,16 @@ def test_debug_config_marks_inapplicable_fields() -> None:
 
 
 def test_all_six_visible_widgets_covered() -> None:
-    # 6 control người dùng nhìn thấy trực tiếp phải nằm trong danh sách vô hiệu hoá.
+    # Control CHỈ Edge người dùng nhìn thấy trực tiếp phải nằm trong danh sách vô hiệu
+    # hoá.
+    # [v3.23.596] "Elastic timing" và "Nén êm" nay VieNeu/Gemini cũng dùng
+    # (``line_placement``) nên KHÔNG được khoá khi chọn hai engine đó.
+    body = _SRC.split("def _sync_edge_only_controls")[1].split("def ")[0]
     for widget in (
-        "self._strategy", "self._high_quality", "self._double_pass",
-        "self._elastic_timing", "self._comfort_ratio", "self._min_pause",
+        "self._strategy", "self._high_quality", "self._double_pass", "self._min_pause",
     ):
-        assert widget in _SRC.split("def _sync_edge_only_controls")[1].split("def ")[0]
+        assert widget in body
+    for shared in ("self._elastic_timing", "self._comfort_ratio"):
+        assert shared not in body
+    for field in ("elastic_timing", "max_drift_s", "comfort_speed_ratio"):
+        assert field not in _EDGE_ONLY_FIELDS

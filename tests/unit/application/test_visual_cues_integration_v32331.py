@@ -48,7 +48,9 @@ class _FakeTranslator:
 
     def translate_stage(self, *, stage, context, source_lines, input_lines,
                         has_prior_translation, progress_cb, cancel_cb,
-                        video_refs, attach_video):
+                        video_refs, attach_video,
+        **_extra,
+    ):
         # Ghi lại speaker đã được bơm vào để kiểm chứng.
         self.seen_speakers = [ln.speaker for ln in input_lines]
         return input_lines

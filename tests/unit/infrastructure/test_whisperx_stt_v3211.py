@@ -406,6 +406,14 @@ class TestSubprocessCrashRecovery:
         assert "PATH" in env
 
     def test_recovers_result_when_subprocess_crashes_after_dump(self, tmp_path, monkeypatch) -> None:
+        # [v3.23.538] Các test này giả lập Popen nên KHÔNG cần môi trường WhisperX thật.
+        # Trỏ biến môi trường về trình thông dịch hiện tại để qua bước kiểm môi trường,
+        # thay vì đòi người chạy phải dựng sẵn thư mục whisperx_env.
+        import sys as _sys
+
+        from subtitles_extractor.infrastructure.stt import whisperx_adapter as _wa
+
+        monkeypatch.setenv(_wa.WHISPERX_PYTHON_ENV_VAR, _sys.executable)
         import json as _json
 
         import subtitles_extractor.infrastructure.stt.whisperx_adapter as mod
@@ -456,6 +464,14 @@ class TestAlignDeviceCpu:
         assert TranscriptionConfig().align_device == "cpu"
 
     def test_align_device_passed_to_subprocess_config(self, tmp_path, monkeypatch) -> None:
+        # [v3.23.538] Các test này giả lập Popen nên KHÔNG cần môi trường WhisperX thật.
+        # Trỏ biến môi trường về trình thông dịch hiện tại để qua bước kiểm môi trường,
+        # thay vì đòi người chạy phải dựng sẵn thư mục whisperx_env.
+        import sys as _sys
+
+        from subtitles_extractor.infrastructure.stt import whisperx_adapter as _wa
+
+        monkeypatch.setenv(_wa.WHISPERX_PYTHON_ENV_VAR, _sys.executable)
         import json as _json
 
         import subtitles_extractor.infrastructure.stt.whisperx_adapter as mod
@@ -494,6 +510,14 @@ class TestAlignSeparateSubprocess:
     """[v3.23.7] Align chạy ở tiến trình con RIÊNG (tách cuDNN khỏi transcribe)."""
 
     def test_transcribe_then_align_two_subprocesses(self, tmp_path, monkeypatch) -> None:
+        # [v3.23.538] Các test này giả lập Popen nên KHÔNG cần môi trường WhisperX thật.
+        # Trỏ biến môi trường về trình thông dịch hiện tại để qua bước kiểm môi trường,
+        # thay vì đòi người chạy phải dựng sẵn thư mục whisperx_env.
+        import sys as _sys
+
+        from subtitles_extractor.infrastructure.stt import whisperx_adapter as _wa
+
+        monkeypatch.setenv(_wa.WHISPERX_PYTHON_ENV_VAR, _sys.executable)
         import json as _json
 
         import subtitles_extractor.infrastructure.stt.whisperx_adapter as mod
@@ -538,6 +562,14 @@ class TestAlignSeparateSubprocess:
         assert "words" in result.raw_segments[0]
 
     def test_no_align_when_disabled(self, tmp_path, monkeypatch) -> None:
+        # [v3.23.538] Các test này giả lập Popen nên KHÔNG cần môi trường WhisperX thật.
+        # Trỏ biến môi trường về trình thông dịch hiện tại để qua bước kiểm môi trường,
+        # thay vì đòi người chạy phải dựng sẵn thư mục whisperx_env.
+        import sys as _sys
+
+        from subtitles_extractor.infrastructure.stt import whisperx_adapter as _wa
+
+        monkeypatch.setenv(_wa.WHISPERX_PYTHON_ENV_VAR, _sys.executable)
         import json as _json
 
         import subtitles_extractor.infrastructure.stt.whisperx_adapter as mod

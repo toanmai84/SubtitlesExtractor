@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 
 class TranslationStageKind(Enum):
@@ -63,11 +63,12 @@ class TranslationStageConfig:
     tạp (STYLE/LOCALIZE) nhưng tốn thêm thời gian và token."""
     thinking_budget: int = -1
     """Token budget cho thinking: -1 = Dynamic (model tự quyết), 0 = Tắt,
-    1–32768 = giới hạn cụ thể. CHỈ áp dụng cho Gemini 2.5.x khi enable_thinking=True."""
+    1-32768 = giới hạn cụ thể. CHỈ áp dụng cho Gemini 2.5.x khi enable_thinking=True."""
     thinking_level: str = "low"
     """[v3.23.52] Mức suy nghĩ cho Gemini 3.x: 'low' (dịch — nhanh/rẻ, khuyến nghị),
     'medium', hoặc 'high'. Với Gemini 3.x, dùng trường này thay cho thinking_budget
-    (không được dùng cả hai). Dịch thuật nên để 'low' — suy nghĩ nhiều dễ phản tác dụng."""
+    (không được dùng cả hai). Dịch thuật nên để 'low' — suy nghĩ nhiều dễ phản tác
+    dụng."""
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,15 @@ StageProgressCallback = Callable[[float], None]
 # Callback kiểm tra yêu cầu huỷ; trả về True để dừng sớm.
 CancellationCallback = Callable[[], bool]
 
+# [v3.23.584] Callback nhận các dòng của MỘT lô vừa dịch xong (chỉ số theo
+# ``input_lines``) — để tầng ứng dụng lưu tiến độ GIỮA giai đoạn, lần chạy sau tiếp tục.
+BatchDoneCallback = Callable[[list[TranslationLine]], None]
+
+
+#: [v3.23.585] Lý do phân tích dừng khi CHƯA đủ mọi đoạn video.
+ANALYSIS_STOP_OVERLOAD = "overload"
+ANALYSIS_STOP_DAILY_QUOTA = "daily_quota"
+
 
 @dataclass(frozen=True)
 class SubtitleContextAnalysis:
@@ -142,7 +152,12 @@ class SubtitleContextAnalysis:
         characters:  Danh sách nhân vật phát hiện được, ngăn cách dấu phẩy.
         overview:    Tóm tắt súc tích cốt truyện/bối cảnh phim.
         glossary:    Bảng thuật ngữ & viết tắt để dịch nhất quán (mỗi dòng 'gốc => dịch').
-        visual_cues: Gợi ý hình ảnh "ai nói/nói với ai" (JSON rút gọn), rỗng nếu không bật.
+        visual_cues: Gợi ý hình ảnh "ai nói/nói với ai" (JSON rút gọn), rỗng nếu không
+            bật.
+        missing_segments: [v3.23.585] Số thứ tự (từ 1) các đoạn video CHƯA được phân
+            tích; rỗng khi phân tích đủ.
+        total_segments: Tổng số đoạn video của lượt phân tích (0 = không chia đoạn).
+        stop_reason: Vì sao dừng khi còn thiếu đoạn — ``ANALYSIS_STOP_*``, hoặc rỗng.
     """
 
     source_lang: str = ""
@@ -150,6 +165,9 @@ class SubtitleContextAnalysis:
     overview: str = ""
     glossary: str = ""
     visual_cues: str = ""
+    missing_segments: tuple[int, ...] = ()
+    total_segments: int = 0
+    stop_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -225,6 +243,27 @@ class TranslatorUnavailableError(SubtitleTranslationError):
     """Bộ dịch không khả dụng (thiếu thư viện ``google-genai`` hoặc thiếu API key)."""
 
 
+class ModelOverloadedError(SubtitleTranslationError):
+    """[v3.23.616] Model đang quá tải phía máy chủ (503/504/499) đã thử hết lượt.
+
+    Tách riêng để tầng giao diện báo bằng lời dễ hiểu kèm cách xử lý (thử lại sau ít phút,
+    đổi model nhẹ hơn) thay vì hiện nguyên chuỗi JSON lỗi tiếng Anh của máy chủ.
+
+    Attributes:
+        model_name: Model đang quá tải.
+    """
+
+    def __init__(self, message: str, model_name: str = "") -> None:
+        """Khởi tạo lỗi.
+
+        Args:
+            message: Thông điệp tiếng Việt cho người dùng.
+            model_name: Model đang quá tải.
+        """
+        super().__init__(message)
+        self.model_name = model_name
+
+
 class SubtitleTranslatorPort(Protocol):
     """Giao diện cho một bộ dịch phụ đề đa giai đoạn.
 
@@ -249,6 +288,9 @@ class SubtitleTranslatorPort(Protocol):
         cancel_cb: CancellationCallback | None = None,
         video_refs: list[Any] | None = None,
         attach_video: bool = False,
+        source_was_preprocessed: bool = False,
+        resume_lines: list[TranslationLine] | None = None,
+        batch_done_cb: BatchDoneCallback | None = None,
     ) -> list[TranslationLine]:
         """Chạy một giai đoạn dịch trên toàn bộ danh sách dòng.
 
@@ -260,6 +302,9 @@ class SubtitleTranslatorPort(Protocol):
             has_prior_translation: True nếu đã có bản dịch từ giai đoạn trước.
             progress_cb:           Callback tiến độ ``[0.0, 1.0]`` cho giai đoạn này.
             cancel_cb:             Callback kiểm tra huỷ; trả True để dừng sớm.
+            resume_lines:          [v3.23.584] Dòng đã dịch xong ở lần chạy DỞ của chính
+                giai đoạn này — lô nào có đủ mọi dòng thì dùng lại, không gọi API.
+            batch_done_cb:         [v3.23.584] Gọi sau mỗi lô dịch xong để lưu tiến độ.
 
         Returns:
             Danh sách dòng đã xử lý, cùng độ dài và cùng ``index`` với ``input_lines``.
@@ -313,6 +358,9 @@ class SubtitleTranslatorPort(Protocol):
         sleep_between_s: float = 4.0,
         cancel_cb: CancellationCallback | None = None,
         progress_cb: StageProgressCallback | None = None,
+        characters: str = "",
+        known_cues: list[VisualCue] | None = None,
+        context_lines: list[TranslationLine] | None = None,
     ) -> list[VisualCue]:
         """[Vision Director] Phân tích video → gợi ý hình ảnh cho TỪNG dòng phụ đề.
 
@@ -329,6 +377,9 @@ class SubtitleTranslatorPort(Protocol):
             sleep_between_s: Nghỉ giữa lô (giây) chống lỗi 429.
             cancel_cb:    Callback huỷ.
             progress_cb:  Callback tiến độ ∈ [0, 1].
+            characters:   [v3.23.562] Bảng nhân vật — nhãn spk/to phải khớp bảng.
+            known_cues:   [v3.23.581] Nhãn đã có của dòng không cần quét (mạch hội thoại).
+            context_lines: [v3.23.581] Toàn bộ dòng phụ đề (chữ của các dòng đó).
 
         Returns:
             Danh sách :class:`VisualCue` theo thứ tự dòng.
@@ -336,16 +387,41 @@ class SubtitleTranslatorPort(Protocol):
         ...
 
 
+@runtime_checkable
+class LineCharBudgetProvider(Protocol):
+    """[v3.23.605] Năng lực tuỳ chọn của bộ dịch: ngân sách ký tự mỗi dòng.
+
+    Đúng con số ``max_chars`` mà bộ dịch gửi kèm từng dòng cho model — để các lưới sau
+    giai đoạn đo bản dịch theo CÙNG thước đo mà model đã được yêu cầu.
+    """
+
+    def line_char_budgets(self, lines: list[TranslationLine]) -> dict[int, int]:
+        """Ngân sách ký tự theo số dòng.
+
+        Args:
+            lines: Dòng phụ đề có mốc thời gian (thường là câu gốc).
+
+        Returns:
+            ``{index: max_chars}``; dòng không có mốc thời gian hợp lệ thì vắng mặt.
+        """
+        ...
+
+
 __all__ = [
-    "TranslationStageKind",
-    "TranslationStageConfig",
+    "ANALYSIS_STOP_DAILY_QUOTA",
+    "ANALYSIS_STOP_OVERLOAD",
+    "BatchDoneCallback",
+    "CancellationCallback",
+    "LineCharBudgetProvider",
+    "ModelOverloadedError",
+    "StageProgressCallback",
+    "SubtitleContextAnalysis",
+    "SubtitleTranslationError",
+    "SubtitleTranslatorPort",
+    "TranslationCancelledError",
     "TranslationContext",
     "TranslationLine",
-    "SubtitleContextAnalysis",
-    "StageProgressCallback",
-    "CancellationCallback",
-    "SubtitleTranslationError",
-    "TranslationCancelledError",
+    "TranslationStageConfig",
+    "TranslationStageKind",
     "TranslatorUnavailableError",
-    "SubtitleTranslatorPort",
 ]
