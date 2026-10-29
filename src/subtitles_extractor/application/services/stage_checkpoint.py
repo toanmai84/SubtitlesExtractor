@@ -65,6 +65,7 @@ __all__ = [
     "legacy_checkpoint_key",
     "legacy_stage_config_signature",
     "line_input_digest",
+    "line_key_text",
     "lines_to_json",
     "prune_stage_checkpoints",
     "stage_config_signature",
@@ -151,9 +152,19 @@ def stage_input_fingerprint(
     Kết quả đã lưu của giai đoạn chỉ được dùng NGUYÊN khi đầu vào y hệt lần chạy trước.
     """
     payload = json.dumps(
-        [kind.value, [[line.index, line.text] for line in lines]], ensure_ascii=False
+        [kind.value, [[line.index, line_key_text(line)] for line in lines]], ensure_ascii=False
     )
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def line_key_text(line: TranslationLine) -> str:
+    """[v3.23.653] Phần của một dòng đầu vào quyết định bản dịch: chữ, kèm người nói/người nghe NGƯỜI DÙNG chọn.
+
+    Dòng không có cue người dùng → đúng chữ như trước (bộ nhớ đệm đã lưu vẫn khớp); đổi người nói ở trang TTS → dòng
+    đó khác vân tay → chỉ lô chứa nó được dịch lại (xưng hô theo người nói mới).
+    """
+    user_cue = getattr(line, "user_cue", "")
+    return line.text if not user_cue else f"{line.text}\x1f{user_cue}"
 
 
 def line_input_digest(text: str) -> str:
@@ -163,7 +174,7 @@ def line_input_digest(text: str) -> str:
 
 def stage_input_digests(lines: Iterable[TranslationLine]) -> dict[int, str]:
     """[v3.23.608] Vân tay từng dòng đầu vào, theo chỉ số dòng."""
-    return {line.index: line_input_digest(line.text) for line in lines}
+    return {line.index: line_input_digest(line_key_text(line)) for line in lines}
 
 
 def context_fingerprint(context: TranslationContext) -> str:
@@ -384,7 +395,7 @@ def carry_over_lines(
     for line in input_lines:
         saved = by_index.get(line.index)
         digest = stored_digests.get(line.index)
-        if saved is None or digest is None or digest != line_input_digest(line.text):
+        if saved is None or digest is None or digest != line_input_digest(line_key_text(line)):
             continue
         carried.append(saved)
     return carried

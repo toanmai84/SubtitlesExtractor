@@ -49,6 +49,81 @@ from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadK
 
 logger = logging.getLogger(__name__)
 
+
+def _roi_cache_path(cache_path: Path, index: int) -> Path:
+    """[v3.23.659] Tệp cache OCR của ROI thứ ``index`` (0 = tên gốc, ROI sau thêm ``_roi<n>``)."""
+    if index <= 0:
+        return cache_path
+    name = cache_path.name
+    for suffix in (".seraw.json.gz", ".seraw.json"):
+        if name.endswith(suffix):
+            return cache_path.with_name(f"{name[: -len(suffix)]}_roi{index + 1}{suffix}")
+    return cache_path.with_name(f"{cache_path.stem}_roi{index + 1}{cache_path.suffix}")
+
+
+class RebuildFromCacheWorker(QObject):
+    """[v3.23.659] Dựng lại phụ đề từ cache OCR thô của từng ROI ở luồng nền (không chạy lại OCR)."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+    done = Signal()
+
+    def __init__(self, jobs: list, video_path: Path) -> None:
+        super().__init__()
+        self._jobs = jobs
+        self._video_path = video_path
+        self._cancelled = False
+
+    def request_cancel(self) -> None:
+        """Dừng giữa các ROI (nút Huỷ của trang đang bật trong lúc dựng lại)."""
+        self._cancelled = True
+
+    def run(self) -> None:
+        from subtitles_extractor.application.dtos.extract_subtitles_dto import ExtractSubtitlesResponse
+        from subtitles_extractor.application.services.subtitle_builder import SubtitleBuilder
+        from subtitles_extractor.infrastructure.serializers.raw_ocr_serializer import load_raw_ocr
+        from subtitles_extractor.presentation.workers.extract_subtitles_worker import (
+            _merge_events,
+            _shift_event_coordinates,
+        )
+
+        try:
+            per_roi = []
+            total_frames = 0
+            for path, builder_config, clipped_roi, roi in self._jobs:
+                if self._cancelled:
+                    break
+                if not Path(path).is_file():
+                    continue
+                frames, _meta = load_raw_ocr(Path(path))
+                events = SubtitleBuilder(config=builder_config).build(frames, roi=clipped_roi)
+                # Toạ độ ô chữ tính trong ROI → đổi về toạ độ video như lúc trích xuất (khung OCR vẽ đúng chỗ).
+                _shift_event_coordinates(events, roi)
+                per_roi.append(events)
+                total_frames += len(frames)
+            if self._cancelled:
+                # Trang đã đặt cờ huỷ → hiển thị "đã huỷ", không nạp kết quả dở.
+                self.finished.emit(ExtractSubtitlesResponse(
+                    events=[], output_path=self._video_path, elapsed_seconds=0.0, frames_processed=total_frames,
+                ))
+                return
+            if not per_roi:
+                self.failed.emit("Chưa có cache OCR cho video này. Hãy chạy trích xuất một lần trước.")
+                return
+            events = per_roi[0] if len(per_roi) == 1 else _merge_events(per_roi)
+            logger.info("Đã dựng lại %d câu từ cache OCR (%d khung) — không chạy lại OCR.", len(events), total_frames)
+            self.finished.emit(ExtractSubtitlesResponse(
+                events=events, output_path=self._video_path, elapsed_seconds=0.0, frames_processed=total_frames,
+            ))
+        except (OSError, ValueError) as exc:
+            logger.warning("Không đọc được cache OCR: %s", exc)
+            self.failed.emit(f"Không đọc được cache OCR: {exc}")
+        except (IndexError, AttributeError, RuntimeError, TypeError) as exc:
+            logger.exception("Dựng lại phụ đề từ cache thất bại.")
+            self.failed.emit(f"Dựng lại thất bại: {exc}")
+        finally:
+            self.done.emit()
+
 class ExtractPageViewModel(QObject):
     video_loaded = Signal(object)
     progress_changed = Signal(int, int, str)
@@ -91,6 +166,7 @@ class ExtractPageViewModel(QObject):
         self._video: VideoMetadata | None = None
         self._roi: Roi | None = None
         self._is_busy = False
+        self._rebuild_worker: RebuildFromCacheWorker | None = None  # [v3.23.659]
         self._detected_rois: list[Roi] = []
         self._last_analysis_result = None
         # [Phần 6] Khi True: sau khi phân tích xong, tự chọn 1 ROI phụ đề đậm đặc
@@ -214,9 +290,18 @@ class ExtractPageViewModel(QObject):
     def _on_hardsub_detected(self, result: HardsubDetectionResult) -> None:
         self.hardsub_detected.emit(result)
 
-    def detect_auto_roi(self) -> None:
+    def detect_auto_roi(self, primary: bool = False) -> None:
+        """Tự dò ROI.
+
+        Args:
+            primary: [v3.23.659] ``True`` = tự chọn một ROI phụ đề chính (không mở hộp kiểm duyệt). Trước đây là cờ
+                đặt TRƯỚC khi gọi và chỉ được gỡ khi phân tích ra kết quả — không có chữ / dò lỗi / đang bận thì cờ
+                kẹt, lần bấm "Tự dò ROI" sau âm thầm chọn một ROI mà không hiện hộp kiểm duyệt.
+        """
+        self._primary_roi_mode = False
         if self._video is None or self._is_busy:
             return
+        self._primary_roi_mode = primary
         settings = self._container.settings_service.current
         step_ms = getattr(settings.roi, "auto_detect_step_ms", 1000)
 
@@ -254,8 +339,7 @@ class ExtractPageViewModel(QObject):
         ``_primary_roi_mode`` để khi phân tích xong sẽ tự chọn cụm đậm đặc nhất
         thay vì mở dialog kiểm duyệt.
         """
-        self._primary_roi_mode = True
-        self.detect_auto_roi()
+        self.detect_auto_roi(primary=True)
 
     def review_auto_roi_again(self) -> None:
         # [v3.6 bugfix RAR-1]: Kiểm tra _is_busy trước khi gọi dialog.
@@ -550,11 +634,13 @@ class ExtractPageViewModel(QObject):
         if self._video is None:
             return requests
         cache_path = raw_ocr_cache_path(self._video.path)
+        # [v3.23.659] Mỗi ROI một tệp cache (ROI 1 giữ tên cũ). Trước đây mọi ROI ghi CHUNG một tệp + checkpoint: ROI
+        # sau đè ROI trước, "Dựng lại từ OCR đã lưu" ra phụ đề sai và lượt tiếp tục của ROI này xoá checkpoint ROI kia.
         return [
             request
             if request.raw_ocr_output_path is not None
-            else dataclasses.replace(request, raw_ocr_output_path=cache_path)
-            for request in requests
+            else dataclasses.replace(request, raw_ocr_output_path=_roi_cache_path(cache_path, index))
+            for index, request in enumerate(requests)
         ]
 
     def has_cached_ocr(self) -> bool:
@@ -575,14 +661,8 @@ class ExtractPageViewModel(QObject):
 
         Phát ``extraction_finished`` khi xong, hoặc ``extraction_failed`` nếu lỗi.
         """
-        from subtitles_extractor.application.dtos.extract_subtitles_dto import (
-            ExtractSubtitlesResponse,
-        )
         from subtitles_extractor.domain.value_objects.output_naming import (
             raw_ocr_cache_path,
-        )
-        from subtitles_extractor.infrastructure.serializers.raw_ocr_serializer import (
-            load_raw_ocr,
         )
 
         if self._video is None or self._is_busy:
@@ -595,39 +675,39 @@ class ExtractPageViewModel(QObject):
             return
 
         try:
-            frames, _meta = load_raw_ocr(cache_path)
-        except (OSError, ValueError) as exc:
-            logger.warning("Không đọc được cache OCR %s: %s", cache_path, exc)
-            self.extraction_failed.emit(f"Không đọc được cache OCR: {exc}")
-            return
-
-        try:
-            from subtitles_extractor.application.services.subtitle_builder import (
-                SubtitleBuilder,
-            )
-
-            request = self._build_requests()[0]
-            # Dùng CHÍNH cấu hình dựng câu đang đặt trên giao diện -> đổi tham số rồi
-            # bấm dựng lại là thấy kết quả mới ngay.
-            builder = SubtitleBuilder(config=request.builder)
-            events = builder.build(frames, roi=request.roi)
+            requests = self._build_requests()
         except (IndexError, AttributeError, ValueError, RuntimeError) as exc:
-            logger.exception("Dựng lại phụ đề từ cache thất bại.")
             self.extraction_failed.emit(f"Dựng lại thất bại: {exc}")
             return
-
-        logger.info(
-            "Đã dựng lại %d câu từ cache OCR (%d khung) — không chạy lại OCR.",
-            len(events), len(frames),
+        # Dùng CHÍNH cấu hình dựng câu đang đặt trên giao diện -> đổi tham số rồi bấm dựng lại là thấy kết quả mới.
+        jobs = [
+            (_roi_cache_path(cache_path, index), request.builder, self._clipped_roi(request), request.roi)
+            for index, request in enumerate(requests or [None])
+            if request is not None
+        ]
+        # [v3.23.659] Đọc + dựng chạy ở LUỒNG NỀN: tệp cache 27k khung mất vài giây, phim ghép 2h24m > 15 s — trước đây
+        # cửa sổ đứng hình suốt thời gian đó.
+        worker = RebuildFromCacheWorker(jobs, self._video.path)
+        worker.finished.connect(self.extraction_finished)
+        worker.failed.connect(self.extraction_failed)
+        self._rebuild_worker = worker
+        worker.done.connect(
+            lambda w=worker: setattr(self, "_rebuild_worker", None) if self._rebuild_worker is w else None
         )
-        self.extraction_finished.emit(
-            ExtractSubtitlesResponse(
-                events=events, output_path=self._video.path,
-                elapsed_seconds=0.0, frames_processed=len(frames),
-            )
-        )
+        self._start_detection_worker(worker)
 
+    def _clipped_roi(self, request):
+        """[v3.23.655] ROI kẹp vào khung video như lúc trích xuất (bug #16) — dựng lại từ cache phải ra cùng kết quả."""
+        if request.roi is None:
+            return None
+        try:
+            from subtitles_extractor.application.use_cases.extract_subtitles import effective_roi
 
+            meta = self._container.make_load_video_metadata_use_case().execute(request.video_path)
+            return effective_roi(request.roi, meta.width, meta.height)
+        except Exception as exc:  # noqa: BLE001 — không đọc được video thì dùng ROI như cũ
+            logger.debug("Không đọc được kích thước video để kẹp ROI: %s", exc)
+            return request.roi
 
     @property
     def ocr_language_override(self) -> str:
@@ -819,7 +899,7 @@ class ExtractPageViewModel(QObject):
             self._benchmark_reporter.request_cancel()
         # [v3.22] Hủy cả worker nguồn mới (embedded OCR bitmap / STT WhisperX) — chúng
         # hỗ trợ dừng mềm giữa chừng qua request_cancel.
-        for worker_attr in ("_embedded_worker", "_transcribe_worker"):
+        for worker_attr in ("_embedded_worker", "_transcribe_worker", "_rebuild_worker"):
             worker = getattr(self, worker_attr, None)
             if worker is not None and hasattr(worker, "request_cancel"):
                 worker.request_cancel()
@@ -956,7 +1036,7 @@ class ExtractPageViewModel(QObject):
             builder=SubtitleBuilderConfig(
                 similarity_threshold=min(post.similarity_threshold, snapshot.threshold.text_similarity),
                 min_duration_sec=post.min_duration_sec, max_duration_sec=post.max_duration_sec,
-                merge_gap_sec=post.merge_gap_sec, min_confidence=snapshot.threshold.ocr_min_confidence,
+                merge_gap_sec=post.merge_gap_sec, merge_progressive=bool(getattr(post, "merge_progressive", False)), min_confidence=snapshot.threshold.ocr_min_confidence,
                 use_viterbi=post.use_viterbi, viterbi_open_penalty=post.viterbi_open_penalty,
                 min_text_chars=snapshot.threshold.drop_short_text_chars, line_similarity_threshold=snapshot.threshold.line_similarity,
                 sample_step_sec=snapshot.frame.sample_step_sec, temporal_padding_sec=post.temporal_padding_sec,

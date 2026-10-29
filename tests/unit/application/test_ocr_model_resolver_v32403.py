@@ -8,12 +8,13 @@ from subtitles_extractor.application.services.ocr_model_resolver import (
 from subtitles_extractor.infrastructure.settings.application_settings import OcrSettings
 
 
-def test_default_is_ppocrv6_medium() -> None:
+def test_default_is_ppocrv6_small() -> None:
+    """[v3.23.661] Mặc định đổi medium → small theo số đo thật trên phim mẫu."""
     settings = OcrSettings()
-    assert settings.version == "PP-OCRv6_medium"
+    assert settings.version == "PP-OCRv6_small"
     det, rec = resolve_ocr_model_names(settings)
-    assert det == "PP-OCRv6_medium_det"
-    assert rec == "PP-OCRv6_medium_rec"
+    assert det == "PP-OCRv6_small_det"
+    assert rec == "PP-OCRv6_small_rec"
 
 
 def test_resolve_ppocrv6_tiers() -> None:

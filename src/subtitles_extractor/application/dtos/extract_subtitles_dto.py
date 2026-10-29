@@ -36,6 +36,8 @@ class SubtitleBuilderConfig:
     alignment_center_tolerance_ratio: float = 0.10
     alignment_margin_tolerance_ratio: float = 0.20
     alignment_tolerance_min_px: float = 60.0
+    merge_progressive: bool = False
+    """[v3.23.654] Gộp phụ đề "hiện dần" (``我`` → ``我只是``) thành một câu (xem ``merge_progressive_events``)."""
 
 @dataclass(frozen=True, slots=True)
 class ExtractSubtitlesRequest:

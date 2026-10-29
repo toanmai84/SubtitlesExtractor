@@ -11,6 +11,7 @@ khi truy cập từ worker dịch (QThread).
 from __future__ import annotations
 
 import contextlib
+import logging
 import sqlite3
 
 from subtitles_extractor.infrastructure.database.db_guard import prepare_database
@@ -22,6 +23,9 @@ from subtitles_extractor.application.services.translation_memory import (
 )
 
 __all__ = ["SqliteTranslationMemoryStore"]
+
+
+logger = logging.getLogger(__name__)
 
 
 class SqliteTranslationMemoryStore:
@@ -41,7 +45,12 @@ class SqliteTranslationMemoryStore:
         self._conn.row_factory = sqlite3.Row
         with contextlib.suppress(sqlite3.Error):
             self._conn.execute("PRAGMA journal_mode=WAL")
-        self._init_db()
+        self._has_video_key = False
+        try:
+            self._init_db()
+        except sqlite3.Error:
+            self._conn.close()  # [v3.23.654] không rò kết nối (Windows khoá tệp CSDL khi còn handle mở)
+            raise
 
     def _init_db(self) -> None:
         with self._lock, self._conn:
@@ -56,6 +65,20 @@ class SqliteTranslationMemoryStore:
                 )
                 """
             )
+            # [v3.23.654] Ghi nhớ câu thuộc VIDEO nào để khi dịch lại chính video đó không lấy bản dịch cũ của nó làm
+            # "tham chiếu" (bộ nhớ tự nuôi chính nó, kể cả lỗi). Hàng cũ: NULL.
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(translation_memory)")}
+            self._has_video_key = "video_key" in columns
+            if not self._has_video_key:
+                try:
+                    self._conn.execute("ALTER TABLE translation_memory ADD COLUMN video_key TEXT")
+                    self._has_video_key = True
+                except sqlite3.OperationalError as exc:
+                    # CSDL đang bị khoá / chỉ đọc / phiên khác vừa thêm cột: dùng tiếp kiểu cũ, không treo/không vỡ.
+                    if "duplicate column" in str(exc).lower():
+                        self._has_video_key = True
+                    else:
+                        logger.warning("Bộ nhớ dịch: chưa thêm được cột video_key (%s) — tạm dùng như cũ.", exc)
             # [v3.23.56] Ngữ cảnh chung của phim bộ: bảng thuật ngữ + roster nhân vật +
             # tóm tắt — chia sẻ giữa các tập để không phải khai báo lại mỗi tập.
             self._conn.execute(
@@ -75,7 +98,7 @@ class SqliteTranslationMemoryStore:
         return str(series_key or "").strip()
 
     def add_entries(
-        self, series_key: str, entries: list[TranslationMemoryEntry]
+        self, series_key: str, entries: list[TranslationMemoryEntry], video_key: str = "",
     ) -> int:
         """Thêm/cập nhật các cặp câu đã dịch cho một phim bộ.
 
@@ -95,20 +118,33 @@ class SqliteTranslationMemoryStore:
         key = self._normalize_key(series_key)
         if not key:
             raise ValueError("series_key không được rỗng.")
+        video = str(video_key or "").strip() or None
         rows = [
-            (key, e.source_text.strip(), e.target_text.strip())
+            (key, e.source_text.strip(), e.target_text.strip(), video)
             for e in entries
             if e.source_text.strip() and e.target_text.strip()
         ]
         if not rows:
             return 0
         with self._lock, self._conn:
+            if not self._has_video_key:
+                self._conn.executemany(
+                    """
+                    INSERT INTO translation_memory (series_key, source_text, target_text, updated_at)
+                    VALUES (?, ?, ?, datetime('now'))
+                    ON CONFLICT(series_key, source_text)
+                    DO UPDATE SET target_text = excluded.target_text, updated_at = excluded.updated_at
+                    """,
+                    [row[:3] for row in rows],
+                )
+                return len(rows)
             self._conn.executemany(
                 """
-                INSERT INTO translation_memory (series_key, source_text, target_text, updated_at)
-                VALUES (?, ?, ?, datetime('now'))
+                INSERT INTO translation_memory (series_key, source_text, target_text, video_key, updated_at)
+                VALUES (?, ?, ?, ?, datetime('now'))
                 ON CONFLICT(series_key, source_text)
                 DO UPDATE SET target_text = excluded.target_text,
+                              video_key = excluded.video_key,
                               updated_at = excluded.updated_at
                 """,
                 rows,
@@ -116,7 +152,7 @@ class SqliteTranslationMemoryStore:
         return len(rows)
 
     def get_entries(
-        self, series_key: str, *, limit: int = 5000
+        self, series_key: str, *, limit: int = 5000, exclude_video: str = "",
     ) -> list[TranslationMemoryEntry]:
         """Lấy các cặp câu đã dịch của một phim bộ (mới nhất trước).
 
@@ -131,15 +167,24 @@ class SqliteTranslationMemoryStore:
         if not key:
             return []
         with self._lock, self._conn:
-            cursor = self._conn.execute(
-                """
-                SELECT source_text, target_text FROM translation_memory
-                WHERE series_key = ?
-                ORDER BY updated_at DESC
-                LIMIT ?
-                """,
-                (key, limit),
-            )
+            if not self._has_video_key:
+                # [v3.23.659] Chưa thêm được cột (CSDL bị khoá lúc mở): câu SQL có nhắc tới video_key lỗi ngay khi
+                # biên dịch ("no such column") dù điều kiện "? = 0" — trước đây làm tắt bộ nhớ dịch cả phiên.
+                cursor = self._conn.execute(
+                    "SELECT source_text, target_text FROM translation_memory WHERE series_key = ? "
+                    "ORDER BY updated_at DESC LIMIT ?",
+                    (key, limit),
+                )
+            else:
+                cursor = self._conn.execute(
+                    """
+                    SELECT source_text, target_text FROM translation_memory
+                    WHERE series_key = ? AND (video_key IS NULL OR video_key != ?)
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (key, str(exclude_video or "").strip(), limit),
+                )
             return [
                 TranslationMemoryEntry(
                     source_text=row["source_text"], target_text=row["target_text"]

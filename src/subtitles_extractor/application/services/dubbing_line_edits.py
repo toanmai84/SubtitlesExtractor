@@ -34,6 +34,7 @@ MAX_REMEMBERED_SUBTITLES = 40
 _KEY_SPEAKERS = "speakers"
 _KEY_TEXTS = "texts"
 _KEY_LINES = "lines"
+_KEY_ADDRESSEES = "addressees"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,11 +81,13 @@ class LineEdits:
     speakers: dict[int, str] = field(default_factory=dict)
     texts: dict[int, TextEdit] = field(default_factory=dict)
     lines: tuple[LineSnapshot, ...] | None = None
+    #: [v3.23.654] ``{vị trí: người được nói tới}`` chọn tay ("" = không nói với ai / độc thoại).
+    addressees: dict[int, str] = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
         """Không có chỉnh sửa nào."""
-        return not self.speakers and not self.texts and self.lines is None
+        return not self.speakers and not self.texts and self.lines is None and not self.addressees
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +212,10 @@ def encode_line_edits(edits: LineEdits) -> dict[str, object]:
             for position, edit in sorted(edits.texts.items())
         },
     }
+    if edits.addressees:
+        encoded[_KEY_ADDRESSEES] = {
+            str(position): addressee for position, addressee in sorted(edits.addressees.items())
+        }
     if edits.lines is not None:
         encoded[_KEY_LINES] = [
             [line.origin, line.start_sec, line.end_sec, line.text] for line in edits.lines
@@ -246,7 +253,16 @@ def decode_line_edits(raw: object) -> LineEdits:
                 and all(isinstance(part, str) for part in pair)
             ):
                 texts[position] = TextEdit(original=pair[0], edited=pair[1])
-    return LineEdits(speakers=speakers, texts=texts, lines=_decode_lines(raw.get(_KEY_LINES)))
+    addressees: dict[int, str] = {}
+    raw_addressees = raw.get(_KEY_ADDRESSEES)
+    if isinstance(raw_addressees, Mapping):
+        for key, addressee in raw_addressees.items():
+            position = _position(key)
+            if position is not None and isinstance(addressee, str):
+                addressees[position] = addressee
+    return LineEdits(
+        speakers=speakers, texts=texts, lines=_decode_lines(raw.get(_KEY_LINES)), addressees=addressees,
+    )
 
 
 def _decode_lines(raw: object) -> tuple[LineSnapshot, ...] | None:

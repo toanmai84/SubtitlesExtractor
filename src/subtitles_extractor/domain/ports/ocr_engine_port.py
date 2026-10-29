@@ -78,6 +78,12 @@ class OcrEnginePort(Protocol):
         images_rgb: list[np.ndarray],
         frame_indices: list[int],
         timestamps_sec: list[float],
-    ) -> list[OcrFrameResult]: ...
+    ) -> list[OcrFrameResult]:
+        """Nhận dạng một lô ảnh.
+
+        [v3.23.656] Engine thật nhận thêm ``config: OcrEngineConfig | None`` (cấu hình của LƯỢT gọi — không đổi
+        trạng thái engine dùng chung giữa các lượt chạy song song). Người gọi kiểm tra chữ ký trước khi truyền.
+        """
+        ...
 
 __all__ = ["OcrEngineConfig", "OcrEnginePort", "PreprocessConfig"]

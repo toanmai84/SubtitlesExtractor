@@ -90,7 +90,10 @@ def test_error_frames_stay_in_sequence_as_empty(tmp_path: Path) -> None:
 
     _run(tmp_path, _RecordingEngine(), _PatternSampler(kind))
     by_index = {index: boxes for index, _ts, boxes in _frames(tmp_path)}
-    assert by_index[7] == [] and by_index[8] == []
+    assert by_index[7] == []
+    # [v3.23.652] Khung trùng 8 trùng với khung ẢNH THẬT gần nhất (6 — bộ lọc trùng chỉ nhớ khung đã OCR), không với
+    # khung lỗi 7: chép chữ của 6 (trước đây ra rỗng → câu bị cắt khi có khung lỗi giải mã xen giữa).
+    assert by_index[8] == by_index[6]
     assert by_index[6] != [] and by_index[9] != []
 
 

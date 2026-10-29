@@ -189,8 +189,12 @@ def gated_loudness_from_kweighted(
     if n == 0:
         return float("-inf")
     block_size = max(1, int(sample_rate * block_ms / 1000.0))
-    n_blocks = n // block_size
-    if n_blocks == 0:
+    # [v3.23.662] BS.1770: block 400 ms CHỒNG 75% (bước 100 ms). Bản cũ dùng block rời → lệch tới 0,3 LU với thoại
+    # nhiều khoảng lặng (so pyloudnorm). Tính công suất theo khối con 1/4 block rồi trung bình trượt 4 khối con.
+    hop = max(1, round(block_size / 4))  # 11025 Hz: 1102 mẫu — lệch block 2 mẫu/4410, không đáng kể
+    n_hops = n // hop
+    n_blocks = n_hops - 3
+    if n // block_size == 0:
         # Tín hiệu ngắn hơn một block: đo trực tiếp toàn bộ (không đủ để gating).
         mean_square = float(np.mean(kweighted.astype(np.float64) ** 2))
         return (
@@ -203,12 +207,22 @@ def gated_loudness_from_kweighted(
     # K-weighted sang float64 rồi bình phương (~4x RAM audio, cộng dồn thành ~12x cho cả
     # bộ đo) -> phim dài ngốn hàng GB. Lô nhỏ giữ RAM tạm ở mức vài chục MB; kết quả
     # BIT-IDENTICAL (cùng phép toán, chỉ khác thứ tự gom).
-    block_ms_powers = np.empty(n_blocks, dtype=np.float64)
-    batch = 200  # ~200 x 400ms = 80s dữ liệu mỗi lô
-    for i in range(0, n_blocks, batch):
-        j = min(i + batch, n_blocks)
-        segment = kweighted[i * block_size : j * block_size].astype(np.float64)
-        block_ms_powers[i:j] = np.mean(segment.reshape(j - i, block_size) ** 2, axis=1)
+    if n_blocks > 0:
+        hop_powers = np.empty(n_hops, dtype=np.float64)
+        batch = 800  # ~800 x 100ms = 80s dữ liệu mỗi lô
+        for i in range(0, n_hops, batch):
+            j = min(i + batch, n_hops)
+            segment = kweighted[i * hop : j * hop].astype(np.float64)
+            hop_powers[i:j] = np.mean(segment.reshape(j - i, hop) ** 2, axis=1)
+        block_ms_powers = (hop_powers[:-3] + hop_powers[1:-2] + hop_powers[2:-1] + hop_powers[3:]) / 4.0
+    else:
+        # Block chỉ vài mẫu (tần số lấy mẫu rất thấp, chỉ gặp trong test): block rời như cũ.
+        n_blocks = n // block_size
+        block_ms_powers = np.empty(n_blocks, dtype=np.float64)
+        for i in range(0, n_blocks, 200):
+            j = min(i + 200, n_blocks)
+            segment = kweighted[i * block_size : j * block_size].astype(np.float64)
+            block_ms_powers[i:j] = np.mean(segment.reshape(j - i, block_size) ** 2, axis=1)
     block_loudness = np.full(n_blocks, -np.inf)
     valid = block_ms_powers > 1e-12
     block_loudness[valid] = -0.691 + 10.0 * np.log10(block_ms_powers[valid])

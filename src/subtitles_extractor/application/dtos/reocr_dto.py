@@ -147,6 +147,9 @@ class ReOcrResponse:
     frames_processed: int
     ranges_processed: int = 0
     was_cancelled: bool = False
+    #: [v3.23.659] Các khoảng OCR lại bị LỖI (giải mã hỏng, hết VRAM…): dòng gốc nằm trong các khoảng này phải được
+    #: GIỮ — trước đây vẫn bị xoá (không có bản thay) vì ``replaced_uids`` là toàn bộ dòng đã chọn.
+    failed_ranges: tuple[TimeRange, ...] = ()
 
 
 def _merge_overlapping_ranges(

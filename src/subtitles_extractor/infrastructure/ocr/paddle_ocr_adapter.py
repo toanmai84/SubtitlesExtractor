@@ -199,6 +199,14 @@ class PaddleOcrAdapter:
         self._active_device: DeviceKind | None = None
         self._init_lock: threading.RLock = threading.RLock()
         self._release_after_init: bool = False
+        # [v3.23.656] B1/B2: cấu hình MẶC ĐỊNH (Cài đặt) tách khỏi cấu hình đã DỰNG model (``_config``). Mỗi lượt chạy
+        # truyền cấu hình của nó vào ``infer_batch(config=…)``; trước đây lượt nào bắt đầu cũng ``apply_config`` lên
+        # engine dùng chung → Re-OCR chạy giữa lúc trích xuất âm thầm đổi ngưỡng/tiền xử lý của lượt trích xuất (đo:
+        # 17 → 4 ô chữ trên cùng 40 khung), đổi model thì giải phóng model giữa chừng.
+        self._default_config: OcrEngineConfig = config
+        #: Một lô suy luận tại một thời điểm; nạp lại model (khi lượt cần model khác) chỉ xảy ra trong khoá này.
+        self._infer_lock: threading.Lock = threading.Lock()
+        self._release_after_infer: bool = False
 
     @property
     def is_initialized(self) -> bool:
@@ -304,11 +312,31 @@ class PaddleOcrAdapter:
         return model
 
     def apply_config(self, new_config: OcrEngineConfig) -> None:
-        with self._init_lock:
-            requires_reload: bool = self._needs_model_reload(new_config)
+        """Đổi cấu hình MẶC ĐỊNH (Cài đặt).
+
+        [v3.23.656] Không giải phóng model (lượt khác có thể đang suy luận) và không chờ khoá nạp model (gọi từ luồng
+        giao diện khi lưu Cài đặt — trước đây đứng tới hết lượt nạp model). Lượt nào cần model khác sẽ tự nạp lại giữa
+        hai lô; đổi thông số không dựng vào model (ngưỡng, tiền xử lý) thì áp ngay cho lượt không truyền cấu hình.
+        """
+        self._default_config = new_config
+        if self._model is None or not self._needs_model_reload(new_config):
             self._config = new_config
-            if requires_reload and self._model is not None:
+
+    def prepare(self, config: OcrEngineConfig | None = None) -> None:
+        """[v3.23.656] Nạp sẵn model đúng cho cấu hình của lượt sắp chạy (tránh nạp hai lần lúc khởi động lạnh)."""
+        with self._infer_lock:
+            self._ensure_model_for(config if config is not None else self._default_config)
+
+    def _ensure_model_for(self, config: OcrEngineConfig) -> None:
+        """[v3.23.656] Model đang nạp phải khớp ``config`` (tên model, thiết bị…); lệch thì nạp lại. Gọi trong khoá suy luận."""
+        with self._init_lock:
+            if self._model is not None and self._needs_model_reload(config):
+                logger.info("Lượt OCR cần model/cấu hình dựng khác → nạp lại model (không lượt nào đang suy luận).")
                 self._release_internal()
+            if self._model is None:
+                self._config = config
+        if self._model is None:
+            self.initialize()
 
     def update_preprocess_config(self, new_config: OcrEngineConfig) -> None:
         self.apply_config(new_config)
@@ -316,6 +344,16 @@ class PaddleOcrAdapter:
     def release(self) -> None:
         # [v3.23.650] Không chặn luồng gọi (thường là giao diện lúc đóng app) khi ``initialize()`` đang giữ khoá:
         # đánh dấu để ``initialize()`` tự dọn sau khi nạp xong.
+        # [v3.23.656] Một lô đang suy luận: không giải phóng model/VRAM dưới chân nó — hoãn tới khi lô xong.
+        if not self._infer_lock.acquire(blocking=False):
+            self._release_after_infer = True
+            return
+        try:
+            self._release_locked_safely()
+        finally:
+            self._infer_lock.release()
+
+    def _release_locked_safely(self) -> None:
         if not self._init_lock.acquire(blocking=False):
             self._release_after_init = True
             return
@@ -349,16 +387,41 @@ class PaddleOcrAdapter:
         self._empty_paddle_vram()
         self._empty_cupy_pool()
 
-    def infer(self, image_rgb: np.ndarray, frame_index: int, timestamp_sec: float) -> OcrFrameResult:
-        results = self.infer_batch([image_rgb], [frame_index], [timestamp_sec])
+    def infer(
+        self, image_rgb: np.ndarray, frame_index: int, timestamp_sec: float, config: OcrEngineConfig | None = None,
+    ) -> OcrFrameResult:
+        results = self.infer_batch([image_rgb], [frame_index], [timestamp_sec], config=config)
         return results[0]
 
-    def infer_batch(self, images_rgb: list[np.ndarray], frame_indices: list[int], timestamps_sec: list[float]) -> list[OcrFrameResult]:
+    def infer_batch(
+        self, images_rgb: list[np.ndarray], frame_indices: list[int], timestamps_sec: list[float],
+        config: OcrEngineConfig | None = None,
+    ) -> list[OcrFrameResult]:
+        """Nhận dạng một lô ảnh.
+
+        Args:
+            config: [v3.23.656] Cấu hình của LƯỢT gọi (ngưỡng, tiền xử lý, model); ``None`` = cấu hình mặc định (Cài
+                đặt). Không đổi trạng thái của engine dùng chung.
+        """
         if not images_rgb: return []
-        if not self.is_initialized: self.initialize()
-        prepared_images = [self._prepare_image(img) for img in images_rgb]
-        bgr_list = [p.image_bgr for p in prepared_images]
-        raw_results = self._predict_batch(bgr_list, frame_indices)
+        with self._infer_lock:
+            if config is not None:
+                run_config = config
+            elif self._model is not None:
+                # [v3.23.656] Lượt không có cấu hình riêng (tự dò ROI, OCR phụ đề nhúng): dùng model đang nạp — trước
+                # đây chúng dùng cấu hình áp gần nhất; ép về Cài đặt sẽ nạp lại model qua lại với lượt trích xuất.
+                run_config = self._config
+            else:
+                run_config = self._default_config
+            self._ensure_model_for(run_config)
+            prepared_images = [self._prepare_image(img, run_config) for img in images_rgb]
+            bgr_list = [p.image_bgr for p in prepared_images]
+            try:
+                raw_results = self._predict_batch(bgr_list, frame_indices, run_config)
+            finally:
+                if self._release_after_infer:
+                    self._release_after_infer = False
+                    self._release_locked_safely()
 
         # [CRITICAL BUG FIX]: Đã thêm "prepared_images" vào trong zip()
         return [
@@ -366,15 +429,18 @@ class PaddleOcrAdapter:
             for raw, frame_idx, ts, prep in zip(raw_results, frame_indices, timestamps_sec, prepared_images, strict=True)
         ]
 
-    def _predict_batch(self, bgr_images: list[np.ndarray], frame_indices: list[int]) -> list[Any]:
+    def _predict_batch(
+        self, bgr_images: list[np.ndarray], frame_indices: list[int], config: OcrEngineConfig | None = None,
+    ) -> list[Any]:
         if self._model is None: raise OcrInferenceError("Model chưa khởi tạo.")
+        cfg = config if config is not None else self._config
         try:
             raw_output = self._model.predict(
                 input=bgr_images, use_doc_orientation_classify=False, use_doc_unwarping=False,
-                use_textline_orientation=self._config.use_textline_orientation,
-                **self._det_limit_kwargs(),
-                text_det_thresh=self._config.det_thresh, text_det_box_thresh=self._config.det_box_thresh,
-                text_det_unclip_ratio=self._config.det_unclip_ratio, text_rec_score_thresh=self._config.score_threshold,
+                use_textline_orientation=cfg.use_textline_orientation,
+                **self._det_limit_kwargs(cfg),
+                text_det_thresh=cfg.det_thresh, text_det_box_thresh=cfg.det_box_thresh,
+                text_det_unclip_ratio=cfg.det_unclip_ratio, text_rec_score_thresh=cfg.score_threshold,
             )
         except RuntimeError as exc:
             # [CRITICAL BUG FIX v2.9+]: Phân biệt lỗi OOM GPU với lỗi thông thường.
@@ -400,12 +466,12 @@ class PaddleOcrAdapter:
             materialized = materialized[:len(bgr_images)]
         return materialized
 
-    def _prepare_image(self, image_rgb: np.ndarray) -> _PreparedImage:
+    def _prepare_image(self, image_rgb: np.ndarray, config: OcrEngineConfig | None = None) -> _PreparedImage:
         if image_rgb is None or image_rgb.ndim < 2 or image_rgb.size == 0:
             black = np.zeros((_FALLBACK_BLACK_IMAGE_SIZE, _FALLBACK_BLACK_IMAGE_SIZE, 3), dtype=np.uint8)
             return _PreparedImage(image_bgr=black, scale=1.0, border_px=0)
 
-        pre = self._config.preprocess
+        pre = (config if config is not None else self._config).preprocess
         orig_height = float(max(1, image_rgb.shape[0]))
 
         working_rgb = apply_cpu_preprocessing_pipeline(
@@ -463,16 +529,17 @@ class PaddleOcrAdapter:
                 ) from exc
         raise OcrModelLoadError(f"Không khởi tạo được PaddleOCR sau {_MAX_INIT_RETRY} lần thử.")
 
-    def _det_limit_kwargs(self) -> dict[str, Any]:
+    def _det_limit_kwargs(self, config: OcrEngineConfig | None = None) -> dict[str, Any]:
         """[v3.23.619] Giới hạn cạnh ảnh khi dò chữ theo cài đặt; 0 = PaddleOCR tự quyết.
 
         Trước đây luôn truyền ``None`` → cài đặt "Giới hạn cạnh" ở trang Cài đặt/Biên
         tập/Debug không có tác dụng (đổi giá trị chỉ làm nạp lại model vô ích).
         """
-        side = int(self._config.limit_side_len or 0)
+        cfg = config if config is not None else self._config
+        side = int(cfg.limit_side_len or 0)
         if side <= 0:
             return {"text_det_limit_side_len": None, "text_det_limit_type": None}
-        kind = self._config.limit_type if self._config.limit_type in ("max", "min") else "max"
+        kind = cfg.limit_type if cfg.limit_type in ("max", "min") else "max"
         return {"text_det_limit_side_len": side, "text_det_limit_type": kind}
 
     def _build_init_kwargs(self, *, use_gpu: bool, use_trt: bool) -> dict[str, Any]:
@@ -519,11 +586,14 @@ class PaddleOcrAdapter:
         return (
             old.detection_model_name != new_config.detection_model_name or old.recognition_model_name != new_config.recognition_model_name
             or old.use_tensorrt != new_config.use_tensorrt or old.precision != new_config.precision
-            or old.limit_type != new_config.limit_type or old.limit_side_len != new_config.limit_side_len
-            or old.det_thresh != new_config.det_thresh or old.det_box_thresh != new_config.det_box_thresh
-            or old.det_unclip_ratio != new_config.det_unclip_ratio or old.use_textline_orientation != new_config.use_textline_orientation
+            # [v3.23.656] Ngưỡng dò chữ / giới hạn cạnh / ngưỡng nhận dạng truyền theo TỪNG lần predict → không cần
+            # nạp lại (trước đây đổi chúng nạp lại model 7–19 s; nay lượt trích xuất và Re-OCR khác ngưỡng xen kẽ nhau).
+            or old.use_textline_orientation != new_config.use_textline_orientation
             or old.enable_mkldnn != new_config.enable_mkldnn or old.batch_size != new_config.batch_size or old.language != new_config.language
             or old.det_batch_size != new_config.det_batch_size
+            # [v3.23.656] Thiết bị / luồng CPU / tham số thêm cũng dựng vào model.
+            or old.device != new_config.device or old.parallel_workers != new_config.parallel_workers
+            or old.extra_kwargs != new_config.extra_kwargs
         )
 
     @staticmethod

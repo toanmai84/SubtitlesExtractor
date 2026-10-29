@@ -337,7 +337,8 @@ def run_job(job_path: Path) -> int:
             "text": text, "voice": _voice_for_item(engine, item, voice, role_voices),
         }
         # Chỉ truyền tham số mà bản SDK này thực sự nhận — bản cũ không có 'style'.
-        for name in ("max_new_frames", "style", "repetition_penalty", "temperature"):
+        # [v3.23.663] + use_ref_codes: lần sinh lại câu ngắn bị đọc lặp tắt mã tham chiếu trong ngữ cảnh.
+        for name in ("max_new_frames", "style", "repetition_penalty", "temperature", "use_ref_codes"):
             if name in item and item[name] is not None and name in supported:
                 kwargs[name] = item[name]
 
@@ -489,7 +490,8 @@ def serve() -> int:
             continue
 
         kwargs: dict[str, Any] = {"text": text, "voice": item_voice}
-        for name in ("max_new_frames", "style", "repetition_penalty", "temperature"):
+        # [v3.23.663] + use_ref_codes: lần sinh lại câu ngắn bị đọc lặp tắt mã tham chiếu trong ngữ cảnh.
+        for name in ("max_new_frames", "style", "repetition_penalty", "temperature", "use_ref_codes"):
             if name in item and item[name] is not None and name in supported:
                 kwargs[name] = item[name]
 

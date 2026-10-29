@@ -152,7 +152,9 @@ class TestGeminiModels:
         self, qapp: QApplication, container: Any
     ) -> None:
         page = _tts_page(container)
-        assert page._gemini_model.itemText(0) == "gemini-3.8-flash-lite-tts"
+        # [v3.23.661] 3.8 Live lên đầu (không giới hạn lượt/ngày với key miễn phí); 3.8 Flash-Lite TTS vẫn có.
+        assert page._gemini_model.itemText(0) == "gemini-3.8-live"
+        assert page._gemini_model.findText("gemini-3.8-flash-lite-tts") >= 0
         assert page._gemini_model.findText("gemini-3.8-flash-tts") >= 0
 
     def test_translate_page_offers_38_flash(self) -> None:

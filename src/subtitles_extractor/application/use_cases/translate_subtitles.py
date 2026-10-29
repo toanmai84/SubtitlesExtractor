@@ -283,6 +283,7 @@ def build_stage_cache_scope(
         stages=tuple(request.stages),
         attach_video_stages=frozenset(request.attach_video_stages),
         context_fingerprint=context_fingerprint(request.context),
+        visual_cues=request.context.visual_cues or "",  # [v3.23.656]
     )
 
 
@@ -1884,9 +1885,17 @@ class TranslateSubtitlesUseCase:
         )
 
         sources = {ln.index: (ln.original_text or ln.text or "") for ln in source_lines}
-        fixes = fix_vocative_cue_labels(deserialize_visual_cues(raw), sources, characters)
+        original_cues = deserialize_visual_cues(raw)
+        fixes = fix_vocative_cue_labels(original_cues, sources, characters)
         if not fixes.changed:
             return request
+        from subtitles_extractor.application.services.visual_cue_serializer import keep_user_cues
+
+        # [v3.23.653] Người nói người dùng chọn (vd sửa ở trang TTS) không bị lưới tiếng gọi đảo lại.
+        kept = keep_user_cues(fixes.cues, original_cues)
+        if kept == sorted(original_cues, key=lambda cue: cue.line_no):
+            return request
+        fixes = replace(fixes, cues=kept)
         if fixes.kin_relabeled:
             logger.info(
                 "Đổi người nói ở %d tiếng gọi kèm vai vế có nhãn trái vai: %s",
@@ -2921,6 +2930,10 @@ class TranslateSubtitlesUseCase:
                 raise TranslationCancelledError("Người dùng đã huỷ tiến trình dịch.")
 
             stage_label = self._STAGE_LABELS.get(stage.kind, stage.kind.value)
+            # [v3.23.653] Người nói NGƯỜI DÙNG chọn là một phần đầu vào của dòng (vân tay bộ nhớ đệm).
+            from subtitles_extractor.application.services.visual_cue_serializer import tag_user_cues
+
+            current_lines = tag_user_cues(current_lines, request.context.visual_cues)
             stage_run = StageRun.for_stage(
                 stage, current_lines,
                 attach_video=stage.kind in request.attach_video_stages,

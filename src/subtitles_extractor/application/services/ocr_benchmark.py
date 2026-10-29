@@ -50,6 +50,8 @@ class BenchmarkScenario:
     det_batch: int | None = None
     gate: bool | None = None
     luma: int | None = None
+    #: [v3.23.657] Bộ dò chữ thay thế (vd ``PP-OCRv6_small_det``) — nhận dạng giữ nguyên.
+    det_model: str | None = None
 
     @property
     def lossless(self) -> bool:
@@ -67,10 +69,14 @@ DEFAULT_SCENARIOS: tuple[BenchmarkScenario, ...] = (
     BenchmarkScenario(
         "gate200_det8", "Lọc chữ sáng 200 + batch dò chữ 8", orientation=False, det_batch=8, gate=True, luma=200,
     ),
+    # [v3.23.657] Bộ dò chữ nhỏ (nhận dạng giữ model hiện tại): phần dò chữ chiếm phần lớn thời gian GPU.
+    BenchmarkScenario(
+        "det_small", "Bộ dò chữ v6 small (tải model lần đầu)", orientation=False, det_model="PP-OCRv6_small_det",
+    ),
 )
 
 #: Các kịch bản chọn sẵn (vừa đủ để quyết định, ~5 lượt đo).
-DEFAULT_KEYS: tuple[str, ...] = ("current", "no_orientation", "det8", "gate200", "gate200_det8")
+DEFAULT_KEYS: tuple[str, ...] = ("current", "no_orientation", "det8", "gate200", "gate200_det8", "det_small")
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +149,8 @@ def apply_scenario(
         ocr = dataclasses.replace(ocr, use_textline_orientation=scenario.orientation)
     if scenario.det_batch is not None:
         ocr = dataclasses.replace(ocr, det_batch_size=scenario.det_batch)
+    if scenario.det_model:
+        ocr = dataclasses.replace(ocr, detection_model_name=scenario.det_model)
     sampling = dataclasses.replace(
         base.sampling, skip_intro_sec=window.skip_intro_sec, skip_outro_sec=window.skip_outro_sec,
     )
@@ -186,7 +194,10 @@ def compare_events(reference: Sequence[EventSig], other: Sequence[EventSig]) -> 
 def current_settings_values(base: ExtractSubtitlesRequest) -> dict[str, dict[str, object]]:
     """Giá trị HIỆN TẠI của các cài đặt mà kịch bản có thể đổi, cùng dạng với ``Recommendation.settings_patch``."""
     return {
-        "ocr": {"use_textline_orientation": base.ocr.use_textline_orientation},
+        "ocr": {
+            "use_textline_orientation": base.ocr.use_textline_orientation,
+            "detection_model_override": str(getattr(base.ocr, "detection_model_name", "") or ""),
+        },
         "hardware": {"det_batch_size": int(getattr(base.ocr, "det_batch_size", 1) or 1)},
         "frame": {
             "white_text_gate": bool(getattr(base.sampling, "white_text_gate", False)),
@@ -247,6 +258,8 @@ def recommend(
         patch.setdefault("ocr", {})["use_textline_orientation"] = scenario.orientation
     if scenario.det_batch is not None:
         patch.setdefault("hardware", {})["det_batch_size"] = scenario.det_batch
+    if scenario.det_model:
+        patch.setdefault("ocr", {})["detection_model_override"] = scenario.det_model
     if scenario.gate is not None:
         patch.setdefault("frame", {})["white_text_gate"] = scenario.gate
     if scenario.luma is not None:

@@ -111,7 +111,8 @@ def test_adapter_load_sets_pause_first_and_never_uses_future_wait_v323651(monkey
     video = tmp_path / "a.mp4"
     video.write_bytes(b"x")
     adapter = MpvPlayerAdapter(wid=1234, mpv_options={})
-    assert created[0]["load_scripts"] is False and created[0]["ytdl"] is False
+    # [v3.23.665] created[0] có thể là lõi thăm dò tuỳ chọn (vo=null); lõi thật là bản cuối.
+    assert created[-1]["load_scripts"] is False and created[-1]["ytdl"] is False
     adapter.load(video)                        # FakeMPV.wait_until_playing sẽ ném AssertionError nếu bị gọi
     assert adapter._mpv.calls[-1][:2] == ("loadfile", str(video))
     assert adapter._mpv.pause is True

@@ -169,4 +169,6 @@ def test_complete_set_is_cached_and_reused(tmp_path: Path) -> None:
 
 
 def _key(meta: VideoMetadata) -> str:
-    return f"{meta.path.name}|{_sampling_signature(FrameSamplingConfig())}|none"
+    from subtitles_extractor.application.use_cases.extract_subtitles import _video_identity  # [v3.23.652]
+
+    return f"{_video_identity(meta.path)}|{_sampling_signature(FrameSamplingConfig())}|none"

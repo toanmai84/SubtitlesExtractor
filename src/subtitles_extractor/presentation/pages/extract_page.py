@@ -99,6 +99,10 @@ logger = logging.getLogger(__name__)
 
 class ExtractPage(QWidget):
     extraction_completed = Signal(object)
+    #: [v3.23.656] Đang trích xuất (kể cả giữa hai tập của lượt hàng loạt) — trang khác khoá Re-OCR theo tín hiệu này.
+    extraction_running_changed = Signal(bool)
+    #: [v3.23.658] Dây chuyền phim bộ: khâu Trích xuất chạy xong (``StageRunResult``).
+    series_batch_finished = Signal(object)
 
     def __init__(self, container: ApplicationContainer, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -773,7 +777,7 @@ class ExtractPage(QWidget):
                 self._translator.translate("extract.dlg_nocache_body"),
             )
             return
-        self._extract_start_time = time.time()
+        self._reset_eta()
         self._view_model.rebuild_from_cached_ocr()
 
     def _refresh_rebuild_button(self) -> None:
@@ -993,7 +997,7 @@ class ExtractPage(QWidget):
             return
         self._canvas.pause()
         self._is_probing = True
-        self._extract_start_time = time.time()
+        self._reset_eta()
         ratio = self._cb_probe_position.currentData()
         self._view_model.start_probe_extraction(
             center_ratio=float(ratio) if ratio is not None else 0.5
@@ -1166,6 +1170,12 @@ class ExtractPage(QWidget):
 
     def _on_batch_clicked(self) -> None:
         """Chọn nhiều tập rồi chạy tuần tự với cùng ROI/tham số."""
+        if getattr(self, "_batch_queue", None):  # [v3.23.658] không thay hàng đợi đang chạy
+            self._set_status(self._translator.translate("series.err_page_busy"))
+            return
+        if getattr(self, "_reocr_running", False):  # [v3.23.656] Re-OCR dùng chung engine OCR
+            self._set_status(self._translator.translate("extract.ss_reocr_running"))
+            return
         from PySide6.QtWidgets import QFileDialog, QMessageBox
 
         from subtitles_extractor.application.services.batch_extraction_plan import (
@@ -1220,7 +1230,53 @@ class ExtractPage(QWidget):
         self._batch_queue = runnable
         self._batch_index = 0
         self._batch_failures = []
+        self._emit_extraction_running()  # [v3.23.656] khoá Re-OCR suốt lượt hàng loạt, cả giữa hai tập
         self._run_next_batch_item()
+
+    def start_series_batch(self, videos: list[Path]) -> str:
+        """[v3.23.658] Dây chuyền phim bộ: trích xuất các tập với ROI/tham số đang đặt, không hộp thoại.
+
+        Returns:
+            ``""`` nếu đã bắt đầu (kết quả về qua ``series_batch_finished``), ngược lại lý do không chạy được.
+        """
+        if getattr(self, "_batch_queue", None) or self._view_model.is_busy:
+            return self._translator.translate("series.err_page_busy")
+        if getattr(self, "_reocr_running", False):
+            return self._translator.translate("extract.ss_reocr_running")
+        from subtitles_extractor.application.services.batch_extraction_plan import (
+            BatchItemStatus,
+            build_batch_plan,
+        )
+        from subtitles_extractor.presentation.view_models.series_pipeline_controller import StageRunResult
+
+        video = self._view_model.video
+        reference_roi = self._view_model.roi
+        reference_size = (video.width, video.height) if video is not None else None
+        if reference_roi is not None and reference_size is None:
+            reference_roi = None
+        plan = build_batch_plan(
+            [Path(v) for v in videos], reference_roi=reference_roi, reference_size=reference_size,
+            skip_existing=True,
+        )
+        invalid = {item.video_path.name: item.note or "" for item in plan if item.status is BatchItemStatus.INVALID}
+        runnable = [item for item in plan if item.will_run]
+        if not runnable:
+            QTimer.singleShot(0, lambda: self.series_batch_finished.emit(StageRunResult(failed=invalid)))
+            return ""
+        self._series_batch = True
+        self._series_invalid = invalid
+        self._batch_queue = runnable
+        self._batch_index = 0
+        self._batch_failures = []
+        self._batch_cancelled = False
+        self._emit_extraction_running()
+        QTimer.singleShot(0, self._run_next_batch_item)
+        return ""
+
+    def cancel_series_batch(self) -> None:
+        """[v3.23.658] Dừng khâu Trích xuất của dây chuyền (như bấm Huỷ)."""
+        if getattr(self, "_series_batch", False):
+            self._on_cancel_clicked()
 
     def _run_next_batch_item(self) -> None:
         """Nạp và chạy tập kế tiếp trong hàng đợi; báo tổng kết khi hết."""
@@ -1239,12 +1295,20 @@ class ExtractPage(QWidget):
 
         # Nạp video rồi áp ROI của kế hoạch (đã co giãn nếu cần) trước khi chạy.
         self._pending_batch_item = item
+        # [v3.23.659] Khung xem trước / đọc khung nhanh theo đúng tập đang chạy (như khi người dùng tự mở video).
+        # Trước đây vẫn là video mở đầu tiên: xong lượt, ROI vẽ trên video cũ mà Bắt đầu lại trích tập CUỐI.
+        self._pending_video_path = item.video_path
         self._view_model.load_video(item.video_path)
 
     def _start_batch_item_extraction(self) -> None:
         """Chạy trích xuất cho tập vừa nạp xong (gọi từ ``_on_video_loaded``)."""
         item = getattr(self, "_pending_batch_item", None)
         if item is None:
+            return
+        if getattr(self, "_batch_cancelled", False):
+            # [v3.23.658] Bấm Huỷ trong lúc đang nạp tập kế: trước đây tập đó VẪN được trích xuất rồi mới dừng.
+            self._pending_batch_item = None
+            self._finish_batch()
             return
         if self._view_model.is_busy:
             # [v3.23.613] Luồng tập trước chưa báo thoát: start_extraction sẽ thoát im
@@ -1254,7 +1318,7 @@ class ExtractPage(QWidget):
         self._pending_batch_item = None
         if item.roi is not None:
             self._view_model.set_roi(item.roi)
-        self._extract_start_time = time.time()
+        self._reset_eta()
         self._view_model.start_extraction()
 
     def _advance_batch(self, *, failed_name: str | None = None) -> bool:
@@ -1290,8 +1354,19 @@ class ExtractPage(QWidget):
         self._batch_failures = []
         self._batch_cancelled = False
         self._is_cancelled_by_user = False
+        self._emit_extraction_running()  # [v3.23.656]
 
         done = max(0, processed - len(failures))
+        if getattr(self, "_series_batch", False):
+            # [v3.23.658] Dây chuyền phim bộ: báo về bộ điều phối, không hiện hộp thoại tổng kết.
+            from subtitles_extractor.presentation.view_models.series_pipeline_controller import StageRunResult
+
+            self._series_batch = False
+            failed = dict(getattr(self, "_series_invalid", {}) or {})
+            failed.update({name: "Trích xuất lỗi — xem Nhật ký" for name in failures})
+            self._set_status(f"Phim bộ — trích xuất xong {done}/{total} tập.")
+            self.series_batch_finished.emit(StageRunResult(failed=failed, cancelled=cancelled))
+            return
         if cancelled:
             message = (
                 f"Đã huỷ hàng loạt. Hoàn tất {done}/{total} tập, "
@@ -1305,6 +1380,18 @@ class ExtractPage(QWidget):
                 message += f"\n… và {len(failures) - 10} tập nữa."
         QMessageBox.information(self, self._translator.translate("extract.dlg_batchdone_title"), message)
         self._set_status(message.splitlines()[0])
+
+    def _reset_eta(self) -> None:
+        """[v3.23.659] Bắt đầu một lượt (tập hàng loạt, dò thử, dựng lại…): đặt lại mốc giờ + bộ làm mượt ETA.
+
+        Trước đây chỉ nút Bắt đầu đặt lại: từ tập thứ 2 của lượt hàng loạt / dây chuyền phim bộ, ETA bị kẹp theo giá
+        trị cuối của tập trước (~0) nên luôn hiện "~00:00".
+        """
+        self._extract_start_time = time.time()
+        self._eta_ema_fps = None
+        self._eta_last_time = None
+        self._eta_last_frame = None
+        self._eta_display_sec = None
 
     def _set_status(self, text: str) -> None:
         """Cập nhật dòng trạng thái nếu trang có nhãn trạng thái."""
@@ -1333,8 +1420,16 @@ class ExtractPage(QWidget):
         self._view_model.load_video(path)
 
     def _on_start_clicked(self) -> None:
+        if getattr(self, "_reocr_running", False):  # [v3.23.656] Re-OCR dùng chung engine OCR
+            self._set_status(self._translator.translate("extract.ss_reocr_running"))
+            return
         if self._view_model.is_busy:
             return  # [v3.23.650] nút có thể bật lại bởi _on_video_loaded; bấm lúc bận từng xoá hàng đợi/cờ của lượt đang chạy
+        if getattr(self, "_batch_queue", None):
+            # [v3.23.658] Giữa hai tập của lượt hàng loạt / dây chuyền phim bộ (nút được bật lại một nhịp): bấm Bắt đầu
+            # từng xoá hàng đợi đang chạy → dây chuyền treo vĩnh viễn.
+            self._set_status(self._translator.translate("series.err_page_busy"))
+            return
         if self._view_model.video is None or not self._run_preflight():
             return
 
@@ -1374,7 +1469,7 @@ class ExtractPage(QWidget):
         self._eta_last_frame = None
         self._eta_display_sec = None
         self._canvas.pause()                # [#8] tắt tiếng video khi gọi AI
-        self._extract_start_time = time.time()
+        self._reset_eta()
         self._view_model.start_extraction()
 
     def _on_cancel_clicked(self) -> None:
@@ -1398,6 +1493,9 @@ class ExtractPage(QWidget):
         self._view_model.detect_hardsub()
 
     def _on_detect_roi_clicked(self) -> None:
+        if self.is_extraction_running():  # [v3.23.656] tự dò ROI dùng chung engine OCR với lượt trích xuất
+            self._set_status(self._translator.translate("extract.ss_roi_locked_extracting"))
+            return
         self._canvas.pause()  # [#8]
         self._view_model.detect_auto_roi()
 
@@ -1617,7 +1715,7 @@ class ExtractPage(QWidget):
         busy = self._view_model.is_busy  # [v3.23.650] đang bận thì KHÔNG bật lại các nút bắt đầu
         if hasattr(self, '_start_button'): self._start_button.setEnabled(not busy)
         if hasattr(self, '_detect_hardsub_button'): self._detect_hardsub_button.setEnabled(not busy)
-        if hasattr(self, '_detect_roi_button'): self._detect_roi_button.setEnabled(not busy)
+        if hasattr(self, '_detect_roi_button'): self._detect_roi_button.setEnabled(not self.is_extraction_running())  # [v3.23.656]
         if hasattr(self, '_btn_export_raw'): self._btn_export_raw.setVisible(True)
         # [v3.21] Cho phép quét phụ đề nhúng; reset combo của video cũ.
         if hasattr(self, '_btn_scan_embedded'):
@@ -1687,7 +1785,14 @@ class ExtractPage(QWidget):
                 if idx >= 0:
                     self._sync_preset_combo_to(default_preset)
                 self._canvas.pause()  # [#8]
-                QTimer.singleShot(300, self._view_model.detect_auto_roi)  # AI (1 luồng)
+                batch_item = getattr(self, "_pending_batch_item", None)
+                if batch_item is not None and getattr(batch_item, "roi", None) is None:
+                    # [v3.23.659] Hàng loạt không có ROI mẫu: dò NGAY và tự chọn ROI chính (không hộp kiểm duyệt). Lối
+                    # cũ hẹn 300 ms nên lượt trích xuất (hẹn 0 ms) chạy trước với ROI rỗng = OCR CẢ KHUNG HÌNH, còn
+                    # lượt dò sau đó bị bỏ vì trang đang bận.
+                    self._view_model.detect_primary_subtitle_roi()
+                else:
+                    QTimer.singleShot(300, self._view_model.detect_auto_roi)  # AI (1 luồng)
 
             else:
                 self._sync_preset_combo_to(default_preset)
@@ -1737,19 +1842,60 @@ class ExtractPage(QWidget):
 
             self._status_label.setText(message)
 
+    def is_extraction_running(self) -> bool:
+        """[v3.23.656] Đang trích xuất: một tập đang chạy HOẶC lượt hàng loạt chưa xong."""
+        return bool(self._view_model.is_busy or getattr(self, "_batch_queue", None))
+
+    def _emit_extraction_running(self) -> None:
+        running = self.is_extraction_running()
+        if running != getattr(self, "_last_running_emitted", False):
+            self._last_running_emitted = running
+            self.extraction_running_changed.emit(running)
+            if not running:
+                self._refresh_ocr_locks()   # lượt hàng loạt xong sau lần busy=False cuối: mở khoá các nút OCR
+
+    def set_reocr_running(self, running: bool) -> None:
+        """[v3.23.656] Re-OCR ở trang Chỉnh sửa đang chạy → khoá bắt đầu trích xuất / tự dò ROI / đo tốc độ.
+
+        Hai lượt dùng chung engine OCR với model khác nhau (Re-OCR có thể chọn model riêng) sẽ nạp lại model ở MỖI lô.
+        """
+        self._reocr_running = bool(running)
+        self._refresh_ocr_locks()
+
+    def _refresh_ocr_locks(self, busy: bool | None = None) -> None:
+        """[v3.23.656] Các nút cùng dùng engine OCR: khoá khi đang trích xuất (kể cả giữa 2 tập) hoặc đang Re-OCR."""
+        running = (self._view_model.is_busy if busy is None else busy) or bool(getattr(self, "_batch_queue", None))
+        reocr = bool(getattr(self, "_reocr_running", False))
+        has_video = self._view_model.video is not None
+        free = not running and not reocr
+        if hasattr(self, '_probe_button'): self._probe_button.setEnabled(free)
+        if hasattr(self, '_bench_button'): self._bench_button.setEnabled(free)
+        if hasattr(self, '_detect_roi_button'): self._detect_roi_button.setEnabled(free and has_video)
+        if reocr:
+            if hasattr(self, '_start_button'): self._start_button.setEnabled(False)
+            if hasattr(self, '_batch_button'): self._batch_button.setEnabled(False)
+        elif not running:
+            if hasattr(self, '_start_button'): self._start_button.setEnabled(has_video)
+            if hasattr(self, '_batch_button'): self._batch_button.setEnabled(True)
+        tip = self._translator.translate("extract.ss_reocr_running") if reocr else ""
+        for name in ('_start_button', '_batch_button', '_detect_roi_button', '_bench_button'):
+            button = getattr(self, name, None)
+            if button is not None:
+                if not hasattr(button, "_tip_before_lock"):
+                    button._tip_before_lock = button.toolTip()
+                button.setToolTip(tip or button._tip_before_lock)
+
     def _on_busy_changed(self, busy: bool) -> None:
+        self._emit_extraction_running()  # [v3.23.656]
         has_video = self._view_model.video is not None
         if hasattr(self, '_select_button'): self._select_button.setEnabled(not busy)
         if hasattr(self, '_batch_button'): self._batch_button.setEnabled(not busy)
-        if hasattr(self, '_probe_button'): self._probe_button.setEnabled(not busy)
-        if hasattr(self, '_bench_button'): self._bench_button.setEnabled(not busy)
         if hasattr(self, '_cb_main_ocr_language'): self._cb_main_ocr_language.setEnabled(not busy)
         if hasattr(self, '_cb_probe_position'): self._cb_probe_position.setEnabled(not busy)
         if hasattr(self, '_rebuild_button'): self._rebuild_button.setEnabled((not busy) and self._view_model.has_cached_ocr())
         if hasattr(self, '_start_button'): self._start_button.setEnabled(not busy and has_video)
         if hasattr(self, '_cancel_button'): self._cancel_button.setEnabled(busy)
         if hasattr(self, '_detect_hardsub_button'): self._detect_hardsub_button.setEnabled(not busy and has_video)
-        if hasattr(self, '_detect_roi_button'): self._detect_roi_button.setEnabled(not busy and has_video)
         # [v3.22] Khoá các nút nguồn MỚI khi đang chạy tác vụ nền (chống chạy chồng
         # nhiều thread cùng lúc gây tranh chấp GPU/IO).
         if hasattr(self, '_btn_scan_embedded'):
@@ -1767,6 +1913,8 @@ class ExtractPage(QWidget):
             self._progress_bar.setRange(0, 1)
             self._progress_bar.setValue(0)
 
+        self._refresh_ocr_locks(busy)  # [v3.23.656] sau mọi setEnabled ở trên
+
     def _on_extraction_finished(self, response: ExtractSubtitlesResponse) -> None:
         # [v3.23.320] Thử nhanh: chỉ báo kết quả, KHÔNG nạp sang Biên tập/lưu dự án.
         if getattr(self, "_is_probing", False):
@@ -1775,6 +1923,18 @@ class ExtractPage(QWidget):
             return
         # [v3.23.319] Đang chạy hàng loạt -> sang tập kế, KHÔNG chuyển tab/hiện hộp thoại.
         if getattr(self, "_batch_queue", None):
+            if not response.events and getattr(self, "_batch_cancelled", False):
+                # [v3.23.659] Bị huỷ: lượt trả 0 câu — không phải lỗi của tập (trước đây tính lỗi, "xong" thiếu một tập).
+                self._advance_batch()
+                return
+            if not response.events:
+                # [v3.23.658] 0 câu: không có tệp nào được ghi — trước đây cũng không tính lỗi, nên dây chuyền phim bộ
+                # OCR lại tập đó ở MỌI lượt. Nay báo lỗi (thường do ROI sai / tập không có phụ đề cứng).
+                index = min(self._batch_index, len(self._batch_queue) - 1)
+                name = self._batch_queue[index].video_path.name
+                logger.warning("Hàng loạt: tập %s không ra câu phụ đề nào — kiểm ROI.", name)
+                self._advance_batch(failed_name=name)
+                return
             # [v3.23.364] SỬA BUG NGHIÊM TRỌNG: trước đây batch nhảy tập kế mà KHÔNG lưu
             # gì → trích 84 tập xong nhưng trang Dịch/TTS quét đĩa thấy "chưa trích xuất".
             # Nay lưu phụ đề gốc từng tập (ghi .original.srt + lưu CSDL) trước khi tiếp.
@@ -2163,7 +2323,7 @@ class ExtractPage(QWidget):
             self._status_label.setText(self._translator.translate("extract.st_raw_running"))
         if hasattr(self, '_btn_export_raw'): self._btn_export_raw.setEnabled(False)
 
-        self._extract_start_time = time.time()
+        self._reset_eta()
         self._view_model.start_extraction_with_raw_export(raw_ocr_output_path=Path(save_path), export_images=export_images)
 
     def _on_raw_export_finished(self, raw_path: Path | None, response: ExtractSubtitlesResponse) -> None:
@@ -2296,6 +2456,7 @@ class ExtractPage(QWidget):
         luồng (có bơm sự kiện) không kích hoạt tập kế tiếp / hộp thoại / nạp Editor giữa lúc đang tắt."""
         self._batch_cancelled = True
         self._batch_queue = []
+        self._series_batch = False  # [v3.23.658]
         self._pending_batch_item = None
         vm = getattr(self, "_view_model", None)
         if vm is None:

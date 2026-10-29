@@ -64,14 +64,15 @@ class SrtExporter:
     ) -> str:
         """Tạo nội dung SRT.
 
-        Dùng ``event.index`` thay vì counter vòng lặp để đảm bảo số thứ tự
-        khớp với những gì user thấy trong editor sau khi xoá/chèn câu.
+        [v3.23.659] Đánh số 1..N theo thứ tự ghi (trước đây dùng ``event.index``: danh sách đã lọc/cắt/ghép hoặc câu
+        nhập có index 0/trùng cho số thứ tự nhảy cóc/lặp — nhiều trình phát và trình nhập SRT từ chối). Trang Chỉnh
+        sửa luôn đánh lại index liên tục nên số hiển thị không đổi.
 
         [v3.23.441] Ngắt dòng dài (>``max_chars_per_line``) thành 2 dòng CÂN ĐỐI tại điểm
         tự nhiên (0 = tắt) — tránh player tự wrap tùy tiện giữa cụm từ.
         """
         blocks: list[str] = []
-        for event in events:
+        for number, event in enumerate(events, start=1):
             start = _format_srt_timestamp(event.interval.start_ms())
             end = _format_srt_timestamp(event.interval.end_ms())
             text = _normalize_text(event.text)
@@ -79,7 +80,7 @@ class SrtExporter:
                 text = wrap_subtitle_line(text, max_chars_per_line)
             # [v3.23.610] Dòng chữ phải-sang-trái: bọc dấu định hướng để dấu câu đúng chỗ.
             text = mark_rtl_lines(text)
-            blocks.append(f"{event.index}\n{start} --> {end}\n{text}\n")
+            blocks.append(f"{number}\n{start} --> {end}\n{text}\n")
         return "\n".join(blocks)
 
 

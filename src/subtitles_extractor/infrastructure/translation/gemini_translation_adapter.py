@@ -95,6 +95,13 @@ from subtitles_extractor.infrastructure.translation.gemini_quota_manager import 
 from subtitles_extractor.infrastructure.translation.key_rotation_policy import (
     should_switch_for_viability,
 )
+from subtitles_extractor.infrastructure.translation.openai_compat_client import (
+    FALLBACK_TYPES as _CUSTOM_FALLBACK_TYPES,
+    CustomProviderConfig,
+    CustomProviderError,
+    OpenAICompatModule,
+    is_text_model as _is_custom_text_model,
+)
 from subtitles_extractor.infrastructure.translation.overload_retry_policy import (
     deadline_was_hit,
     escalated_request_timeout,
@@ -364,6 +371,20 @@ def _batch_constrained_schema(
         if isinstance(item_properties, dict) and field in item_properties:
             item_properties[field] = {**item_properties[field], "description": note}
     return schema
+
+
+def _strip_batch_constraints(schema: dict[str, Any], array_key: str = "subtitles") -> dict[str, Any]:
+    """[v3.23.659] Bỏ ràng buộc số phần tử / khoảng line_no mà :func:`_batch_constrained_schema` đã gắn."""
+    stripped = copy.deepcopy(schema)
+    target = stripped.get("properties", {}).get(array_key)
+    if isinstance(target, dict):
+        target.pop("minItems", None)
+        target.pop("maxItems", None)
+        line_no = target.get("items", {}).get("properties", {}).get("line_no")
+        if isinstance(line_no, dict):
+            line_no.pop("minimum", None)
+            line_no.pop("maximum", None)
+    return stripped
 
 
 _TRANSLATE_SCHEMA: dict[str, Any] = {
@@ -876,6 +897,31 @@ def _repair_json_text(sanitized: str) -> tuple[Any, str] | None:
     return None
 
 
+def _normalize_response_shape(data: Any) -> dict[str, Any]:
+    """[v3.23.659] Đưa phản hồi về đúng hình dạng mong đợi trước khi kiểm/đọc.
+
+    Model đôi khi trả mảng ở gốc, chuỗi, ``"subtitles": null`` / đối tượng đơn / lẫn chuỗi trong mảng. Trước đây
+    ``.get`` / ``len`` trên các dạng đó ném AttributeError/TypeError — KHÔNG thuộc nhóm thử lại → hỏng cả tập ngay
+    lần gọi đầu. Nay: mảng gốc → ``{"subtitles": mảng}``; dạng không dùng được → ``JSONDecodeError`` (được thử lại);
+    phần tử không phải đối tượng bị bỏ (dòng thiếu sẽ được vá).
+
+    Raises:
+        json.JSONDecodeError: Phản hồi không phải đối tượng JSON dùng được.
+    """
+    if isinstance(data, list):
+        data = {"subtitles": data}
+    if not isinstance(data, dict):
+        raise json.JSONDecodeError("Phản hồi không phải đối tượng JSON", str(data)[:80], 0)
+    if "subtitles" in data:
+        items = data["subtitles"]
+        if isinstance(items, dict):
+            items = [items]
+        if not isinstance(items, list):
+            raise json.JSONDecodeError("Trường subtitles không phải danh sách", str(items)[:80], 0)
+        data["subtitles"] = [item for item in items if isinstance(item, dict)]
+    return data
+
+
 def _sanitize_json_text(raw_text: str) -> str:
     """[v3.20.3 #3] Bóc tách JSON khỏi văn bản "lắm lời" của AI (Hallucination Shield).
 
@@ -923,6 +969,12 @@ def _wrap_xml_block(tag: str, payload: Any) -> str:
 
 class _BatchValidationError(Exception):
     """Lỗi nội bộ: model trả batch sai cấu trúc — kích hoạt retry chuyên biệt."""
+
+
+# [v3.23.659] Phản hồi bị máy chủ CHẶN là tất định: thử tối đa 2 lần mỗi lượt gọi, và mỗi lô gốc chỉ chia đôi vì bị chặn
+# tối đa 8 lần (đủ cô lập 1–2 dòng bị chặn trong lô 50 dòng).
+_BLOCKED_ATTEMPTS = 2
+_BLOCKED_HALVING_BUDGET = 8
 
 
 class _EmptyResponseError(SubtitleTranslationError):
@@ -1746,7 +1798,15 @@ class GeminiSubtitleTranslator:
         native_address: bool = False,
         model_health: ModelHealth | None = None,
         clip_video_to_batch: bool = True,
+        custom_provider: CustomProviderConfig | None = None,
     ) -> None:
+        # [v3.23.666] Nhà cung cấp tuỳ chỉnh kiểu OpenAI (vd OxionAI): mọi lời gọi văn bản đi qua
+        # ``openai_compat_client`` thay vì Gemini; video/tách giọng (cần tải tệp lên Gemini) bị tắt.
+        self._custom_provider = (
+            custom_provider if custom_provider is not None and custom_provider.is_complete else None
+        )
+        if self._custom_provider is not None:
+            api_key = self._custom_provider.api_key
         # [v3.23.610] Sổ token dùng chung: ghi mọi lời gọi máy chủ đã trả lời.
         self._token_ledger = token_ledger
         # [v3.23.631] Sức khoẻ model dùng chung (bộ ngắt mạch quá tải + model dự phòng);
@@ -2030,6 +2090,9 @@ class GeminiSubtitleTranslator:
         leaked") và key hết hạn ("API key expired"). Khác với 403 do FILE thuộc key khác
         (xem ``_is_file_permission_error``) và 400 do schema (``_is_generic_invalid_argument``).
         """
+        # [v3.23.666] Nhà cung cấp kiểu OpenAI báo key sai bằng 401.
+        if isinstance(error, CustomProviderError):
+            return error.code == 401
         text = str(error).lower()
         return any(marker in text for marker in (
             "api_key_invalid", "api key not valid", "api key expired", "api_key_expired",
@@ -2374,7 +2437,26 @@ class GeminiSubtitleTranslator:
         return True
 
     # ── Khả dụng & SDK ───────────────────────────────────────────────────
+    @property
+    def uses_custom_provider(self) -> bool:
+        """[v3.23.666] True khi lời gọi đi tới nhà cung cấp tuỳ chỉnh (không phải Gemini)."""
+        return getattr(self, "_custom_provider", None) is not None
+
     def _load_sdk(self) -> None:
+        provider = getattr(self, "_custom_provider", None)
+        if provider is not None:
+            # [v3.23.666] Client kiểu OpenAI; vẫn dựng cấu hình bằng ``google.genai.types`` khi có
+            # (bản exe luôn có), không có thì dùng bộ types tối thiểu — nhà cung cấp tuỳ chỉnh
+            # không cần google-genai.
+            self._genai_module = OpenAICompatModule(provider.normalized_base_url)
+            try:
+                from google.genai import types
+
+                self._types_module = types
+            except ImportError:
+                self._types_module = _CUSTOM_FALLBACK_TYPES
+            logger.info("Dùng nhà cung cấp AI tuỳ chỉnh: %s", provider.normalized_base_url)
+            return
         try:
             from google import genai
             from google.genai import types
@@ -2394,7 +2476,10 @@ class GeminiSubtitleTranslator:
                 "Chưa cài thư viện 'google-genai'. Cài bằng: pip install google-genai"
             )
         if not self._api_key:
-            raise TranslatorUnavailableError("Chưa nhập API Key Gemini.")
+            raise TranslatorUnavailableError(
+                "Chưa nhập API Key của nhà cung cấp tuỳ chỉnh." if self.uses_custom_provider
+                else "Chưa nhập API Key Gemini."
+            )
 
     def _get_client(self) -> Any:
         client = self._client
@@ -2708,6 +2793,18 @@ class GeminiSubtitleTranslator:
         except (TypeError, ValueError):
             return None
 
+    def _rescope_config(self, config: Any, batch: list[Any]) -> Any:
+        """[v3.23.659] Config cho LÔ CON (nửa lô / cửa sổ vá) với schema ràng buộc theo đúng lô con.
+
+        Trước đây lô con dùng lại config của lô cha: cửa sổ vá 12 dòng mang schema "đúng 30 phần tử, line_no 1..30"
+        → model tuân schema phải BỊA thêm 18 dòng (trả dư, thử lại, chia đôi — đúng điều kiện sinh lệch dòng).
+        """
+        schema = getattr(config, "response_schema", None)
+        if not isinstance(schema, dict) or not batch:
+            return config
+        rescoped = _batch_constrained_schema(_strip_batch_constraints(schema), batch)
+        return self._copy_config(config, response_schema=rescoped) or config
+
     @staticmethod
     def _config_thinking_level(config: Any) -> str:
         """Mức ``thinking_level`` đang gửi trong ``config`` (chữ thường, có thể rỗng)."""
@@ -2902,6 +2999,10 @@ class GeminiSubtitleTranslator:
         """
         if isinstance(error, ModelOverloadedError):
             return True
+        # [v3.23.666] Lỗi nhà cung cấp tuỳ chỉnh: chỉ mã HTTP quyết định — chữ "UNAVAILABLE" của
+        # 502 sai giao thức (sai địa chỉ API) từng làm vòng chờ quá tải 10 phút chạy vô ích.
+        if isinstance(error, CustomProviderError):
+            return error.retryable and error.code in _OVERLOAD_HTTP_CODES
         if _safe_int(getattr(error, "code", None), 0) in _OVERLOAD_HTTP_CODES:
             return True
         if _safe_int(getattr(error, "status_code", None), 0) in _OVERLOAD_HTTP_CODES:
@@ -2917,6 +3018,10 @@ class GeminiSubtitleTranslator:
         # retry để gen lại thay vì bỏ cả đoạn/lô. Lớp cứu cắt cụt đã chạy trước đó.
         if isinstance(error, (json.JSONDecodeError, ModelOverloadedError)):
             return True
+        # [v3.23.666] Lỗi nhà cung cấp tuỳ chỉnh tự nêu có đáng thử lại không: chữ "quota" trong
+        # "insufficient_quota" (402 hết tiền) không được làm vòng thử lại quay vô ích.
+        if isinstance(error, CustomProviderError):
+            return error.retryable
         if _safe_int(getattr(error, "code", None), 0) in _RETRYABLE_HTTP_CODES:
             return True
         if _safe_int(getattr(error, "status_code", None), 0) in _RETRYABLE_HTTP_CODES:
@@ -3012,6 +3117,11 @@ class GeminiSubtitleTranslator:
         """[v3.23.478] Rút gọn lỗi Gemini để LOG gọn: '429 RESOURCE_EXHAUSTED (quota token/phút)'
         thay vì in nguyên khối JSON ~1000 ký tự làm rối nhật ký. Chi tiết đầy đủ vẫn nằm trong
         exception gốc khi cần."""
+        # [v3.23.666] Lỗi nhà cung cấp tuỳ chỉnh vốn đã gọn: giữ cả lời giải thích (vd gợi ý "phải
+        # kết thúc bằng /v1"), vốn bị cắt nếu chỉ lấy "502 BAD_RESPONSE".
+        if isinstance(error, CustomProviderError):
+            head = f"{error.code} {error.status}" if error.code else "MẤT KẾT NỐI"
+            return f"{head}: {error.message[:200]}" if error.message else head
         text = str(error)
         low = text.lower()
         # [v3.23.480] Lỗi mạng/DNS → thông báo thân thiện (giúp người dùng biết là MẤT MẠNG, không
@@ -3250,6 +3360,15 @@ class GeminiSubtitleTranslator:
         # chỉ số key sẽ ném IndexError khó hiểu).
         if not self._api_keys:
             raise TranslatorUnavailableError("Chưa nhập API Key Gemini.")
+        # [v3.23.666] Nhà cung cấp tuỳ chỉnh không đọc được tệp video đã tải lên Gemini: gửi
+        # phần chữ (ngữ cảnh, cues đã có) thay vì hỏng cả lời gọi.
+        if self.uses_custom_provider and (video_files or video_refs):
+            logger.info(
+                "Nhà cung cấp tuỳ chỉnh không nhận video → bỏ %d đoạn video, chỉ gửi văn bản.",
+                len(video_files or video_refs or []),
+            )
+            video_files = None
+            video_refs = None
 
         # ── PHÂN LUỒNG 2 KÊNH theo đúng thiết kế Gemini API ──────────────────
         # KÊNH 1 (config.system_instruction): vai trò + quy tắc bền vững — đã nằm trong
@@ -3275,6 +3394,7 @@ class GeminiSubtitleTranslator:
         video_dropped_for_empty = False
         # [v3.23.591] Số phản hồi rỗng KHÔNG rõ lý do của lời gọi này.
         unexplained_empties = 0
+        blocked_replies = 0  # [v3.23.659] lần bị CHẶN (không còn video để bỏ) — chặn là tất định, không thử lại 5 lần
         # [v3.23.554] Ngân sách chờ RIÊNG cho lỗi quá tải server — xem OVERLOAD_RETRY_BUDGET_S.
         overload_waited = 0.0
         # [v3.23.616] Mốc bắt đầu lời gọi — để báo người dùng đã chờ bao lâu khi bỏ cuộc.
@@ -3486,6 +3606,7 @@ class GeminiSubtitleTranslator:
                         "JSON model hỏng -> đã sửa bằng %s (%s).",
                         repair_method, json_err,
                     )
+                data = _normalize_response_shape(data)
                 try:
                     validator(data)
                 except _BatchPartialError as partial:
@@ -3585,6 +3706,10 @@ class GeminiSubtitleTranslator:
                             "Người dùng đã huỷ tiến trình dịch."
                         ) from exc
                     continue
+                if exc.diagnosis.blocked:
+                    blocked_replies += 1
+                    if blocked_replies >= _BLOCKED_ATTEMPTS:
+                        raise
                 if attempt < self._retry_count - 1:
                     delay = self._retry_delay(attempt, base_seconds=2.0, max_seconds=20.0)
                     logger.warning(
@@ -3629,6 +3754,12 @@ class GeminiSubtitleTranslator:
                         video_needs_refresh = True
                         attempt_offset = raw_attempt + 1
                         continue
+                    if self.uses_custom_provider:
+                        raise SubtitleTranslationError(
+                            "Nhà cung cấp tuỳ chỉnh từ chối API key (401): "
+                            f"{self._concise_error(exc)}. Kiểm tra lại 'API Key nhà cung cấp' ở "
+                            "trang Dịch."
+                        ) from exc
                     raise SubtitleTranslationError(
                         "Mọi API key đều bị Gemini từ chối (không hợp lệ / hết hạn / bị vô hiệu "
                         f"hoá): {self._concise_error(exc)}. Kiểm tra lại API key trong phần "
@@ -4086,7 +4217,8 @@ class GeminiSubtitleTranslator:
         Có cache theo ``remote_name`` để không gọi lại ``files.get`` nhiều lần.
         Bỏ qua (cảnh báo) đoạn nào không resolve được thay vì làm hỏng cả lần dịch.
         """
-        if not video_refs:
+        # [v3.23.666] Nhà cung cấp tuỳ chỉnh không có Files API của Gemini.
+        if not video_refs or self.uses_custom_provider:
             return []
         client = self._get_client()
         handles: list[Any] = []
@@ -4626,6 +4758,7 @@ class GeminiSubtitleTranslator:
         dual_payload: bool = False,
         expansion_indices: frozenset[int] = frozenset(),
         video_token_estimate: int = 0,
+        _blocked_budget: list[int] | None = None,
     ) -> list[TranslationLine]:
         """Dịch một batch, TỰ ĐỘNG CHIA ĐÔI đệ quy khi AI trả sai số dòng.
 
@@ -4831,9 +4964,22 @@ class GeminiSubtitleTranslator:
 
             return batch_result
 
-        except _BatchCountMismatchError as exc:
+        except (_BatchCountMismatchError, _EmptyResponseError) as exc:
+            # [v3.23.659] Lô bị máy chủ CHẶN (PROHIBITED_CONTENT, RECITATION — lời bài hát, BLOCKLIST…: không tắt
+            # được bằng cài đặt an toàn, lặp lại ở mọi lần chạy) trước đây làm hỏng CẢ tập. Nay chia đôi như lô sai
+            # số dòng: chỉ dòng thật sự bị chặn giữ bản gốc. Phản hồi rỗng KHÔNG rõ lý do vẫn báo lỗi như cũ.
+            if isinstance(exc, _EmptyResponseError) and not exc.diagnosis.blocked:
+                raise
+            if _blocked_budget is None:
+                _blocked_budget = [_BLOCKED_HALVING_BUDGET]
+            out_of_block_budget = False
+            if isinstance(exc, _EmptyResponseError):
+                # [v3.23.659] Mỗi lô gốc chỉ được chia đôi vì bị CHẶN tối đa N lần: thứ bị chặn chung (chỉ dẫn hệ thống,
+                # bảng thuật ngữ, ngữ cảnh) lặp lại ở MỌI nhánh — chia tới từng dòng từng tốn ~300 lượt gọi/lô 50 dòng.
+                _blocked_budget[0] -= 1
+                out_of_block_budget = _blocked_budget[0] < 0
             # ── Kích hoạt halving đệ quy ────────────────────────────────────
-            if len(batch) == 1 or _depth >= _MAX_DEPTH:
+            if len(batch) == 1 or _depth >= _MAX_DEPTH or out_of_block_budget:
                 # Không thể chia tiếp → giữ text gốc, ghi log, tiếp tục
                 _record_process_event(
                     "batch_gave_up",
@@ -4861,7 +5007,8 @@ class GeminiSubtitleTranslator:
                 batch=first_half, source_before=source_before,
                 source_after=extra_src + source_after,
                 history_before=history_before, start_idx=start_idx,
-                is_preprocess=is_preprocess, is_literal=is_literal, config=config,
+                is_preprocess=is_preprocess, is_literal=is_literal,
+                config=self._rescope_config(config, first_half),
                 model_name=model_name,
                 cancel_cb=cancel_cb, _depth=_depth + 1, _ctx_size=_ctx_size,
                 # [v3.23.152] Mỗi nửa vẫn đính TOÀN BỘ video_files -> phải truyền tiếp
@@ -4872,6 +5019,7 @@ class GeminiSubtitleTranslator:
                 # [v3.23.576] Cờ needs_expansion phải theo xuống nửa lô / cửa sổ vá —
                 # trước đây mất khi lô bị chia đôi, dòng dịch thiếu không được nhắc.
                 expansion_indices=expansion_indices,
+                _blocked_budget=_blocked_budget,
             )
 
             # Nửa sau: history_before + output nửa đầu, có CAP theo ctx_size
@@ -4884,7 +5032,8 @@ class GeminiSubtitleTranslator:
                 source_after=source_after,
                 history_before=combined_hist,
                 start_idx=start_idx + mid,
-                is_preprocess=is_preprocess, is_literal=is_literal, config=config,
+                is_preprocess=is_preprocess, is_literal=is_literal,
+                config=self._rescope_config(config, second_half),
                 model_name=model_name,
                 cancel_cb=cancel_cb, _depth=_depth + 1, _ctx_size=_ctx_size,
                 video_files=video_files, video_refs=video_refs, dual_payload=dual_payload,
@@ -4892,6 +5041,7 @@ class GeminiSubtitleTranslator:
                 # [v3.23.576] Cờ needs_expansion phải theo xuống nửa lô / cửa sổ vá —
                 # trước đây mất khi lô bị chia đôi, dòng dịch thiếu không được nhắc.
                 expansion_indices=expansion_indices,
+                _blocked_budget=_blocked_budget,
             )
 
             return first_result + second_result
@@ -4934,8 +5084,12 @@ class GeminiSubtitleTranslator:
         if not windows:
             return batch_result
         # Cả batch nằm trong một cửa sổ → vá riêng vô nghĩa, để halving xử lý.
+        # [v3.23.659] Trước đây chỉ ``return batch_result`` — không có gì kích hoạt chia đôi, nên dòng thiếu của mọi
+        # lô ≤13 dòng (lô cuối, lô đã chia, các lượt sửa) giữ NGUYÊN chữ Hán. Nay ném để nhánh chia đôi xử lý.
         if len(windows) == 1 and windows[0] == (0, len(batch)):
-            return batch_result
+            raise _BatchCountMismatchError(
+                f"Thiếu {len(missing_set)} dòng trong lô {len(batch)} dòng — chia đôi để dịch lại."
+            )
 
         result_by_index = {r.index: r for r in batch_result}
         for start, end in windows:
@@ -4969,7 +5123,7 @@ class GeminiSubtitleTranslator:
                 history_before=history_before,
                 start_idx=window_batch[0].index - 1,
                 is_preprocess=is_preprocess, is_literal=is_literal,
-                config=config, model_name=model_name, cancel_cb=cancel_cb,
+                config=self._rescope_config(config, window_batch), model_name=model_name, cancel_cb=cancel_cb,
                 _depth=_depth + 1, _ctx_size=_ctx_size,
                 video_files=video_files, video_refs=video_refs, dual_payload=dual_payload,
                 video_token_estimate=video_token_estimate,
@@ -6416,6 +6570,11 @@ class GeminiSubtitleTranslator:
         """Gọi tách giọng lần lượt theo từng API key (xoay key khi hết hạn mức)."""
         from subtitles_extractor.infrastructure.translation import gemini_diarization as diar
 
+        if self.uses_custom_provider:
+            # [v3.23.666] Tách giọng cần tải âm thanh lên Gemini (Files API) — nhà cung cấp kiểu
+            # OpenAI không có; người nói vẫn được gán từ phụ đề.
+            logger.info("Nhà cung cấp tuỳ chỉnh: bỏ qua tách giọng (cần Gemini Files API).")
+            return []
         self._ensure_available()
         timeout_ms = int(max(self._request_timeout_s, 120.0) * 1000)
         keys = list(self._api_keys) or [self._api_key]
@@ -6445,6 +6604,8 @@ class GeminiSubtitleTranslator:
         """
         if not self.is_available():
             return []
+        if self.uses_custom_provider:
+            return self._list_custom_models()
         try:
             client = self._get_client()
             result: list[str] = []
@@ -6503,6 +6664,34 @@ class GeminiSubtitleTranslator:
         except Exception as exc:
             logger.warning("Không lấy được danh sách model Gemini: %s", exc)
             return []
+
+    def _list_custom_models(self) -> list[str]:
+        """[v3.23.666] Mọi model sinh văn bản của nhà cung cấp tuỳ chỉnh (``GET /models``).
+
+        Không lọc "free tier" như Gemini — nhà cung cấp trả phí cho dùng cả bản pro.
+
+        Raises:
+            SubtitleTranslationError: Không lấy được (key sai, sai địa chỉ, mất mạng) — nút "Tải
+                danh sách model" là cách người dùng kiểm tra địa chỉ/key, phải báo đúng lý do.
+        """
+        try:
+            items = list(self._get_client().models.list())
+        except Exception as exc:  # noqa: BLE001 — mạng/HTTP/JSON: báo lý do lên giao diện
+            reason = self._concise_error(exc)
+            logger.warning("Không lấy được danh sách model của nhà cung cấp tuỳ chỉnh: %s", reason)
+            raise SubtitleTranslationError(
+                f"Nhà cung cấp tuỳ chỉnh không trả danh sách model: {reason}"
+            ) from exc
+        result = sorted({
+            str(getattr(m, "name", "") or "") for m in items
+            if _is_custom_text_model(str(getattr(m, "name", "") or ""), getattr(m, "caps", None))
+        })
+        logger.info(
+            "Nhà cung cấp tuỳ chỉnh: %d model, %d model văn bản dùng được.", len(items), len(result),
+        )
+        if self._model_health is not None and result:
+            self._model_health.set_known_models(result)
+        return result
 
     @staticmethod
     def _is_free_tier_text_model(model_id: str) -> bool:
@@ -7253,7 +7442,11 @@ class GeminiSubtitleTranslator:
                     replace(ln, index=reindex_map.get(ln.index, ln.index)) for ln in output
                 ]
                 translated_by_index = {ln.index: ln for ln in output}
-                return [translated_by_index.get(ln.index, ln) for ln in full_input_lines]
+                output = [translated_by_index.get(ln.index, ln) for ln in full_input_lines]
+            # [v3.23.659] Cùng lưới an toàn với đường tuần tự: trước đây nhánh song song trả thẳng → giai đoạn tinh
+            # chỉnh/bản địa hoá làm RỚT nội dung không được hoàn nguyên, dịch thiếu không được cảnh báo.
+            output = self._revert_stage_regressions(full_input_lines, output, use_dual_payload)
+            self._warn_under_translated(output, is_preprocess)
             return output
 
         reused_batches = 0

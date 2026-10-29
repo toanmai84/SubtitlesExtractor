@@ -211,3 +211,17 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             widget.close()
             shiboken6.delete(widget)
     app.processEvents()
+
+
+@pytest.fixture(autouse=True)
+def _reset_publish_mode_settings() -> Iterator[None]:
+    """[v3.23.659] Trang Xuất bản nhớ cặp chế độ xuất qua QSettings: một test đổi chế độ không được làm trang của
+    test sau mở ở chế độ khác (đo được: 3 test xuất thử hỏng tuỳ thứ tự chạy)."""
+    yield
+    try:
+        from PySide6.QtCore import QSettings
+    except ImportError:
+        return
+    settings = QSettings()
+    settings.remove("publish/subtitle_mode")
+    settings.remove("publish/audio_mode")

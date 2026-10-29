@@ -90,7 +90,7 @@ def _retry(
     adapter = _adapter()
     calls = {"n": 0}
 
-    def fake_infer_once(engine, text, voice_data, idx=-1):
+    def fake_infer_once(engine, text, voice_data, idx=-1, **_kw):
         take = takes[min(calls["n"], len(takes) - 1)]
         calls["n"] += 1
         return take

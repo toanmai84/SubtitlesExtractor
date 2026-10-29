@@ -114,7 +114,8 @@ class SqliteSubtitleRepository(SubtitleRepositoryPort):
                 "frame_count": e.frame_count,
                 "position": e.position,
                 "bounding_box": e.bounding_box,
-                "uid": e.uid
+                "uid": e.uid,
+                **({"ocr_notes": list(e.ocr_notes)} if getattr(e, "ocr_notes", ()) else {}),  # [v3.23.655]
             }
             for e in events
         ]
@@ -142,7 +143,8 @@ class SqliteSubtitleRepository(SubtitleRepositoryPort):
                     frame_count=int(d.get("frame_count", 0)),
                     position=position,  # type: ignore
                     bounding_box=bounding_box,  # type: ignore
-                    uid=uid_str
+                    uid=uid_str,
+                    ocr_notes=tuple(str(note) for note in d.get("ocr_notes") or () if note),  # [v3.23.655]
                 ))
             return events
         except (json.JSONDecodeError, KeyError, ValueError, TypeError, ConfigurationError) as exc:

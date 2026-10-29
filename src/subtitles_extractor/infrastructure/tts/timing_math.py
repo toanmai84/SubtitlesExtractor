@@ -210,6 +210,16 @@ ABNORMAL_VS_FLOOR_RATIO = 2.5
 # (≥1.8s cho câu ngắn vẫn được retry để tìm bản gọn hơn).
 ABNORMAL_MIN_ABSOLUTE_S = 1.8
 
+#: [v3.23.663] Câu NGẮN (≤ chừng này âm tiết) dùng lưới riêng :func:`is_short_line_overlong`. Sàn 1,8 s ở trên khiến
+#: câu 1–3 tiếng KHÔNG BAO GIỜ bị bắt: SDK VieNeu chặn trần ở 1,04 / 1,44 / 1,84 s nên bản đọc LẶP ("Hóa Thần hóa
+#: thần") luôn lọt. Đo thật 28/10 (VieNeu v3 Turbo, 296 câu tập 1–3): 17 câu ngắn bị đọc lặp, cả 17 đều lọt lưới cũ.
+SHORT_LINE_MAX_SYLLABLES = 3
+
+#: [v3.23.663] Bội số so với biên dưới để coi câu ngắn là dài bất thường. Đo thật (phần tiếng, giọng Ngọc Huyền):
+#: câu đúng dài nhất 0,52 / 0,76 / 1,10 s (1 / 2 / 3 tiếng, ≤1,32× biên dưới); bản lặp ngắn nhất 0,94 / 1,18 / 1,46 s
+#: (≥1,75×). Ngưỡng 1,5× nằm giữa hai cụm.
+SHORT_LINE_OVERLONG_RATIO = 1.5
+
 # [v3.23.227] Với câu CỰC NGẮN, ngưỡng dư tuyệt đối 1.0s là QUÁ LỎNG: "Ơ," (kỳ vọng
 # 0.40s) ngân 1.20s là dài GẤP BA, đủ để đè lên câu sau, nhưng phần dư chỉ 0.80s -> lọt
 # lưới. Đo thực: câu 1-4 ký tự có tỉ lệ hallucination **50%** (VieNeu dùng LLM backbone,
@@ -660,6 +670,32 @@ def is_abnormally_long_vs_floor(
     # [v3.23.458] Phải vượt CẢ floor×ratio LẪN sàn tuyệt đối → bỏ false-positive câu cực ngắn.
     threshold = max(floor * ratio_threshold, min_absolute_s)
     return audio_duration_s > threshold + _EPS
+
+
+def is_short_line_overlong(
+    speech_s: float,
+    syllable_count: int,
+    min_base_s: float = MIN_SPEECH_BASE_S,
+    min_per_syllable_s: float = MIN_SPEECH_PER_SYLLABLE_S,
+) -> bool:
+    """[v3.23.663] Câu ngắn (≤ :data:`SHORT_LINE_MAX_SYLLABLES` tiếng) dài quá mức một lần đọc (hàm thuần).
+
+    Dạng lỗi chính của VieNeu với câu ngắn là đọc LẠI cả câu (trượt điểm dừng), không phải ngân dài vài giây — nên
+    lưới chung (×2,5 và sàn 1,8 s) không bắt được. Xem :data:`SHORT_LINE_OVERLONG_RATIO`.
+
+    Args:
+        speech_s: Độ dài phần tiếng (đã cắt lặng biên).
+        syllable_count: Số âm tiết của câu.
+        min_base_s: Chi phí vào câu của biên dưới (theo engine).
+        min_per_syllable_s: Chi phí mỗi âm tiết của biên dưới (theo engine).
+
+    Returns:
+        True nếu là câu ngắn và phần tiếng vượt ngưỡng.
+    """
+    if speech_s <= 0.0 or not 0 < syllable_count <= SHORT_LINE_MAX_SYLLABLES:
+        return False
+    floor = min_speech_seconds(syllable_count, min_base_s, min_per_syllable_s)
+    return floor > 0.0 and speech_s > floor * SHORT_LINE_OVERLONG_RATIO + _EPS
 
 
 def is_abnormally_long(

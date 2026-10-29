@@ -152,6 +152,31 @@ Một nhịp đơn lẻ không đủ tin: tín hiệu kết thúc hợp lệ có
 khoá sau 5-10 giây trong ca kẹt thật — vẫn hơn hẳn phải End Task."""
 
 
+
+def _tm_video_key(video_path: str) -> str:
+    """[v3.23.654] Khoá video cho Bộ nhớ dịch (đường dẫn chuẩn hoá, không phân biệt hoa thường trên Windows)."""
+    import os
+
+    try:
+        return os.path.normcase(os.path.abspath(str(video_path or "")))
+    except (TypeError, ValueError):
+        return str(video_path or "")
+
+
+def _drop_own_legacy_entries(entries: list, source_lines: list[str], min_overlap: float = 0.3) -> list:
+    """[v3.23.654] Mục bản cũ (không ghi video) nhưng phần lớn trùng đúng câu của phụ đề đang dịch → bỏ các câu trùng.
+
+    Bộ nhớ lưu trước 3.23.654 không biết câu thuộc video nào; dịch lại cùng một tập thì ≥ 30% câu của tập nằm nguyên
+    văn trong bộ nhớ — khi đó các câu trùng nguyên văn là bản dịch cũ của chính tập này.
+    """
+    current = {line.strip() for line in source_lines if line and line.strip()}
+    if not current or not entries:
+        return entries
+    overlap = sum(1 for entry in entries if entry.source_text.strip() in current)
+    if overlap < min_overlap * len(current):
+        return entries
+    return [entry for entry in entries if entry.source_text.strip() not in current]
+
 class TranslatePageViewModel(QObject):
     """ViewModel điều phối dịch phụ đề.
 
@@ -394,7 +419,7 @@ class TranslatePageViewModel(QObject):
             if not entries:
                 return
             store = self._container.translation_memory_store
-            saved = store.add_entries(series_key, entries)
+            saved = store.add_entries(series_key, entries, video_key=_tm_video_key(video_path))
             logger.info(
                 "Đã lưu %d cặp câu vào Bộ nhớ dịch cho phim bộ '%s'.", saved, series_key
             )
@@ -490,28 +515,24 @@ class TranslatePageViewModel(QObject):
             from subtitles_extractor.application.services.translation_memory import (
                 derive_series_key,
                 format_reference_block,
-                retrieve_relevant,
+                retrieve_for_lines,
             )
             series_key = derive_series_key(video_path)
             if not series_key:
                 return ""
             store = self._container.translation_memory_store
-            entries = store.get_entries(series_key)
+            # [v3.23.654] Không lấy câu của CHÍNH video đang dịch (bộ nhớ tự nuôi chính nó, kể cả lỗi cũ).
+            entries = store.get_entries(series_key, exclude_video=_tm_video_key(video_path))
+            entries = _drop_own_legacy_entries(entries, source_lines)
             if not entries:
                 return ""
             # Lấy mẫu các câu DÀI nhất (giàu danh từ riêng/thuật ngữ) để giảm số truy vấn.
             query_lines = sorted(
                 (ln for ln in source_lines if ln.strip()), key=len, reverse=True
             )[:max_query_lines]
-            collected: list = []
-            seen: set[str] = set()
-            for line in query_lines:
-                for entry in retrieve_relevant(line, entries, top_k=per_line_k):
-                    if entry.source_text not in seen:
-                        seen.add(entry.source_text)
-                        collected.append(entry)
-                if len(collected) >= max_references:
-                    break
+            collected = retrieve_for_lines(
+                query_lines, entries, per_line_k=per_line_k, max_references=max_references,
+            )
             return format_reference_block(collected, max_entries=max_references)
         except (OSError, ValueError, ImportError, sqlite3.Error) as exc:
             logger.warning("Không truy hồi được Bộ nhớ dịch: %s", exc)
@@ -621,6 +642,19 @@ class TranslatePageViewModel(QObject):
             except (OSError, ValueError, sqlite3.Error) as exc:
                 logger.warning("Không lưu được ngữ cảnh đã sửa tên vào phiên: %s", exc)
         return corrected, corrections
+
+    def save_context_edits(
+        self, video_path: str, *, characters: str, overview: str, glossary: str, visual_cues: str,
+    ) -> None:
+        """[v3.23.652] Lưu sửa tay các ô ngữ cảnh vào phiên dịch (giữ hash phân tích như cũ)."""
+        if not video_path:  # [v3.23.652] xoá trắng các ô cũng là một sửa tay cần lưu
+            return
+        try:
+            self._container.translation_session_store.save_analysis_texts(
+                video_path, characters=characters, overview=overview, glossary=glossary, visual_cues=visual_cues,
+            )
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            logger.warning("Không lưu được ngữ cảnh sửa tay vào phiên: %s", exc)
 
     def get_native_address(self) -> bool:
         """[v3.23.612] Đang bật xưng hô thuần Việt ("anh Kiếm" thay "Kiếm ca")?"""
@@ -766,16 +800,17 @@ class TranslatePageViewModel(QObject):
         """
         if not visual_cues:
             return
-        self.visual_cues_topped_up.emit(visual_cues)
         video_path = video_path or getattr(self, "_last_translate_video_path", "") or ""
-        if not video_path:
-            return
-        try:
-            self._container.translation_session_store.save_visual_cues(
-                video_path, visual_cues
-            )
-        except (OSError, ValueError, sqlite3.Error) as exc:
-            logger.warning("Không lưu được Visual Cues bổ sung vào session: %s", exc)
+        # [v3.23.655] LƯU TRƯỚC rồi mới báo trang: trang gộp 3 chiều với sửa tay trong lúc chạy rồi lưu bản đã gộp —
+        # lưu sau khi báo thì bản chưa gộp đè lên bản đã gộp (mất sửa tay).
+        if video_path:
+            try:
+                self._container.translation_session_store.save_visual_cues(
+                    video_path, visual_cues
+                )
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                logger.warning("Không lưu được Visual Cues bổ sung vào session: %s", exc)
+        self.visual_cues_topped_up.emit(visual_cues)
 
     def _persist_stage_outputs(self) -> None:
         """[v3.23.48] Lưu kết quả từng giai đoạn vào session store (theo video_path)."""
@@ -1294,6 +1329,11 @@ class TranslatePageViewModel(QObject):
         if self._is_busy:
             self.status_message.emit("Đang dịch, vui lòng chờ tiến trình hiện tại hoàn tất.")
             return False
+        if self.custom_provider_active() and (attach_video_stages or enable_visual_cues):
+            # [v3.23.666] Nhà cung cấp tuỳ chỉnh không xem được video: dịch bằng văn bản + cues có sẵn.
+            attach_video_stages = frozenset()
+            enable_visual_cues = False
+            self.status_message.emit(self._CUSTOM_NO_VIDEO_NOTE)
         if not self._source_events:
             self.error_occurred.emit("Chưa có phụ đề nguồn để dịch.")
             return False
@@ -1615,6 +1655,12 @@ class TranslatePageViewModel(QObject):
         if not self._source_events:
             self.error_occurred.emit("Chưa có phụ đề nguồn để phân tích.")
             return False
+        if self.custom_provider_active() and video_path:
+            # [v3.23.666] Phân tích bằng phụ đề; vẫn lưu theo video của phim.
+            session_path = session_path or video_path
+            video_path = None
+            enable_visual_cues = False
+            self.status_message.emit(self._CUSTOM_NO_VIDEO_NOTE)
 
         use_case = self._container.make_analyze_context_use_case(api_key)
         probe = self._container.make_subtitle_translator(api_key, retry_count=3)
@@ -1640,8 +1686,8 @@ class TranslatePageViewModel(QObject):
             enable_visual_cues=bool(enable_visual_cues and video_path),
             prior_context=prior_context,
             fallback_model=self.analysis_fallback_model(),
-            audit_model=self.audit_chain()[0],
-            audit_fallbacks=self.audit_chain()[1],
+            audit_model=self.audit_chain(model_name)[0],
+            audit_fallbacks=self.audit_chain(model_name)[1],
             # Có video đính kèm + Visual Cues thì nhãn đến từ video; còn lại gán từ phụ đề.
             text_cues=bool(
                 getattr(self, "_text_cues", False) and not (enable_visual_cues and video_path)
@@ -1673,25 +1719,74 @@ class TranslatePageViewModel(QObject):
         self._fallback_choice = (value or "").strip()
         try:
             self._container.gemini_model_health.set_preferred_fallback(self._fallback_choice)
+            # [v3.23.666] Cùng lựa chọn cho nhà cung cấp tuỳ chỉnh (khi đang dùng).
+            if self.custom_provider_active():
+                self._container.custom_model_health.set_preferred_fallback(self._fallback_choice)
         except Exception as exc:  # noqa: BLE001 — cấu hình phụ: lỗi không được làm hỏng giao diện
             logger.warning("Không áp được model dự phòng '%s': %s", value, exc)
+
+    #: [v3.23.666] Thông báo khi nhà cung cấp tuỳ chỉnh bỏ qua video.
+    _CUSTOM_NO_VIDEO_NOTE = (
+        "Nhà cung cấp tuỳ chỉnh không xem được video — chạy bằng phụ đề (và Visual Cues đã có)."
+    )
+    _CUSTOM_VIDEO_ONLY_NOTE = (
+        "Tính năng này cần Gemini xem video — nhà cung cấp tuỳ chỉnh không hỗ trợ. Chuyển "
+        "'Nhà cung cấp AI' về Google Gemini để dùng."
+    )
+
+    def set_custom_provider(self, enabled: bool, base_url: str, api_key: str) -> bool:
+        """[v3.23.666] Bật/tắt nhà cung cấp AI tuỳ chỉnh (API kiểu OpenAI, vd OxionAI).
+
+        Args:
+            enabled: Người dùng chọn "Tuỳ chỉnh".
+            base_url: Địa chỉ API gốc (vd ``https://oxionai.com/v1``).
+            api_key: Khoá API của nhà cung cấp.
+
+        Returns:
+            True nếu nhà cung cấp tuỳ chỉnh đang có hiệu lực (bật + đủ địa chỉ và key).
+        """
+        from subtitles_extractor.infrastructure.translation.openai_compat_client import (
+            CustomProviderConfig,
+        )
+
+        config = CustomProviderConfig(base_url=base_url or "", api_key=api_key or "")
+        self._container.set_custom_text_provider(config if enabled else None)
+        active = self.custom_provider_active()
+        if active:
+            self._container.custom_model_health.set_preferred_fallback(
+                getattr(self, "_fallback_choice", "") or ""
+            )
+        return active
+
+    def custom_provider_active(self) -> bool:
+        """[v3.23.666] True khi các lời gọi AI văn bản đang đi tới nhà cung cấp tuỳ chỉnh."""
+        try:
+            return self._container.custom_text_provider is not None
+        except AttributeError:  # container giả trong kiểm thử cũ
+            return False
 
     def set_audit_model(self, value: str) -> None:
         """[v3.23.640] Model tự kiểm tra phân tích do người dùng chọn (``""`` = mặc định rẻ)."""
         self._audit_choice = (value or "").strip()
 
-    def audit_chain(self) -> tuple[str, tuple[str, ...]]:
+    def audit_chain(self, analysis_model: str = "") -> tuple[str, tuple[str, ...]]:
         """[v3.23.640] ``(model tự kiểm tra, các model dự phòng của nó)`` theo lựa chọn hiện tại.
 
         Model chính = lựa chọn của người dùng (mặc định ``DEFAULT_AUDIT_MODEL``: rẻ, 500 request/ngày).
         Dự phòng: model dự phòng người dùng chọn (nếu là một model cụ thể), rồi model mặc định.
+
+        [v3.23.666] Nhà cung cấp tuỳ chỉnh: mặc định là chính ``analysis_model`` (tên Gemini cố
+        định có thể không được nhà cung cấp bán → 404), không thêm model mặc định của Gemini.
         """
         from subtitles_extractor.application.services.analysis_audit import DEFAULT_AUDIT_MODEL
 
-        primary = getattr(self, "_audit_choice", "") or DEFAULT_AUDIT_MODEL
+        custom = self.custom_provider_active()
+        default = (analysis_model or DEFAULT_AUDIT_MODEL) if custom else DEFAULT_AUDIT_MODEL
+        primary = getattr(self, "_audit_choice", "") or default
         backup = getattr(self, "_fallback_choice", "")
         candidates = [backup] if backup and backup != "-" else []
-        candidates.append(DEFAULT_AUDIT_MODEL)
+        if not custom:
+            candidates.append(DEFAULT_AUDIT_MODEL)
         return primary, tuple(dict.fromkeys(m for m in candidates if m and m != primary))
 
     def analysis_fallback_model(self) -> str:
@@ -1700,6 +1795,8 @@ class TranslatePageViewModel(QObject):
         choice = getattr(self, "_fallback_choice", "")
         if choice == "-":
             return ""
+        if self.custom_provider_active():
+            return choice  # [v3.23.666] không tự đoán tên model Gemini cho nhà cung cấp tuỳ chỉnh
         return choice or ANALYSIS_FALLBACK_MODEL
 
     def start_analysis_refinement(
@@ -1737,7 +1834,7 @@ class TranslatePageViewModel(QObject):
             source_lang=source_lang, characters=characters, overview=overview,
             glossary=glossary, visual_cues=visual_cues,
         )
-        audit_primary, audit_backups = self.audit_chain()
+        audit_primary, audit_backups = self.audit_chain(model_name)
         self._analyze_worker = RefineAnalysisWorker(
             self._container.make_analyze_context_use_case(api_key),
             source_lines, target_lang, model_name, current,
@@ -1865,6 +1962,9 @@ class TranslatePageViewModel(QObject):
         if not self._source_events:
             self.error_occurred.emit("Chưa có phụ đề nguồn.")
             return False
+        if self.custom_provider_active():
+            self.analyze_error.emit(self._CUSTOM_VIDEO_ONLY_NOTE)
+            return False
         if not video_path:
             self.analyze_error.emit(
                 "Cần video của phim để biết ai đang nói — hãy chọn video ngữ cảnh."
@@ -1913,6 +2013,72 @@ class TranslatePageViewModel(QObject):
             f"bằng {model_name}…"
         )
         return True
+
+    def start_cue_recheck(
+        self, *, api_key: str, model_name: str, video_path: str, visual_cues: str,
+        characters: str, target_lang: str, session_path: str = "",
+    ) -> bool:
+        """[v3.23.655] Hỏi lại AI CHỈ các dòng Visual Cues bị chấm nghi (rẻ hơn phân tích lại cả phim)."""
+        if self._is_busy:
+            self.status_message.emit("Đang bận, vui lòng chờ.")
+            return False
+        if not self._source_events:
+            self.error_occurred.emit("Chưa có phụ đề nguồn.")
+            return False
+        if self.custom_provider_active():
+            self.analyze_error.emit(self._CUSTOM_VIDEO_ONLY_NOTE)
+            return False
+        if not video_path:
+            self.analyze_error.emit("Cần video của phim để kiểm lại ai đang nói — hãy chọn video ngữ cảnh.")
+            return False
+        probe = self._container.make_subtitle_translator(api_key, retry_count=3)
+        if not probe.is_available():
+            self.error_occurred.emit("API Key Gemini chưa hợp lệ hoặc thiếu thư viện google-genai.")
+            return False
+        from subtitles_extractor.application.use_cases.translate_subtitles import (
+            _events_to_lines_helper,
+        )
+        from subtitles_extractor.presentation.workers.complete_speakers_worker import RecheckCuesWorker
+
+        self._analyze_worker = RecheckCuesWorker(
+            self._container.make_recheck_cues_use_case(api_key),
+            _events_to_lines_helper(self._source_events),
+            target_lang,
+            model_name,
+            video_provider=self._container.make_video_context_provider(api_key),
+            video_path=video_path,
+            visual_cues=visual_cues,
+            characters=characters,
+        )
+        self._speaker_completion_video_path = session_path or video_path
+        self._analyze_worker.finished_ok.connect(self._on_cue_recheck_finished)
+        self._analyze_worker.video_refs_ready.connect(self._on_video_refs_ready)
+        self._analyze_worker.cancelled.connect(lambda: self.status_message.emit("Đã huỷ kiểm lại dòng nghi."))
+        self._analyze_worker.failed.connect(self.analyze_error.emit)
+        self._analyze_worker.progress_message.connect(self.status_message.emit)
+        self._analyze_worker.finished.connect(self._on_analyze_thread_finished)
+        self._pending_analysis_video_path = session_path or video_path
+        self._set_busy(True)
+        self._analyze_worker.start()
+        self.status_message.emit(f"Đang kiểm lại các dòng nghi bằng {model_name}…")
+        return True
+
+    def _on_cue_recheck_finished(self, result: object) -> None:
+        from subtitles_extractor.application.use_cases.complete_speakers import CueRecheckResult
+
+        if not isinstance(result, CueRecheckResult):
+            return
+        if result.changed:
+            self._persist_topped_up_cues(
+                result.visual_cues, getattr(self, "_speaker_completion_video_path", "") or "",
+            )
+        message = (
+            f"Kiểm lại {result.suspicious} dòng nghi: sửa {len(result.fixed)}, giữ nguyên {len(result.unchanged)}"
+            f" — còn {result.still_suspicious} dòng nghi"
+            + (" (mở 📋 Bảng người nói để xem/sửa tay)" if result.still_suspicious else "")
+        )
+        tokens = self._close_token_report()
+        self.speaker_completion_done.emit(message + "." + (f" {tokens}" if tokens else ""))
 
     def _on_speaker_completion_finished(self, result: object) -> None:
         """[v3.23.601] Lưu cues đã bổ sung vào phiên rồi báo kết quả cho trang."""
@@ -2554,7 +2720,10 @@ class TranslatePageViewModel(QObject):
         self._fetch_models_worker.models_ready.connect(self.models_ready.emit)
         self._fetch_models_worker.failed.connect(self.error_occurred.emit)
         self._fetch_models_worker.finished.connect(self._on_fetch_models_finished)
-        self.status_message.emit("Đang tải danh sách model từ Gemini API…")
+        self.status_message.emit(
+            "Đang tải danh sách model từ nhà cung cấp tuỳ chỉnh…" if self.custom_provider_active()
+            else "Đang tải danh sách model từ Gemini API…"
+        )
         self._fetch_models_worker.start()
 
     def _on_fetch_models_finished(self) -> None:

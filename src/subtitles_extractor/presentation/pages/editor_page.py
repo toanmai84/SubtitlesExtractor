@@ -18,7 +18,7 @@ from typing import Any
 
 from loguru import logger
 from subtitles_extractor.presentation.qt_compat import is_valid
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, QItemSelection, QItemSelectionModel
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, QItemSelection, QItemSelectionModel, Signal
 from PySide6.QtGui import (
     QCloseEvent, QColor, QDragEnterEvent, QDropEvent, QImage, QKeyEvent, QShowEvent, QHideEvent,
 )
@@ -728,6 +728,8 @@ class _DetachedVideoWindow(QWidget):
 
 
 class EditorPage(QWidget):
+    #: [v3.23.656] Lượt Re-OCR đang chạy (trang Trích xuất khoá bắt đầu trích xuất theo tín hiệu này).
+    reocr_running_changed = Signal(bool)
 
     _VIDEO_EXTENSIONS: frozenset[str] = frozenset({".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".ts", ".m4v"})
     _SUBTITLE_EXTENSIONS: frozenset[str] = frozenset({".srt", ".ass", ".ssa", ".vtt"})
@@ -805,6 +807,9 @@ class EditorPage(QWidget):
 
         for btn in (*self.findChildren(QPushButton), *self.findChildren(QToolButton)):
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            # [v3.23.659] Nút không lấy focus → ô sửa chữ không mất focus → chữ đang gõ chưa được ghi. Ghi TRƯỚC khi
+            # nút làm việc (pressed phát trước clicked): Gộp / Áp thời gian / Xoá / Chèn… từng làm mất chữ vừa gõ.
+            btn.pressed.connect(self._commit_pending_text)
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
@@ -1041,8 +1046,10 @@ class EditorPage(QWidget):
         layout.addWidget(self._find_edit); layout.addWidget(self._btn_find_prev); layout.addWidget(self._btn_find_next)
 
         self._filter_combo = ComboBox()
-        self._filter_combo.addItems([self._translator.translate("editor.ed_flt_all"), self._translator.translate("editor.ed_flt_ocr_err"), self._translator.translate("editor.ed_flt_warn")])
-        self._filter_combo.setFixedWidth(120)
+        self._filter_combo.addItems([self._translator.translate("editor.ed_flt_all"), self._translator.translate("editor.ed_flt_ocr_err"), self._translator.translate("editor.ed_flt_warn"), self._translator.translate("editor.ed_flt_suspect")])
+        # [v3.23.654] "Nghi ngờ OCR": theo hình thái kết quả (ít khung, hiện dần, biến thể liền kề, chữ Latin lẫn).
+        self._filter_combo.setToolTip(self._translator.translate("editor.ed_flt_suspect_tip"))
+        self._filter_combo.setFixedWidth(140)
         layout.addWidget(self._filter_combo); layout.addWidget(self._lbl_find_count)
         layout.addSpacing(10); layout.addWidget(StrongBodyLabel(self._translator.translate("editor.ed_lbl_replace")))
 
@@ -1074,6 +1081,10 @@ class EditorPage(QWidget):
         self._table = QTableView(parent=self)
         self._table_model = SubtitleTableModel(self)
         self._proxy_model = SubtitleFilterProxyModel(self)
+        # [v3.23.657] Lý do "Nghi ngờ OCR" hiện bằng chữ (cột cảnh báo + tooltip).
+        self._proxy_model.set_reason_labeler(
+            lambda reason: self._translator.translate(f"editor.ed_suspect_{reason}")
+        )
         self._proxy_model.setSourceModel(self._table_model)
         self._table.setModel(self._proxy_model)
 
@@ -1623,7 +1634,23 @@ class EditorPage(QWidget):
         self._edit_text.setFocus()
         self._on_text_focus_out(None)
 
+    def _commit_pending_text(self) -> None:
+        """[v3.23.659] Ghi chữ đang gõ trong ô sửa vào ĐÚNG dòng đang sửa (tra theo uid), nếu có thay đổi."""
+        uid: str | None = getattr(self, "_pending_edit_uid", None)
+        if not uid:
+            return
+        self._pending_edit_uid: str | None = None
+        text = self._edit_text.toPlainText()
+        for index, event in enumerate(self._table_model.events):
+            if event.uid == uid:
+                if event.text != text:
+                    self._view_model.update_text(index, text)
+                return
+
     def _on_text_editing(self) -> None:
+        idx = self._current_row()
+        if 0 <= idx < len(self._table_model.events):
+            self._pending_edit_uid = self._table_model.events[idx].uid  # [v3.23.659] dòng có chữ đang gõ dở
         if self._video_widget.is_playing:
             self._video_widget.pause()
 
@@ -1653,6 +1680,9 @@ class EditorPage(QWidget):
     def _on_text_focus_out(self, ev: QEvent | None) -> None:
         if ev:
             TextEdit.focusOutEvent(self._edit_text, ev)
+        if getattr(self, "_pending_edit_uid", None):
+            self._commit_pending_text()  # [v3.23.659] ghi vào đúng dòng đã gõ, kể cả khi lựa chọn vừa đổi
+            return
         idx = self._current_row()
         if idx < 0 or idx >= len(self._table_model.events):
             return
@@ -2031,6 +2061,9 @@ class EditorPage(QWidget):
         filter_mode = self._filter_combo.currentIndex()
 
         self._proxy_model.set_filter_params(query, filter_mode)
+        # [v3.23.657] Lọc "Nghi ngờ OCR": cột cảnh báo ghi lý do bằng chữ → nới rộng (về 40 px khi bỏ lọc).
+        suspect_mode = filter_mode == SubtitleFilterProxyModel.FILTER_SUSPECT
+        self._table.setColumnWidth(COL_WARN, 190 if suspect_mode else 40)
 
         match_cnt = self._proxy_model.rowCount()
         if query or filter_mode > 0: self._lbl_find_count.setText(self._translator.translate("editor.ed_find_count").replace("{n}", str(match_cnt)))
@@ -2323,16 +2356,48 @@ class EditorPage(QWidget):
         if msg:  # Chỉ cập nhật status label khi có nội dung thực sự
             self._status_label.setText(msg)
 
+    def set_extraction_running(self, running: bool) -> None:
+        """[v3.23.656] Trang Trích xuất đang chạy → khoá Re-OCR (cùng engine OCR; chạy chồng làm hỏng lượt trích xuất)."""
+        self._extraction_running = bool(running)
+        self._refresh_reocr_buttons()
+
+    def _refresh_reocr_buttons(self) -> None:
+        busy = bool(getattr(self, "_reocr_is_busy", False))
+        extracting = bool(getattr(self, "_extraction_running", False))
+        buttons = (self._btn_reocr, self._btn_fast_reocr)
+        if not hasattr(self, "_reocr_tips"):
+            self._reocr_tips = {id(button): button.toolTip() for button in buttons}
+        locked_tip = self._translator.translate("editor.ed_tt_reocr_locked")
+        for button in buttons:
+            button.setEnabled(not busy and not extracting)
+            button.setToolTip(locked_tip if extracting else self._reocr_tips.get(id(button), ""))
+
+    def _warn_extraction_running(self) -> bool:
+        """[v3.23.656] ``True`` (đã báo) nếu đang trích xuất — người gọi dừng lại."""
+        if not getattr(self, "_extraction_running", False):
+            return False
+        InfoBar.warning(
+            self._translator.translate("editor.ib_reocr_locked_t"),
+            self._translator.translate("editor.ib_reocr_locked_c"), parent=self, duration=4000,
+        )
+        return True
+
     def _on_reocr_busy(self, is_busy: bool) -> None:
-        self._btn_reocr.setEnabled(not is_busy)
-        self._btn_fast_reocr.setEnabled(not is_busy)
-        
-        # [V3.47 PERF FIX] Vô hiệu hóa Nút Xuất khi hệ thống bận I/O để tránh Spam
+        self._reocr_is_busy = bool(is_busy)
+        self._refresh_reocr_buttons()
+        # [v3.23.659] Bật lại "Lưu tệp" khi hết bận (từng bị bỏ ở v3.23.656): xuất lỗi / Re-OCR xong lúc còn bận làm nút
+        # kẹt tắt tới khi người dùng sửa một dòng.
         self._export_button.setEnabled(not is_busy and bool(self._table_model.events))
-        
-        self._status_label.setStyleSheet(f"color: {_c.warning()}; font-weight: bold;" if is_busy else f"color: {_c.on_surface_muted()};")
+        reocr = bool(is_busy) and bool(getattr(self._view_model, "_busy_is_reocr", False))
+        if not is_busy:
+            self._view_model._busy_is_reocr = False
+        if reocr != getattr(self, "_reocr_running_emitted", False):
+            self._reocr_running_emitted = reocr
+            self.reocr_running_changed.emit(reocr)
 
     def _on_reocr_clicked(self) -> None:
+        if self._warn_extraction_running():
+            return
         if not self._current_video_path:
             InfoBar.warning(self._translator.translate("editor.ib_no_video_t"), self._translator.translate("editor.ib_no_video_open_c"), parent=self, duration=3000)
             return
@@ -2405,6 +2470,8 @@ class EditorPage(QWidget):
         )
 
     def _on_fast_reocr_clicked(self) -> None:
+        if self._warn_extraction_running():
+            return
         if not self._current_video_path:
             InfoBar.warning(self._translator.translate("editor.ib_no_video_t"), self._translator.translate("editor.ib_no_video_c"), parent=self, duration=3000)
             return
@@ -2779,13 +2846,26 @@ class EditorPage(QWidget):
             end_sec = self._table_model.events[idx].end_sec
         except (AttributeError, ValueError, IndexError): return
 
+        pending_uid = getattr(self, "_pending_edit_uid", None)
+        keep_typing = pending_uid is not None and pending_uid == self._table_model.events[idx].uid
+        if pending_uid is not None and not keep_typing:
+            # [v3.23.659] Lựa chọn chuyển sang dòng khác khi chữ chưa ghi → ghi vào dòng cũ trước khi nạp dòng mới.
+            self._commit_pending_text()
+            idx = self._current_row()
+            if not (0 <= idx < len(self._table_model.events)):
+                return
+            start_sec = self._table_model.events[idx].start_sec
+            end_sec = self._table_model.events[idx].end_sec
+
         self._edit_start.blockSignals(True)
         self._edit_end.blockSignals(True)
         self._edit_text.blockSignals(True)
         try:
             self._edit_start.setValue(int(start_sec * 1000))
             self._edit_end.setValue(int(end_sec * 1000))
-            self._edit_text.setPlainText(self._table_model.events[idx].text)
+            if not keep_typing:
+                # Cùng dòng đang gõ dở (bảng vừa làm mới do Re-OCR / lưu tự động…) → GIỮ chữ đang gõ, không đè.
+                self._edit_text.setPlainText(self._table_model.events[idx].text)
         finally:
             self._edit_start.blockSignals(False)
             self._edit_end.blockSignals(False)

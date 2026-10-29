@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 import sqlite3
 from pathlib import Path
 
@@ -38,16 +39,52 @@ from subtitles_extractor.presentation.workers.qt_progress_reporter import (
 
 logger = logging.getLogger(__name__)
 
+class _AutoSaveGate:
+    """[v3.23.655] Bug #15: tuần tự hoá các lượt tự lưu và bỏ lượt có ảnh chụp CŨ hơn lượt đã yêu cầu sau.
+
+    Mỗi lượt tự lưu là một QRunnable riêng trên QThreadPool chung — hai lượt có thể chạy song song và xong ngược thứ
+    tự, bản cũ đè bản mới. Số thứ tự tính THEO VIDEO (đổi video giữa chừng không được bỏ lượt lưu của video trước).
+    """
+
+    def __init__(self) -> None:
+        #: Khoá GHI (giữ suốt lúc ghi CSDL, chỉ luồng nền dùng).
+        self.lock = threading.Lock()
+        #: Khoá bộ đếm (rất ngắn) — luồng giao diện ``next_seq`` không bao giờ phải chờ một lượt ghi đang chạy.
+        self._seq_lock = threading.Lock()
+        self._newest: dict[str, int] = {}
+        self._counter = 0
+
+    def next_seq(self, path_str: str = "") -> int:
+        with self._seq_lock:
+            self._counter += 1
+            self._newest[path_str] = self._counter
+            return self._counter
+
+    def is_stale(self, path_str: str, seq: int) -> bool:
+        with self._seq_lock:
+            return seq < self._newest.get(path_str, seq)
+
+
 class _AutoSaveRunnable(QRunnable):
-    def __init__(self, repo, path_str: str, events: list):
+    def __init__(self, repo, path_str: str, events: list, *, gate: _AutoSaveGate | None = None, seq: int = 0):
         super().__init__()
         self.repo = repo
         self.path_str = path_str
         self.events = events
+        self.gate = gate
+        self.seq = seq
 
     def run(self):
+        gate = self.gate
         try:
-            self.repo.save_events(self.path_str, self.events)
+            if gate is None:
+                self.repo.save_events(self.path_str, self.events)
+                return
+            with gate.lock:            # một lượt ghi tại một thời điểm; lượt cũ hơn lượt đã yêu cầu sau thì bỏ
+                if gate.is_stale(self.path_str, self.seq):
+                    logger.debug("Bỏ lượt tự lưu cũ #%d (đã có lượt mới hơn).", self.seq)
+                    return
+                self.repo.save_events(self.path_str, self.events)
         except (sqlite3.Error, OSError, ValueError) as exc:
             logger.warning("Lỗi auto-save Database: %s", exc)
 
@@ -308,7 +345,10 @@ class EditorPageViewModel(QObject):
         path_str = str(self._current_video_path.resolve())
         events_snapshot = list(events)
 
-        worker = _AutoSaveRunnable(self._container.subtitle_repository, path_str, events_snapshot)
+        gate = self.__dict__.setdefault("_autosave_gate", _AutoSaveGate())  # [v3.23.655]
+        worker = _AutoSaveRunnable(
+            self._container.subtitle_repository, path_str, events_snapshot, gate=gate, seq=gate.next_seq(path_str),
+        )
         self._thread_pool.start(worker)
 
     def export_to_file(self, output_path: Path, output_format: SubtitleFormat) -> bool:
@@ -369,8 +409,8 @@ class EditorPageViewModel(QObject):
         # Dừng watchdog và giải phóng reference.
         self._export_watchdog.stop()
         self._export_worker = None
+        self._set_busy(False)  # [v3.23.659] hết bận TRƯỚC khi báo lỗi — trang tắt nút Xuất khi nhận lỗi lúc còn bận
         self.error_occurred.emit(f"Lỗi khi xuất tệp: {err_msg}")
-        self._set_busy(False)
 
     def _on_export_watchdog_timeout(self) -> None:
         """Safety net: force-reset nếu signal export bị drop sau 60 giây.
@@ -472,6 +512,7 @@ class EditorPageViewModel(QObject):
         if persist_roi:
             self._save_roi_to_video_state(video_path, roi)
 
+        self._busy_is_reocr = True   # [v3.23.656] trang Trích xuất khoá bắt đầu trích xuất suốt lượt Re-OCR
         self._set_busy(True)
         self._launch_reocr_thread(request)
 
@@ -507,18 +548,13 @@ class EditorPageViewModel(QObject):
         from subtitles_extractor.application.dtos.reocr_dto import ReOcrRequest
         snapshot = self._container.settings_service.current
         post = snapshot.post_process
-        from subtitles_extractor.application.services.ocr_model_resolver import (
-            default_models_for_version,
-            resolve_ocr_model_names,
-        )
+        from subtitles_extractor.application.services.ocr_model_resolver import models_for_reocr
         from subtitles_extractor.domain.ports.ocr_engine_port import PreprocessConfig
 
         # [v3.23.104] Khi Studio chỉ định version (model_override), map ĐÚNG qua nguồn sự
         # thật chung (hỗ trợ PP-OCRv6); không còn rơi về PP-OCRv5 như bug trước.
-        if model_override:
-            det_model, rec_model = default_models_for_version(model_override)
-        else:
-            det_model, rec_model = resolve_ocr_model_names(snapshot.ocr)
+        # [v3.23.657] Cùng phiên bản với Cài đặt → giữ bộ dò chữ chọn riêng (xem ``models_for_reocr``).
+        det_model, rec_model = models_for_reocr(snapshot.ocr, model_override)
 
         from importlib.util import find_spec
         has_cupy = find_spec("cupy") is not None
@@ -584,7 +620,7 @@ class EditorPageViewModel(QObject):
         builder_cfg = SubtitleBuilderConfig(
             similarity_threshold=min(post.similarity_threshold, snapshot.threshold.text_similarity),
             min_duration_sec=post.min_duration_sec, max_duration_sec=post.max_duration_sec,
-            merge_gap_sec=post.merge_gap_sec, min_confidence=min_conf,
+            merge_gap_sec=post.merge_gap_sec, merge_progressive=bool(getattr(post, "merge_progressive", False)), min_confidence=min_conf,
             use_viterbi=post.use_viterbi, viterbi_open_penalty=post.viterbi_open_penalty,
             min_text_chars=snapshot.threshold.drop_short_text_chars, line_similarity_threshold=snapshot.threshold.line_similarity,
             sample_step_sec=snapshot.frame.sample_step_sec, temporal_padding_sec=post.temporal_padding_sec,
@@ -652,10 +688,21 @@ class EditorPageViewModel(QObject):
             self.progress_changed.emit(100, 100, "Re-OCR hoàn tất: KHÔNG tìm thấy đoạn Text nào đủ chất lượng.")
             return
 
+        uids_to_remove = list(response.replaced_uids)
+        failed_ranges = tuple(getattr(response, "failed_ranges", ()) or ())
+        if failed_ranges:
+            # [v3.23.659] Đoạn OCR lại bị lỗi: giữ dòng gốc nằm trong đoạn đó (trước đây bị xoá mà không có bản thay).
+            by_uid = {event.uid: event for event in self._service.snapshot_state().events}
+            uids_to_remove = [
+                uid for uid in uids_to_remove
+                if uid in by_uid and not any(
+                    by_uid[uid].start_sec < r.end_sec and by_uid[uid].end_sec > r.start_sec for r in failed_ranges
+                )
+            ]
         try:
             state = self._service.replace_events_by_uid(
-                uids_to_remove=response.replaced_uids, new_events=response.new_events,
-                description=f"Re-OCR ({len(response.replaced_uids)} → {len(response.new_events)} câu)"
+                uids_to_remove=uids_to_remove, new_events=response.new_events,
+                description=f"Re-OCR ({len(uids_to_remove)} → {len(response.new_events)} câu)"
             )
         except (ValueError, KeyError, IndexError, RuntimeError, AttributeError) as exc:
             self.error_occurred.emit(f"Lỗi khi áp dụng kết quả Re-OCR vào Bảng dữ liệu: {exc}.")

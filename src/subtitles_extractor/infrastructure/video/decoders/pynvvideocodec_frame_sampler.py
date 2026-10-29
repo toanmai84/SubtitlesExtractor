@@ -323,6 +323,28 @@ def _create_packet_data(data: bytes, av_packet: Any) -> tuple[Any, np.ndarray]:
     packet_data.key = bool(getattr(av_packet, 'is_keyframe', False))
     return packet_data, numpy_array
 
+def nvdec_frame_time(pts_val: Any, time_base: float, fallback_sec: float, stream_has_pts: bool) -> float:
+    """[v3.23.655] Bug #16: mốc giờ của khung NVDEC trả về.
+
+    Bản cũ ``float(pts) * tb if pts else <mốc gói>``: PTS = 0 (khung ĐẦU phim) bị coi là "không có" → lấy mốc của gói
+    vừa nạp (thứ tự GIẢI MÃ, lệch với khung B). Chỉ dùng mốc dự phòng khi thật sự không có PTS.
+    """
+    if pts_val is None or (not stream_has_pts and not pts_val):
+        return fallback_sec
+    return float(pts_val) * time_base
+
+
+def error_frame_time(packet_sec: float, last_sec: float, start_sec: float) -> float | None:
+    """[v3.23.655] Bug #16: mốc của "khung lỗi" khi NVDEC giải mã một gói thất bại; ``None`` = không phát khung lỗi.
+
+    Bản cũ gán mốc của GÓI (thứ tự giải mã: có thể -1 khi gói không có PTS, hoặc lùi/tiến so với khung đã phát) rồi dời
+    mốc lấy mẫu theo đó → khung rỗng chen sai chỗ (cắt đôi câu phụ đề) và lịch lấy mẫu nhảy. Nay mốc không bao giờ lùi.
+    """
+    if packet_sec < 0 or packet_sec < start_sec:
+        return None
+    return max(packet_sec, last_sec)
+
+
 @functools.lru_cache(maxsize=1)
 def _get_nv_codec_map() -> dict[str, Any]:
     try:
@@ -613,9 +635,12 @@ class PyNvVideoCodecFrameSampler:
             except (RuntimeError, ValueError, AttributeError, OSError) as exc:
                 logger.warning("Bỏ qua lỗi PyAV khi Seek: %s.", exc)
 
+        stream_has_pts = False   # [v3.23.655] có gói mang PTS → PTS 0 của khung là mốc thật, không phải "thiếu"
+        last_emitted_sec = start_sec
         for av_packet in av_container.demux(av_stream):
             if av_packet.size == 0: continue
 
+            stream_has_pts = stream_has_pts or av_packet.pts is not None
             packet_timestamp_sec = float(av_packet.pts * time_base) if av_packet.pts is not None else -1.0
             if packet_timestamp_sec > end_sec + 2.0: break
 
@@ -631,15 +656,20 @@ class PyNvVideoCodecFrameSampler:
                 decoded_frames = nv_decoder.Decode(packet_data)
             except RuntimeError as exc:
                 logger.debug("NVDEC Decode thất bại: %s", exc)
-                yield SampledFrame(frame_index=frame_counter_idx, timestamp_sec=packet_timestamp_sec, image_rgb=EMPTY_ARRAY, is_error=True)
-                frame_counter_idx += 1; next_target_sec = packet_timestamp_sec + step_sec
+                error_sec = error_frame_time(packet_timestamp_sec, last_emitted_sec, start_sec)
+                if error_sec is None or error_sec > end_sec:
+                    continue
+                yield SampledFrame(frame_index=frame_counter_idx, timestamp_sec=error_sec, image_rgb=EMPTY_ARRAY, is_error=True)
+                frame_counter_idx += 1; last_emitted_sec = error_sec
+                next_target_sec = max(next_target_sec, error_sec + step_sec)
                 continue
 
             if not decoded_frames: continue
 
             for device_frame in decoded_frames:
-                pts_val = device_frame.getPTS()
-                frame_timestamp_sec = float(pts_val) * time_base if pts_val else packet_timestamp_sec
+                frame_timestamp_sec = nvdec_frame_time(
+                    device_frame.getPTS(), time_base, packet_timestamp_sec, stream_has_pts,
+                )
 
                 if frame_timestamp_sec < start_sec: continue
                 if frame_timestamp_sec > end_sec: return
@@ -710,6 +740,7 @@ class PyNvVideoCodecFrameSampler:
                     deduper.accept(final_rgb_numpy, frame_timestamp_sec)
 
                 frame_counter_idx += 1
+                last_emitted_sec = max(last_emitted_sec, frame_timestamp_sec)
                 next_target_sec = frame_timestamp_sec + step_sec
 
         # Flush EOS
@@ -720,8 +751,7 @@ class PyNvVideoCodecFrameSampler:
             packet_eos.bsl = 0; packet_eos.decode_flag = enum_eos
 
             for device_frame in nv_decoder.Decode(packet_eos) or []:
-                pts_val = device_frame.getPTS()
-                frame_timestamp_sec = float(pts_val) * time_base if pts_val else end_sec
+                frame_timestamp_sec = nvdec_frame_time(device_frame.getPTS(), time_base, end_sec, stream_has_pts)
                 if frame_timestamp_sec > end_sec: break
                 if not is_sample_due(frame_timestamp_sec, next_target_sec):
                     continue

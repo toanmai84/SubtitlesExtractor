@@ -37,6 +37,7 @@ __all__ = [
     "format_reference_block",
     "merge_characters",
     "merge_glossary",
+    "retrieve_for_lines",
     "retrieve_relevant",
     "roster_overlap_ratio",
 ]
@@ -215,6 +216,53 @@ def retrieve_relevant(
         if score >= min_score:
             result.append(entries[index])
     return result
+
+
+_QUERY_CHUNK = 50
+
+
+def retrieve_for_lines(
+    queries: list[str],
+    entries: list[TranslationMemoryEntry],
+    *,
+    per_line_k: int = 2,
+    max_references: int = 40,
+    min_score: float = 70.0,
+) -> list[TranslationMemoryEntry]:
+    """[v3.23.654] Truy hồi tham chiếu cho NHIỀU câu một lượt (``rapidfuzz.process.cdist``, đa luồng).
+
+    Thay vòng ``retrieve_relevant`` từng câu (400 câu × mọi mục, đo 4–7 s trên luồng giao diện với phim 3648 dòng).
+    Thứ tự kết quả giữ như cũ: theo thứ tự ``queries``, mỗi câu tối đa ``per_line_k`` mục điểm cao nhất, bỏ trùng,
+    dừng ở ``max_references``.
+    """
+    queries = [q.strip() for q in queries if q and q.strip()]
+    if not queries or not entries or per_line_k <= 0:
+        return []
+    import numpy as np
+
+    candidates = [entry.source_text for entry in entries]
+    collected: list[TranslationMemoryEntry] = []
+    seen: set[str] = set()
+    # Từng khúc nhỏ: đủ tham chiếu thì dừng sớm như vòng cũ (dữ liệu khớp nhiều), mỗi khúc chạy song song.
+    for start in range(0, len(queries), _QUERY_CHUNK):
+        scores = process.cdist(
+            queries[start:start + _QUERY_CHUNK], candidates,
+            scorer=fuzz.token_set_ratio, score_cutoff=min_score, workers=-1,
+        )
+        for row in scores:
+            hits = np.flatnonzero(row >= min_score)
+            if hits.size == 0:
+                continue
+            # Điểm giảm dần; cùng điểm thì mục đứng trước (mới hơn) thắng — như process.extract.
+            order = hits[np.lexsort((hits, -row[hits]))][:per_line_k]
+            for index in order.tolist():
+                source = entries[index].source_text
+                if source not in seen:
+                    seen.add(source)
+                    collected.append(entries[index])
+            if len(collected) >= max_references:
+                return collected[:max_references]
+    return collected[:max_references]
 
 
 def format_reference_block(

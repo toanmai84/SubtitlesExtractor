@@ -7,11 +7,15 @@ lệnh là hàm thuần nên kiểm thử được đầy đủ, còn module nà
 from __future__ import annotations
 
 import logging
+import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -125,8 +129,61 @@ def _render_resolved(
     on_progress: ProgressCallback | None,
     is_cancelled: CancelCallback | None,
 ) -> Path:
-    """Dò bộ mã hoá, chạy lệnh xuất; bộ mã hoá GPU lỗi thì xuất lại bằng CPU."""
+    """Dò bộ mã hoá, chạy lệnh xuất; bộ mã hoá GPU lỗi thì xuất lại bằng CPU.
 
+    [v3.23.652] ffmpeg ghi vào tệp tạm cạnh tệp đích rồi mới thay thế: trước đây lệnh ghi thẳng (``-y``) lên tệp đích và
+    lỗi/huỷ thì ``unlink`` — mất luôn bản xuất cũ (có thể đã mất nhiều giờ) của người dùng.
+    """
+    final_path = request.output_path
+    _refuse_overwriting_inputs(request)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = final_path.with_name(f"{final_path.stem}.partial{final_path.suffix}")
+    try:
+        _render_to(ffmpeg, replace(request, output_path=partial_path), total_duration_sec, on_progress, is_cancelled)
+    except BaseException:
+        partial_path.unlink(missing_ok=True)  # ffmpeg lỗi / huỷ: chỉ bỏ tệp tạm, tệp đích cũ còn nguyên
+        raise
+    _move_into_place(partial_path, final_path)
+    logger.info("Xuất video xong: %s", final_path)
+    return final_path
+
+
+def _refuse_overwriting_inputs(request: RenderRequest) -> None:
+    """[v3.23.652] Tệp đích trùng tệp nguồn: ffmpeg tự từ chối, nhưng qua tệp tạm rồi ``os.replace`` sẽ đè mất nguồn."""
+    try:
+        target = request.output_path.resolve()
+        inputs = [p for p in (request.video_path, request.subtitle_path, getattr(request, "audio_path", None)) if p]
+        clash = any(Path(p).resolve() == target for p in inputs)
+    except OSError:
+        return
+    if clash:
+        raise VideoRenderError("Tệp đích trùng với tệp nguồn — hãy chọn tên/thư mục khác để không ghi đè video gốc.")
+
+
+def _move_into_place(partial_path: Path, final_path: Path) -> None:
+    """[v3.23.652] Thay tệp đích bằng bản vừa xuất. Windows khoá tệp đang mở (trình phát, xem trước, diệt virus) →
+    thử lại vài lần; vẫn không được thì GIỮ bản vừa xuất (có thể mất hàng giờ) và báo đường dẫn của nó."""
+    last_error: OSError | None = None
+    for attempt in range(6):
+        try:
+            os.replace(partial_path, final_path)
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.5 * (attempt + 1))
+    raise VideoRenderError(
+        f"Xuất xong nhưng không thay được tệp đích (đang bị mở bởi chương trình khác?): {last_error}. "
+        f"Bản vừa xuất được giữ ở: {partial_path}"
+    )
+
+
+def _render_to(
+    ffmpeg: str,
+    request: RenderRequest,
+    total_duration_sec: float,
+    on_progress: ProgressCallback | None,
+    is_cancelled: CancelCallback | None,
+) -> Path:
     # [v3.23.618] "Tự động (GPU nếu có)": dò bộ mã hoá dùng được thật trên máy này.
     if request.video_encoder == AUTO_VIDEO_ENCODER:
         request = replace(request, video_encoder=pick_video_encoder(ffmpeg, "h264"))
@@ -160,6 +217,18 @@ def _render_resolved(
         )
 
 
+#: [v3.23.656] ffmpeg (``-stats``) in tiến độ ~2 lần/giây; im lặng chừng này coi như treo.
+_STALL_TIMEOUT_SEC: float = 600.0
+
+
+def _kill(process: subprocess.Popen) -> None:
+    try:
+        process.kill()
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _run_render(
     command: list[str],
     request: RenderRequest,
@@ -180,14 +249,45 @@ def _run_render(
     )
 
     error_tail: list[str] = []
+    # [v3.23.656] B4: đọc stderr ở LUỒNG RIÊNG, luồng này kiểm huỷ theo chu kỳ — trước đây huỷ chỉ được kiểm khi ffmpeg
+    # in một dòng, ffmpeg treo im lặng thì nút Huỷ vô tác dụng và luồng xuất kẹt mãi.
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def _pump(stream) -> None:
+        try:
+            for raw_line in stream:
+                lines.put(raw_line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            lines.put(None)
+
+    assert process.stderr is not None  # noqa: S101 — đã set stderr=PIPE
+    reader = threading.Thread(target=_pump, args=(process.stderr,), name="ffmpeg-stderr", daemon=True)
+    reader.start()
+    last_output = time.monotonic()
+    drained = False
     try:
-        assert process.stderr is not None  # noqa: S101 — đã set stderr=PIPE
-        for line in process.stderr:
+        while True:
             if is_cancelled is not None and is_cancelled():
-                process.kill()
-                process.wait(timeout=5)
+                _kill(process)
                 request.output_path.unlink(missing_ok=True)
                 raise VideoRenderError("Đã huỷ xuất video theo yêu cầu.")
+            try:
+                line = lines.get(timeout=0.25)
+            except queue.Empty:
+                if time.monotonic() - last_output > _STALL_TIMEOUT_SEC:
+                    _kill(process)
+                    request.output_path.unlink(missing_ok=True)
+                    raise VideoRenderError(
+                        f"ffmpeg không phản hồi {int(_STALL_TIMEOUT_SEC)} giây (không có tiến độ) — đã dừng. "
+                        "Thử lại; nếu lặp lại, đổi bộ mã hoá (CPU) trong Xuất bản."
+                    ) from None
+                continue
+            if line is None:
+                drained = True
+                break
+            last_output = time.monotonic()
 
             # Giữ lại vài dòng cuối để báo lỗi có ngữ cảnh.
             stripped = line.strip()
@@ -201,6 +301,9 @@ def _run_render(
                 if processed is not None:
                     on_progress(min(1.0, processed / total_duration_sec))
     finally:
+        if not drained and process.poll() is None:
+            _kill(process)          # thoát vòng vì lỗi bất kỳ: không để ffmpeg chạy mồ côi
+        reader.join(timeout=5)
         process.stderr.close() if process.stderr else None
 
     return_code = process.wait()
@@ -214,7 +317,6 @@ def _run_render(
 
     if on_progress is not None:
         on_progress(1.0)
-    logger.info("Xuất video xong: %s", request.output_path)
     return request.output_path
 
 

@@ -24,7 +24,9 @@ Mọi hàm xử lý theo chunk khi cần để an toàn RAM với audio dài hà
 
 from __future__ import annotations
 
+import functools
 import logging
+import math
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -51,10 +53,25 @@ from subtitles_extractor.infrastructure.tts.dsp_primitives import (
 logger = logging.getLogger(__name__)
 
 # Hệ số K-weighting (ITU-R BS.1770) cho phép đo LUFS không cần pyloudnorm.
-_KW_B1 = [1.53512485958697, -2.69169618940638, 1.19839281085285]
-_KW_A1 = [1.0, -1.69065929318241, 0.73248077421585]
-_KW_B2 = [1.0, -2.0, 1.0]
-_KW_A2 = [1.0, -1.99004745483398, 0.99007225036621]
+@functools.lru_cache(maxsize=8)
+def _k_weight_coeffs(sr: int) -> tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...], tuple[float, ...]]:
+    """Hệ số K-weighting (b1, a1, b2, a2) cho ĐÚNG tần số lấy mẫu ``sr`` (công thức libebur128 / pyloudnorm).
+
+    [v3.23.662] Trước đây dùng bảng 48 kHz cho mọi ``sr``: TTS Edge/Gemini/VieNeu ở 24 kHz bị đo TO hơn thật 0,9 LU
+    (tập 1: bộ đo app −15,1, pyloudnorm −16,0) → chuẩn hoá thiếu gain, master ra −16,9 LUFS khi mục tiêu −16.
+    """
+    k = math.tan(math.pi * 1681.974450955533 / sr)
+    q = 0.7071752369554196
+    vh = 10.0 ** (3.999843853973347 / 20.0)
+    vb = vh ** 0.4996667741545416
+    a0 = 1.0 + k / q + k * k
+    b1 = ((vh + vb * k / q + k * k) / a0, 2.0 * (k * k - vh) / a0, (vh - vb * k / q + k * k) / a0)
+    a1 = (1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0)
+    k = math.tan(math.pi * 38.13547087602444 / sr)
+    q = 0.5003270373238773
+    a0 = 1.0 + k / q + k * k
+    a2 = (1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0)
+    return b1, a1, (1.0, -2.0, 1.0), a2
 
 
 # ── Xử lý audio DÀI theo khối (tiết kiệm RAM) ────────────────────────────────
@@ -223,13 +240,14 @@ def clip_for_output(audio: np.ndarray, ceiling: float = 1.0) -> np.ndarray:
 
 
 # ── Đo lường ─────────────────────────────────────────────────────────────────
-def _k_weight_window(window: np.ndarray) -> np.ndarray:
+def _k_weight_window(window: np.ndarray, sr: int) -> np.ndarray:
     """K-weighting (ITU-R BS.1770) một đoạn, khởi tạo trạng thái ở mẫu đầu; float64 nội bộ, trả float32."""
     from scipy.signal import lfilter, lfilter_zi
 
+    kb1, ka1, kb2, ka2 = _k_weight_coeffs(sr)
     block = window.astype(np.float64)
-    stage1 = lfilter(_KW_B1, _KW_A1, block, zi=lfilter_zi(_KW_B1, _KW_A1) * float(block[0]))[0]
-    stage2 = lfilter(_KW_B2, _KW_A2, stage1, zi=lfilter_zi(_KW_B2, _KW_A2) * float(stage1[0]))[0]
+    stage1 = lfilter(kb1, ka1, block, zi=lfilter_zi(kb1, ka1) * float(block[0]))[0]
+    stage2 = lfilter(kb2, ka2, stage1, zi=lfilter_zi(kb2, ka2) * float(stage1[0]))[0]
     return stage2.astype(np.float32)
 
 
@@ -248,7 +266,7 @@ def _kweighted_by_islands(audio: np.ndarray, sr: int) -> np.ndarray:
     def run(job: tuple[int, int]) -> None:
         start, end = job
         lo, hi = max(0, start - pad), min(n, end + pad)
-        kweighted[start:end] = _k_weight_window(audio[lo:hi])[start - lo : start - lo + (end - start)]
+        kweighted[start:end] = _k_weight_window(audio[lo:hi], int(sr))[start - lo : start - lo + (end - start)]
 
     workers = min(master_worker_count(), max(1, len(jobs)))
     if workers > 1:
@@ -284,7 +302,8 @@ def measure_lufs(audio: np.ndarray, sr: int) -> float:
     if audio.ndim == 1 and n > _LONG_AUDIO_S * sr:
         return _gated_loudness_from_kweighted(_kweighted_by_islands(audio, sr), sr)
 
-    zi1 = lfilter_zi(_KW_B1, _KW_A1) * float(audio[0])
+    kb1, ka1, kb2, ka2 = _k_weight_coeffs(int(sr))
+    zi1 = lfilter_zi(kb1, ka1) * float(audio[0])
     zi2 = None
     chunk = sr * 60
     # [v3.23.212] Ghi THẲNG vào mảng cấp sẵn float32 thay vì tích luỹ list float64 rồi
@@ -294,10 +313,10 @@ def measure_lufs(audio: np.ndarray, sr: int) -> float:
     kweighted = np.empty(n, dtype=np.float32)
     for start in range(0, n, chunk):
         block = audio[start:start + chunk].astype(np.float64)
-        s1, zi1 = lfilter(_KW_B1, _KW_A1, block, zi=zi1)
+        s1, zi1 = lfilter(kb1, ka1, block, zi=zi1)
         if zi2 is None:
-            zi2 = lfilter_zi(_KW_B2, _KW_A2) * float(s1[0])
-        s2, zi2 = lfilter(_KW_B2, _KW_A2, s1, zi=zi2)
+            zi2 = lfilter_zi(kb2, ka2) * float(s1[0])
+        s2, zi2 = lfilter(kb2, ka2, s1, zi=zi2)
         kweighted[start:start + len(s2)] = s2.astype(np.float32)
     return _gated_loudness_from_kweighted(kweighted, sr)
 
@@ -416,14 +435,8 @@ def normalize_to_lufs(
         # [v3.23.212] Audio DÀI: pyloudnorm yêu cầu bản float64 TOÀN BỘ (2x RAM + mảng
         # nội bộ) -> dùng bộ đo K-weighted gated tự viết (measure_lufs, xử lý theo
         # chunk, cùng chuẩn ITU-R BS.1770). Audio ngắn giữ pyloudnorm như cũ.
-        if audio.size > _LONG_AUDIO_S * sr:
-            current = measure_lufs(audio, sr)
-        else:
-            try:
-                import pyloudnorm as pyln
-                current = pyln.Meter(sr).integrated_loudness(audio.astype(np.float64))
-            except ImportError:
-                current = measure_lufs(audio, sr)
+        # [v3.23.662] Dùng chung ``_integrated_lufs``: audio < 400 ms trước đây làm pyloudnorm ném ValueError.
+        current = _integrated_lufs(audio, sr)
     if current == float("-inf"):
         return audio
     # [v3.23.182] Đồng bộ fix v178: gain có TRẦN (+15dB) chống nổi nhiễu nền ở master
@@ -580,10 +593,64 @@ def master_finalize(
     out = soft_limit(out, threshold=0.85, ceiling=0.92)
     np.clip(out, -1.0, 1.0, out=out)
     out = true_peak_limit(out, sr, ceiling=tp_ceiling)
+    return compensate_lufs_shortfall(out, sr, target_lufs, tp_ceiling)
+
+
+def compensate_lufs_shortfall(
+    audio: np.ndarray, sr: int, target_lufs: float, tp_ceiling: float = 0.95,
+) -> np.ndarray:
+    """Bù phần độ to bị ghìm đỉnh làm hụt so với mục tiêu (tối đa +3 dB, 2 vòng), ghìm đỉnh lại sau mỗi vòng.
+
+    [v3.23.660] Giọng nhiều đỉnh nhọn → soft-limit từ 0,85 cắt bớt năng lượng: đo thật ra −16,9 LUFS khi mục tiêu −16.
+    [v3.23.662] Tách thành hàm chung để đường master riêng của Edge TTS cũng dùng (trước đó Edge vẫn ra −16,91 LUFS).
+    Có thể sửa TẠI CHỖ mảng vào (tránh nhân đôi RAM với master dài) — người gọi dùng giá trị trả về.
+    """
+    out = np.asarray(audio, dtype=np.float32)
+    if out.size == 0 or target_lufs >= 0.0:
+        return out
+    for _ in range(2):
+        current = _integrated_lufs(out, sr)
+        shortfall = target_lufs - current
+        if not np.isfinite(current) or shortfall <= _LUFS_TOLERANCE:
+            break
+        out *= np.float32(10.0 ** (min(shortfall, 3.0) / 20.0))  # tại chỗ: master dài cả trăm MB
+        out = soft_limit(out, threshold=0.85, ceiling=0.92)
+        np.clip(out, -1.0, 1.0, out=out)
+        out = true_peak_limit(out, sr, ceiling=tp_ceiling)
     return out
 
 
+#: [v3.23.660] Sai lệch độ to chấp nhận được sau master (LU).
+_LUFS_TOLERANCE = 0.2
+
+
+def _integrated_lufs(audio: np.ndarray, sr: int) -> float:
+    """Độ to tích hợp: pyloudnorm cho audio ngắn (như ``normalize_to_lufs``), bộ đo theo chunk cho audio dài."""
+    # [v3.23.662] Audio ngắn hơn một block 400 ms: pyloudnorm ném ValueError → master 1 câu ngắn làm hỏng cả lượt TTS.
+    if audio.size > _LONG_AUDIO_S * sr or audio.size < 0.4 * sr:
+        return measure_lufs(audio, sr)
+    try:
+        import pyloudnorm as pyln
+        return float(pyln.Meter(sr).integrated_loudness(audio.astype(np.float64)))
+    except (ImportError, ValueError):
+        return measure_lufs(audio, sr)
+
+
 # ── Ghi file đa định dạng ────────────────────────────────────────────────────
+def effective_bitrate_kbps(fmt: str, bitrate_kbps: int, channels: int = 1) -> int:
+    """[v3.23.659] Kẹp bitrate vào giới hạn của bộ mã hoá.
+
+    libopus từ chối > 256 kbps mỗi kênh ("The bit rate 320000 bps is unsupported") — mặc định 320 kbps của trang TTS
+    làm Opus LUÔN lỗi, ứng dụng âm thầm ghi WAV mà vẫn nhớ đường dẫn .opus (TTS lại dòng / ghép lại sau xoá dòng hỏng).
+    """
+    rate = max(32, int(bitrate_kbps))
+    if fmt == "opus":
+        return min(rate, 256 * max(1, channels), 510)
+    if fmt == "mp3":
+        return min(rate, 320)
+    return rate
+
+
 def _encode_with_ffmpeg(
     audio: np.ndarray, sr: int, target: Path, fmt: str, bitrate_kbps: int
 ) -> bool:
@@ -607,7 +674,7 @@ def _encode_with_ffmpeg(
         q = 3 if bitrate_kbps <= 128 else (5 if bitrate_kbps <= 224 else 7)
         rate_args = ["-q:a", str(q)]
     else:
-        rate_args = ["-b:a", f"{bitrate_kbps}k"]
+        rate_args = ["-b:a", f"{effective_bitrate_kbps(fmt, bitrate_kbps, 1 if np.ndim(audio) == 1 else int(np.shape(audio)[1]))}k"]
 
     # [BrokenPipeError Fix] KHÔNG bơm vài GB float32 vào stdin (pipe:0) — Windows dễ
     # đóng pipe giữa chừng làm file ra 0 byte (mất tiếng). Chiến thuật Temp File

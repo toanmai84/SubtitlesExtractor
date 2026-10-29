@@ -83,12 +83,11 @@ class ExtractEmbeddedSubtitlesUseCase:
         if not result.is_bitmap:
             return ExtractEmbeddedResponse(events=result.events, used_ocr=False)
 
-        return ExtractEmbeddedResponse(
-            events=self._ocr_bitmap_frames(
-                result.bitmap_frames, progress_callback, cancellation_check
-            ),
-            used_ocr=True,
-        )
+        try:
+            events = self._ocr_bitmap_frames(result.bitmap_frames, progress_callback, cancellation_check)
+        finally:
+            _remove_bitmap_temp_dirs(result.bitmap_frames)
+        return ExtractEmbeddedResponse(events=events, used_ocr=True)
 
     def _ocr_bitmap_frames(
         self,
@@ -114,7 +113,7 @@ class ExtractEmbeddedSubtitlesUseCase:
             timestamps: list[float] = []
             valid_frames = []
             for offset, frame in enumerate(batch_frames):
-                image_bgr = cv2.imread(str(frame.image_path), cv2.IMREAD_COLOR)
+                image_bgr = _read_image_bgr(frame.image_path)
                 if image_bgr is None:
                     continue
                 images_rgb.append(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
@@ -149,6 +148,37 @@ class ExtractEmbeddedSubtitlesUseCase:
             progress_callback(total, total, f"Hoàn tất OCR {len(events)} câu phụ đề.")
         logger.info("OCR bitmap (theo lô) xong: {} câu từ {} ảnh.", len(events), total)
         return events
+
+
+def _read_image_bgr(path: Path):
+    """[v3.23.659] Đọc ảnh an toàn với đường dẫn Unicode.
+
+    ``cv2.imread`` trên Windows trả ``None`` khi đường dẫn có ký tự ngoài ASCII (vd %TEMP% dưới tên người dùng có
+    dấu) → OCR phụ đề hình nhúng ra 0 câu mà không báo lỗi.
+    """
+    import numpy as np
+
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
+def _remove_bitmap_temp_dirs(frames) -> None:
+    """[v3.23.659] Xoá thư mục ảnh tạm (``se_pgs_*``, ``se_vobsub_*``, ``se_embed_bmp_*``) — trước đây rò mỗi lần trích."""
+    import shutil
+    import tempfile
+
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    for folder in {Path(getattr(frame, "image_path", "")).parent for frame in frames or ()}:
+        try:
+            if folder.name.startswith("se_") and folder.resolve().parent == temp_root:
+                shutil.rmtree(folder, ignore_errors=True)
+        except OSError:
+            continue
 
 
 __all__ = [

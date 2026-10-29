@@ -86,9 +86,17 @@ def find_concat_videos(
         and entry.suffix.lower() in _VIDEO_SUFFIXES
         and entry.name not in exclude
         and not is_full_series_output(entry)
-        and (name_filter is None or name_filter in entry.name)
+        and not _is_partial_or_preview(entry)
+        # [v3.23.659] Đúng HẬU TỐ (trước là "chứa chuỗi": "_phude" khớp cả "_phude_thuyetminh", "_phude_xemthu").
+        and (name_filter is None or entry.stem.endswith(name_filter))
     ]
     return sorted(candidates, key=natural_sort_key)
+
+
+def _is_partial_or_preview(path: Path) -> bool:
+    """[v3.23.659] Tệp đang ghi dở (``.partial``) hoặc bản xuất thử (``_xemthu``) — không phải một tập."""
+    stem = path.stem.lower()
+    return stem.endswith(".partial") or "_xemthu" in stem
 
 
 #: Hậu tố tên tệp trọn bộ do chính ứng dụng tạo (xem :func:`default_concat_output`).

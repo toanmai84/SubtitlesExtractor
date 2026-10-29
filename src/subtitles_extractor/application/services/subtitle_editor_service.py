@@ -175,17 +175,17 @@ class SubtitleEditorService:
 
     def update_timing(self, index: int, start_sec: float, end_sec: float) -> EditorState:
         self._validate_index(index)
+        # [v3.23.659] Kiểm giờ hợp lệ TRƯỚC khi ghi undo: _push_undo xoá ngăn Làm lại → giờ sai (bị từ chối) từng làm
+        # mất toàn bộ lịch sử Làm lại.
+        new_interval = TimeInterval(start_sec=start_sec, end_sec=end_sec)
         self._push_undo("Sửa thời gian")
-        try:
-            old_ev = self._events[index]
-            self._events[index] = SubtitleEvent(
-                index=old_ev.index, text=old_ev.text, interval=TimeInterval(start_sec=start_sec, end_sec=end_sec),
-                confidence=old_ev.confidence, frame_count=old_ev.frame_count,
-                position=old_ev.position, bounding_box=old_ev.bounding_box, uid=old_ev.uid
-            )
-        except ConfigurationError:
-            self._undo_stack.pop()
-            raise
+        old_ev = self._events[index]
+        self._events[index] = SubtitleEvent(
+            index=old_ev.index, text=old_ev.text, interval=new_interval,
+            confidence=old_ev.confidence, frame_count=old_ev.frame_count,
+            position=old_ev.position, bounding_box=old_ev.bounding_box, uid=old_ev.uid,
+            ocr_notes=old_ev.ocr_notes,  # [v3.23.655] chỉ đổi giờ: giữ ghi chú OCR (sửa chữ thì bỏ)
+        )
         # [v3.23.158] GIỮ BẤT BIẾN "danh sách sorted theo start": người dùng có thể gõ
         # start tuỳ ý qua spinbox/nudge khiến event vượt qua hàng xóm — nếu giữ nguyên
         # vị trí, mọi bisect (_starts_cache trong find_event_index_at_time, chèn sub
@@ -413,7 +413,8 @@ class SubtitleEditorService:
                 index=event.index, text=event.text,
                 interval=TimeInterval(start_sec=event.start_sec + offset_sec, end_sec=event.end_sec + offset_sec),
                 confidence=event.confidence, frame_count=event.frame_count,
-                position=event.position, bounding_box=event.bounding_box, uid=event.uid
+                position=event.position, bounding_box=event.bounding_box, uid=event.uid,
+                ocr_notes=event.ocr_notes,  # [v3.23.655]
             )
         # [v3.6 bugfix A]: Vô hiệu hoá starts_cache — tất cả start_sec đã thay đổi.
         # Không có dòng này trước đây → find_event_index_at_time trả sai kết quả
@@ -503,6 +504,7 @@ class SubtitleEditorService:
             index=keep_event.index, text=keep_event.text, interval=TimeInterval(new_start, new_end),
             confidence=keep_event.confidence, frame_count=keep_event.frame_count,
             position=keep_event.position, bounding_box=keep_event.bounding_box, uid=keep_event.uid,
+            ocr_notes=keep_event.ocr_notes,  # [v3.23.659] chỉ cắt giờ: giữ ghi chú OCR
         )
 
     def auto_fix_timeline(self) -> int:
@@ -550,12 +552,14 @@ class SubtitleEditorService:
                 self._events[i] = SubtitleEvent(
                     index=curr.index, text=curr.text, interval=TimeInterval(curr.start_sec, curr_new_end),
                     confidence=curr.confidence, frame_count=curr.frame_count, position=curr.position,
-                    bounding_box=curr.bounding_box, uid=curr.uid
+                    bounding_box=curr.bounding_box, uid=curr.uid,
+                    ocr_notes=curr.ocr_notes,  # [v3.23.659] Auto-Fix chỉ đổi giờ: giữ ghi chú OCR
                 )
                 self._events[i+1] = SubtitleEvent(
                     index=nxt.index, text=nxt.text, interval=TimeInterval(nxt_new_start, nxt.end_sec),
                     confidence=nxt.confidence, frame_count=nxt.frame_count, position=nxt.position,
-                    bounding_box=nxt.bounding_box, uid=nxt.uid
+                    bounding_box=nxt.bounding_box, uid=nxt.uid,
+                    ocr_notes=nxt.ocr_notes,  # [v3.23.659] Auto-Fix chỉ đổi giờ: giữ ghi chú OCR
                 )
                 applied_fixes += 1
 
@@ -576,12 +580,14 @@ class SubtitleEditorService:
                 self._events[i] = SubtitleEvent(
                     index=curr.index, text=curr.text, interval=TimeInterval(curr.start_sec, curr_new_end),
                     confidence=curr.confidence, frame_count=curr.frame_count, position=curr.position,
-                    bounding_box=curr.bounding_box, uid=curr.uid
+                    bounding_box=curr.bounding_box, uid=curr.uid,
+                    ocr_notes=curr.ocr_notes,  # [v3.23.659] Auto-Fix chỉ đổi giờ: giữ ghi chú OCR
                 )
                 self._events[i+1] = SubtitleEvent(
                     index=nxt.index, text=nxt.text, interval=TimeInterval(nxt_new_start, nxt.end_sec),
                     confidence=nxt.confidence, frame_count=nxt.frame_count, position=nxt.position,
-                    bounding_box=nxt.bounding_box, uid=nxt.uid
+                    bounding_box=nxt.bounding_box, uid=nxt.uid,
+                    ocr_notes=nxt.ocr_notes,  # [v3.23.659] Auto-Fix chỉ đổi giờ: giữ ghi chú OCR
                 )
                 applied_fixes += 1
 
@@ -649,12 +655,14 @@ class SubtitleEditorService:
             first_idx = grp[0]
             curr_ev = self._events[first_idx]
             new_end = max(self._events[idx].end_sec for idx in grp)
-            best_text = max((self._events[idx].text for idx in grp), key=len)
+            best_event = max((self._events[idx] for idx in grp), key=lambda ev: len(ev.text))
+            best_text = best_event.text
 
             self._events[first_idx] = SubtitleEvent(
                 index=curr_ev.index, text=best_text, interval=TimeInterval(curr_ev.start_sec, new_end),
                 confidence=curr_ev.confidence, frame_count=curr_ev.frame_count,
-                position=curr_ev.position, bounding_box=curr_ev.bounding_box, uid=curr_ev.uid
+                position=curr_ev.position, bounding_box=curr_ev.bounding_box, uid=curr_ev.uid,
+                ocr_notes=best_event.ocr_notes,  # [v3.23.659] giữ ghi chú OCR của câu được chọn
             )
 
             for r in reversed(grp[1:]):

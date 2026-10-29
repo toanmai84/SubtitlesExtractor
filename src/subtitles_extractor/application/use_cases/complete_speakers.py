@@ -340,8 +340,127 @@ class CompleteSpeakersUseCase(GeminiQuotaAwareUseCase):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CueRecheckResult:
+    """[v3.23.655] Kết quả kiểm lại các dòng Visual Cues đáng nghi.
+
+    Attributes:
+        visual_cues: JSON sau khi áp nhãn mới (nguyên bản nếu không đổi dòng nào).
+        suspicious: Số dòng nghi trước khi hỏi.
+        fixed: Các dòng nhận nhãn mới và hết bị nghi.
+        unchanged: Các dòng model trả nhãn như cũ / không trả / nhãn mới vẫn nghi (giữ nhãn cũ).
+        still_suspicious: Số dòng còn nghi sau khi hỏi.
+    """
+
+    visual_cues: str
+    suspicious: int
+    fixed: tuple[int, ...]
+    unchanged: tuple[int, ...]
+    still_suspicious: int
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.fixed)
+
+
+class RecheckSuspiciousCuesUseCase(GeminiQuotaAwareUseCase):
+    """[v3.23.655] Phân tích lại CÓ CHỌN LỌC: chỉ hỏi lại các dòng bị chấm nghi (``cue_review``).
+
+    Thay vì quét lại cả phim (~25 request với phim 3648 dòng), chỉ gửi các dòng nghi kèm nhãn của dòng quanh chúng
+    làm ngữ cảnh; ``analyze_visual_cues`` tự gom lô theo đoạn video và chỉ đính đúng đoạn phủ các dòng đó.
+    Nhãn mới chỉ được nhận khi nó HẾT bị nghi (kiểm lại bằng chính bộ chấm); cue người dùng không bao giờ bị đổi.
+    """
+
+    def __init__(self, translator: SubtitleTranslatorPort) -> None:
+        self._translator = translator
+
+    def execute(
+        self,
+        source_lines: list[TranslationLine],
+        visual_cues: str,
+        *,
+        characters: str,
+        target_lang: str,
+        model_name: str,
+        video_refs: list[Any],
+        batch_size: int = 150,
+        cancel_cb: CancellationCallback | None = None,
+        progress_cb: ProgressCallback | None = None,
+        video_reupload_cb: Callable[..., list] | None = None,
+    ) -> CueRecheckResult:
+        from subtitles_extractor.application.services.cue_review import review_cues
+        from subtitles_extractor.domain.ports.subtitle_translator_port import CUE_ORIGIN_USER
+
+        if not (visual_cues or "").strip():
+            raise SubtitleTranslationError("Chưa có Visual Cues — hãy Phân tích ngữ cảnh trước.")
+        if not video_refs:
+            raise SubtitleTranslationError("Cần video ngữ cảnh để kiểm lại ai đang nói — hãy chọn video của phim.")
+        analyze = getattr(self._translator, "analyze_visual_cues", None)
+        if analyze is None:
+            raise SpeakerCompletionUnsupportedError("Bộ dịch hiện tại không hỏi được người nói từ video.")
+        if video_reupload_cb is not None and hasattr(self._translator, "set_video_reupload_callback"):
+            self._translator.set_video_reupload_callback(video_reupload_cb)
+
+        texts_by_line = {line.index: (line.original_text or line.text or "") for line in source_lines}
+        ordered = sorted(source_lines, key=lambda line: line.index)
+        texts = [texts_by_line.get(i + 1, "") for i in range(max(texts_by_line, default=0))]
+        cues = canonicalize_cue_labels(deserialize_visual_cues(visual_cues), characters)
+        by_line = {cue.line_no: cue for cue in cues}
+        issues = review_cues(cues, texts, characters)
+        suspects = sorted(
+            line for line in issues
+            if line in texts_by_line and by_line.get(line, VisualCue(line_no=line)).origin != CUE_ORIGIN_USER
+        )
+        if not suspects:
+            return CueRecheckResult(visual_cues, 0, (), (), len(issues))
+        wanted = set(suspects)
+        lines = [line for line in ordered if line.index in wanted]
+        known = [cue for cue in cues if cue.line_no not in wanted and (cue.speaker or cue.addressee)]
+        scanner = _ModelCueScanner(
+            analyze, target_lang=target_lang, model_name=model_name, video_refs=video_refs,
+            batch_size=batch_size, characters=characters, context_lines=ordered,
+            cancel_cb=cancel_cb, progress_cb=progress_cb,
+        )
+        found = {cue.line_no: cue for cue in scanner(lines, known) if cue.line_no in wanted}
+        if scanner.errors and not found:
+            raise scanner.errors[-1]
+
+        fixed: list[int] = []
+        unchanged: list[int] = []
+        current = dict(by_line)
+        for line_no in suspects:
+            new = found.get(line_no)
+            old = current.get(line_no) or VisualCue(line_no=line_no)
+            if new is None or not new.speaker or (new.speaker, new.addressee) == (old.speaker, old.addressee):
+                unchanged.append(line_no)
+                continue
+            trial = dict(current)
+            trial[line_no] = VisualCue(
+                line_no=line_no, speaker=new.speaker, addressee=new.addressee,
+                scene=old.scene or new.scene,
+            )
+            # Tự nhất quán: chỉ nhận khi nhãn mới không còn bị chính bộ chấm nghi.
+            if line_no in review_cues(list(trial.values()), texts, characters):
+                unchanged.append(line_no)
+                continue
+            current = trial
+            fixed.append(line_no)
+        remaining = review_cues(list(current.values()), texts, characters)
+        logger.info(
+            "Kiểm lại dòng nghi: %d dòng → sửa %d, giữ %d; còn nghi %d.",
+            len(suspects), len(fixed), len(unchanged), len(remaining),
+        )
+        return CueRecheckResult(
+            visual_cues=serialize_visual_cues([current[k] for k in sorted(current)]) if fixed else visual_cues,
+            suspicious=len(suspects), fixed=tuple(fixed), unchanged=tuple(unchanged),
+            still_suspicious=len(remaining),
+        )
+
+
 __all__ = [
     "CompleteSpeakersUseCase",
+    "CueRecheckResult",
+    "RecheckSuspiciousCuesUseCase",
     "GeminiQuotaAwareUseCase",
     "SpeakerCompletionResult",
     "SpeakerCompletionUnsupportedError",

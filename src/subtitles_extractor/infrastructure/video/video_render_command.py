@@ -31,7 +31,9 @@ _MATROSKA_SUFFIXES: Final[frozenset[str]] = frozenset({".mkv", ".mka"})
 _MP4_SUFFIXES: Final[frozenset[str]] = frozenset({".mp4", ".m4v", ".mov"})
 
 # Chất lượng mặc định khi phải mã hoá lại (CRF thấp hơn = nét hơn, tệp lớn hơn).
-_DEFAULT_CRF: Final[int] = 20
+# [v3.23.661] 20 → 23: đo thật tập 1 (nguồn HEVC 0,71 Mbps) x264 medium — CRF 20: 57,6 MB, SSIM 0,992; CRF 23: 42,9 MB
+# (−25%), SSIM 0,990. Nguồn phim ngắn bitrate thấp, CRF thấp hơn chỉ làm tệp to mà không nét hơn nguồn.
+_DEFAULT_CRF: Final[int] = 23
 _DEFAULT_PRESET: Final[str] = "medium"
 # NVENC dùng thang -cq thay cho -crf.
 _NVENC_PRESET: Final[str] = "p5"
@@ -210,9 +212,13 @@ def escape_filter_path(path: Path) -> str:
         Chuỗi đã thoát, dùng được trực tiếp trong biểu thức bộ lọc.
     """
     text = str(path).replace("\\", "/")
-    for char in ("\\", "'", "[", "]", ",", ";"):
+    for char in ("\\", "[", "]", ",", ";"):
         text = text.replace(char, f"\\{char}")
-    return text.replace(":", r"\:")
+    text = text.replace(":", r"\:")
+    # [v3.23.659] Giá trị nằm trong '...': ở đó dấu \ là ký tự thường nên "\'" đóng nháy sớm (thư mục "it's",
+    # tên Windows "O'Neil" trong %TEMP% → ffmpeg không mở được phụ đề). Đóng nháy, thoát nháy cho cả hai lớp
+    # phân tích của ffmpeg (đồ thị lọc + tham số lọc), rồi mở lại — đã thử với ffmpeg thật.
+    return text.replace("'", r"'\\\''")
 
 
 #: Bộ lọc trộn nhiều kênh xuống stereo, giữ nguyên độ lớn kênh giữa (thoại).
@@ -396,17 +402,9 @@ def _validate(request: RenderRequest) -> None:
     if not request.video_path.is_file():
         raise VideoRenderError(f"Không tìm thấy video nguồn: {request.video_path}")
 
-    if request.mode in (RenderMode.SOFT_SUB, RenderMode.HARD_SUB):
-        if request.subtitle_path is None:
-            raise VideoRenderError("Kiểu xuất này cần tệp phụ đề.")
-        if not request.subtitle_path.is_file():
-            raise VideoRenderError(f"Không tìm thấy phụ đề: {request.subtitle_path}")
-
-    if request.mode in (RenderMode.DUB_AUDIO, RenderMode.VOICE_OVER):
-        if request.audio_path is None:
-            raise VideoRenderError("Kiểu này cần tệp âm thanh tiếng Việt.")
-        if not request.audio_path.is_file():
-            raise VideoRenderError(f"Không tìm thấy âm thanh: {request.audio_path}")
+    # [v3.23.659] Phụ đề / âm thanh bắt buộc theo CẶP CHẾ ĐỘ thật (``_validate_modes``), không theo ``mode`` cũ:
+    # trang Xuất bản luôn gửi ``mode=SOFT_SUB`` nên "Phụ đề: Không" + thuyết minh từng báo "cần tệp phụ đề" —
+    # xuất cả bộ / dây chuyền phim bộ hỏng ở MỌI tập.
 
     if request.clip_start_sec < 0 or request.clip_duration_sec < 0:
         raise VideoRenderError("Đoạn xuất thử không hợp lệ (mốc hoặc độ dài âm).")
@@ -538,6 +536,9 @@ def build_render_command(ffmpeg_binary: str, request: RenderRequest) -> list[str
 
     if clip:
         command += ["-t", f"{request.clip_duration_sec:.3f}"]
+    if request.output_path.suffix.lower() in {".mp4", ".m4v", ".mov"}:
+        # [v3.23.656] Chỉ mục đầu tệp: xem được ngay khi đang tải lên / phát qua mạng.
+        command += ["-movflags", "+faststart"]
     command.append(str(request.output_path))
     return command
 

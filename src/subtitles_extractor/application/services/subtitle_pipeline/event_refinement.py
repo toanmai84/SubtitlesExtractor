@@ -220,6 +220,45 @@ def drop_flash_fragments(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
     return kept
 
 
+#: [v3.23.654] Khoảng hở tối đa (giây) giữa hai câu để coi câu sau là bản "hiện dần" của câu trước.
+PROGRESSIVE_MAX_GAP_SEC: float = 0.35
+
+
+def _progressive_key(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def merge_progressive_events(
+    events: list[SubtitleEvent], max_gap_sec: float = PROGRESSIVE_MAX_GAP_SEC,
+) -> tuple[list[SubtitleEvent], int]:
+    """[v3.23.654] Gộp phụ đề "hiện dần": ``我`` rồi ``我只是`` liền nhau → một câu ``我只是`` từ mốc của câu đầu.
+
+    Phụ đề kiểu chữ chạy hiện từng phần; bộ dựng tách mỗi trạng thái thành một câu nên TTS đọc lặp ("Ta… Ta chỉ là…")
+    và bản dịch có hai dòng. Điều kiện: chữ câu trước (bỏ khoảng trắng) là TIỀN TỐ thật sự của câu sau và câu sau bắt
+    đầu không quá ``max_gap_sec`` sau khi câu trước tắt. Chuỗi nhiều bước (``师`` → ``师叔`` → ``师叔你``) gộp hết.
+
+    Returns:
+        ``(danh sách mới, số câu đã gộp vào câu sau)``.
+    """
+    merged: list[SubtitleEvent] = []
+    absorbed = 0
+    for event in events:
+        if merged:
+            previous = merged[-1]
+            before, after = _progressive_key(previous.text), _progressive_key(event.text)
+            gap = float(event.start_sec) - float(previous.end_sec)
+            if before and len(after) > len(before) and after.startswith(before) and -0.05 <= gap <= max_gap_sec:
+                merged[-1] = dataclasses.replace(
+                    event,
+                    interval=dataclasses.replace(event.interval, start_sec=previous.start_sec),
+                    frame_count=int(getattr(previous, "frame_count", 0)) + int(getattr(event, "frame_count", 0)),
+                )
+                absorbed += 1
+                continue
+        merged.append(event)
+    return merged, absorbed
+
+
 def refine_final_events(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
     """Tinh lọc cuối: đuôi watermark → watermark Latin → rác chữ số → mảnh flash."""
     refined = strip_latin_suffix_from_cjk_events(events)

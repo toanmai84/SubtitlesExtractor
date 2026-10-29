@@ -236,6 +236,27 @@ def _soften_all_caps(text: str) -> str:
     )
 
 
+# Một cụm dấu ngắt (", " / "..." / "?!" / chấm đơn / gạch có cách) còn chữ phía sau — kể cả chữ mở bằng ngoặc kép /
+# ngoặc vuông (thẻ cảm xúc "[cười]"). Không tính dấu nằm giữa hai chữ số ("1,000", "10:30", "3.5").
+_INTERNAL_BREAK_RE = re.compile(
+    r"(?:\.{2,}|…|[,;:](?!\d)|[!?]|(?<!\d)\.(?!\d)|\s[-–—](?=\s))+(?=\s*[\"'“‘(\[]*\w)"
+)
+
+
+def count_internal_breaks(text: str) -> int:
+    """[v3.23.664] Số chỗ ngắt BÊN TRONG câu (dấu phẩy, "...", "?"… còn chữ phía sau) — model ngừng ở đó (hàm thuần).
+
+    "Sư muội, ta..." → 1 (dấu "..." cuối câu không tính); "Hóa Thần" → 0.
+    """
+    return len(_INTERNAL_BREAK_RE.findall(text or ""))
+
+
+def has_repeated_word(text: str) -> bool:
+    """[v3.23.663] Lời thoại tự lặp từ ("Hả? Hả?", "Đi, đi", "Dao Dao") — không được coi là model đọc lặp (hàm thuần)."""
+    words = re.findall(r"\w+", (text or "").lower())
+    return len(set(words)) < len(words)
+
+
 def dem_am_tiet(text: str) -> int:
     """Đếm số âm tiết trong văn bản tiếng Việt (hàm thuần).
 

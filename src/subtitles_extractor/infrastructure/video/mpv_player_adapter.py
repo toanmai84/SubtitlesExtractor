@@ -48,12 +48,75 @@ def _get_mpv_errors() -> tuple[type[Exception], ...]:
 
 
 # Tuỳ chọn tắt script Lua/ytdl — ứng dụng chỉ nhúng mpv để phát khung hình, không cần chúng.
+# [v3.23.665] Bộ cũ (4 tuỳ chọn) chỉ tắt script NGƯỜI DÙNG + vài script cũ. libmpv đời mới (shinchiro, nhánh master)
+# còn nạp sẵn select / positioning / commands / auto_profiles / console (đổi tên từ osd-console)… nên Lua VẪN chạy:
+# fault.log 29/10 của người dùng đầy ngoại lệ LuaJIT 0xe24c4a02 khi kéo thanh seek rồi access violation. Liệt kê đủ
+# mọi script dựng sẵn; tên nào bản libmpv không có thì bỏ (xem :func:`_supported_lean_options`).
 _LEAN_MPV_OPTIONS: dict[str, Any] = {
     "load_scripts": False,
     "ytdl": False,
+    "osc": False,
     "load_stats_overlay": False,
+    "load_console": False,
     "load_osd_console": False,
+    "load_auto_profiles": False,
+    "load_select": False,
+    "load_positioning": False,
+    "load_commands": False,
+    "load_context_menu": False,
 }
+
+#: Bộ tối thiểu của 3.23.651 — dùng khi không dò được (lõi thăm dò không trả lời).
+_BASE_LEAN_OPTIONS: tuple[str, ...] = ("load_scripts", "ytdl", "load_stats_overlay", "load_osd_console")
+
+#: Tuỳ chọn tắt script mà bản libmpv đang dùng thực sự có: ``(lớp MPV đã dò, kết quả)`` — dò một lần mỗi tiến trình.
+_SUPPORTED_LEAN: tuple[Any, dict[str, Any]] | None = None
+
+
+def _supported_lean_options(mpv_module: Any) -> dict[str, Any]:
+    """[v3.23.665] Chỉ giữ tuỳ chọn tắt script mà libmpv này biết — đọc ``options/<tên>`` trên một lõi thăm dò.
+
+    Không được "thử rồi bắt lỗi" với lõi thật: python-mpv vẫn ``mpv_initialize`` lõi khi một tuỳ chọn bị từ chối
+    rồi mới ném lỗi, lõi đó bị bỏ rơi nhưng vẫn gắn vào cửa sổ video (``wid``). Lõi thăm dò không có cửa sổ,
+    không âm thanh/hình và được ``terminate`` ngay.
+    """
+    global _SUPPORTED_LEAN
+    if _SUPPORTED_LEAN is not None and _SUPPORTED_LEAN[0] is mpv_module.MPV:
+        return _SUPPORTED_LEAN[1]
+    supported: dict[str, Any] = {}
+    probe: Any = None
+    try:
+        probe = mpv_module.MPV(load_scripts=False, vo="null", ao="null", idle=True)
+        for name, value in _LEAN_MPV_OPTIONS.items():
+            try:
+                probe[name.replace("_", "-")]  # đọc ``options/<tên>``: không có tuỳ chọn → lỗi
+            except _get_mpv_errors():
+                continue
+            supported[name] = value
+    except _get_mpv_errors() as exc:
+        logger.info("Không dò được tuỳ chọn libmpv ({}) — dùng bộ tắt-script tối thiểu.", exc)
+        supported = {}
+    finally:
+        if probe is not None:
+            with contextlib.suppress(*_get_mpv_errors()):
+                probe.terminate()
+    if "load_scripts" not in supported:
+        # ``load-scripts`` có ở mọi bản libmpv: thiếu nó nghĩa là lõi thăm dò không trả lời được, không phải libmpv
+        # không có tuỳ chọn — lùi về bộ tối thiểu (nếu libmpv từ chối, ``create_lean_mpv`` dựng lại với cấu hình gốc).
+        supported = {name: _LEAN_MPV_OPTIONS[name] for name in _BASE_LEAN_OPTIONS}
+    skipped = sorted(set(_LEAN_MPV_OPTIONS) - set(supported))
+    logger.info("Tắt script mpv: {} (bản libmpv không có: {}).", ", ".join(sorted(supported)), ", ".join(skipped) or "—")
+    _SUPPORTED_LEAN = (mpv_module.MPV, supported)
+    return supported
+
+
+def create_lean_mpv(mpv_module: Any, kwargs: dict[str, Any]) -> Any:
+    """Dựng ``mpv.MPV`` với script Lua/ytdl TẮT; libmpv không nhận tuỳ chọn nào thì dựng lại với cấu hình gốc."""
+    try:
+        return mpv_module.MPV(**{**_supported_lean_options(mpv_module), **kwargs})
+    except _get_mpv_errors() as lean_exc:
+        logger.info("libmpv không nhận tuỳ chọn tắt script ({}) — dùng cấu hình gốc.", lean_exc)
+        return mpv_module.MPV(**kwargs)
 
 
 class MpvPlayerAdapter:
@@ -83,11 +146,7 @@ class MpvPlayerAdapter:
             # [v3.23.651] Tắt script Lua (ytdl_hook/stats/console/osc…): log crash cho thấy hàng chục ngoại lệ LuaJIT
             # (0xe24c4a02) xen với `access violation` trong mpv. Ta không dùng script nào; nếu bản libmpv không biết một
             # tuỳ chọn thì lùi về cấu hình gốc ngay bên dưới.
-            try:
-                instance = mpv_module.MPV(**{**_LEAN_MPV_OPTIONS, **kwargs})
-            except _get_mpv_errors() as lean_exc:
-                logger.info("libmpv không nhận tuỳ chọn tắt script ({}) — dùng cấu hình gốc.", lean_exc)
-                instance = mpv_module.MPV(**kwargs)
+            instance = create_lean_mpv(mpv_module, kwargs)
             logger.info("Mpv player khởi tạo THÀNH CÔNG: wid={}, hwdec={}, vo={}.", wid, kwargs.get("hwdec", "?"), kwargs.get("vo", "?"))
             return instance
         except _get_mpv_errors() as exc:
@@ -99,7 +158,7 @@ class MpvPlayerAdapter:
         safe_kwargs["hwdec"] = "no"
         safe_kwargs["vo"] = "gpu"
         try:
-            instance = mpv_module.MPV(**safe_kwargs)
+            instance = create_lean_mpv(mpv_module, safe_kwargs)  # [v3.23.652] nhánh dự phòng cũng tắt script Lua
         except _get_mpv_errors() as fallback_exc:
             raise RuntimeError(f"Không thể khởi tạo MPV Engine: {fallback_exc}.") from fallback_exc
         except OSError as fallback_exc:

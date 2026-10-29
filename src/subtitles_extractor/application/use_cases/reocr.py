@@ -166,6 +166,7 @@ class ReOcrUseCase:
         )
 
         all_new_events: list[SubtitleEvent] = []
+        failed_ranges: list[TimeRange] = []
         total_frames_processed = 0
         slice_ratio = 1.0 / total_valid_ranges
         was_cancelled = False
@@ -210,6 +211,7 @@ class ReOcrUseCase:
                     total_valid_ranges,
                     exc,
                 )
+                failed_ranges.append(time_range)
                 continue
 
             all_new_events.extend(
@@ -239,6 +241,7 @@ class ReOcrUseCase:
             frames_processed=total_frames_processed,
             ranges_processed=total_valid_ranges,
             was_cancelled=was_cancelled,
+            failed_ranges=tuple(failed_ranges),
         )
 
     @staticmethod

@@ -1,4 +1,4 @@
-# Subtitles Extractor — v3.23.651
+# Subtitles Extractor — v3.23.666
 
 Ứng dụng desktop **trích xuất phụ đề hardsub/embedded → dịch bằng AI → lồng tiếng (TTS)**
 cho video, viết hoàn toàn bằng Python (PySide6) theo kiến trúc **Clean Architecture / Hexagonal**.
@@ -18,6 +18,8 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
 - Hai thuật toán gộp câu: **Greedy** (mặc định, nhanh) và **Viterbi** (tối ưu khi OCR nhiễu).
 - **Tự phát hiện ROI** vùng phụ đề bằng clustering Connected Components, lấy mẫu phân tầng theo thời gian.
 - Nhận biết và xử lý riêng văn bản **CJK** (Trung/Nhật/Hàn) và Latin xuyên suốt pipeline.
+- Có thể kiểm tra lại dòng OCR đáng ngờ bằng AI; điều phối Re-OCR và cài đặt an toàn hơn khi đang
+  trích xuất.
 
 ### ✏️ Biên tập phụ đề
 - Mở/sửa `.srt`/`.ass`; bảng sửa trực tiếp; chèn/xoá/tách/gộp dòng.
@@ -25,10 +27,13 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
 - Undo/Redo (Memento). Waveform âm thanh với phím tắt chuẩn DAW.
 - Xem trước video đồng bộ (MPV/PyAV/OpenCV).
 
-### 🌐 Dịch bằng AI (Gemini, đa giai đoạn)
+### 🌐 Dịch bằng AI (Gemini hoặc API tương thích OpenAI, đa giai đoạn)
 - Pipeline dịch nhiều giai đoạn: **Tiền xử lý → Dịch thô → Tinh chỉnh văn phong → Bản địa hoá**.
 - **Phân tích ngữ cảnh toàn cục**: tự nhận diện ngôn ngữ, nhân vật, tóm tắt cốt truyện, bảng thuật ngữ.
 - **Phân tích hình ảnh (visual cues)**: đính video để AI hiểu bối cảnh, xưng hô, người nói.
+- Chọn **Google Gemini** hoặc nhà cung cấp tuỳ chỉnh dùng API kiểu OpenAI; nhập API URL, API key
+  và tải danh sách model ngay trong trang Dịch. Các thao tác xử lý văn bản dùng được với nhà cung
+  cấp tuỳ chỉnh; tính năng cần phân tích video/âm thanh vẫn cần Gemini.
 - `thinking_level` tối ưu cho Gemini 3.x (nhanh/rẻ cho dịch), `thinking_budget` cho Gemini 2.5.
 - Length-hint (`max_chars`) cho bản dịch súc tích, vừa thời lượng đọc TTS.
 - **Tinh chỉnh chuyên dụng**: dịch lại dòng đã chọn, sửa bản dịch tại chỗ, so sánh các giai đoạn,
@@ -45,28 +50,30 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
 - **Chia sẻ bảng thuật ngữ + roster nhân vật** tự động giữa các tập (gộp thông minh, giữ
   cách dịch đã thống nhất).
 - Giao diện quản lý: xem/xoá bộ nhớ dịch theo từng phim bộ.
+- **Dây chuyền phim bộ**: xử lý liên tiếp các tập qua trích xuất, dịch và xuất bản; có thể dừng
+  sau khâu Dịch để rà soát trước khi tiếp tục.
 
 ### 🎙️ Lồng tiếng (TTS)
-- Tổng hợp giọng nói bằng EdgeTTS, đồng bộ thời gian với phụ đề.
+- Tổng hợp giọng nói bằng EdgeTTS, Gemini TTS và VieNeu, đồng bộ thời gian với phụ đề.
 - Bỏ qua nội dung không đọc được; tag người nói được giữ trong file phụ đề nhưng không đọc thành tiếng.
 - Cân chỉnh tốc độ/time-stretch để khớp thời lượng.
+- Phát hiện và xử lý phần đọc lặp ở câu ngắn; cân chỉnh độ to theo LUFS với hệ số đúng theo tần số lấy mẫu.
+- Sửa người nghe/xưng hô theo từng dòng, tạo lại audio riêng từng câu và quản lý lịch sử audio
+  có thể khôi phục.
 
 ### 🛠️ Cấu hình & Đa ngôn ngữ
 - Validate runtime bằng `pydantic-settings`; override qua biến môi trường (`SE_HW_*`,
   `SE_OCR_*`, `SE_VIDCTX_*`, `SE_TRANS_*`...).
 - Lưu tự động qua QSettings. Giao diện tiếng Việt, theme Sáng/Tối/Tự động.
+- Khi dùng nhà cung cấp API tuỳ chỉnh, video/Visual Cues và các tính năng cần âm thanh hoặc video
+  sẽ yêu cầu chuyển về Google Gemini.
 
 ### 🛡️ Ổn định, chẩn đoán & phục hồi
-- Chẩn đoán crash native: lưu `fault.log`, giữ các log crash trước đó và cảnh báo khi lần chạy
-  trước kết thúc bất thường.
-- Bảo vệ trình phát mpv: tránh các đường gọi dễ gây crash khi khởi động/nạp video; tự chuyển
-  sang trình xem dự phòng sau khi phát hiện lỗi access violation. Có thể bật lại mpv bằng
-  `SUBTITLES_EXTRACTOR_FORCE_MPV=1` hoặc tắt hẳn bằng `SUBTITLES_EXTRACTOR_NO_MPV=1`.
-- Sao lưu xoay vòng và phục hồi cơ sở dữ liệu SQLite khi phát hiện tệp hỏng; giữ lại các bản
-  dữ liệu hỏng để có thể kiểm tra, thay vì âm thầm xoá.
-- Chỉnh sửa phụ đề, waveform và bảng dịch ổn định hơn với danh sách lớn; xử lý an toàn hơn
-  khi đóng ứng dụng đang có tác vụ nền, đổi video/dự án hoặc gặp dữ liệu thời gian lỗi.
-- Nạp lại bảng dịch theo lô hiệu quả hơn, giảm thời gian chờ khi xử lý hàng nghìn dòng.
+- mpv được cấu hình an toàn hơn; lệnh seek được gộp khi kéo thanh thời gian để giảm tải và hạn chế
+  crash trên Windows. Có thể tự chuyển sang trình xem dự phòng nếu phát hiện lỗi mpv.
+- Ghi nhật ký crash native và cảnh báo khi lần chạy trước kết thúc bất thường.
+- Sao lưu xoay vòng và phục hồi cơ sở dữ liệu SQLite khi phát hiện hỏng; giữ lại bản dữ liệu lỗi
+  để có thể kiểm tra.
 
 ---
 
@@ -104,12 +111,13 @@ Python, không phụ thuộc Qt/Paddle/OpenCV; các tầng giao tiếp qua `Prot
 ### Yêu cầu
 - Python ≥ **3.11** (khuyến nghị 3.12).
 - (Tuỳ chọn) GPU NVIDIA + CUDA cho OCR/STT nhanh.
-- API Key Gemini (miễn phí tại https://aistudio.google.com/apikey) để dùng tính năng dịch.
+- API Key Google Gemini (miễn phí tại https://aistudio.google.com/apikey) hoặc API key từ nhà cung
+  cấp tương thích OpenAI. Một số tính năng xử lý video/âm thanh cần Gemini.
 
 ### Cài đặt
 ```bash
-git clone <repo>
-cd subtitles-extractor
+git clone https://github.com/toanmai84/SubtitlesExtractor.git
+cd SubtitlesExtractor
 python -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -r requirements.txt

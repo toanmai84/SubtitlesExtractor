@@ -70,7 +70,8 @@ class _CountingEngine:
 
     def infer(self, text, voice=None):
         self.calls += 1
-        return (0.2 * np.sin(2 * np.pi * 220 * np.arange(_SR) / _SR)).astype(np.float32)
+        # [v3.23.663] 0,5 s cho câu 2 tiếng (thực tế 0,5–0,76 s); 1 s bị lưới câu ngắn coi là đọc lặp.
+        return (0.2 * np.sin(2 * np.pi * 220 * np.arange(_SR // 2) / _SR)).astype(np.float32)
 
     def list_preset_voices(self):
         return [("Giọng A", "a")]

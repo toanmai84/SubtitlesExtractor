@@ -29,6 +29,8 @@ Thứ tự pipeline:
 
 from __future__ import annotations
 
+import logging
+import re
 from collections.abc import Sequence
 from functools import lru_cache
 
@@ -71,8 +73,12 @@ from subtitles_extractor.application.services.subtitle_pipeline.voting import (
     prewarm_frame_cache,
 )
 from subtitles_extractor.domain.entities.ocr_frame_result import OcrFrameResult
+from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
+    centering_reference,
+    collect_restored_texts,
+)
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
-from subtitles_extractor.domain.value_objects.roi import Roi
+from subtitles_extractor.domain.value_objects.roi import Roi, TextAlignment, TextOrientation
 
 # Số vòng lặp tối đa cho echo trail filter (hội tụ thường <= 2 vòng).
 _ECHO_TRAIL_MAX_ITERATIONS: int = 3
@@ -105,6 +111,9 @@ def _frame_boxes(frame: OcrFrameResult) -> list[tuple[int, int, int, int]]:
         box.bounding_box for box in frame.text_boxes if box.bounding_box is not None
     ]
 
+
+
+logger = logging.getLogger(__name__)
 
 class SubtitleBuilder:
     """Service xây dựng :class:`SubtitleEvent` từ kết quả OCR theo frame.
@@ -286,6 +295,17 @@ class SubtitleBuilder:
 
         # ── Stage 5: Group thành FrameGroup ──
         text_similarity_cached.cache_clear()
+        # [v3.23.655] Thu các câu được khôi phục ký tự (Yi-Restorer) để đánh dấu "Nghi ngờ OCR".
+        restored_scope = collect_restored_texts()
+        restored_texts = restored_scope.__enter__()
+        # [v3.23.657] Phụ đề căn giữa: tâm ROI (toạ độ ô chữ tính trong ROI) để bộ khôi phục ký tự kiểm căn giữa.
+        # Chỉ phụ đề NGANG: phụ đề dọc thì bề rộng hộp ≈ một chữ, ngưỡng "0,25 chữ" thành ~1 px → loại nhầm.
+        centered = (
+            roi is not None and roi.alignment in (TextAlignment.CENTER, TextAlignment.UNKNOWN)
+            and roi.orientation == TextOrientation.HORIZONTAL
+        )
+        center_scope = centering_reference(roi.width / 2.0 if centered and roi is not None else None)
+        center_scope.__enter__()
         try:
             # Làm nóng cache frame text + confidence một lần O(N) trước khi
             # bước vào greedy/Viterbi loop O(N²) để tránh tính lại thừa.
@@ -349,6 +369,16 @@ class SubtitleBuilder:
             )
             subtitle_events = refine_final_events(subtitle_events)
 
+            # ── Stage 13d': [v3.23.654] Gộp phụ đề "hiện dần" (tuỳ chọn) ──
+            if getattr(self._config, "merge_progressive", False):
+                from subtitles_extractor.application.services.subtitle_pipeline.event_refinement import (
+                    merge_progressive_events,
+                )
+
+                subtitle_events, absorbed = merge_progressive_events(subtitle_events)
+                if absorbed:
+                    logger.info("Gộp %d phụ đề hiện dần vào câu đầy đủ ngay sau.", absorbed)
+
             # ── Stage 13e: Mốc kết thúc = lúc chữ biến mất (độ giữ khung) ──
             # Làm SAU mọi bộ lọc theo thời lượng để không đổi câu nào bị giữ/bỏ.
             subtitle_events = extend_ends_by_display_hold(
@@ -356,11 +386,37 @@ class SubtitleBuilder:
                 frame_display_hold([frame.timestamp_sec for frame in frame_results]),
             )
 
+            mark_restored_events(subtitle_events, restored_texts)
+
             # ── Stage 14: Reindex ──
             return reindex_events(subtitle_events)
         finally:
+            center_scope.__exit__(None, None, None)
+            restored_scope.__exit__(None, None, None)
             text_similarity_cached.cache_clear()
             clear_frame_build_cache()
 
 
-__all__ = ["SubtitleBuilder", "text_similarity_cached"]
+#: [v3.23.655] Ghi chú ``SubtitleEvent.ocr_notes``: câu có ký tự OCR làm rơi được khôi phục theo số đông khung.
+OCR_NOTE_RESTORED = "restored_char"
+
+
+def mark_restored_events(events: Sequence[SubtitleEvent], restored_texts: set[str]) -> int:
+    """[v3.23.655] Gắn :data:`OCR_NOTE_RESTORED` cho câu chứa một câu đã được khôi phục ký tự. Trả số câu gắn."""
+    keys = {re.sub(r"\s+", "", text) for text in restored_texts}
+    keys = {key for key in keys if len(key) >= 2}
+    if not keys:
+        return 0
+    marked = 0
+    for event in events:
+        # Khớp NGUYÊN câu (hoặc nguyên một dòng của câu nhiều dòng) — khớp chuỗi con thì câu khôi phục ngắn
+        # (vd "一个") đánh dấu oan mọi câu đúng có chứa nó.
+        parts = {re.sub(r"\s+", "", event.text or "")}
+        parts.update(re.sub(r"\s+", "", line) for line in (event.text or "").splitlines())
+        if parts & keys and OCR_NOTE_RESTORED not in event.ocr_notes:
+            event.ocr_notes = (*event.ocr_notes, OCR_NOTE_RESTORED)
+            marked += 1
+    return marked
+
+
+__all__ = ["OCR_NOTE_RESTORED", "SubtitleBuilder", "mark_restored_events", "text_similarity_cached"]

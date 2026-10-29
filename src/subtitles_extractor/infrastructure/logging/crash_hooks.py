@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import contextlib
 import faulthandler
+import re
 import os
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import IO, Any
@@ -27,7 +29,9 @@ __all__ = [
     "begin_session",
     "end_session",
     "mpv_disabled_by_crash",
+    "classify_fault_text",
     "install_crash_hooks",
+    "mark_clean_exit",
     "note_fatal",
     "pop_previous_crash",
     "rearm",
@@ -100,9 +104,17 @@ def install_crash_hooks(log_dir: Path | None) -> None:
             log_dir.mkdir(parents=True, exist_ok=True)
             _archive_previous_fault_log(log_dir)
             _FAULT_FILE = (log_dir / "fault.log").open("a", encoding="utf-8")
-            faulthandler.enable(file=_FAULT_FILE, all_threads=True)
+            faulthandler.enable(file=_FAULT_FILE, all_threads=_FAULT_ALL_THREADS)
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("Không bật được faulthandler: {}.", exc)
+
+
+#: [v3.23.665] Windows: faulthandler chạy cho MỌI ngoại lệ SEH lượt đầu, kể cả loại được bắt ngay (LuaJIT 0xe24c4a02
+#: trong mpv, CUDA…). Với ``all_threads=True`` mỗi lần nó đọc ngăn xếp của mọi luồng Python mà KHÔNG giữ GIL trong khi
+#: luồng chính đang chạy — kéo thanh seek sinh hàng trăm lần như vậy, một lần đọc trúng khung đang đổi là access
+#: violation thật (fault.log người dùng 29/10: "access violation" chen giữa lúc đang in ngăn xếp luồng chính). Chỉ ghi
+#: luồng đang lỗi: crash trên luồng chính vẫn có đủ ngăn xếp.
+_FAULT_ALL_THREADS: bool = sys.platform != "win32"
 
 
 def _archive_previous_fault_log(log_dir: Path) -> None:
@@ -121,24 +133,88 @@ def _archive_previous_fault_log(log_dir: Path) -> None:
         while target.exists():
             target = log_dir / f"fault_{stamp}_{counter}.log"
             counter += 1
-        # [v3.23.651] Crash NATIVE trong mpv (access violation + khung mpv.py) → lần chạy sau tạm dùng VideoCanvas
-        # thay vì lặp lại crash. (Các dòng 0xe24c4a02 là ngoại lệ Lua đã được xử lý, không phải crash.)
-        mpv_crash = False
         try:
             text = current.read_text(encoding="utf-8", errors="replace")
-            mpv_crash = "access violation" in text and "mpv" in text.lower()
         except OSError:
-            pass
+            text = ""
+        verdict = classify_fault_text(text)
         current.replace(target)
-        if mpv_crash:
+        if verdict.mpv_crash:
             with contextlib.suppress(OSError):
                 (log_dir / _MPV_FLAG).write_text(f"{target.name}\n", encoding="utf-8")
-        _PREVIOUS_CRASH = {"fault_log": target, "log_dir": log_dir, "mpv_disabled": mpv_crash}
-        for old in sorted(log_dir.glob("fault_*.log"))[:-_KEEP_FAULT_LOGS]:
-            with contextlib.suppress(OSError):
-                old.unlink()
+        if verdict.shutdown_crash:
+            logger.warning("Lần trước có lỗi native SAU khi đã đóng sạch (lúc dọn dẹp): {}.", target.name)
+        if not verdict.fatal:
+            # [v3.23.652] Chỉ có ngoại lệ đã được xử lý (vd LuaJIT 0xe24c4a02 của mpv) hoặc lỗi sau khi đóng sạch:
+            # vẫn cất tệp để chẩn đoán nhưng KHÔNG báo "lần trước bị tắt đột ngột" (từng báo giả mỗi lần đóng app).
+            _prune_fault_logs(log_dir)
+            return
+        _PREVIOUS_CRASH = {"fault_log": target, "log_dir": log_dir, "mpv_disabled": verdict.mpv_crash}
+        _prune_fault_logs(log_dir)
     except OSError as exc:
         logger.warning("Không cất được fault.log cũ: {}.", exc)
+
+
+def _prune_fault_logs(log_dir: Path) -> None:
+    for old in sorted(log_dir.glob("fault_*.log"))[:-_KEEP_FAULT_LOGS]:
+        with contextlib.suppress(OSError):
+            old.unlink()
+
+
+_CLEAN_EXIT_TAG = "[clean-exit"
+# Chữ ký crash THẬT. Windows: faulthandler ghi mọi ngoại lệ SEH ở lượt đầu (kể cả đã được bắt) → không coi dòng
+# "Windows fatal exception: code 0x…" là chí tử trừ mã nhóm lỗi 0xC… (vd 0xC0000409 tràn bộ đệm ngăn xếp).
+_FATAL_PATTERNS = (
+    re.compile(r"access violation", re.I),
+    re.compile(r"stack overflow", re.I),
+    re.compile(r"Fatal Python error"),
+    re.compile(r"Segmentation fault"),
+    re.compile(r"\bAborted\b"),
+    re.compile(r"illegal instruction", re.I),
+    re.compile(r"page error", re.I),
+    re.compile(r"divide by zero|float overflow", re.I),
+    re.compile(r"\[Qt FATAL\]"),
+    re.compile(r"fatal exception: code 0xc[0-9a-f]{7}", re.I),
+)
+
+
+@dataclass(frozen=True)
+class FaultVerdict:
+    fatal: bool            # crash thật khi đang chạy → báo người dùng
+    mpv_crash: bool        # crash thật nằm trong mpv → tạm tắt mpv lần sau
+    shutdown_crash: bool   # lỗi native SAU khi đã đóng sạch (chỉ ghi log)
+
+
+def classify_fault_text(text: str) -> FaultVerdict:
+    """[v3.23.652] Phân loại nội dung ``fault.log`` của lần chạy trước."""
+    before, marker, after = text.partition(_CLEAN_EXIT_TAG)
+
+    def last_fatal(chunk: str) -> int:
+        positions = [m.start() for pattern in _FATAL_PATTERNS for m in pattern.finditer(chunk)]
+        return max(positions) if positions else -1
+
+    if marker:
+        # Đã đóng sạch: mọi "access violation" trước dấu là ngoại lệ lượt đầu đã được bắt (app vẫn chạy tiếp tới lúc đóng).
+        return FaultVerdict(fatal=False, mpv_crash=False, shutdown_crash=last_fatal(after) >= 0)
+    position = last_fatal(before)
+    if position < 0:
+        return FaultVerdict(fatal=False, mpv_crash=False, shutdown_crash=False)
+    tail = before[position:]
+    # all_threads=True: luồng sự kiện của python-mpv luôn có khung mpv.py — chỉ xét khối "Current thread" (luồng gây lỗi).
+    current = re.search(r"Current thread[^\n]*\n(.*?)(?:\n\s*\n|\nThread 0x|\Z)", tail, re.S)
+    scope = current.group(1) if current else tail
+    return FaultVerdict(fatal=True, mpv_crash="mpv" in scope.lower(), shutdown_crash=False)
+
+
+def mark_clean_exit() -> None:
+    """[v3.23.652] Ghi dấu "đóng sạch" vào ``fault.log`` rồi tắt faulthandler (dọn dẹp sau đó không bị tính là crash)."""
+    if _FAULT_FILE is not None:
+        with contextlib.suppress(OSError, ValueError):
+            _FAULT_FILE.write(f"{_CLEAN_EXIT_TAG} {time.strftime('%Y-%m-%d %H:%M:%S')}]\n")
+            _FAULT_FILE.flush()
+    with contextlib.suppress(RuntimeError, ValueError):
+        faulthandler.disable()
+    end_session()
 
 
 def rearm() -> None:
@@ -152,7 +228,7 @@ def rearm() -> None:
         return
     try:
         faulthandler.disable()
-        faulthandler.enable(file=_FAULT_FILE, all_threads=True)
+        faulthandler.enable(file=_FAULT_FILE, all_threads=_FAULT_ALL_THREADS)
     except (OSError, RuntimeError, ValueError) as exc:
         logger.debug("Không cài lại được faulthandler: {}.", exc)
 

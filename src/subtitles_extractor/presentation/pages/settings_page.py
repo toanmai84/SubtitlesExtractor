@@ -160,6 +160,19 @@ class SettingsPage(QWidget):
         )
         ocr_form.addRow(self._translator.translate("settings.rl_ocr_version"), self._cb_ocr_version)
 
+        # [v3.23.657] Bộ dò chữ riêng (rỗng = theo phiên bản) — đề xuất của "Đo tốc độ OCR" ghi vào đây.
+        self._cb_det_override = QComboBox()
+        for label, key in [
+            (self._translator.translate("settings.co_det_follow_version"), ""),
+            ("PP-OCRv6_small_det", "PP-OCRv6_small_det"),
+            ("PP-OCRv6_tiny_det", "PP-OCRv6_tiny_det"),
+            ("PP-OCRv6_medium_det", "PP-OCRv6_medium_det"),
+        ]:
+            self._cb_det_override.addItem(label, userData=key)
+        self._cb_det_override.setToolTip(self._translator.translate("settings.tip_det_override"))
+        ocr_form.addRow(self._translator.translate("settings.rl_det_override"), self._cb_det_override)
+        self._cb_ocr_version.currentIndexChanged.connect(self._on_ocr_version_changed)
+
         self._cb_ocr_language = QComboBox()
         for label, key in[
             (self._translator.translate("settings.co_lang_vi"), "vi"), (self._translator.translate("settings.co_lang_en"), "en"),
@@ -667,6 +680,10 @@ class SettingsPage(QWidget):
 
         self._sp_merge_gap = _make_double_spin(0.0, 10.0, 0.05, 2, suffix=" s")
         form_algo.addRow(self._translator.translate("settings.rl_max_gap"), self._sp_merge_gap)
+        # [v3.23.654] Gộp phụ đề "hiện dần" (我 → 我只是).
+        self._cb_merge_progressive = QCheckBox(self._translator.translate("settings.cb_merge_progressive"))
+        self._cb_merge_progressive.setToolTip(self._translator.translate("settings.tip_merge_progressive"))
+        form_algo.addRow(self._translator.translate("settings.rl_merge_progressive"), self._cb_merge_progressive)
 
         self._cb_output_format = QComboBox()
         for f in SubtitleFormat:
@@ -1070,6 +1087,16 @@ class SettingsPage(QWidget):
         self._save_button.setEnabled(False)
         self._cancel_button.setEnabled(False)
 
+    def _on_ocr_version_changed(self, _index: int) -> None:
+        """[v3.23.657] Người dùng đổi phiên bản OCR → bộ dò chữ riêng về "Theo phiên bản".
+
+        Không thì bộ dò đã chọn (vd ``PP-OCRv6_small_det`` từ đề xuất "Đo tốc độ OCR") âm thầm đi kèm bộ nhận
+        dạng của phiên bản khác.
+        """
+        if getattr(self, "_is_populating", False):
+            return
+        self._cb_det_override.setCurrentIndex(self._cb_det_override.findData(""))
+
     def _populate_form(self, snapshot: ApplicationSettings) -> None:
         # [v3.6 bugfix POP-1]: try/finally đảm bảo _is_populating luôn được reset.
         # Trước đây không có guard → nếu bất kỳ setValue/setChecked nào raise
@@ -1078,6 +1105,10 @@ class SettingsPage(QWidget):
         self._is_populating = True
         try:
             _set_combo(self._cb_ocr_version, snapshot.ocr.version)
+            override = str(getattr(snapshot.ocr, "detection_model_override", "") or "")
+            if override and self._cb_det_override.findData(override) < 0:
+                self._cb_det_override.addItem(override, userData=override)  # tên tuỳ chỉnh: vẫn hiện, không mất
+            _set_combo(self._cb_det_override, override)
             _set_combo(self._cb_ocr_language, snapshot.ocr.language)
             self._sp_score_threshold.setValue(snapshot.ocr.score_threshold)
 
@@ -1151,6 +1182,7 @@ class SettingsPage(QWidget):
             self._sp_min_dur.setValue(snapshot.post_process.min_duration_sec)
             self._sp_max_dur.setValue(snapshot.post_process.max_duration_sec)
             self._sp_merge_gap.setValue(snapshot.post_process.merge_gap_sec)
+            self._cb_merge_progressive.setChecked(bool(getattr(snapshot.post_process, "merge_progressive", False)))
             _set_combo(self._cb_output_format, snapshot.post_process.output_format.value)
             self._chk_use_viterbi.setChecked(snapshot.post_process.use_viterbi)
             self._sp_viterbi_penalty.setValue(snapshot.post_process.viterbi_open_penalty)
@@ -1230,6 +1262,7 @@ class SettingsPage(QWidget):
         return {
             "ocr": {
                 "version": self._cb_ocr_version.currentData(),
+                "detection_model_override": self._cb_det_override.currentData() or "",
                 "language": self._cb_ocr_language.currentData(),
                 "score_threshold": self._sp_score_threshold.value(),
                 "limit_side_len": self._sp_limit_side.value(),
@@ -1304,6 +1337,7 @@ class SettingsPage(QWidget):
                 "min_duration_sec": self._sp_min_dur.value(),
                 "max_duration_sec": self._sp_max_dur.value(),
                 "merge_gap_sec": self._sp_merge_gap.value(),
+                "merge_progressive": self._cb_merge_progressive.isChecked(),
                 "output_format": self._cb_output_format.currentData(),
                 "use_viterbi": self._chk_use_viterbi.isChecked(),
                 "viterbi_open_penalty": self._sp_viterbi_penalty.value(),

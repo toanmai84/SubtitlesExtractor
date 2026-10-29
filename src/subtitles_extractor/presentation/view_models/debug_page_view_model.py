@@ -66,6 +66,13 @@ def _ndarray_to_qimage(arr: np.ndarray) -> QImage:
 # ==============================================================================
 # BẤT ĐỒNG BỘ OCR INFERENCE WORKER
 # ==============================================================================
+#: [v3.23.656] Các trường lượt thử OCR một khung đặt riêng (phần còn lại lấy từ cấu hình ứng dụng).
+_TRIAL_FIELDS = frozenset({
+    "device", "detection_model_name", "recognition_model_name", "language", "limit_side_len", "det_thresh",
+    "det_unclip_ratio", "det_box_thresh", "score_threshold", "enable_mkldnn", "use_tensorrt", "precision", "preprocess",
+})
+
+
 class _SingleFrameReocrWorker(QObject):
     success_result = Signal(object, object, object, str, str, bool)
     failed = Signal(str)
@@ -235,7 +242,11 @@ class _SingleFrameReocrWorker(QObject):
                 contrast_factor=self.tweaks.get("contrast_factor", self.settings.preprocess.contrast_factor),
             )
 
-            temp_ocr_cfg = OcrEngineConfig(
+            # [v3.23.656] Dựng TỪ cấu hình đầy đủ của ứng dụng rồi chỉ thay phần thử: thiếu batch/luồng CPU… (về mặc
+            # định dataclass) làm lượt thử nạp lại model, rồi lượt trích xuất kế tiếp nạp lại lần nữa.
+            build_base = getattr(self.container, "_build_ocr_config", None)
+            base_cfg = build_base() if callable(build_base) else OcrEngineConfig()
+            trial_cfg = OcrEngineConfig(
                 device=DeviceKind(self.settings.hardware.device.value),
                 detection_model_name=det_model,
                 recognition_model_name=rec_model,
@@ -250,18 +261,16 @@ class _SingleFrameReocrWorker(QObject):
                 precision=PrecisionMode(self.settings.hardware.precision.value),
                 preprocess=temp_pre_cfg,
             )
+            temp_ocr_cfg = dataclasses.replace(base_cfg, **{name: getattr(trial_cfg, name) for name in _TRIAL_FIELDS})
 
             ocr_engine = self.container.ocr_engine
             if not ocr_engine.is_initialized:
                 ocr_engine.initialize()
 
-            apply_cfg = getattr(ocr_engine, "apply_config", None) or getattr(ocr_engine, "update_preprocess_config", None)
-            if callable(apply_cfg):
-                apply_cfg(temp_ocr_cfg)
-
-            # 6. Chạy Inference
+            # 6. Chạy Inference — [v3.23.656] cấu hình thử đi kèm lượt này, KHÔNG đổi engine dùng chung (trước đây
+            # thử ở trang Gỡ lỗi đổi luôn cấu hình của lượt trích xuất đang chạy).
             new_frame_result = ocr_engine.infer(
-                cropped_rgb, self.old_frame.frame_index, self.old_frame.timestamp_sec
+                cropped_rgb, self.old_frame.frame_index, self.old_frame.timestamp_sec, config=temp_ocr_cfg,
             )
 
             # 7. Vẽ Output Image bằng QPainter
@@ -385,10 +394,29 @@ class DebugPageViewModel(QObject):
         self._current_idx: int = -1
         self._base_img_dir: Path | None = None
         self._async_thread: QThread | None = None
+        self._reocr_target: tuple[list[OcrFrameResult], int] | None = None  # [v3.23.659]
 
     @property
     def total_frames(self) -> int:
         return len(self._frames)
+
+    def _clip_roi_to_video(self, roi: Roi) -> Roi:
+        """[v3.23.656] Kẹp ROI vào khung video (như lúc trích xuất); không tìm thấy video thì giữ nguyên."""
+        base = getattr(self, "_base_img_dir", None)
+        name = getattr(self._meta, "video_name", "") if self._meta else ""
+        if base is None or not name:
+            return roi
+        try:
+            video_path = Path(base).parent / name
+            if not video_path.is_file():
+                return roi
+            from subtitles_extractor.application.use_cases.extract_subtitles import effective_roi
+
+            metadata = self._container.metadata_reader.read(video_path)
+            return effective_roi(roi, metadata.width, metadata.height) or roi
+        except Exception as exc:  # noqa: BLE001 — đọc metadata hỏng không được phá việc dựng lại
+            logger.debug("Không kẹp được ROI theo video: %s", exc)
+            return roi
 
     def load_raw_file(self, file_path: Path) -> None:
         try:
@@ -503,6 +531,9 @@ class DebugPageViewModel(QObject):
             return
 
         old_frame = self._frames[self._current_idx]
+        # [v3.23.659] Nhớ khung ĐANG OCR lại: người dùng vẫn bấm Trước/Sau/kéo thanh trong lúc chờ — trước đây kết quả
+        # ghi đè lên khung đang xem (sai khung, mất dữ liệu khung kia).
+        self._reocr_target = (self._frames, self._current_idx)
 
         self.is_busy.emit(True)
 
@@ -534,7 +565,19 @@ class DebugPageViewModel(QObject):
 
     def _on_worker_success(self, new_frame_result, qimg_in, qimg_out, diff_summary, json_txt, is_noop):
         self._container.apply_settings_changes()
-        self._frames[self._current_idx] = new_frame_result
+        target = getattr(self, "_reocr_target", None) or (self._frames, self._current_idx)
+        target_frames, target_idx = target
+        self._reocr_target = None
+        if target_frames is not self._frames or not 0 <= target_idx < len(self._frames):
+            # Đã nạp tệp khác trong lúc chờ → bỏ kết quả cũ.
+            self.is_busy.emit(False)
+            return
+        self._frames[target_idx] = new_frame_result
+        if target_idx != self._current_idx:
+            # Người dùng đã sang khung khác: lưu kết quả vào đúng khung, không đổi màn hình đang xem.
+            self.action_success.emit(self._container.translator.translate("debug.vm_title"), diff_summary, is_noop)
+            self.is_busy.emit(False)
+            return
 
         # [LỖI 8 MẤT ẢNH FIX]: Bắn Signal Cập nhật Khung Text trống (frame_changed) TRƯỚC,
         # và Đổ Dữ liệu Ảnh Mới Sinh từ RAM (live_images_ready) SAU.
@@ -565,7 +608,7 @@ class DebugPageViewModel(QObject):
                 similarity_threshold=min(post.similarity_threshold, threshold.text_similarity),
                 min_duration_sec=post.min_duration_sec,
                 max_duration_sec=post.max_duration_sec,
-                merge_gap_sec=post.merge_gap_sec,
+                merge_gap_sec=post.merge_gap_sec, merge_progressive=bool(getattr(post, "merge_progressive", False)),
                 min_confidence=threshold.ocr_min_confidence,
                 use_viterbi=post.use_viterbi,
                 viterbi_open_penalty=post.viterbi_open_penalty,
@@ -587,6 +630,7 @@ class DebugPageViewModel(QObject):
                 align = saved_state.roi.alignment if (saved_state and saved_state.roi) else TextAlignment.CENTER
                 orient = saved_state.roi.orientation if (saved_state and saved_state.roi) else TextOrientation.HORIZONTAL
                 roi = Roi(x=rx, y=ry, width=rw, height=rh, alignment=align, orientation=orient)
+                roi = self._clip_roi_to_video(roi)  # [v3.23.656] B7: cache cũ có thể lưu ROI vượt mép khung
 
             builder = SubtitleBuilder(builder_cfg)
             events = builder.build(self._frames, roi=roi)

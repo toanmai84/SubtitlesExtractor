@@ -16,6 +16,10 @@ Tất cả các hàm là **pure function** (không state) — dễ unit test.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+from collections.abc import Iterator
+
 from loguru import logger
 
 from subtitles_extractor.application.services.cjk_utils import is_predominantly_cjk
@@ -140,9 +144,13 @@ def accumulate_confidence_bucket(
     return (high_count, medium_count)
 
 
+_MIN_NON_YI_SUPPORT_RATIO = 0.2
+
+
 def apply_yi_suffix_restore(
     voted_text: str,
     texts_with_confidences: list[tuple[str, float]],
+    geometry: dict[str, tuple[float, float]] | None = None,
 ) -> str:
     """Phục hồi ký tự CJK bị OCR drop ở đầu/giữa/cuối câu.
 
@@ -251,6 +259,14 @@ def apply_yi_suffix_restore(
     if not is_strong_evidence:
         return voted_text
 
+    # [v3.23.652] Ngưỡng tuyệt đối (2 high) quá lỏng với nhóm dài: '终于被我逮到了吧' (31 khung) có 4 khung đọc lẫn chữ
+    # cảnh sau → '…吧天'. Chữ khác '一' phải xuất hiện ở ≥ 20% số khung của nhóm (drop thật '不愧…' 2/10, '…了' 8/24).
+    # '一' giữ ngưỡng cũ: drop '一' thật vẫn hay chỉ 1/11–1/31 khung đọc được.
+    if inserted_char != "一":
+        support = best_high + best_med
+        if support < _MIN_NON_YI_SUPPORT_RATIO * len(texts_with_confidences):
+            return voted_text
+
     if operation_type == "suffix_append":
         restored = voted_text + inserted_char
     elif operation_type == "yi_insert":
@@ -260,6 +276,13 @@ def apply_yi_suffix_restore(
         # Luôn prepend ở đầu câu.
         restored = inserted_char + voted_text
     else:
+        return voted_text
+
+    # [v3.23.657] B3: phụ đề căn giữa — ký tự thật làm hộp chữ CÂN quanh tâm; ký tự "khôi phục" từ vệt nhiễu cạnh chữ
+    # làm hộp lệch tâm (ca thật tập 8: '一小小教训…' lệch 18 px, bản không '一' trùng tâm ROI). Bác khi bản có ký tự lệch
+    # tâm hơn bản không có quá 1/4 bề rộng một chữ.
+    if geometry and not _centering_supports(restored, voted_text, geometry):
+        logger.debug("Char-Restorer: bác '{}' → '{}' (hộp chữ lệch tâm phụ đề).", voted_text, restored)
         return voted_text
 
     # [GUARD] Chặn over-correction tạo ký tự CJK lặp liền kề bất thường mà voted gốc
@@ -365,6 +388,7 @@ def restore_dropped_space(
 def restore_dropped_yi_prefix(
     voted_text: str,
     texts_with_confidences: list[tuple[str, float]],
+    geometry: dict[str, tuple[float, float]] | None = None,
 ) -> str:
     """Orchestrator: chạy Yi-Restorer rồi Space-Restorer (đúng thứ tự).
 
@@ -381,12 +405,66 @@ def restore_dropped_yi_prefix(
     if not is_predominantly_cjk(voted_text):
         return voted_text
 
-    yi_restored_text = apply_yi_suffix_restore(voted_text, texts_with_confidences)
+    yi_restored_text = apply_yi_suffix_restore(voted_text, texts_with_confidences, geometry)
+    if yi_restored_text != voted_text:
+        collector = _RESTORED_TEXTS.get()
+        if collector is not None:
+            collector.add(yi_restored_text)
+            collector.add(clean_edge_noise(restore_dropped_space(yi_restored_text, texts_with_confidences)))
     return restore_dropped_space(yi_restored_text, texts_with_confidences)
+
+
+#: [v3.23.657] Tâm phụ đề (toạ độ trong ROI) khi phụ đề CĂN GIỮA; ``None`` = không kiểm căn giữa.
+_CENTER_X: contextvars.ContextVar[float | None] = contextvars.ContextVar("subtitle_center_x", default=None)
+#: Bản có ký tự khôi phục được lệch tâm hơn bản không có tối đa chừng này bề rộng một chữ.
+_MAX_EXTRA_OFFSET_CHARS = 0.25
+
+
+def current_centering_reference() -> float | None:
+    """[v3.23.657] Tâm phụ đề đang áp (để tầng bỏ phiếu biết có cần tính hình học hộp chữ không)."""
+    return _CENTER_X.get()
+
+
+@contextlib.contextmanager
+def centering_reference(center_x: float | None) -> Iterator[None]:
+    """[v3.23.657] Đặt tâm phụ đề căn giữa cho khối ``with`` (``None`` = tắt kiểm căn giữa)."""
+    token = _CENTER_X.set(center_x)
+    try:
+        yield
+    finally:
+        _CENTER_X.reset(token)
+
+
+def _centering_supports(restored: str, voted: str, geometry: dict[str, tuple[float, float]]) -> bool:
+    center = _CENTER_X.get()
+    with_char, without_char = geometry.get(restored), geometry.get(voted)
+    if center is None or with_char is None or without_char is None or not voted:
+        return True
+    char_width = without_char[1] / max(1, len(voted))
+    extra_offset = abs(with_char[0] - center) - abs(without_char[0] - center)
+    return extra_offset <= _MAX_EXTRA_OFFSET_CHARS * char_width
+
+
+#: [v3.23.655] Câu có ký tự được khôi phục trong lượt dựng phụ đề đang chạy (``None`` = không thu thập).
+_RESTORED_TEXTS: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar("restored_texts", default=None)
+
+
+@contextlib.contextmanager
+def collect_restored_texts() -> Iterator[set[str]]:
+    """[v3.23.655] Thu các câu được Yi-Restorer thêm ký tự trong khối ``with`` (để đánh dấu "Nghi ngờ OCR")."""
+    found: set[str] = set()
+    token = _RESTORED_TEXTS.set(found)
+    try:
+        yield found
+    finally:
+        _RESTORED_TEXTS.reset(token)
 
 
 __all__ = [
     "accumulate_confidence_bucket",
+    "centering_reference",
+    "collect_restored_texts",
+    "current_centering_reference",
     "apply_yi_suffix_restore",
     "clean_edge_noise",
     "correct_hallucination_typos",

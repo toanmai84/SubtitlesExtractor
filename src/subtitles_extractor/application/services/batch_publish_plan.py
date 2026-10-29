@@ -37,7 +37,7 @@ VIDEO_SUFFIXES: Final[frozenset[str]] = frozenset(
 )
 
 #: Phần mở rộng tệp giọng đọc có thể có (TTS ghi ra .flac hoặc .wav).
-_AUDIO_SUFFIXES: Final[tuple[str, ...]] = (".flac", ".wav", ".m4a", ".mp3")
+_AUDIO_SUFFIXES: Final[tuple[str, ...]] = (".flac", ".wav", ".m4a", ".mp3", ".opus", ".ogg")  # [v3.23.658] + opus/ogg (trang TTS xuất được)
 
 #: Tệp do chính ứng dụng xuất ra — KHÔNG được coi là video nguồn.
 _GENERATED_MARKERS: Final[tuple[str, ...]] = (

@@ -44,6 +44,9 @@ class SubtitleEvent:
     đóng góp vào event này. Dùng cho OCR overlay trên VideoCanvas.
     ``None`` nếu không có thông tin vị trí (ví dụ: import từ file SRT)."""
     uid: str = field(default_factory=lambda: str(uuid.uuid4()))
+    #: [v3.23.655] Ghi chú của khâu OCR về câu này (vd ``"restored_char"``: ký tự bị OCR làm rơi đã được khôi phục
+    #: theo số đông khung) — để bộ lọc "Nghi ngờ OCR" đưa ra soát. Rỗng với câu nhập từ tệp / sửa tay.
+    ocr_notes: tuple[str, ...] = ()
 
     @property
     def start_sec(self) -> float:

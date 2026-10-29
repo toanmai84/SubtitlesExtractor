@@ -34,7 +34,7 @@ def test_early_stop_when_overlong_not_improving(monkeypatch: pytest.MonkeyPatch)
     # Mọi lần infer trả audio DÀI BẰNG NHAU (không cải thiện).
     fixed = np.ones(48000 * 2, dtype=np.float32)  # 2s
 
-    def fake_infer_once(engine, text, voice_data, idx=-1):
+    def fake_infer_once(engine, text, voice_data, idx=-1, **_kw):
         calls["n"] += 1
         return fixed
 
@@ -59,7 +59,7 @@ def test_normal_audio_returns_immediately(monkeypatch: pytest.MonkeyPatch) -> No
     calls = {"n": 0}
     good = np.ones(48000, dtype=np.float32)
 
-    def fake_infer_once(engine, text, voice_data, idx=-1):
+    def fake_infer_once(engine, text, voice_data, idx=-1, **_kw):
         calls["n"] += 1
         return good
 

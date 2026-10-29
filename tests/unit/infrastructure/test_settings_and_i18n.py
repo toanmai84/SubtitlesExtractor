@@ -29,7 +29,7 @@ class TestApplicationSettings:
         settings = ApplicationSettings()
         assert settings.hardware.device == DeviceKind.GPU
         assert settings.hardware.batch_size_ocr == 128
-        assert settings.frame.sample_step_sec == pytest.approx(0.04)
+        assert settings.frame.sample_step_sec == pytest.approx(0.12)  # [v3.23.661]
 
     def test_rejects_out_of_range_batch_size_ocr(self) -> None:
         with pytest.raises(Exception):  # pydantic ValidationError

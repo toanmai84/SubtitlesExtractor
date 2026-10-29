@@ -50,6 +50,31 @@ def model_tier(model: str) -> str:
     return "lite" if "flash-lite" in name or "flash_lite" in name else "flash"
 
 
+def model_family(model: str) -> str:
+    """[v3.23.666] Họ model: phần trước dấu ``-`` đầu tiên (``gemini``, ``gpt``, ``claude``…).
+
+    Bỏ tiền tố nhà cung cấp kiểu ``google/gemini-3.7-flash``.
+    """
+    name = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return name.split("-", 1)[0]
+
+
+#: [v3.23.666] Dấu hiệu bậc giá trong tên model (nhà cung cấp tuỳ chỉnh bán nhiều hãng).
+_PREMIUM_MARKERS = ("-pro", "-max", "-ultra", "opus", "-plus", "-large", "-high", "reasoner")
+_BUDGET_MARKERS = ("-lite", "-mini", "-nano", "-small", "haiku", "-flash-8b", "-air", "-fast")
+
+
+def cost_tier(model: str) -> str:
+    """[v3.23.666] Bậc giá ước theo tên: ``"premium"`` (pro/max/opus…), ``"budget"`` (lite/mini…)
+    hoặc ``"standard"``. Dùng để dự phòng tự động không nhảy sang model đắt hơn hẳn."""
+    name = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if any(marker in name for marker in _PREMIUM_MARKERS):
+        return "premium"
+    if any(marker in name for marker in _BUDGET_MARKERS):
+        return "budget"
+    return "standard"
+
+
 def model_version(model: str) -> float:
     """Số đời của model (``gemini-3.5-flash`` → 3.5); 0 nếu không đọc được."""
     match = _VERSION_RE.search(model.lower())
@@ -108,13 +133,20 @@ class ModelHealth:
         self,
         clock: Callable[[], float] = time.monotonic,
         seed_models: Iterable[str] = (),
+        same_family_only: bool = False,
     ) -> None:
         """Khởi tạo.
 
         Args:
             clock: Đồng hồ đơn điệu (kiểm thử thay được).
             seed_models: Model biết chắc dùng được ngay từ đầu (khi chưa lấy danh sách API).
+            same_family_only: [v3.23.666] Dự phòng TỰ ĐỘNG chỉ trong cùng họ model (``gemini-*``
+                → ``gemini-*``) VÀ cùng bậc giá (:func:`cost_tier`). Nhà cung cấp tuỳ chỉnh bán cả
+                ``claude-opus``/``gpt-5.6-pro`` giá gấp chục lần: quá tải một lúc không được lặng lẽ
+                chuyển sang model đắt hơn. Model người dùng tự chọn làm dự phòng vẫn được dùng nếu
+                nhà cung cấp có model đó (nằm trong danh sách đã tải).
         """
+        self._same_family_only = bool(same_family_only)
         self._clock = clock
         self._lock = threading.Lock()
         self._consecutive: dict[str, int] = {}
@@ -207,13 +239,22 @@ class ModelHealth:
         preferred = self.preferred_fallback
         if preferred == NO_FALLBACK:
             return []
+        family, tier = model_family(model), cost_tier(model)
+        known = self.known_models
         ranked = rank_fallbacks(
             model,
-            (m for m in self.known_models if m not in skipped),
+            (
+                m for m in known
+                if m not in skipped
+                and not (self._same_family_only and (
+                    model_family(m) != family or cost_tier(m) != tier))
+            ),
             cooling=self.cooling_remaining, daily_limit=daily_limit, available=available,
         )
         # [v3.23.638] Model người dùng chọn đứng ĐẦU khi dùng được (không phải chính nó, chưa thử, không
         # đang ngắt mạch, còn hạn mức); không dùng được thì rơi về thứ tự tự động chứ không bỏ cuộc.
+        if self._same_family_only and preferred not in known:
+            preferred = ""  # vd tên Gemini cũ mà nhà cung cấp tuỳ chỉnh không bán → 404 hỏng lời gọi
         if (
             preferred and preferred != model and preferred not in skipped
             and self.cooling_remaining(preferred) <= 0 and available(preferred)
@@ -224,5 +265,5 @@ class ModelHealth:
 
 __all__ = [
     "AUTO_FALLBACK", "NO_FALLBACK", "BASE_COOLDOWN_S", "FAILOVER_AFTER_IN_CALL", "MAX_COOLDOWN_S", "TRIP_AFTER",
-    "ModelHealth", "model_tier", "model_version", "rank_fallbacks",
+    "ModelHealth", "cost_tier", "model_family", "model_tier", "model_version", "rank_fallbacks",
 ]

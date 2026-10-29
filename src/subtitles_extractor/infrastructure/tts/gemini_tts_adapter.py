@@ -22,6 +22,7 @@ import importlib.util
 
 import asyncio
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from subtitles_extractor.domain.ports.subtitle_tts_port import (
     SubtitleTTSPort,
     TTSCancellationCallback,
     TTSCancelledError,
+    TTSGenerationError,
     TTSProgressCallback,
     TTSRequest,
     TTSSegmentResult,
@@ -60,6 +62,7 @@ from subtitles_extractor.infrastructure.tts.gemini_tts_schema import (
     sampling_params_deprecated,
     uses_verbatim_tts_schema,
 )
+from subtitles_extractor.infrastructure.tts.segment_store import line_segments_dir, write_line_segment
 from subtitles_extractor.infrastructure.tts.line_placement import (
     comfort_speed,
     line_context,
@@ -102,7 +105,15 @@ _STANDARD_TTS_MODELS = [
 # Native Audio Dialog: dùng Live API (WebSocket) — giọng tự nhiên, cảm xúc
 # Chú ý: enable_affective_dialog chỉ hoạt động với model đầu tiên + api_version=v1alpha
 _NATIVE_AUDIO_MODELS = [
-    "gemini-2.5-flash-native-audio-latest",              # ★ Recommended tracking alias
+    # [v3.23.661] Live API GA 9/2026. Đo thật 28/10 (key miễn phí): KHÔNG giới hạn lượt/ngày (khác TTS thường: 10/ngày/key),
+    # đọc đúng nguyên văn 60/60 câu tiếng Việt, ~0,4 s/dòng khi chạy 9 phiên (3 key). Giới hạn thật là SỐ PHIÊN ĐỒNG THỜI
+    # (~4–5/key; vượt thì 1011 "exceeded your current quota").
+    "gemini-3.8-live",                                   # ★ khuyến nghị — miễn phí không giới hạn lượt
+    # [v3.23.662] Đo thật 40 câu: 3.8 extended-thinking sai 0 câu, 3.1 flash-live sai 2 câu (CER 0,033) nhưng đọc nhanh hơn.
+    "gemini-3.8-live-extended-thinking",                 # cần thinking_level (tự đặt "low")
+    "gemini-3.1-flash-live-preview",                     # preview cũ — Google khuyên chuyển sang 3.8 Live
+    # [v3.23.662] Đo thật: đời 2.5 phát âm tiếng Việt sai 24/40 câu ("không có ta" → "không có bà") — chỉ giữ để tương thích.
+    "gemini-2.5-flash-native-audio-latest",              # Tracking alias đời 2.5
     "gemini-2.5-flash-preview-native-audio-dialog",      # Hỗ trợ affective dialog (v1alpha)
     "gemini-live-2.5-flash-native-audio",                # Stable pinned
     "gemini-2.5-flash-native-audio-preview-12-2025",     # Preview 12-2025
@@ -113,7 +124,16 @@ _AFFECTIVE_DIALOG_SUPPORTED_MODELS = {
     "gemini-2.5-flash-preview-native-audio-dialog",
 }
 
-GEMINI_TTS_MODELS = _STANDARD_TTS_MODELS + _NATIVE_AUDIO_MODELS
+#: [v3.23.661] Model Live đời mới: đọc NGUYÊN VĂN câu gửi lên (không cần lời dẫn bọc quanh), không nhận
+#: ``enable_affective_dialog`` / ``thinking_level`` (tài liệu di chuyển 3.8 Live).
+_LIVE_VERBATIM_MODELS = frozenset({
+    "gemini-3.8-live", "gemini-3.8-live-extended-thinking", "gemini-3.1-flash-live-preview",
+})
+#: [v3.23.662] Model Live BẮT BUỘC khai báo mức suy nghĩ (thiếu → 1007 "Thinking level must be specified").
+_LIVE_THINKING_LEVEL = {"gemini-3.8-live-extended-thinking": "LOW"}
+
+# [v3.23.661] 3.8 Live lên đầu: TTS thường miễn phí chỉ 10 lượt/ngày/key — không đủ một tập phim.
+GEMINI_TTS_MODELS = _NATIVE_AUDIO_MODELS[:1] + _STANDARD_TTS_MODELS + _NATIVE_AUDIO_MODELS[1:]
 
 # 30 voices (Gemini TTS, tháng 5/2026)
 # [v3.23.249] 30 giọng CHÍNH THỨC theo tài liệu Google (GoogleCloudPlatform/generative-ai
@@ -143,9 +163,65 @@ _SAMPLE_RATE = 24_000
 # depending on the provided context". App đọc phụ đề tiếng Việt nên cố định vi-VN, tránh
 # model đổi giọng/ngôn ngữ theo ngữ cảnh (vd gặp tên riêng CJK trong bản dịch).
 _TTS_LANGUAGE_CODE = "vi-VN"
-_NATIVE_CONCURRENCY = 10  # Sessions chạy song song (RPM/RPD Unlimited)
+_NATIVE_CONCURRENCY = 10  # Trần tổng số phiên song song
+#: [v3.23.661] Số phiên Live đồng thời MỖI key. Đo thật key miễn phí: 4 phiên/key ổn, 5 → 3/40 lỗi, 6 → 19/40 lỗi
+#: "1011 … exceeded your current quota"; trước đây 10 phiên trên MỘT key → 76 lỗi/95 dòng, 9 dòng câm.
+_LIVE_SESSIONS_PER_KEY = 3
+#: [v3.23.661] Chỉ dẫn mặc định cho model Live đọc nguyên văn: nhịp thoại phim (đo thật: ngắn hơn 12% so với chỉ dẫn
+#: "tự nhiên, truyền cảm" → ít phải nén cho vừa khung).
+_LIVE_VERBATIM_STYLE = (
+    "Bạn là máy đọc lồng tiếng phim. Với mỗi tin nhắn, chỉ ĐỌC NGUYÊN VĂN câu tiếng Việt được gửi, giọng diễn cảm "
+    "tự nhiên, nhịp nhanh như thoại phim; không thêm, không bớt, không trả lời."
+)
+#: [v3.23.662] Dòng có khung chật: để MODEL tự đọc nhanh thay vì nén âm thanh (nén mạnh làm méo giọng). Đo thật 40 câu
+#: (3.8 Live): 3,06 → 3,43 âm tiết/giây, đúng nguyên văn 39/40 câu (ngang Edge 39/40).
+_LIVE_FAST_STYLE = (
+    "Bạn là máy đọc lồng tiếng phim. Với mỗi tin nhắn, chỉ ĐỌC NGUYÊN VĂN câu tiếng Việt được gửi; không thêm, không "
+    "bớt, không trả lời. Đọc RẤT NHANH như lời thoại dồn dập (khoảng 6 âm tiết mỗi giây), liền mạch, không kéo dài âm "
+    "cuối, không ngừng nghỉ."
+)
+#: [v3.23.662] Nhịp tự nhiên đo được của 3.8 Live (âm tiết/giây); dòng cần nhanh hơn ngưỡng này mới vừa khung thì dùng
+#: ``_LIVE_FAST_STYLE``.
+_LIVE_NATURAL_SYLLABLES_PER_S = 3.2
 _TURN_TIMEOUT_S = 45      # Timeout tối đa cho mỗi dòng trong session
 
+
+
+# ── [v3.23.660] Hạn mức miễn phí (429) ─────────────────────────────────────────
+#: Tổng thời gian tối đa chờ hạn mức theo phút cho MỘT dòng trước khi bỏ dòng đó.
+_QUOTA_MAX_WAIT_PER_LINE_S = 300.0
+#: Chờ mặc định khi máy chủ không nêu ``retryDelay``.
+_QUOTA_DEFAULT_DELAY_S = 20.0
+_RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*:\s*['\"](\d+(?:\.\d+)?)s")
+_RETRY_IN_RE = re.compile(r"retry in (\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+
+
+def _parse_quota_error(exc: BaseException) -> tuple[bool, float] | None:
+    """[v3.23.660] ``(hết hạn mức NGÀY?, số giây máy chủ bảo chờ)`` nếu ``exc`` là lỗi 429 hạn mức, ngược lại ``None``.
+
+    Đo thật 28/10/2026: Gemini TTS bản miễn phí chỉ cho **3 lượt/phút/model** (``quotaId`` …PerMinute…, ``quotaValue`` 3)
+    và trả ``retryDelay`` vài giây.
+    """
+    text = str(exc)
+    if "RESOURCE_EXHAUSTED" not in text and "429" not in text[:40]:
+        return None
+    daily = "PerDay" in text
+    match = _RETRY_DELAY_RE.search(text) or _RETRY_IN_RE.search(text)
+    delay = float(match.group(1)) if match else _QUOTA_DEFAULT_DELAY_S
+    return daily, delay
+
+
+def _quota_sleep(seconds: float) -> None:
+    """Điểm chờ hạn mức (tách riêng để test thay thế)."""
+    time.sleep(seconds)
+
+
+def _live_style_for(text: str, available_s: float) -> str:
+    """[v3.23.662] Chỉ dẫn đọc cho model Live theo khung của dòng: đủ chỗ → nhịp tự nhiên, chật → đọc rất nhanh."""
+    syllables = dem_am_tiet(text)
+    if available_s > 0 and syllables / available_s > _LIVE_NATURAL_SYLLABLES_PER_S:
+        return _LIVE_FAST_STYLE
+    return _LIVE_VERBATIM_STYLE
 
 class GeminiTTSAdapter(SubtitleTTSPort):
     """TTS dùng Gemini API — Standard TTS + Native Audio Dialog."""
@@ -153,12 +229,17 @@ class GeminiTTSAdapter(SubtitleTTSPort):
     def __init__(self, api_key: str) -> None:
         # [v3.23.130] Nếu nhận chuỗi NHIỀU key (mỗi dòng/phẩy một key), chỉ lấy key ĐẦU
         # tiên — tránh ký tự xuống dòng lọt vào header HTTP (LocalProtocolError).
-        first = ""
+        # [v3.23.660] Giữ MỌI key (trước đây chỉ key đầu): hạn mức miễn phí của TTS tính theo key + model, 3 lượt/phút —
+        # nhiều key = nhiều lượt, và key hết hạn mức ngày được thay bằng key khác.
+        keys: list[str] = []
         for piece in (api_key or "").replace(",", "\n").splitlines():
-            if piece.strip():
-                first = piece.strip()
-                break
-        self._api_key = first or (api_key or "").strip()
+            piece = piece.strip()
+            if piece and piece not in keys:
+                keys.append(piece)
+        self._api_keys = keys or ([(api_key or "").strip()] if (api_key or "").strip() else [])
+        self._api_key = self._api_keys[0] if self._api_keys else ""
+        self._active_client: Any = None
+        self._daily_exhausted: set[str] = set()
 
     def is_available(self) -> bool:
         """Kiểm tra PACKAGE đã cài chưa (không phụ thuộc API key).
@@ -195,7 +276,16 @@ class GeminiTTSAdapter(SubtitleTTSPort):
 
     # ── Client factory ────────────────────────────────────────────────────────
 
-    def _make_client(self, *, use_v1alpha: bool = False):
+    def _live_session_keys(self) -> list[str]:
+        """[v3.23.661] Danh sách "chỗ" phiên Live: mỗi key ``_LIVE_SESSIONS_PER_KEY`` chỗ, trần ``_NATIVE_CONCURRENCY``."""
+        keys = self._api_keys or [self._api_key]
+        slots = [key for _ in range(_LIVE_SESSIONS_PER_KEY) for key in keys]
+        return slots[:_NATIVE_CONCURRENCY]
+
+    def _live_concurrency(self) -> int:
+        return len(self._live_session_keys())
+
+    def _make_client(self, *, use_v1alpha: bool = False, api_key: str = ""):
         """Tạo Gemini client. Native Audio affective dialog yêu cầu v1alpha.
 
         [Native Audio Fallback] Tính năng Lồng tiếng Cảm xúc cần ``api_version=v1alpha``
@@ -208,7 +298,7 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         if use_v1alpha:
             try:
                 return genai.Client(
-                    api_key=self._api_key,
+                    api_key=api_key or self._api_key,
                     http_options={"api_version": "v1alpha"},
                 )
             except TypeError:
@@ -216,7 +306,7 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                     "SDK google-genai bản cũ không hỗ trợ http_options (v1alpha) → "
                     "fallback Client mặc định; tính năng lồng tiếng cảm xúc có thể bị hạn chế."
                 )
-        return genai.Client(api_key=self._api_key)
+        return genai.Client(api_key=api_key or self._api_key)
 
     # ── Public generate ───────────────────────────────────────────────────────
 
@@ -239,6 +329,8 @@ class GeminiTTSAdapter(SubtitleTTSPort):
 
         model = request.language or _STANDARD_TTS_MODELS[0]
         voice = request.speaker or "Aoede"
+        self._active_client = None
+        self._daily_exhausted = set()
         is_native = model in _NATIVE_AUDIO_MODELS
         sr = _SAMPLE_RATE
 
@@ -263,6 +355,8 @@ class GeminiTTSAdapter(SubtitleTTSPort):
             dtype=np.float32,
         )
 
+        # [v3.23.655] Giữ audio từng dòng (như VieNeu) → nghe lại + TTS lại dòng chọn.
+        self._segments_dir = line_segments_dir(request, output_path)
         if is_native:
             results = self._generate_native_audio(
                 model=model, voice=voice, request=request,
@@ -522,7 +616,11 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         ss = max(0, int(play_start_sec * sr)); es = min(ss + len(audio), len(master))
         if ss < len(master):
             master[ss:es] += audio[:es - ss]
+        segment_file = write_line_segment(
+            getattr(self, "_segments_dir", None), idx, audio[:max(0, es - ss)], sr,
+        )
         return TTSSegmentResult(
+            segment_audio_path=segment_file,
             event_index=idx, start_sec=start_sec, end_sec=end_sec,
             text=text, audio_duration_s=len(audio) / sr,
             speed_used=speed_used, was_truncated=was_truncated,
@@ -569,6 +667,67 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         except (TypeError, ValueError):
             return types.SpeechConfig(voice_config=prebuilt)
 
+    def _generate_within_quota(
+        self, client: Any, *, model: str, contents: Any, config: Any,
+        cancel_cb: TTSCancellationCallback | None,
+    ) -> Any:
+        """[v3.23.660] Gọi ``generate_content`` và tự xử lý lỗi 429 hạn mức thay vì bỏ dòng.
+
+        * Hạn mức theo PHÚT: chuyển sang key khác chưa bị chặn; mọi key đều bị chặn thì chờ đúng ``retryDelay`` máy chủ
+          báo (tối đa ``_QUOTA_MAX_WAIT_PER_LINE_S`` mỗi dòng). Lượt chờ KHÔNG tính vào số lần thử của dòng.
+        * Hạn mức NGÀY: bỏ key đó cho cả lượt; hết mọi key thì dừng với ``TTSGenerationError`` nêu rõ lý do.
+
+        Trước đây: chỉ dùng key đầu, thử lại 3 lần cách 1–2 s rồi bỏ dòng — đo thật 11/20 dòng mất tiếng.
+        """
+        waited = 0.0
+        limited_now: set[str] = set()
+        while True:
+            active = self._active_client or client
+            try:
+                return active.models.generate_content(model=model, contents=contents, config=config)
+            except Exception as exc:  # noqa: BLE001 — chỉ xử lý 429, lỗi khác trả về vòng thử lại của dòng
+                info = _parse_quota_error(exc)
+                if info is None:
+                    raise
+                daily, delay = info
+                current = self._api_key
+                if daily:
+                    self._daily_exhausted.add(current)
+                limited_now.add(current)
+                spare = [k for k in self._api_keys if k not in self._daily_exhausted and k not in limited_now]
+                if spare:
+                    self._switch_key(spare[0])
+                    logger.info("Gemini TTS: key …%s chạm hạn mức %s — chuyển sang key khác.",
+                                current[-4:], "ngày" if daily else "phút")
+                    continue
+                alive = [k for k in self._api_keys if k not in self._daily_exhausted]
+                if not alive:
+                    raise TTSGenerationError(
+                        f"Gemini TTS: đã hết hạn mức NGÀY của model {model} trên cả {len(self._api_keys)} key. "
+                        "Chạy tiếp vào ngày mai (các dòng đã đọc được giữ lại khi chạy lại), thêm key khác, "
+                        "hoặc dùng Edge/VieNeu."
+                    ) from exc
+                pause = max(delay, 1.0) + 0.5
+                if waited + pause > _QUOTA_MAX_WAIT_PER_LINE_S:
+                    raise
+                logger.info("Gemini TTS: mọi key đang chạm hạn mức theo phút — chờ %.1f s theo máy chủ.", pause)
+                slept = 0.0
+                while slept < pause:
+                    if cancel_cb and cancel_cb():
+                        raise TTSCancelledError("Huỷ khi chờ hạn mức Gemini TTS.") from exc
+                    step = min(1.0, pause - slept)
+                    _quota_sleep(step)
+                    slept += step
+                waited += pause
+                limited_now = set()
+                if alive[0] != self._api_key:
+                    self._switch_key(alive[0])
+
+    def _switch_key(self, key: str) -> None:
+        """[v3.23.660] Đổi key đang dùng cho các lời gọi Standard TTS sau."""
+        self._api_key = key
+        self._active_client = self._make_client()
+
     def _standard_with_retry(
         self, client, model, text, config, request, cancel_cb, available_s: float = 0.0
     ):
@@ -593,13 +752,13 @@ class GeminiTTSAdapter(SubtitleTTSPort):
             try:
                 # [v3.23.595] Model ≥ 3.8 đọc NGUYÊN VĂN ``text``: lời dẫn bọc quanh câu
                 # (dành cho model cũ, v3.23.245) sẽ bị đọc thành tiếng.
-                response = client.models.generate_content(
-                    model=model,
+                response = self._generate_within_quota(
+                    client, model=model,
                     contents=(
                         text.strip() if uses_verbatim_tts_schema(model)
                         else wrap_transcript_for_tts(text)
                     ),
-                    config=config,
+                    config=config, cancel_cb=cancel_cb,
                 )
                 # [v3.23.258] SDK google-genai 2.x TỰ decode base64 -> ``inline_data.data``
                 # đã là BYTES audio thô (PCM 16-bit), KHÔNG phải chuỗi base64. Trước đây gọi
@@ -648,6 +807,8 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                         attempt + 1, request.retry_count,
                         "rỗng" if len(audio) == 0 else "toàn im lặng", text[:25],
                     )
+            except (TTSCancelledError, TTSGenerationError):
+                raise  # [v3.23.660] huỷ / hết hạn mức ngày trên mọi key: dừng, không âm thầm bỏ dòng
             except Exception as exc:
                 quality_retry = False  # lỗi thật (429/mạng/SDK) -> backoff tăng dần
                 logger.warning("Standard TTS lần %d/%d: %s", attempt + 1, request.retry_count, exc)
@@ -712,8 +873,8 @@ class GeminiTTSAdapter(SubtitleTTSPort):
 
         logger.info(
             "Native Audio concurrent: %d dòng, concurrency=%d (~%.0fx nhanh hơn)",
-            n_valid, _NATIVE_CONCURRENCY,
-            min(_NATIVE_CONCURRENCY, n_valid),
+            n_valid, self._live_concurrency(),
+            min(self._live_concurrency(), n_valid),
         )
 
         # Chạy toàn bộ items song song trong 1 event loop
@@ -826,7 +987,11 @@ class GeminiTTSAdapter(SubtitleTTSPort):
             ss = max(0, int(play_start_sec * sr)); es = min(ss + len(audio), len(master))
             if ss < len(master):
                 master[ss:es] += audio[:es - ss]
+            segment_file = write_line_segment(
+                getattr(self, "_segments_dir", None), idx, audio[:max(0, es - ss)], sr,
+            )
             results[idx] = TTSSegmentResult(
+                segment_audio_path=segment_file,
                 event_index=idx, start_sec=start_sec, end_sec=end_sec,
                 text=text_clean, audio_duration_s=len(audio) / sr,
                 speed_used=speed_used, was_truncated=was_truncated,
@@ -851,8 +1016,13 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         self, *, model, voice, valid_indices: list[int], request,
         use_affective: bool, cancel_cb, progress_cb, n_valid: int,
     ) -> dict[int, np.ndarray | None]:
-        """asyncio.gather + Semaphore — chạy _NATIVE_CONCURRENCY sessions song song."""
-        semaphore = asyncio.Semaphore(_NATIVE_CONCURRENCY)
+        """asyncio.gather + hàng key — chạy song song tối đa ``_LIVE_SESSIONS_PER_KEY`` phiên MỖI key.
+
+        [v3.23.661] Trước đây 10 phiên cùng MỘT key (key đầu) — vượt giới hạn phiên đồng thời của key miễn phí.
+        """
+        slots: asyncio.Queue[str] = asyncio.Queue()
+        for key in self._live_session_keys():
+            slots.put_nowait(key)
         completed = 0
         audio_map: dict[int, np.ndarray | None] = {}
         lock = asyncio.Lock()
@@ -866,7 +1036,8 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                 strip_speaker_tag=True,
             )
 
-            async with semaphore:
+            key = await slots.get()
+            try:
                 if cancel_cb and cancel_cb():
                     audio_map[idx] = None
                     return
@@ -883,7 +1054,10 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                     available_s=effective_available_seconds(
                         event.start_sec, event.end_sec, nxt
                     ),
+                    api_key=key,
                 )
+            finally:
+                slots.put_nowait(key)
 
             async with lock:
                 audio_map[idx] = audio
@@ -893,7 +1067,7 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                     progress_cb(
                         ratio,
                         f"Đã xong {completed}/{n_valid} "
-                        f"(x{min(_NATIVE_CONCURRENCY, n_valid)} song song)…"
+                        f"(x{min(self._live_concurrency(), n_valid)} song song)…"
                     )
 
         outcomes = await asyncio.gather(
@@ -902,6 +1076,10 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         # [v3.23.613] Trước đây kết quả gather bị bỏ đi: dòng lỗi chỉ hiện "Không xử lý
         # được." mà log không có một chữ nào về nguyên nhân.
         completed_task_results(outcomes, "Gemini TTS")
+        if cancel_cb and cancel_cb():
+            # [v3.23.659] Trước đây trả bình thường với các dòng None → generate() ghi đè audio chính bằng bản thiếu
+            # tiếng, "TTS lại dòng chọn" báo thành công với dòng chọn câm.
+            raise TTSCancelledError("Người dùng đã huỷ TTS.")
         return audio_map
 
     @staticmethod
@@ -975,7 +1153,7 @@ class GeminiTTSAdapter(SubtitleTTSPort):
 
     async def _async_native_single_with_retry(
         self, *, model, voice, text: str, request, use_affective: bool,
-        available_s: float = 0.0,
+        available_s: float = 0.0, api_key: str = "",
     ) -> np.ndarray | None:
         """Fully async retry — asyncio.sleep thay time.sleep để không block event loop."""
         current_affective = use_affective
@@ -991,7 +1169,8 @@ class GeminiTTSAdapter(SubtitleTTSPort):
             try:
                 audio = await self._async_native_single(
                     model=model, voice=voice, text=text,
-                    request=request, use_affective=current_affective,
+                    request=request, use_affective=current_affective, api_key=api_key,
+                    available_s=available_s,
                 )
                 if audio is not None and len(audio) > 0:
                     duration_s = speech_seconds(audio, _SAMPLE_RATE)  # [v3.23.601]
@@ -1040,7 +1219,7 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                     try:
                         audio = await self._async_native_single(
                             model=model, voice=voice, text=text,
-                            request=request, use_affective=False,
+                            request=request, use_affective=False, api_key=api_key,
                         )
                         if audio is not None and len(audio) > 0:
                             return audio
@@ -1075,7 +1254,8 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         return None
 
     async def _async_native_single(
-        self, *, model, voice, text: str, request, use_affective: bool
+        self, *, model, voice, text: str, request, use_affective: bool, api_key: str = "",
+        available_s: float = 0.0,
     ) -> np.ndarray | None:
         """1 Live API session = 1 dòng phụ đề. Session ngắn giảm mạnh nguy cơ 1011.
 
@@ -1085,8 +1265,11 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         """
         from google.genai import types
 
+        verbatim = model in _LIVE_VERBATIM_MODELS
         style = request.style_prompt.strip()
-        if not style:
+        if not style and verbatim:
+            style = _live_style_for(text, available_s)
+        elif not style:
             # [v3.23.251] Style MẶC ĐỊNH kèm lớp bảo vệ ngôn ngữ THỨ HAI (cùng language_code
             # ở SpeechConfig). Tài liệu Live API khuyến nghị nêu rõ ngôn ngữ trong system
             # instruction để model không đổi ngôn ngữ theo ngữ cảnh (vd tên riêng CJK còn
@@ -1122,11 +1305,14 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         temperature = getattr(request, "gemini_temperature", None)
         if temperature is not None:
             config_kwargs["temperature"] = temperature
+        thinking_level = _LIVE_THINKING_LEVEL.get(model)
+        if thinking_level:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=types.ThinkingLevel(thinking_level))
         if use_affective and model in _AFFECTIVE_DIALOG_SUPPORTED_MODELS:
             config_kwargs["enable_affective_dialog"] = True
-            client = self._make_client(use_v1alpha=True)
+            client = self._make_client(use_v1alpha=True, api_key=api_key)
         else:
-            client = self._make_client(use_v1alpha=False)
+            client = self._make_client(use_v1alpha=False, api_key=api_key)
 
         config = types.LiveConnectConfig(**config_kwargs)
         chunks: list[bytes] = []
@@ -1134,7 +1320,7 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         async with client.aio.live.connect(model=model, config=config) as session:
             await session.send_client_content(
                 turns=types.Content(
-                    parts=[types.Part(text=wrap_transcript_for_tts(text))],
+                    parts=[types.Part(text=text if verbatim else wrap_transcript_for_tts(text))],
                     role="user",
                 ),
                 turn_complete=True,

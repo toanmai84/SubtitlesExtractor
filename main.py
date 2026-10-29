@@ -60,6 +60,8 @@ def _qt_message_handler(msg_type: int, context: object, message: str) -> None:
 
     # Hạ severity cho các Qt internal warnings đã biết — không cần làm ô nhiễm log.
     _KNOWN_NOISY_PATTERNS: tuple[str, ...] = (
+        # [v3.23.652] Trợ năng/IME Windows hỏi vị trí con trỏ cũ sau setPlainText ngắn hơn — Qt bỏ qua, vô hại.
+        "QTextCursor::setPosition: Position",
         "QFont::setPointSize: Point size <= 0",
         "must be a top level window",
         "QObject::connect: Cannot queue arguments",
@@ -178,9 +180,13 @@ def main() -> int:
             )
 
     # QApplication TRƯỚC khi import bất cứ thứ gì liên quan đến giao diện.
-    from PySide6.QtCore import qInstallMessageHandler
+    from PySide6.QtCore import Qt, qInstallMessageHandler
     from PySide6.QtWidgets import QApplication
 
+    # [v3.23.652] Cửa sổ native của mpv (WA_NativeWindow) khiến Qt biến MỌI trang anh em thành cửa sổ native riêng
+    # ("QWidgetWindow(...translatePageWindow) must be a top level window", nháy/sai thứ tự lớp). Chỉ widget nào thật
+    # sự cần mới native.
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings, True)
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName("SubtitlesExtractor")
     qt_app.setOrganizationName("SubtitlesExtractor")
@@ -211,20 +217,28 @@ def main() -> int:
         window = MainWindow(container)
         window.show()
         exit_code = qt_app.exec()
-        try:
-            from subtitles_extractor.infrastructure.logging.crash_hooks import end_session
-
-            end_session()  # thoát bình thường → xoá dấu phiên
-        except Exception:  # noqa: BLE001
-            pass
     except (ImportError, RuntimeError, OSError):
         logger.exception("Ứng dụng kết thúc do lỗi không bắt được.")
         try:
             container.shutdown()
         except (RuntimeError, OSError) as shutdown_exc:
             logger.warning("Không shutdown sạch container: %s.", shutdown_exc)
+        _mark_clean_exit()
         return 1
+    # [v3.23.652] Chỉ thoát có kiểm soát mới ghi dấu đóng sạch (lỗi khác trào ra vẫn phải được báo lần mở sau).
+    _mark_clean_exit()
     return exit_code
+
+
+def _mark_clean_exit() -> None:
+    """[v3.23.652] Ghi dấu đóng sạch + tắt faulthandler + xoá dấu phiên: lỗi native lúc Python dọn dẹp sau đó không bị
+    báo "lần trước bị tắt đột ngột"."""
+    try:
+        from subtitles_extractor.infrastructure.logging.crash_hooks import mark_clean_exit
+
+        mark_clean_exit()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 if __name__ == "__main__":

@@ -125,6 +125,10 @@ class TranslationLine:
     # [Visual Cues] Bối cảnh + thái độ/cảm xúc người nói (vd "giận dữ trong đại điện")
     # do AI nghe-nhìn video ghi chú; truyền xuống khâu dịch để chọn đúng giọng văn.
     scene: str = ""
+    # [v3.23.653] "người nói\x1fngười nghe" của cue NGƯỜI DÙNG chọn cho dòng này (rỗng = không có). Đưa vào vân tay
+    # đầu vào của bộ nhớ đệm giai đoạn: đổi người nói → chỉ dịch lại lô có dòng đó. Dòng không có cue người dùng giữ
+    # vân tay cũ (theo chữ) nên bộ nhớ đệm đã có không bị mất.
+    user_cue: str = ""
 
 
 # Callback báo tiến độ trong khoảng [0.0, 1.0] cho MỘT giai đoạn.
@@ -182,12 +186,22 @@ class VisualCue:
         speaker:   Người đang nói (vd "Lâm Côn", "Nam đệ tử").
         addressee: Người được nói tới (vd "Nữ tỳ", "Sư phụ").
         scene:     Bối cảnh + thái độ/cảm xúc ngắn gọn (vd "tức giận, trong đại điện").
+        origin:    [v3.23.653] Nguồn nhãn: :data:`CUE_ORIGIN_USER` = người dùng chọn (vd sửa người nói ở trang TTS) —
+            các bước tự động (vá phân tích, lưới tiếng gọi, phân tích lại) không được đè; rỗng = AI/tự động.
     """
 
     line_no: int
     speaker: str = ""
     addressee: str = ""
     scene: str = ""
+    origin: str = ""
+    #: [v3.23.655] Nhãn AI TRƯỚC khi người dùng sửa (``"người nói\x1fngười nghe"``) — chọn lại "Tự động" ở trang TTS
+    #: thì trả về nhãn này và bỏ dấu người dùng. Rỗng = không có/không phải cue người dùng.
+    auto_label: str = ""
+
+
+#: [v3.23.653] Nhãn cue do người dùng chọn.
+CUE_ORIGIN_USER = "user"
 
 
 def apply_visual_cues_to_lines(

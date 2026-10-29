@@ -72,6 +72,7 @@ from subtitles_extractor.infrastructure.tts.dsp_primitives import (
     true_peak_chunked_overlap as _true_peak_chunked_overlap,
 )
 from subtitles_extractor.infrastructure.tts import text_prep as _text_prep
+from subtitles_extractor.infrastructure.tts.segment_store import line_segments_dir, write_line_segment
 from subtitles_extractor.infrastructure.tts.text_prep import (
     SkipOptions as _SkipOptions,  # noqa: F401
 )
@@ -1075,6 +1076,8 @@ class EdgeTTSAdapter(SubtitleTTSPort):
 
         self._ts_heavy_count = 0
         self._has_librosa = self._check_librosa()
+        # [v3.23.655] Giữ audio từng dòng (như VieNeu) → nghe lại + TTS lại dòng chọn.
+        self._segments_dir = line_segments_dir(request, output_path)
 
         results, stats = self._run_concurrent(
             voice=voice, sr=sr, request=request,
@@ -1152,6 +1155,12 @@ class EdgeTTSAdapter(SubtitleTTSPort):
             # encode lossy.
             tp_before = self._measure_true_peak(master, sr)
             master = self._true_peak_limit(master, sr, ceiling=0.95)
+            # [v3.23.662] Bù độ to bị limiter làm hụt (cùng hàm với master_finalize): trước đây Edge ra −16,91 LUFS
+            # khi mục tiêu −16 vì đường master riêng này không có bước bù.
+            if request.target_lufs < 0.0:
+                from subtitles_extractor.infrastructure.tts.audio_mastering import compensate_lufs_shortfall
+
+                master = compensate_lufs_shortfall(master, sr, request.target_lufs, tp_ceiling=0.95)
             if tp_before > 0.95:
                 tp_after = self._measure_true_peak(master, sr)
                 logger.info(
@@ -1234,6 +1243,18 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         sf.write(str(wav_path), master, sr, subtype=subtype)
         return wav_path
 
+    def _duck_placed_lines(
+        self, placed_lines: list[tuple[int, int, np.ndarray]], start: int, duck: np.ndarray, sr: int,
+    ) -> None:
+        """[v3.23.659] Áp cùng đường duck lên audio từng dòng của các câu trước đã nằm trong vùng chồng rồi ghi lại."""
+        end = start + len(duck)
+        for line_idx, line_start, audio in placed_lines:
+            lo, hi = max(start, line_start), min(end, line_start + len(audio))
+            if hi <= lo:
+                continue
+            audio[lo - line_start:hi - line_start] *= duck[lo - start:hi - start]
+            write_line_segment(getattr(self, "_segments_dir", None), line_idx, audio, sr)
+
     @staticmethod
     def _encode_with_ffmpeg(
         master: np.ndarray, sr: int, target: Path, fmt: str, bitrate_kbps: int
@@ -1243,6 +1264,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         import subprocess
 
         from subtitles_extractor.infrastructure.media import find_ffmpeg
+        from subtitles_extractor.infrastructure.tts.audio_mastering import effective_bitrate_kbps
         ffmpeg = find_ffmpeg()
         if not ffmpeg:
             return False
@@ -1259,7 +1281,8 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         cmd = [
             ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
             "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0",
-            "-c:a", codec, "-b:a", f"{bitrate_kbps}k", *extra, str(target),
+            # [v3.23.659] Kẹp bitrate (opus mono ≤ 256 kbps) — mặc định 320 làm Opus luôn lỗi.
+            "-c:a", codec, "-b:a", f"{effective_bitrate_kbps(fmt, bitrate_kbps)}k", *extra, str(target),
         ]
         try:
             proc = subprocess.run(
@@ -1390,6 +1413,9 @@ class EdgeTTSAdapter(SubtitleTTSPort):
             return idx, result
 
         p1_raw = await asyncio.gather(*[_p1(i) for i in to_process], return_exceptions=True)
+        if cancel_cb and cancel_cb():
+            # [v3.23.659] Chế độ một lượt trước đây đi tiếp và GHI ĐÈ audio chính bằng bản câm/thiếu trước khi báo huỷ.
+            raise TTSCancelledError("Người dùng đã huỷ TTS.")
         p1_results: dict[int, tuple[np.ndarray, int] | None] = {}
         for _idx, _res in completed_task_results(p1_raw, "Pass 1"):
             p1_results[_idx] = _res
@@ -1673,6 +1699,10 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         # ducking luôn dìm đúng câu liền TRƯỚC đã nằm trong master — an toàn kể cả khi
         # events bị xáo trộn thứ tự sau chỉnh sửa/gộp hoặc khi câu được dời sớm.
         time_order = sorted(p1_map.keys(), key=lambda i: events[i].start_sec)
+        # [v3.23.659] Các dòng vừa đặt vào master (vị trí, mẫu đã cộng) — để GHI LẠI audio từng dòng sau khi bị
+        # ducking. Trước đây tệp dòng lưu bản CHƯA duck → mọi lần ghép lại (TTS lại dòng, xoá dòng) trả các đoạn
+        # chồng về âm lượng đầy đủ, master khác lượt đầy đủ.
+        placed_lines: list[tuple[int, int, np.ndarray]] = []
         for idx in time_order:
             p1 = p1_map[idx]
             event = events[idx]
@@ -1943,7 +1973,15 @@ class EdgeTTSAdapter(SubtitleTTSPort):
                         s_curve = 0.5 * (1.0 + np.cos(np.pi * t))  # 1 → 0
                         duck[:fade_len] = adapt_floor + (1.0 - adapt_floor) * s_curve
                     region[:ov_end] *= duck
+                    self._duck_placed_lines(placed_lines, ss, duck, sr)
                 master[ss:es] += audio_final[:es - ss]
+            # [v3.23.655] Đúng đoạn đã cộng vào master (sau nén/cắt) → ghép lại master khớp lượt đầy đủ.
+            segment_file = write_line_segment(
+                getattr(self, "_segments_dir", None), idx, audio_final[:max(0, es - ss)], sr,
+            )
+            if segment_file:
+                placed_lines.append((idx, ss, np.array(audio_final[:max(0, es - ss)], dtype=np.float32)))
+                del placed_lines[:-4]  # chỉ câu gần nhất mới có thể bị câu sau chồng lên
 
             adj_start = -1.0
             adj_end = -1.0
@@ -1972,6 +2010,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
                 pause_ms=pause_dur * 1000.0,
                 is_dialog=is_dialog,
                 ducked_prev_s=_dbg_ducked,
+                segment_audio_path=segment_file,
             )
 
         return results, stats

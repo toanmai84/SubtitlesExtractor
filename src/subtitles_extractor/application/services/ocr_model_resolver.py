@@ -84,6 +84,10 @@ def resolve_ocr_model_names(ocr_settings: OcrSettings) -> tuple[str, str]:
         if ocr_settings.detection_model in _DEFAULT_MODEL_NAMES
         else ocr_settings.detection_model
     )
+    # [v3.23.657] Bộ dò chữ chọn riêng (Cài đặt / đề xuất của "Đo tốc độ OCR") thắng mặc định theo phiên bản.
+    override = str(getattr(ocr_settings, "detection_model_override", "") or "").strip()
+    if override:
+        det = override
     rec = (
         rec_default
         if ocr_settings.recognition_model in _DEFAULT_MODEL_NAMES
@@ -92,4 +96,16 @@ def resolve_ocr_model_names(ocr_settings: OcrSettings) -> tuple[str, str]:
     return det, rec
 
 
-__all__ = ["default_models_for_version", "resolve_ocr_model_names"]
+def models_for_reocr(ocr_settings: OcrSettings, version_override: str | None) -> tuple[str, str]:
+    """[v3.23.657] Model cho Re-OCR: phiên bản chọn riêng ≠ Cài đặt → bộ mặc định của phiên bản đó; còn lại theo Cài đặt.
+
+    Hộp thoại Re-OCR Nâng cao luôn trả phiên bản (mặc định = phiên bản Cài đặt). Bản trước luôn tra mặc định theo
+    phiên bản, bỏ qua bộ dò chữ chọn riêng → trích xuất dùng ``small_det`` còn Re-OCR dùng ``medium_det``: engine dùng
+    chung nạp lại model (7–19 s) mỗi lần đổi qua lại.
+    """
+    if version_override and version_override != ocr_settings.version:
+        return default_models_for_version(version_override)
+    return resolve_ocr_model_names(ocr_settings)
+
+
+__all__ = ["default_models_for_version", "models_for_reocr", "resolve_ocr_model_names"]

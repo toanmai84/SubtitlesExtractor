@@ -62,7 +62,9 @@ class MpvFrameSampler:
         os.environ.setdefault("HOME", str(Path.home()))
 
         mpv_kwargs = self._build_mpv_kwargs()
-        instance = mpv.MPV(**mpv_kwargs)
+        from subtitles_extractor.infrastructure.video.mpv_player_adapter import create_lean_mpv
+
+        instance = create_lean_mpv(mpv, mpv_kwargs)  # [v3.23.652] tắt script Lua (nguồn ngoại lệ LuaJIT trong fault.log)
 
         try:
             instance.command("loadfile", str(metadata.path))
@@ -75,7 +77,7 @@ class MpvFrameSampler:
                 # Thu lai voi hwdec=no (an toan nhat cho headless).
                 safe_kwargs = dict(mpv_kwargs)
                 safe_kwargs["hwdec"] = "no"
-                instance = mpv.MPV(**safe_kwargs)
+                instance = create_lean_mpv(mpv, safe_kwargs)
                 instance.command("loadfile", str(metadata.path))
                 instance.pause = True
                 if not self._wait_file_loaded(instance, timeout=15.0):

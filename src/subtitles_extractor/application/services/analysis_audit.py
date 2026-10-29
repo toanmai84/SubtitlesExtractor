@@ -39,6 +39,7 @@ from subtitles_extractor.application.services.visual_cue_serializer import (
     serialize_visual_cues,
 )
 from subtitles_extractor.domain.ports.subtitle_translator_port import (
+    CUE_ORIGIN_USER,
     SubtitleContextAnalysis,
     VisualCue,
 )
@@ -319,6 +320,8 @@ def apply_audit_patch(
             if line_no not in valid_line_ids or not speaker:
                 continue
             old = cues.get(line_no) or VisualCue(line_no=line_no)
+            if old.origin == CUE_ORIGIN_USER:
+                continue  # [v3.23.653] người nói người dùng chọn thắng bản vá của AI
             new = replace(
                 old, speaker=speaker,
                 addressee=str(item.get("to") or "").strip() or old.addressee,

@@ -92,4 +92,24 @@ class CompleteSpeakersWorker(AnalyzeContextWorker):
         )
 
 
-__all__ = ["CompleteSpeakersWorker"]
+class RecheckCuesWorker(CompleteSpeakersWorker):
+    """[v3.23.655] Hỏi lại các dòng Visual Cues đáng nghi trên thread nền (``finished_ok`` phát ``CueRecheckResult``)."""
+
+    def _needed_requests(self) -> int:
+        return 2
+
+    def _execute(self, video_refs, video_reupload_cb):
+        return self._speaker_use_case.execute(
+            self._source_lines,
+            self._visual_cues,
+            characters=self._characters,
+            target_lang=self._target_lang,
+            model_name=self._model_name,
+            video_refs=list(video_refs or []),
+            cancel_cb=self._is_cancelled,
+            progress_cb=lambda _fraction, message: self.progress_message.emit(message),
+            video_reupload_cb=video_reupload_cb,
+        )
+
+
+__all__ = ["CompleteSpeakersWorker", "RecheckCuesWorker"]

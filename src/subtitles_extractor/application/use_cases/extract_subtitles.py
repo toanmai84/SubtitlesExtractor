@@ -31,10 +31,12 @@ from subtitles_extractor.application.dtos.extract_subtitles_dto import (
 from subtitles_extractor.application.services.subtitle_builder import (
     SubtitleBuilder,
 )
+from subtitles_extractor.application.services.frame_prefetch import DEFAULT_PREFETCH, prefetched
 from subtitles_extractor.application.use_cases.load_video_metadata import (
     LoadVideoMetadataUseCase,
 )
 from subtitles_extractor.domain.entities.ocr_frame_result import OcrFrameResult
+from subtitles_extractor.domain.value_objects.roi import Roi
 from subtitles_extractor.domain.exceptions import (
     OcrInferenceError,
     OcrModelLoadError,
@@ -77,6 +79,56 @@ _CHECKPOINT_INTERVAL_SEC: float = 30.0
 #: [v3.23.644] Hàng đợi khung chờ tối đa ``batch_size`` × hệ số này (khung trùng/trống không tốn ảnh nhưng
 #: đừng để một phụ đề đứng yên hàng phút làm hàng đợi phình vô hạn trước khi trả kết quả).
 _MAX_PENDING_FACTOR = 16
+
+
+def _video_identity(path: Path) -> str:
+    """[v3.23.652] Định danh tệp video cho cache khung RAM: đường dẫn tuyệt đối + mtime_ns + kích thước."""
+    try:
+        resolved = Path(path).resolve()
+        stat = resolved.stat()
+    except OSError:
+        return str(path)
+    return f"{resolved}|{stat.st_mtime_ns}|{stat.st_size}"
+
+
+def _accepts_config(engine: object) -> bool:
+    """[v3.23.656] Engine nhận cấu hình theo từng lượt (``infer_batch(..., config=...)``)?"""
+    import inspect
+
+    method = getattr(engine, "infer_batch", None)
+    try:
+        return method is not None and "config" in inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _infer_batch(engine: OcrEnginePort, config: object, **kwargs: object) -> list[OcrFrameResult]:
+    """[v3.23.656] Gọi ``infer_batch`` kèm cấu hình của lượt khi engine hỗ trợ (engine giả trong test thì không)."""
+    if _accepts_config(engine):
+        return engine.infer_batch(config=config, **kwargs)  # type: ignore[call-arg]
+    return engine.infer_batch(**kwargs)  # type: ignore[arg-type]
+
+
+def effective_roi(roi: Roi | None, frame_width: int, frame_height: int) -> Roi | None:
+    """[v3.23.655] ROI kẹp vào khung (đúng vùng bộ giải mã cắt); giữ nguyên khi không biết kích thước khung."""
+    if roi is None or frame_width <= 0 or frame_height <= 0:
+        return roi
+    if roi.x >= 0 and roi.y >= 0 and roi.x + roi.width <= frame_width and roi.y + roi.height <= frame_height:
+        return roi
+    return roi.clip_to(frame_width, frame_height)
+
+
+class _NoCancelReporter:
+    """[v3.23.655] Bọc reporter cho luồng giải mã: chuyển báo tiến độ, không tự trả lời "huỷ"."""
+
+    def __init__(self, inner: ProgressReporterPort) -> None:
+        self._inner = inner
+
+    def is_cancelled(self) -> bool:
+        return False
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
 
 
 def _needs_ocr(frame: SampledFrame) -> bool:
@@ -242,15 +294,35 @@ class ExtractSubtitlesUseCase:
 
         video_metadata = self._load_metadata_use_case.execute(request.video_path)
         if request.roi is not None:
+            # [v3.23.655] Bug #16: ROI vượt mép khung — bộ giải mã cắt theo ROI ĐÃ kẹp vào khung, nhưng phần sau (tỉ lệ
+            # upscale, lọc căn giữa theo bề rộng ROI) dùng ROI gốc → toạ độ ô chữ lệch, dòng căn giữa bị lọc oan. Kẹp
+            # một lần ở đây để mọi khâu dùng đúng vùng thật được cắt.
+            clipped = effective_roi(request.roi, video_metadata.width, video_metadata.height)
+            if clipped != request.roi:
+                logger.warning(
+                    "ROI %s vượt khung %dx%d — kẹp về %s.", request.roi, video_metadata.width,
+                    video_metadata.height, clipped,
+                )
+                request = dataclasses.replace(request, roi=clipped)
             video_metadata = video_metadata.replace_roi(request.roi)
 
-        apply_configuration_method = getattr(self._ocr_engine_port, "apply_config", None)
-        if callable(apply_configuration_method):
-            apply_configuration_method(request.ocr)
+        # [v3.23.656] B1/B2: KHÔNG apply_config lên engine dùng chung nữa — cấu hình của lượt này đi kèm từng lô
+        # (``infer_batch(config=request.ocr)``). Trước đây Re-OCR bắt đầu giữa lúc trích xuất đổi ngưỡng/tiền xử lý
+        # của lượt trích xuất, đổi model thì giải phóng model giữa chừng.
+        if not _accepts_config(self._ocr_engine_port):
+            apply_configuration_method = getattr(self._ocr_engine_port, "apply_config", None)
+            if callable(apply_configuration_method):
+                apply_configuration_method(request.ocr)
 
+        prepare = getattr(self._ocr_engine_port, "prepare", None) if _accepts_config(self._ocr_engine_port) else None
         if not self._ocr_engine_port.is_initialized:
             progress_reporter.report(0, 100, "Đang nạp mô hình AI OCR lên thiết bị xử lý…")
-            self._ocr_engine_port.initialize()
+            if callable(prepare):
+                prepare(request.ocr)       # [v3.23.656] nạp đúng model của lượt này ngay (không nạp 2 lần)
+            else:
+                self._ocr_engine_port.initialize()
+        elif callable(prepare):
+            prepare(request.ocr)
 
         debug_frames_directory: Path | None = None
         if request.save_debug_frames:
@@ -417,46 +489,61 @@ class ExtractSubtitlesUseCase:
                 processed_batch_count += 1
             produced = iter(_align_results(ocr_frames, ocr_results))
             resolved: list[OcrFrameResult] = []
-            previous = carried
+            # [v3.23.652] Khung trùng = trùng với khung ẢNH THẬT gần nhất (bộ giải mã so với ảnh cuối giữ lại), nên phải
+            # chép kết quả của khung đó — không phải khung ngay trước. Trước đây khung lỗi giải mã (rỗng) xen giữa làm
+            # cả chuỗi khung trùng sau nó mất chữ → câu bị cắt/tách đôi.
+            reference = carried
             for frame in pending:
                 if _needs_ocr(frame):
                     result = next(produced)
-                elif frame.is_duplicate and previous is not None:
+                elif frame.is_duplicate and reference is not None:
                     result = OcrFrameResult(
                         frame_index=frame.frame_index, timestamp_sec=frame.timestamp_sec,
-                        text_boxes=list(previous.text_boxes),
+                        text_boxes=list(reference.text_boxes),
                     )
                 else:   # lỗi giải mã / khung trống / trùng khi chưa có kết quả trước → rỗng, KHÔNG bỏ khung
                     result = OcrFrameResult(
                         frame_index=frame.frame_index, timestamp_sec=frame.timestamp_sec, text_boxes=[],
                     )
                 resolved.append(result)
-                previous = result
+                if not (frame.is_duplicate or frame.is_error):
+                    reference = result
             accumulated_results.extend(resolved)
-            carried = previous
+            carried = reference
             pending = []
             ocr_pending = 0
 
-        for sampled_frame in self._iterate_sampled_frames(metadata, sampling_request, reporter):
-            if reporter.is_cancelled():
-                break
-            if frame_offset:
-                sampled_frame = dataclasses.replace(
-                    sampled_frame, frame_index=sampled_frame.frame_index + frame_offset,
-                )
-            save_checkpoint()
-
-            pending.append(sampled_frame)
-            if _needs_ocr(sampled_frame):
-                ocr_pending += 1
-            if ocr_pending >= current_batch_size or len(pending) >= current_batch_size * _MAX_PENDING_FACTOR:
-                flush()
-                if len(accumulated_results) - last_reported_frame_count >= progress_report_interval:
-                    reporter.report(
-                        len(accumulated_results), expected_total_frames,
-                        f"Đã quét OCR {len(accumulated_results)}/{expected_total_frames} frame…",
+        prefetch = self._prefetch_size()
+        # Luồng giải mã không tự hỏi "huỷ chưa": luồng OCR hỏi mỗi khung và khi huỷ thì dừng hẳn luồng giải mã.
+        producer_reporter = _NoCancelReporter(reporter) if prefetch > 0 else reporter
+        frames = prefetched(
+            lambda: self._iterate_sampled_frames(metadata, sampling_request, producer_reporter),
+            prefetch,
+        )
+        # [v3.23.655] Đóng chắc chắn (kể cả khi OCR ném lỗi): luồng giải mã dừng, trả NVDEC/VRAM ngay — không chờ GC.
+        try:
+            for sampled_frame in frames:
+                if reporter.is_cancelled():
+                    break
+                if frame_offset:
+                    sampled_frame = dataclasses.replace(
+                        sampled_frame, frame_index=sampled_frame.frame_index + frame_offset,
                     )
-                    last_reported_frame_count = len(accumulated_results)
+                save_checkpoint()
+
+                pending.append(sampled_frame)
+                if _needs_ocr(sampled_frame):
+                    ocr_pending += 1
+                if ocr_pending >= current_batch_size or len(pending) >= current_batch_size * _MAX_PENDING_FACTOR:
+                    flush()
+                    if len(accumulated_results) - last_reported_frame_count >= progress_report_interval:
+                        reporter.report(
+                            len(accumulated_results), expected_total_frames,
+                            f"Đã quét OCR {len(accumulated_results)}/{expected_total_frames} frame…",
+                        )
+                        last_reported_frame_count = len(accumulated_results)
+        finally:
+            frames.close()
 
         if pending and not reporter.is_cancelled():
             flush()
@@ -464,6 +551,20 @@ class ExtractSubtitlesUseCase:
                 len(accumulated_results), expected_total_frames,
                 f"Đã quét xong {len(accumulated_results)} khung hình.",
             )
+
+    def _prefetch_size(self) -> int:
+        """[v3.23.655] Số khung giải mã trước ở luồng riêng (0 = tắt).
+
+        Tắt với bộ lấy mẫu mpv (libmpv từng crash khi dùng chéo luồng — xem 3.23.651) và khi đặt biến môi trường
+        ``SUBTITLES_EXTRACTOR_NO_PREFETCH=1``.
+        """
+        import os
+
+        if os.environ.get("SUBTITLES_EXTRACTOR_NO_PREFETCH", "").strip() in {"1", "true", "yes"}:
+            return 0
+        if "mpv" in type(self._frame_sampler_port).__name__.lower():
+            return 0
+        return DEFAULT_PREFETCH
 
     @staticmethod
     def _open_checkpoint(
@@ -516,7 +617,9 @@ class ExtractSubtitlesUseCase:
             # (bước lấy mẫu, ngưỡng khử trùng, toàn bộ tiền xử lý VRAM). Trước đây chỉ gồm
             # intro/outro/roi -> đổi tiền xử lý (upscale/sharpen/contrast…) vẫn trúng cache cũ
             # và phục vụ frame lỗi thời. (Model OCR không đổi pixel nên không cần đưa vào.)
-            cache_key = f"{metadata.path.name}|{_sampling_signature(request.sampling)}|{roi_str}"
+            # [v3.23.652] Khoá theo ĐƯỜNG DẪN ĐẦY ĐỦ + mtime + kích thước, không chỉ tên tệp: hai "tap01.mp4" ở hai thư
+            # mục (hoặc tệp bị ghi đè bằng bản khác) từng trúng cache của nhau → Re-OCR chèn phụ đề của video khác.
+            cache_key = f"{_video_identity(metadata.path)}|{_sampling_signature(request.sampling)}|{roi_str}"
             cached_frames = _GLOBAL_FRAME_CACHE.get(cache_key)
             if cached_frames is not None:
                 yield from cached_frames
@@ -552,7 +655,8 @@ class ExtractSubtitlesUseCase:
             self._save_debug_frames_to_disk(batch_queue, debug_dir)
 
         try:
-            raw_inference_results = _align_results(batch_queue, self._ocr_engine_port.infer_batch(
+            raw_inference_results = _align_results(batch_queue, _infer_batch(
+                self._ocr_engine_port, request.ocr,
                 images_rgb=[frame.image_rgb for frame in batch_queue],
                 frame_indices=[frame.frame_index for frame in batch_queue],
                 timestamps_sec=[frame.timestamp_sec for frame in batch_queue],
@@ -579,7 +683,8 @@ class ExtractSubtitlesUseCase:
                         results.append(blank)
                         continue
                     try:
-                        single = _align_results([frame], self._ocr_engine_port.infer_batch(
+                        single = _align_results([frame], _infer_batch(
+                            self._ocr_engine_port, request.ocr,
                             images_rgb=[frame.image_rgb], frame_indices=[frame.frame_index],
                             timestamps_sec=[frame.timestamp_sec],
                         ))
@@ -608,7 +713,8 @@ class ExtractSubtitlesUseCase:
         if not request.sampling.vram_upscale_small_text and not request.sampling.vram_add_border:
             return raw_results
             
-        orig_h = request.roi.height if request.roi else metadata.height
+        roi = effective_roi(request.roi, metadata.width, metadata.height)  # [v3.23.655] chiều cao THẬT đã cắt
+        orig_h = roi.height if roi else metadata.height
         border_px = request.sampling.vram_border_thickness_px if request.sampling.vram_add_border else 0
         
         reversed_results = []
@@ -816,7 +922,11 @@ class ExtractSubtitlesUseCase:
                     f"frame_{sampled_frame.frame_index:06d}_"
                     f"{sampled_frame.timestamp_sec * 1000:.0f}ms.png"
                 )
-                cv2.imwrite(str(debug_directory / file_name), bgr_image_array)
+                # [v3.23.659] imencode + tofile: cv2.imwrite trên Windows không ghi được vào đường dẫn có chữ Hán/tiếng
+                # Việt (thư mục gỡ lỗi đặt theo tên video) — ảnh gỡ lỗi âm thầm không được lưu.
+                encoded_ok, encoded = cv2.imencode(Path(file_name).suffix or ".png", bgr_image_array)
+                if encoded_ok:
+                    encoded.tofile(str(debug_directory / file_name))
             except (OSError, cv2.error, ValueError) as exc:
                 logger.debug("Bỏ qua lưu debug frame #%d: %s.", sampled_frame.frame_index, exc)
 

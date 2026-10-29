@@ -34,7 +34,7 @@ from subtitles_extractor.domain.value_objects.output_naming import (
 logger = logging.getLogger(__name__)
 
 #: Phần mở rộng tệp giọng đọc mà khâu TTS có thể đã ghi ra.
-_AUDIO_SUFFIXES: tuple[str, ...] = (".flac", ".wav", ".m4a", ".mp3")
+_AUDIO_SUFFIXES: tuple[str, ...] = (".flac", ".wav", ".m4a", ".mp3", ".opus", ".ogg")  # [v3.23.658] + opus/ogg (trang TTS xuất được)
 
 
 class TtsItemStatus(StrEnum):

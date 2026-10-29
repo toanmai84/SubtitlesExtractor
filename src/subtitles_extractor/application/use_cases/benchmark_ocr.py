@@ -56,10 +56,16 @@ class CountingOcrEngine:
 
     def infer_batch(
         self, images_rgb: list[np.ndarray], frame_indices: list[int], timestamps_sec: list[float],
+        config: object = None,
     ) -> list[OcrFrameResult]:
         started = time.perf_counter()
         try:
-            return self._inner.infer_batch(images_rgb, frame_indices, timestamps_sec)
+            # [v3.23.656] Chuyển tiếp cấu hình của lượt đo nếu engine bên trong nhận.
+            from subtitles_extractor.application.use_cases.extract_subtitles import _infer_batch
+
+            return _infer_batch(
+                self._inner, config, images_rgb=images_rgb, frame_indices=frame_indices, timestamps_sec=timestamps_sec,
+            ) if config is not None else self._inner.infer_batch(images_rgb, frame_indices, timestamps_sec)
         finally:
             self.infer_seconds += time.perf_counter() - started
             self.frames += len(images_rgb)
@@ -136,7 +142,14 @@ class BenchmarkOcrUseCase:
         try:
             scenario_reporter.report(0, 1, "Đang nạp model OCR…")
             self._configure_engine(request.ocr)
-            self._engine.initialize()
+            # [v3.23.659] Nạp ĐÚNG model của kịch bản trước khi bấm giờ. Từ v3.23.656 cấu hình đi theo lượt: initialize()
+            # không đổi model đang nạp và lượt nóng máy chạy model CŨ → lần nạp lại 7–19 s rơi vào lô tính giờ đầu tiên,
+            # mọi kịch bản khác "hiện tại" bị đo chậm hơn thật (đề xuất lệch).
+            prepare = getattr(self._engine, "prepare", None)
+            if callable(prepare):
+                prepare(request.ocr)
+            else:
+                self._engine.initialize()
             self._warm_up(request)
             if reporter.is_cancelled():
                 return result
@@ -162,5 +175,10 @@ class BenchmarkOcrUseCase:
         width = max(64, roi.width) if roi else 640
         blank = np.full((height, width, 3), 255, np.uint8)
         count = max(1, int(getattr(request.ocr, "det_batch_size", 1) or 1))     # nóng đúng cỡ lô sẽ dùng
+        from subtitles_extractor.application.use_cases.extract_subtitles import _infer_batch
+
         for _ in range(_WARMUP_FRAMES):
-            self._engine.infer_batch([blank] * count, list(range(count)), [0.0] * count)
+            _infer_batch(
+                self._engine, request.ocr,
+                images_rgb=[blank] * count, frame_indices=list(range(count)), timestamps_sec=[0.0] * count,
+            )

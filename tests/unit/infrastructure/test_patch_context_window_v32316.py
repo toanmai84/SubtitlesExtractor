@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from unittest.mock import MagicMock, patch
 
 from subtitles_extractor.infrastructure.translation.gemini_translation_adapter import (
@@ -114,16 +116,21 @@ class TestPatchMissingWithContext:
         bres = [TranslationLine(index=i, start_ms=0, end_ms=1, text=f"d{i}")
                 for i in range(1, 6)]
         called = []
+        from subtitles_extractor.infrastructure.translation.gemini_translation_adapter import (
+            _BatchCountMismatchError,
+        )
+
         with patch.object(adapter, "_line_to_payload", lambda l: {}), \
              patch.object(adapter, "_translate_single_batch",
-                          lambda **k: called.append(1) or []):
-            out = adapter._patch_missing_with_context(
+                          lambda **k: called.append(1) or []), \
+             pytest.raises(_BatchCountMismatchError):
+            adapter._patch_missing_with_context(
                 batch=batch, batch_result=bres, missing_set={3},
                 source_before=[], source_after=[], history_before=[],
                 is_preprocess=False, is_literal=True, config=MagicMock(),
                 model_name="m", cancel_cb=None, _depth=0, _ctx_size=20,
                 video_files=None, dual_payload=False,
             )
-        # padding 6 phủ cả batch 5 câu → bỏ qua vá riêng.
+        # padding 6 phủ cả batch 5 câu → không vá riêng; [v3.23.659] báo để nhánh CHIA ĐÔI lô xử lý (trước đây trả
+        # nguyên kết quả → dòng thiếu giữ chữ Hán mà không có gì chia đôi).
         assert called == []
-        assert out == bres

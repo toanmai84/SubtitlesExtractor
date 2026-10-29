@@ -99,6 +99,60 @@ def concatenate_videos(
     cancel_check: CancelCheck | None = None,
     timeout_sec: float = 6 * 3600,
 ) -> Path:
+    """Nối ``videos`` (theo đúng thứ tự) thành ``output_path`` — ghi tệp tạm rồi mới thay tệp đích.
+
+    [v3.23.659] Trước đây ffmpeg ghi thẳng ``-y`` lên tệp trọn bộ: lần nối lại bị huỷ / lỗi / tắt app phá luôn bản
+    trọn bộ tốt của lần trước. Nay ghi ``<tên>.partial<đuôi>`` và chỉ thay tệp đích khi xong; phụ đề rời của các
+    tập được nối kèm (nhánh chuẩn hoá trước đây bỏ mất mọi phụ đề).
+    """
+    if len(videos) < 2:
+        raise VideoConcatError("Cần ít nhất 2 tệp để nối.")
+    target = output_path.resolve()
+    clash = next((v for v in videos if v.resolve() == target), None)
+    if clash is not None:
+        raise VideoConcatError(
+            f"Tệp trọn bộ trùng với một tập đầu vào ({clash.name}). "
+            "Hãy đổi tên hoặc chuyển tệp trọn bộ cũ ra khỏi thư mục rồi nối lại."
+        )
+    partial = output_path.with_name(f"{output_path.stem}.partial{output_path.suffix}")
+    try:
+        _concatenate_to(
+            videos, partial, reencode=reencode, total_duration_sec=total_duration_sec,
+            on_progress=on_progress, cancel_check=cancel_check, timeout_sec=timeout_sec,
+        )
+        _attach_episode_subtitles(videos, partial, cancel_check=cancel_check)
+        _replace_with_retry(partial, output_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            partial.unlink(missing_ok=True)
+        raise
+    return output_path
+
+
+def _replace_with_retry(source: Path, target: Path, attempts: int = 5) -> None:
+    """``os.replace`` có thử lại (Windows: trình phát / chống virus giữ tệp đích trong chốc lát)."""
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError as exc:
+            if attempt == attempts - 1:
+                raise VideoConcatError(
+                    f"Không thay được {target.name} (tệp đang mở ở ứng dụng khác?): {exc}"
+                ) from exc
+            time.sleep(0.5 * (attempt + 1))
+
+
+def _concatenate_to(
+    videos: list[Path],
+    output_path: Path,
+    *,
+    reencode: bool = False,
+    total_duration_sec: float = 0.0,
+    on_progress: ProgressCallback | None = None,
+    cancel_check: CancelCheck | None = None,
+    timeout_sec: float = 6 * 3600,
+) -> Path:
     """Nối ``videos`` (theo đúng thứ tự) thành ``output_path``.
 
     Args:
@@ -209,10 +263,14 @@ def _concat_with_demuxer(
             ffmpeg, "-hide_banner", "-y",
             "-f", "concat", "-safe", "0", "-i", str(list_path),
         ]
+        # [v3.23.659] Chọn luồng TƯỜNG MINH: mặc định ffmpeg chỉ giữ MỘT track tiếng (track nhiều kênh nhất = tiếng
+        # gốc stereo) → bản "_tiengviet" nối xong mất giọng Việt; phụ đề rời chỉ giữ được khi ra .mkv.
+        keep_subs = output_path.suffix.lower() == ".mkv"
+        command += ["-map", "0:v:0", "-map", "0:a?"] + (["-map", "0:s?"] if keep_subs else [])
         if reencode:
             # Nén lại: chuẩn hoá về H.264 + AAC để mọi tập ghép được dù lệch thông số.
             command += ["-c:v", "libx264", "-preset", "medium", "-crf", "20",
-                        "-c:a", "aac", "-b:a", "192k"]
+                        "-c:a", "aac", "-b:a", "192k"] + (["-c:s", "copy"] if keep_subs else [])
         else:
             command += ["-c", "copy"]
         command += ["-movflags", "+faststart", str(output_path)]
@@ -634,6 +692,100 @@ def _max_video_packet_gap(path: Path) -> float:
         return 0.0
     stamps.sort()
     return max(later - earlier for earlier, later in pairwise(stamps))
+
+
+def _stream_count(path: Path, kind: str) -> int:
+    """Số luồng loại ``kind`` (``s`` / ``a`` / ``v``) trong tệp; 0 nếu không đọc được."""
+    ffprobe = find_ffprobe()
+    if ffprobe is None:
+        return 0
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", kind, "-show_entries", "stream=index", "-of", "csv=p=0",
+             str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, **no_window_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    return sum(1 for line in (result.stdout or "").splitlines() if line.strip())
+
+
+def _attach_episode_subtitles(videos: list[Path], output_path: Path, cancel_check: CancelCheck | None = None) -> None:
+    """[v3.23.659] Tệp nối chưa có phụ đề mà MỌI tập đều có → nối riêng phụ đề (lệch đúng thời lượng từng tập) rồi gắn.
+
+    Nhánh chuẩn hoá (tập lệch fps — bộ mẫu có tập 30 fps xen 25 fps) chỉ nối hình + tiếng, nên bản "_phude" trọn
+    bộ trước đây không còn phụ đề. Lỗi ở bước này chỉ cảnh báo: tệp hình + tiếng vẫn dùng được.
+    """
+    ffmpeg = find_ffmpeg()
+    if (
+        ffmpeg is None or output_path.suffix.lower() != ".mkv" or _stream_count(output_path, "s") > 0
+        or not all(_stream_count(video, "s") > 0 for video in videos)
+    ):
+        return
+    from subtitles_extractor.application.services.concat_plan import build_concat_list_content
+
+    def cancelled() -> bool:
+        return cancel_check is not None and bool(cancel_check())
+
+    durations = []
+    for video in videos:
+        if cancelled():
+            raise VideoConcatError("Đã huỷ nối video.")
+        durations.append(_probe_duration(video))
+    if any(d <= 0 for d in durations):
+        logger.warning("Không đọc được thời lượng tập — không gắn được phụ đề vào tệp nối.")
+        return
+    # Mỗi tập kèm "duration" để phụ đề tập sau lệch đúng bằng thời lượng tập trước (không theo gói phụ đề cuối).
+    lines = build_concat_list_content(videos).splitlines()
+    listing = "\n".join(f"{line}\nduration {d:.6f}" for line, d in zip(lines, durations, strict=False)) + "\n"
+    work = output_path.with_name(output_path.stem + ".subs")
+    work.mkdir(exist_ok=True)
+    list_path = work / "list.txt"
+    subs_path = work / "subs.mkv"
+    muxed = work / ("muxed" + output_path.suffix)
+    try:
+        list_path.write_text(listing, encoding="utf-8")
+        for command in (
+            [ffmpeg, "-hide_banner", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+             "-map", "0:s", "-c", "copy", str(subs_path)],
+            [ffmpeg, "-hide_banner", "-v", "error", "-y", "-i", str(output_path), "-i", str(subs_path),
+             "-map", "0", "-map", "1:s", "-c", "copy", str(muxed)],
+        ):
+            # [v3.23.659] Chạy có thể huỷ (bước gắn chép lại cả tệp trọn bộ — vài phút với 86 tập).
+            returncode, stderr = _run_cancellable(command, cancelled, timeout_sec=1800)
+            if returncode != 0:
+                logger.warning("Không gắn được phụ đề vào tệp nối: %s", stderr[-400:])
+                return
+        os.replace(muxed, output_path)
+        logger.info("Đã gắn phụ đề của %d tập vào tệp nối.", len(videos))
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Không gắn được phụ đề vào tệp nối: %s", exc)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _run_cancellable(command: list[str], cancelled, timeout_sec: float) -> tuple[int, str]:
+    """Chạy ffmpeg, dừng (kill) khi người dùng huỷ → ``VideoConcatError``."""
+    process = subprocess.Popen(
+        command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+        **no_window_kwargs(),
+    )
+    deadline = time.monotonic() + timeout_sec
+    try:
+        while True:
+            try:
+                _out, err = process.communicate(timeout=0.5)
+                return process.returncode, err or ""
+            except subprocess.TimeoutExpired:
+                if cancelled():
+                    raise VideoConcatError("Đã huỷ nối video.") from None
+                if time.monotonic() > deadline:
+                    raise
+    finally:
+        if process.poll() is None:
+            process.kill()
+            with contextlib.suppress(Exception):
+                process.communicate(timeout=10)
 
 
 def _probe_duration(path: Path) -> float:

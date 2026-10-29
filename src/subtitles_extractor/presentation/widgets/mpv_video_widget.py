@@ -680,6 +680,10 @@ def release_all_mpv_players() -> int:
     return released
 
 
+#: [v3.23.665] Khoảng gộp lệnh seek khi kéo thanh (ms) — ~25 lệnh/giây, mắt vẫn thấy khung hình chạy theo tay.
+_SEEK_COALESCE_MS = 40
+
+
 class MpvVideoWidget(QWidget):
     """Widget MPV player Native Hardware Decode + OSD Overlay."""
 
@@ -719,6 +723,12 @@ class MpvVideoWidget(QWidget):
         self._playback_timer.timeout.connect(self._on_play_tick)
         self._is_playing = False
         self._auto_loop = True
+
+        self._pending_seek_sec: float | None = None
+        self._seek_coalesce_timer = QTimer(self)
+        self._seek_coalesce_timer.setSingleShot(True)
+        self._seek_coalesce_timer.setInterval(_SEEK_COALESCE_MS)
+        self._seek_coalesce_timer.timeout.connect(self._on_seek_coalesce_timeout)
 
         self._update_timer = QTimer(self)
         self._update_timer.setSingleShot(True)
@@ -809,11 +819,28 @@ class MpvVideoWidget(QWidget):
 
     def seek(self, sec: float) -> None:
         if self._player:
-            with contextlib.suppress(RuntimeError, ValueError, TypeError):
-                self._player.seek(sec)
+            # [v3.23.665] Kéo thanh seek bắn valueChanged cho TỪNG pixel: mỗi lệnh là một ``seek exact`` đồng bộ trên
+            # luồng giao diện → mpv bị dồn hàng trăm lệnh/giây (crash 29/10 xảy ra đúng lúc kéo). Gộp: tối đa một lệnh
+            # mỗi ``_SEEK_COALESCE_MS``; vị trí MỚI NHẤT luôn được áp dụng khi hết khoảng chờ.
+            self._pending_seek_sec = sec
+            if not self._seek_coalesce_timer.isActive():
+                self._apply_pending_seek()
+                self._seek_coalesce_timer.start()
         else:
             self.seek_fallback_requested.emit(sec)
         self.position_changed.emit(sec)
+
+    def _apply_pending_seek(self) -> None:
+        sec, self._pending_seek_sec = self._pending_seek_sec, None
+        if sec is None or self._player is None or is_deleted(self):
+            return
+        with contextlib.suppress(RuntimeError, ValueError, TypeError):
+            self._player.seek(sec)
+
+    def _on_seek_coalesce_timeout(self) -> None:
+        if self._pending_seek_sec is not None:
+            self._apply_pending_seek()
+            self._seek_coalesce_timer.start()  # còn kéo tiếp → giữ nhịp; hết lệnh chờ thì lần sau dừng
 
     def _on_play_tick(self) -> None:
         if not self._player: return
@@ -945,6 +972,8 @@ class MpvVideoWidget(QWidget):
     def release_player(self) -> None:
         if is_deleted(self): return
         if self._update_timer.isActive(): self._update_timer.stop()
+        self._seek_coalesce_timer.stop()  # [v3.23.665] không seek vào lõi mpv đã giải phóng
+        self._pending_seek_sec = None
         self.pause()
         if self._osd_renderer is not None:
             with contextlib.suppress(AttributeError, RuntimeError): self._osd_renderer.clear_all()

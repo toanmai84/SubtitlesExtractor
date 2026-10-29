@@ -62,6 +62,7 @@ __all__ = [
     "speech_seconds",
     "speech_span",
     "trim_edge_silence",
+    "trim_repeated_reading",
 ]
 
 #: [v3.23.615] Đảo tiếng ở BIÊN audio ngắn hơn mức này (giây) mà cách phần lời ít nhất
@@ -140,6 +141,113 @@ def speech_span(
     ):
         last -= 1
     return int(starts[first]), int(ends[last])
+
+
+#: [v3.23.663] Khoảng ngừng (giây) tối thiểu giữa lần đọc đầu và lần đọc lặp. Đo thật 15 bản lặp VieNeu: 0,25–0,5 s;
+#: ngừng nội bộ trong một lần đọc (phụ âm tắc, dấu phẩy ngắn) thường dưới 0,1 s.
+REPEAT_GAP_S = 0.2
+
+#: [v3.23.663] Phần lời trước chỗ cắt phải dài ít nhất chừng này giây mỗi âm tiết (đọc đủ câu rồi mới lặp). Lần đọc
+#: đầu đo được 0,20–0,66 s cho 1–3 tiếng, tức ≥0,2 s/tiếng.
+REPEAT_MIN_SPEECH_PER_SYLLABLE_S = 0.15
+
+#: [v3.23.664] Phần bị cắt bỏ (lần "đọc lại") dài tối đa chừng này lần phần giữ lại. Đọc lặp thật: 0,6–1,3 lần
+#: (đo 15 bản lặp VieNeu). Câu "Sư huynh, em..." 20 lần sinh: cắt ở dấu phẩy thì bỏ 1,0–1,1 s mà chỉ giữ 0,45 s
+#: (2,3–2,5 lần) — chính là 4/20 bản mất chữ "em"; cắt sau "em" thì phần bỏ chỉ 0,4–0,9 lần.
+REPEAT_MAX_TAIL_RATIO = 1.6
+
+#: [v3.23.664] Ngừng ở dấu câu (phẩy, "...") ngắn hơn ngừng trước khi đọc lại: đo thật 0,19–0,3 s.
+BREAK_GAP_S = 0.1
+
+#: [v3.23.663] Giữ thêm sau đảo lời cuối (đuôi tắt dần của âm tiết) rồi fade-out.
+REPEAT_TAIL_S = 0.08
+REPEAT_FADE_S = 0.015
+
+
+def _loud_islands(audio: np.ndarray, sr: int, rel_db: float = -30.0, min_gap_s: float = 0.06) -> list[tuple[int, int]]:
+    """Các đảo năng lượng ``[đầu, cuối)`` (mẫu) theo envelope RMS 10 ms, ngưỡng tương đối so với đỉnh."""
+    hop = max(1, int(sr * 0.01))
+    frames = len(audio) // hop
+    if frames == 0:
+        return []
+    env = np.sqrt(np.mean(np.square(audio[: frames * hop].astype(np.float32).reshape(frames, hop)), axis=1))
+    peak = float(env.max())
+    if peak <= 1e-6:
+        return []
+    voiced = np.flatnonzero(env > peak * 10.0 ** (rel_db / 20.0))
+    max_gap = max(1, round(min_gap_s / 0.01))
+    islands: list[tuple[int, int]] = []
+    start = last = int(voiced[0])
+    for index in voiced[1:]:
+        if index - last > max_gap:
+            islands.append((start * hop, (last + 1) * hop))
+            start = int(index)
+        last = int(index)
+    islands.append((start * hop, (last + 1) * hop))
+    return islands
+
+
+def trim_repeated_reading(
+    audio: np.ndarray, sr: int, syllable_count: int, internal_breaks: int = 0,
+) -> np.ndarray | None:
+    """[v3.23.663] Cắt phần ĐỌC LẶP của câu ngắn: giữ lần đọc đầu, bỏ từ khoảng ngừng sau đó (hàm thuần).
+
+    VieNeu v3 Turbo với câu 1–3 tiếng hay trượt điểm dừng rồi đọc lại cả câu ("Đúng vậy" → "Đúng vậy, đúng vậy"; lần
+    đọc lại thường bị SDK cắt cụt ở trần khung nên nghe như tiếng lạ). Đo thật 28/10: 23% số lần sinh câu ngắn bị vậy,
+    9/71 câu hỏng cả 3/3 lần — sinh lại không cứu được. Cấu trúc luôn là: đọc đủ → ngừng 0,25–0,5 s → đọc lại. Giám
+    khảo nghe xác nhận 32/33 bản sau khi cắt đọc đúng một lần, đủ lời.
+
+    Chỉ gọi khi :func:`~subtitles_extractor.infrastructure.tts.timing_math.is_short_line_overlong` đã đúng — câu đúng
+    có dấu phẩy ("Ơ, khoan đã") cũng có khoảng ngừng nhưng không dài quá ngưỡng.
+
+    Args:
+        audio: Bản thu mono float32 của một câu.
+        sr: Tần số lấy mẫu.
+        syllable_count: Số âm tiết của câu.
+        internal_breaks: [v3.23.664] Số chỗ ngắt bên trong lời thoại (``text_prep.count_internal_breaks``). Bấy
+            nhiêu khoảng ngừng đầu tiên là ngắt TỰ NHIÊN của lần đọc đầu, không phải chỗ đọc lại — đo thật: "Sư
+            muội, ta..." và "Sư huynh, em..." bị cắt ở dấu phẩy, mất chữ cuối.
+
+    Returns:
+        Bản đã cắt (kèm fade-out), hoặc ``None`` khi không thấy chỗ cắt hợp lệ.
+    """
+    if sr <= 0 or syllable_count <= 0 or audio.ndim != 1 or audio.size == 0:
+        return None
+    islands = _loud_islands(audio, sr)
+    # Bỏ đảo tạp âm ngắn ở ĐẦU (tiếng "tách" model sinh thêm — cùng quy tắc :func:`speech_span`), nếu không thì
+    # khoảng lặng sau tiếng tách bị tính là "đã đọc" và chỗ cắt rơi vào giữa câu.
+    while (
+        len(islands) > 1
+        and islands[0][1] - islands[0][0] <= EDGE_ISLAND_MAX_S * sr
+        and islands[1][0] - islands[0][1] >= EDGE_ISLAND_MIN_GAP_S * sr
+    ):
+        islands = islands[1:]
+    if len(islands) < 2:
+        return None
+    first_onset = islands[0][0]
+    min_speech = REPEAT_MIN_SPEECH_PER_SYLLABLE_S * syllable_count * sr
+    last_end = islands[-1][1]
+    skip = max(0, internal_breaks)
+    for (_, end), (next_start, _) in zip(islands, islands[1:], strict=False):
+        kept = end - first_onset
+        if skip and next_start - end >= BREAK_GAP_S * sr:
+            skip -= 1  # ngừng ở dấu câu của chính lần đọc đầu
+            continue
+        # [v3.23.664] Phần bỏ đi phải giống một LẦN ĐỌC LẠI (không dài hơn hẳn phần giữ) — nếu không, khoảng ngừng
+        # này là dấu phẩy TRONG lần đọc đầu và cắt ở đây sẽ mất chữ ("Sư huynh, em..." → "Sư huynh"). Câu 1 tiếng
+        # không có ngừng bên trong nên không cần (lần đọc lại "con" có khi dài gấp đôi lần đầu).
+        if (
+            next_start - end >= REPEAT_GAP_S * sr
+            and kept >= min_speech
+            and (syllable_count == 1 or last_end - next_start <= REPEAT_MAX_TAIL_RATIO * kept)
+        ):
+            cut = min(audio.size, end + int(REPEAT_TAIL_S * sr))
+            trimmed = np.array(audio[:cut], dtype=np.float32, copy=True)
+            fade = min(int(REPEAT_FADE_S * sr), trimmed.size)
+            if fade > 0:
+                trimmed[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+            return trimmed
+    return None
 
 
 def shorter_take(

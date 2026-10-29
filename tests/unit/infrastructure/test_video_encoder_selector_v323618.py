@@ -140,6 +140,7 @@ def test_render_resolves_auto_and_falls_back_to_cpu_when_gpu_fails(
         used.append(encoder)
         if encoder == "h264_nvenc":
             raise VideoRenderError("ffmpeg lỗi (mã 1): OpenEncodeSessionEx failed")
+        request.output_path.write_bytes(b"ok")  # [v3.23.652] ffmpeg thật tạo tệp (tạm) rồi mới được thay vào đích
         return request.output_path
 
     monkeypatch.setattr(renderer, "_run_render", fake_run)

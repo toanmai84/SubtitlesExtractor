@@ -27,6 +27,7 @@ from subtitles_extractor.presentation.pages.editor_page import EditorPage
 from subtitles_extractor.presentation.pages.extract_page import ExtractPage
 from subtitles_extractor.presentation.pages.log_page import LogPage
 from subtitles_extractor.presentation.pages.projects_page import ProjectsPage
+from subtitles_extractor.presentation.pages.series_page import SeriesPage
 from subtitles_extractor.presentation.pages.publish_page import PublishPage
 from subtitles_extractor.presentation.widgets.workflow_bar import WorkflowBar
 from subtitles_extractor.presentation.pages.settings_page import SettingsPage
@@ -100,6 +101,9 @@ class MainWindow(FluentWindow):
         self._publish_page = PublishPage(container, parent=self)
         self._debug_page = DebugPage(container, parent=self)
         self._projects_page = ProjectsPage(container.project_repository, container.translator, parent=self)
+        # [v3.23.658] Dây chuyền phim bộ: chạy các khâu "cả bộ" của 4 trang nối tiếp nhau.
+        self._series_controller = self._build_series_controller()
+        self._series_page = SeriesPage(self._series_controller, container.translator, parent=self)
         self._log_page = LogPage(container.log_bridge, container.translator, parent=self)
         self._settings_page = SettingsPage(container, parent=self)
 
@@ -116,6 +120,8 @@ class MainWindow(FluentWindow):
         self._tts_page.set_editor_event_provider(self._collect_editor_events)
         self._tts_page.set_translate_event_provider(self._collect_translated_events)
         self._tts_page.set_dubbing_source_provider(self._collect_dubbing_source)
+        # [v3.23.653] Người nói chọn đúng ở trang TTS → Visual Cues trang Dịch (lần dịch sau xưng hô theo người nói đúng).
+        self._tts_page.speaker_corrections_ready.connect(self._sync_tts_speakers)
         # [v3.23.629] Khoá API + model + ngôn ngữ cho nút "Rút gọn dòng quá dài (AI)" của trang TTS.
         self._tts_page.set_shorten_provider(self._collect_shorten_settings)
         # Liên thông: TTS xong → lưu đường dẫn WAV + cài đặt vào dự án.
@@ -131,6 +137,11 @@ class MainWindow(FluentWindow):
         # Signal Trích xuất
         self._extract_page.extraction_completed = self._extraction_completed
         self._extraction_completed.connect(self._on_extraction_completed)
+        # [v3.23.656] Đang trích xuất → khoá Re-OCR (trang Chỉnh sửa) và chạy thử OCR (trang Gỡ lỗi): cùng engine OCR.
+        self._extract_page.extraction_running_changed.connect(self._editor_page.set_extraction_running)
+        self._extract_page.extraction_running_changed.connect(self._debug_page.set_extraction_running)
+        # Chiều ngược lại: Re-OCR đang chạy → khoá bắt đầu trích xuất (model riêng của Re-OCR sẽ bị nạp lại mỗi lô).
+        self._editor_page.reocr_running_changed.connect(self._extract_page.set_reocr_running)
 
         # [FEATURE]: Signal Gỡ lỗi (Debugger -> Editor)
         self._debug_page._view_model.subtitles_built.connect(self._on_debug_subtitles_built)
@@ -324,6 +335,31 @@ class MainWindow(FluentWindow):
         self.setMinimumSize(QSize(960, 640))
         self.showMaximized()
 
+    def _build_series_controller(self):
+        """[v3.23.658] Bộ điều phối dây chuyền phim bộ, dùng chế độ "cả bộ" của từng trang."""
+        from subtitles_extractor.application.services.series_pipeline import SeriesStage
+        from subtitles_extractor.presentation.view_models.series_pipeline_controller import (
+            SeriesPipelineController,
+            StageRunner,
+        )
+
+        pages = {
+            SeriesStage.EXTRACT: self._extract_page,
+            SeriesStage.TRANSLATE: self._translate_page,
+            SeriesStage.TTS: self._tts_page,
+            SeriesStage.PUBLISH: self._publish_page,
+        }
+        return SeriesPipelineController(
+            {
+                stage: StageRunner(page.start_series_batch, page.series_batch_finished, page.cancel_series_batch)
+                for stage, page in pages.items()
+            },
+            parent=self,
+            # Tập trích xuất ở bản cũ (phụ đề chỉ trong CSDL) → ghi bù .original.srt thay vì OCR lại.
+            prepare=self._translate_page._backfill_original_from_db,
+            publish_suffix=self._publish_page._current_output_suffix,
+        )
+
     def _register_pages(self) -> None:
         self.addSubInterface(
             self._extract_page,
@@ -349,6 +385,11 @@ class MainWindow(FluentWindow):
             self._publish_page,
             FluentIcon.VIDEO,
             self._translator.translate("nav.publish"),
+        )
+        self.addSubInterface(
+            self._series_page,
+            FluentIcon.LINK,
+            self._translator.translate("nav.series"),
         )
         self.addSubInterface(
             self._debug_page,
@@ -473,6 +514,10 @@ class MainWindow(FluentWindow):
                 record.stage = WorkflowStage.EXTRACTED
             repo.save(record)
             if adopt_as_current:
+                if video_hash != self._current_video_hash:
+                    # [v3.23.659] Video khác → giọng đọc nhớ từ dự án trước không còn đúng (Xuất bản "Lấy từ app"
+                    # từng gắn giọng + phụ đề .tts của TẬP TRƯỚC vào video mới).
+                    self._last_tts_wav_path = None
                 self._current_video_hash = video_hash
                 self._tts_page.suggest_output_path(video_path)
                 self._translate_page.suggest_source_path(video_path)
@@ -518,6 +563,10 @@ class MainWindow(FluentWindow):
             self._tts_page.suggest_output_path(video_path)
             self._translate_page.suggest_source_path(video_path)
 
+        if getattr(record, "video_hash", "") != self._current_video_hash:
+            # [v3.23.659] Đổi dự án: lấy giọng đọc của CHÍNH dự án này (nếu còn tệp), không dùng của dự án trước.
+            tts_audio = str(getattr(record, "tts_audio_path", "") or "")
+            self._last_tts_wav_path = tts_audio if tts_audio and Path(tts_audio).is_file() else None
         self._current_video_hash = getattr(record, "video_hash", "")
         if loaded:
             self.switchTo(self._editor_page)
@@ -597,6 +646,8 @@ class MainWindow(FluentWindow):
 
     def _persist_published_project(self, output_path: object) -> None:
         """Ghi khâu "Đã xuất bản" + đường dẫn tệp hoàn chỉnh, rồi chúc mừng."""
+        if "_xemthu" in Path(str(output_path)).stem:
+            return  # [v3.23.659] bản xuất thử 90 s không phải "đã xuất bản"
         if self._current_video_hash:
             try:
                 repo = self._container.project_repository
@@ -718,9 +769,28 @@ class MainWindow(FluentWindow):
         """[v3.23.629] ``(khoá API Gemini, model, ngôn ngữ đích)`` từ trang Dịch cho bước rút gọn."""
         page = self._translate_page
         return (
-            page._combined_keys_text(), "gemini-3.1-flash-lite",
+            page._combined_keys_text(), page.shorten_model(),
             page._lang_combo.currentText() or "Vietnamese",
         )
+
+    def _sync_tts_speakers(self, corrections: dict) -> None:
+        """[v3.23.653] Ghi người nói chọn tay ở trang TTS vào Visual Cues của trang Dịch (không tự dịch lại)."""
+        try:
+            source_events = self._translate_page._view_model.source_events
+            spans = tuple((float(e.start_sec), float(e.end_sec)) for e in source_events)
+            if not spans or spans != self._tts_page._view_model.dubbing_source_spans:
+                # Trang Dịch đã nạp phụ đề khác kể từ lúc trang TTS nạp vai: id cue không còn cùng câu gốc.
+                self._tts_page.show_speaker_sync_result(-3)
+                return
+            normalized = {
+                int(k): (tuple(v) if isinstance(v, tuple | list) else (str(v), None))
+                for k, v in corrections.items()
+            }
+            changed = self._translate_page.apply_user_cues(normalized)
+        except (AttributeError, RuntimeError, ValueError, TypeError) as exc:
+            logger.warning("Không đồng bộ được người nói TTS → trang Dịch: %s", exc)
+            return
+        self._tts_page.show_speaker_sync_result(changed)
 
     def _collect_dubbing_source(self) -> DubbingSource:
         """[v3.23.593] Ngữ cảnh phân vai lồng tiếng cho trang TTS.
@@ -877,6 +947,9 @@ class MainWindow(FluentWindow):
 
         try:
             # ── Bước 1: Yêu cầu hủy tất cả tác vụ đang chạy ──
+            # [v3.23.658] Dây chuyền phim bộ trước tiên: trang báo "xong khâu" lúc dọn dẹp không được kích hoạt khâu kế.
+            # Trạng thái "đang chạy" giữ trên đĩa → mở lại app thấy "Chạy tiếp tất cả".
+            self._series_controller.begin_shutdown()
             if hasattr(self._extract_page, "begin_shutdown"):
                 self._extract_page.begin_shutdown()
             elif hasattr(self._extract_page, "cancel_extraction"):
@@ -1023,6 +1096,13 @@ class MainWindow(FluentWindow):
             # ── Bước 3: Shutdown container (giải phóng GPU, SQLite, settings) ──
             self._container.shutdown()
             logger.info("Shutdown hệ thống an toàn.")
+            # [v3.23.652] Đóng sạch tới đây: lỗi native khi Qt/Python huỷ đối tượng sau đó không phải "crash phiên trước".
+            try:
+                from subtitles_extractor.infrastructure.logging.crash_hooks import mark_clean_exit
+
+                mark_clean_exit()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Không ghi được dấu đóng sạch: %s.", exc)
 
         except Exception as exc:
             logger.warning("Quá trình đóng ứng dụng gặp lỗi nhẹ: %s.", exc)

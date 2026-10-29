@@ -9,6 +9,7 @@ TỐI ƯU HÓA ĐỘT PHÁ (V3.45 - Synchronization Polish):
 """
 
 from __future__ import annotations
+from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, Signal
@@ -166,18 +167,88 @@ class SubtitleTableModel(QAbstractTableModel):
 
 
 class SubtitleFilterProxyModel(QSortFilterProxyModel):
+    #: [v3.23.654] Chế độ lọc "Nghi ngờ OCR" (xem ``ocr_suspicion``).
+    FILTER_SUSPECT = 3
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._search_query: str = ""
         self._filter_mode: int = 0
+        self._suspects: dict[int, list[str]] | None = None
+        #: [v3.23.657] Đổi mã lý do → chữ hiển thị (trang Chỉnh sửa gắn bản dịch; mặc định giữ mã).
+        self._reason_label: Callable[[str], str] = str
+
+    def set_reason_labeler(self, labeler: Callable[[str], str]) -> None:
+        """[v3.23.657] Hàm ``mã lý do → nhãn`` cho cột cảnh báo/tooltip của bộ lọc "Nghi ngờ OCR"."""
+        self._reason_label = labeler
+
+    def suspect_reasons_text(self, source_row: int, separator: str = ", ") -> str:
+        """[v3.23.657] Lý do nghi của một dòng (chuỗi rỗng nếu không nghi)."""
+        return separator.join(self._reason_label(r) for r in self.suspects().get(source_row, ()))
 
     def set_filter_params(self, query: str, mode: int) -> None:
         self._search_query = query.strip().lower()
         self._filter_mode = mode
+        self._suspects = None  # tính lại theo danh sách dòng hiện tại (đã sửa / tách / gộp)
         self.invalidateFilter()
+
+    def setSourceModel(self, model) -> None:  # noqa: N802 — API Qt
+        previous = self.sourceModel()
+        if previous is not None:
+            for signal, slot in self._suspect_hooks(previous):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+        super().setSourceModel(model)
+        if model is not None:
+            for signal, slot in self._suspect_hooks(model):
+                signal.connect(slot)
+
+    def _suspect_hooks(self, model):
+        # Danh sách nghi tính theo HÀNG: phải bỏ TRƯỚC khi proxy lọc lại theo dữ liệu mới ("AboutTo…" chạy trước bộ
+        # xử lý nội bộ của proxy); sửa chữ (dataChanged) thì lọc lại sau khi bỏ.
+        return (
+            (model.modelAboutToBeReset, self._drop_suspects),
+            (model.rowsAboutToBeInserted, self._drop_suspects),
+            (model.rowsAboutToBeRemoved, self._drop_suspects),
+            (model.dataChanged, self._on_source_data_changed),
+        )
+
+    def _drop_suspects(self, *_args) -> None:
+        self._suspects = None
+
+    def _on_source_data_changed(self, _top_left=None, _bottom_right=None, roles=()) -> None:
+        # Tô hàng đang phát (BackgroundRole…) đổi mỗi nhịp phát: không đụng chữ thì không tính lại.
+        if roles and Qt.ItemDataRole.DisplayRole not in roles and Qt.ItemDataRole.EditRole not in roles:
+            return
+        self._suspects = None
+        if self._filter_mode == self.FILTER_SUSPECT:
+            self.invalidateFilter()
+
+    def suspects(self) -> dict[int, list[str]]:
+        """[v3.23.654] ``{hàng nguồn: lý do}`` các dòng nghi OCR sai (tính lười, theo danh sách dòng hiện tại)."""
+        if self._suspects is None:
+            from subtitles_extractor.application.services.ocr_suspicion import ocr_suspicions
+
+            model = self.sourceModel()
+            self._suspects = ocr_suspicions(list(getattr(model, "events", []) or []))
+        return self._suspects
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
         if role == SEARCH_QUERY_ROLE: return self._search_query
+        # [v3.23.657] Đang lọc "Nghi ngờ OCR": cột cảnh báo ghi LÝ DO (trước đây chỉ lọc, không biết vì sao dòng bị nghi).
+        if (
+            self._filter_mode == self.FILTER_SUSPECT and index.isValid() and index.column() == COL_WARN
+            and role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole)
+        ):
+            source_row = self.mapToSource(index).row()
+            reasons = self.suspect_reasons_text(source_row, ", " if role == Qt.ItemDataRole.DisplayRole else "\n")
+            if reasons:
+                base = super().data(index, role)
+                if role == Qt.ItemDataRole.DisplayRole:
+                    return f"{base} 🔎 {reasons}".strip() if base else f"🔎 {reasons}"
+                return f"{reasons}\n{base}" if base else reasons
         return super().data(index, role)
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
@@ -194,6 +265,8 @@ class SubtitleFilterProxyModel(QSortFilterProxyModel):
         elif self._filter_mode == 2:
             event = model.events[source_row]
             if not (event.is_too_short or event.is_too_fast): return False
+        elif self._filter_mode == self.FILTER_SUSPECT:
+            if source_row not in self.suspects(): return False
             
         return True
 

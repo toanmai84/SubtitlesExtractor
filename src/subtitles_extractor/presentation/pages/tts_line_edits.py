@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from subtitles_extractor.application.services.dubbing_line_edits import (
     SHARED_VOICE_SPEAKER,
     decode_line_edits,
+    encode_line_edits,
     remember_line_edits,
 )
 from subtitles_extractor.presentation.utils.table_selection import select_rows_bulk
@@ -68,7 +69,9 @@ COLUMN_TIME = 1
 COLUMN_TEXT = 2
 COLUMN_STATUS = 6
 COLUMN_SPEAKER = 7
-COLUMN_COUNT = 8
+#: [v3.23.654] Cột "Nói với" (người được nói tới) — sửa tay, đồng bộ về Visual Cues trang Dịch.
+COLUMN_ADDRESSEE = 8
+COLUMN_COUNT = 9
 #: Khoá QSettings: ``{dấu phụ đề: sửa tay đã mã hoá}`` (JSON).
 SETTINGS_LINE_EDITS_KEY = "dubbing_line_edits"
 #: Bảng lớn hơn thì bỏ tự giãn chiều cao hàng (đắt với hàng nghìn dòng).
@@ -161,6 +164,76 @@ def confirm_delete(parent, title: str, text: str) -> bool:
     return answer == QMessageBox.StandardButton.Yes
 
 
+def confirm_restore_original(parent, title: str, text: str) -> bool:
+    """[v3.23.652] Hỏi trước khi trả danh sách dòng về phụ đề gốc (tách ra để kiểm thử thay được)."""
+    return confirm_delete(parent, title, text)
+
+
+def ask_restore_deleted(parent, title: str, intro: str, lines: list[tuple[int, float, float, str]]) -> list[int] | None:
+    """[v3.23.652] Liệt kê dòng gốc đang thiếu (giờ + lời) để tick chọn chèn lại; trả các ``origin`` đã chọn."""
+    from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QListWidget, QListWidgetItem, QVBoxLayout
+
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.resize(720, 520)
+    layout = QVBoxLayout(dialog)
+    label = QLabel(intro)
+    label.setWordWrap(True)
+    layout.addWidget(label)
+    listing = QListWidget()
+    for origin, start, _end, text in lines:
+        item = QListWidgetItem(f"#{origin + 1}  {format_row_time(start)}  {text}")
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked)
+        item.setData(Qt.ItemDataRole.UserRole, origin)
+        listing.addItem(item)
+    layout.addWidget(listing)
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+    accepted = dialog.exec() == QDialog.DialogCode.Accepted
+    chosen = [
+        int(listing.item(row).data(Qt.ItemDataRole.UserRole))
+        for row in range(listing.count())
+        if listing.item(row).checkState() == Qt.CheckState.Checked
+    ]
+    dialog.deleteLater()
+    return chosen if accepted else None
+
+
+def ask_history_version(parent, title: str, intro: str, entries: list[tuple[str, str]]) -> int | None:
+    """[v3.23.654] Chọn một phiên bản sửa tay cũ ``(thời điểm, tóm tắt)``; trả chỉ số đã chọn."""
+    from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QListWidget, QVBoxLayout
+
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.resize(640, 420)
+    layout = QVBoxLayout(dialog)
+    label = QLabel(intro)
+    label.setWordWrap(True)
+    layout.addWidget(label)
+    listing = QListWidget()
+    for at, summary in entries:
+        listing.addItem(f"{at.replace('T', ' ')} — {summary}")
+    if entries:
+        listing.setCurrentRow(0)
+    layout.addWidget(listing)
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    listing.itemDoubleClicked.connect(lambda _item: dialog.accept())
+    layout.addWidget(buttons)
+    accepted = dialog.exec() == QDialog.DialogCode.Accepted
+    row = listing.currentRow()
+    dialog.deleteLater()
+    return row if accepted and row >= 0 else None
+
+
+BULK_DELETE_MIN_LINES = 20
+BULK_DELETE_MIN_RATIO = 0.05
+
+
 def format_row_time(seconds: float) -> str:
     """Mốc thời gian một dòng trên bảng: ``mm:ss.mmm``."""
     return f"{int(seconds // 60):02d}:{seconds % 60:06.3f}"
@@ -229,6 +302,7 @@ class TTSLineEditsController(QObject):
         resynthesize: Callable[[set[int]], None] | None = None,
         shorten: Callable[[list], None] | None = None,
         parent: QObject | None = None,
+        edits_store=None,
     ) -> None:
         """Nối bảng dòng với view model, bộ điều phối lồng tiếng và cài đặt.
 
@@ -248,6 +322,8 @@ class TTSLineEditsController(QObject):
             parent: QObject cha.
         """
         super().__init__(parent)
+        # [v3.23.654] Kho tệp (thay registry); ``None`` = dùng QSettings như cũ.
+        self._edits_store = edits_store
         self._rebuild_table = rebuild_table
         self._resynthesize = resynthesize
         self._shorten = shorten
@@ -256,6 +332,8 @@ class TTSLineEditsController(QObject):
         self._dubbing = dubbing
         self._panel = panel
         self._settings = settings
+        if edits_store is not None:
+            self._import_legacy_store()
         self._translate = translate
         self._commit_edit = commit_edit
         self._show_status = show_status
@@ -265,7 +343,13 @@ class TTSLineEditsController(QObject):
         self._build_buttons()
         self._prepare_table()
         view_model.structure_changed.connect(self._on_structure_changed)
-        view_model.line_edits_changed.connect(self._save)
+        # [v3.23.654] Gom các lần đổi liền nhau (một thao tác hay phát 2–3 lần) thành một lần ghi tệp.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(400)
+        self._save_timer.timeout.connect(self.flush_pending_save)
+        self._pending_save: tuple[str, object] | None = None
+        view_model.line_edits_changed.connect(self._schedule_save)
         view_model.line_edits_changed.connect(self.schedule_refresh)
         view_model.busy_changed.connect(lambda _busy: self._update_buttons())
         dubbing.line_speakers_changed.connect(self.schedule_refresh)
@@ -290,11 +374,23 @@ class TTSLineEditsController(QObject):
         Args:
             count: Số dòng vừa nạp.
         """
+        if self._pending_save is not None and self._pending_save[0] != self._view_model.subtitle_fingerprint:
+            self.flush_pending_save()  # sửa tay của phụ đề TRƯỚC còn chờ ghi
         speakers, texts = self._restore() if count > 0 else (0, 0)
+        self._save_timer.stop()  # sửa tay vừa khôi phục = nội dung tệp: không cần ghi lại
+        self._pending_save = None
         if count > 0 and self._panel.is_dubbing_enabled():
             self._dubbing.load_cast()
         self.show_source_rows()
-        if speakers or texts:
+        restored = self._view_model.restored_structure if count > 0 else None
+        if restored is not None:
+            # [v3.23.652] Trước đây áp lại lặng lẽ: người dùng nạp lại bản dịch vẫn thấy danh sách đã xoá nhầm.
+            removed, added = restored
+            self._show_status(
+                self._tr("line_structure_restored")
+                .replace("{removed}", str(removed)).replace("{added}", str(added))
+            )
+        elif speakers or texts:
             self._show_status(
                 self._tr("line_edits_restored")
                 .replace("{speakers}", str(speakers))
@@ -549,10 +645,7 @@ class TTSLineEditsController(QObject):
         if not positions or self._view_model.is_busy:
             return 0
         self._commit_edit()
-        if not confirm_delete(
-            self._table.window(), self._tr("dlg_delete_title"),
-            self._tr("dlg_delete_text").replace("{count}", str(len(set(positions)))),
-        ):
+        if not confirm_delete(self._table.window(), self._tr("dlg_delete_title"), self._delete_question(positions)):
             return 0
         had_result = self._view_model.has_result
         removed = self._view_model.delete_lines(positions)
@@ -566,6 +659,104 @@ class TTSLineEditsController(QObject):
             message += " " + self._tr("line_deleted_retts")
         self._show_status(message)
         return removed
+
+    def _delete_question(self, positions: list[int]) -> str:
+        """[v3.23.652] Câu hỏi xoá; xoá nhiều (≥ 20 dòng hoặc ≥ 5%) thì nêu rõ quy mô, vài dòng mẫu và cách khôi phục."""
+        chosen = sorted(set(positions))
+        events = self._view_model.source_events
+        total = len(events)
+        if len(chosen) < BULK_DELETE_MIN_LINES and len(chosen) < BULK_DELETE_MIN_RATIO * total:
+            return self._tr("dlg_delete_text").replace("{count}", str(len(chosen)))
+        valid = [p for p in chosen if 0 <= p < total]
+        seconds = sum(max(0.0, float(events[p].end_sec) - float(events[p].start_sec)) for p in valid)
+        sample_positions = valid[:3] + (valid[-2:] if len(valid) > 5 else [])
+        samples = "\n".join(
+            f"  {format_row_time(float(events[p].start_sec))}  {str(getattr(events[p], 'text', '') or '')[:60]}"
+            for p in sample_positions
+        )
+        return (
+            self._tr("dlg_delete_many_text")
+            .replace("{count}", str(len(chosen))).replace("{total}", str(total))
+            .replace("{minutes}", f"{seconds / 60:.1f}").replace("{samples}", samples)
+        )
+
+    # ── [v3.23.652] Khôi phục bản gốc / dòng đã xoá ───────────────────────────
+
+    def restore_original(self, _checked: bool = False) -> bool:
+        """Trả danh sách dòng về phụ đề nguồn (chèn lại dòng đã xoá, bỏ dòng thêm, lời/mốc về gốc); giữ người nói."""
+        if self._view_model.is_busy or not self._view_model.has_source:
+            return False
+        self._commit_edit()
+        missing = len(self._view_model.missing_original_lines())
+        text = self._tr("dlg_restore_original_text").replace("{missing}", str(missing))
+        if self._view_model.has_result:
+            text += "\n\n" + self._tr("dlg_restore_original_tts")
+        if not confirm_restore_original(self._table.window(), self._tr("dlg_restore_original_title"), text):
+            return False
+        had_result = self._view_model.has_result
+        if not self._view_model.reset_to_original(keep_speakers=True):
+            self._show_status(self._tr("restore_original_nothing"))
+            return False
+        self._after_restore(had_result, self._tr("restore_original_done"))
+        return True
+
+    def restore_deleted(self, _checked: bool = False) -> int:
+        """Chọn các dòng gốc đã xoá để chèn lại đúng chỗ."""
+        if self._view_model.is_busy or not self._view_model.has_source:
+            return 0
+        missing = self._view_model.missing_original_lines()
+        if not missing:
+            self._show_status(self._tr("restore_deleted_none"))
+            return 0
+        self._commit_edit()
+        chosen = ask_restore_deleted(
+            self._table.window(), self._tr("dlg_restore_deleted_title"),
+            self._tr("dlg_restore_deleted_intro").replace("{count}", str(len(missing))), missing,
+        )
+        if not chosen:
+            return 0
+        had_result = self._view_model.has_result
+        restored = self._view_model.restore_original_lines(chosen)
+        if restored:
+            self._after_restore(had_result, self._tr("restore_deleted_done").replace("{count}", str(restored)))
+        return restored
+
+    def show_history(self, _checked: bool = False) -> bool:
+        """[v3.23.654] Chọn một phiên bản sửa tay cũ của phụ đề này (lưu ở tệp, còn qua lần mở lại) để áp lại."""
+        from subtitles_extractor.infrastructure.tts.line_edits_store import describe_edits
+
+        if self._edits_store is None or self._view_model.is_busy or not self._view_model.has_source:
+            return False
+        self.flush_pending_save()
+        entries = self._edits_store.history(self._view_model.subtitle_fingerprint)
+        if not entries:
+            self._show_status(self._tr("history_empty"))
+            return False
+        if self._view_model.has_result:
+            self._show_status(self._tr("history_after_tts"))
+            return False
+        self._commit_edit()
+        current = describe_edits(encode_line_edits(self._view_model.line_edits()))
+        chosen = ask_history_version(
+            self._table.window(), self._tr("dlg_history_title"),
+            self._tr("dlg_history_intro").replace("{current}", current),
+            [(entry.at, entry.label) for entry in entries],
+        )
+        if chosen is None:
+            return False
+        if not self._view_model.apply_saved_edits(decode_line_edits(entries[chosen].edits)):
+            return False
+        if self._panel.is_dubbing_enabled():
+            self._dubbing.reload_cast()
+        self._show_status(self._tr("history_applied").replace("{label}", entries[chosen].label))
+        return True
+
+    def _after_restore(self, had_result: bool, message: str) -> None:
+        if self._panel.is_dubbing_enabled():
+            self._dubbing.reload_cast()
+        if had_result:
+            message += " " + self._tr("line_deleted_retts")
+        self._show_status(message)
 
     @staticmethod
     def _can_merge(positions: list[int]) -> bool:
@@ -602,6 +793,7 @@ class TTSLineEditsController(QObject):
         self._refresh_pending = False
         enabled = self._panel.is_dubbing_enabled()
         self._table.setColumnHidden(COLUMN_SPEAKER, not enabled)
+        self._table.setColumnHidden(COLUMN_ADDRESSEE, not enabled)
         rows = self._table.rowCount()
         cells = self._dubbing.line_speaker_cells() if enabled and rows else []
         self._review_count = sum(1 for cell in cells if cell.needs_review)
@@ -610,6 +802,7 @@ class TTSLineEditsController(QObject):
             else frozenset()
         )
         edited_tip = self._tr("line_edited_tip")
+        addressee_overrides = self._view_model.addressee_overrides
         self._table.blockSignals(True)
         self._table.setUpdatesEnabled(False)
         try:
@@ -619,6 +812,8 @@ class TTSLineEditsController(QObject):
                     continue
                 if 0 <= position < len(cells):
                     self._paint_speaker(row, cells[position])
+                if enabled:
+                    self._paint_addressee(row, position, addressee_overrides)
                 text_item = self._table.item(row, COLUMN_TEXT)
                 if text_item is not None:
                     self._paint_edited(text_item, position in edited, edited_tip)
@@ -684,6 +879,9 @@ class TTSLineEditsController(QObject):
         speaker_menu = self.build_speaker_menu(positions)
         speaker_menu.setEnabled(bool(positions) and not busy)
         menu.addMenu(speaker_menu)
+        addressee_menu = self.build_addressee_menu(positions)
+        addressee_menu.setEnabled(bool(positions) and not busy and self._panel.is_dubbing_enabled())
+        menu.addMenu(addressee_menu)
         edit_action = menu.addAction(self._tr("menu_edit_text"))
         edit_action.setEnabled(len(positions) == 1)
         edit_action.triggered.connect(partial(self._edit_text, positions))
@@ -716,6 +914,12 @@ class TTSLineEditsController(QObject):
         delete_action = menu.addAction(self._tr("menu_delete_lines"))
         delete_action.setEnabled(bool(positions) and not busy)
         delete_action.triggered.connect(partial(self.delete_lines, positions))
+        restore_deleted = menu.addAction(self._tr("btn_restore_deleted"))
+        restore_deleted.setEnabled(self._btn_restore_deleted.isEnabled())
+        restore_deleted.triggered.connect(self.restore_deleted)
+        restore_original = menu.addAction(self._tr("btn_restore_original"))
+        restore_original.setEnabled(self._btn_restore_original.isEnabled())
+        restore_original.triggered.connect(self.restore_original)
         if self._context_buttons:
             menu.addSeparator()
             for button in self._context_buttons:
@@ -888,6 +1092,7 @@ class TTSLineEditsController(QObject):
         # [v3.23.625] Hai hàng: sáu nút một hàng bị cắt chữ ở cửa sổ 1500 px.
         self._button_row = QVBoxLayout()
         first_row, second_row, third_row = QHBoxLayout(), QHBoxLayout(), QHBoxLayout()
+        restore_row = QHBoxLayout()  # [v3.23.652] hàng riêng: thêm vào hàng 2 làm cắt chữ ở 1500 px
         self._btn_speaker = PushButton(self._tr("btn_speaker"))
         self._btn_speaker.setToolTip(self._tr("btn_speaker_tip"))
         self._btn_speaker.clicked.connect(self._on_speaker_button)
@@ -931,11 +1136,21 @@ class TTSLineEditsController(QObject):
         self._btn_delete_lines.clicked.connect(
             lambda _checked=False: self.delete_lines(self.selected_positions())
         )
+        self._btn_restore_original = PushButton(self._tr("btn_restore_original"))
+        self._btn_restore_original.setToolTip(self._tr("btn_restore_original_tip"))
+        self._btn_restore_original.clicked.connect(lambda _checked=False: self.restore_original())
+        self._btn_restore_deleted = PushButton(self._tr("btn_restore_deleted"))
+        self._btn_restore_deleted.setToolTip(self._tr("btn_restore_deleted_tip"))
+        self._btn_restore_deleted.clicked.connect(lambda _checked=False: self.restore_deleted())
+        self._btn_history = PushButton(self._tr("btn_history"))
+        self._btn_history.setToolTip(self._tr("btn_history_tip"))
+        self._btn_history.clicked.connect(lambda _checked=False: self.show_history())
         for row, buttons in (
             (first_row, (self._btn_speaker, self._btn_quick_review, self._btn_review,
                          self._btn_select_edited, self._btn_revert)),
             (second_row, (self._btn_add_line, self._btn_delete_lines, self._btn_undo,
                           self._btn_redo)),
+            (restore_row, (self._btn_restore_deleted, self._btn_restore_original, self._btn_history)),
             (third_row, (self._btn_timing, self._btn_merge, self._btn_split, self._btn_shorten)),
         ):
             for button in buttons:
@@ -957,6 +1172,10 @@ class TTSLineEditsController(QObject):
         header.moveSection(header.visualIndex(COLUMN_SPEAKER), COLUMN_TEXT)
         table.setColumnWidth(COLUMN_SPEAKER, _SPEAKER_COLUMN_WIDTH)
         table.setColumnHidden(COLUMN_SPEAKER, not self._panel.is_dubbing_enabled())
+        table.setHorizontalHeaderItem(COLUMN_ADDRESSEE, QTableWidgetItem(self._tr("col_addressee")))
+        header.moveSection(header.visualIndex(COLUMN_ADDRESSEE), header.visualIndex(COLUMN_SPEAKER) + 1)
+        table.setColumnWidth(COLUMN_ADDRESSEE, _SPEAKER_COLUMN_WIDTH - 40)
+        table.setColumnHidden(COLUMN_ADDRESSEE, not self._panel.is_dubbing_enabled())
         table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         table.customContextMenuRequested.connect(self._on_context_menu)
         # Ctrl+Z / Ctrl+Y chỉ khi chính bảng giữ focus (ô đang sửa chữ dùng hoàn tác riêng).
@@ -982,6 +1201,83 @@ class TTSLineEditsController(QObject):
             item.setForeground(_REVIEW_FOREGROUND)
         else:
             item.setData(Qt.ItemDataRole.ForegroundRole, None)
+
+    def _paint_addressee(self, row: int, position: int, overrides: dict[int, str]) -> None:
+        item = self._table.item(row, COLUMN_ADDRESSEE)
+        if item is None:
+            item = read_only_item("")
+            self._table.setItem(row, COLUMN_ADDRESSEE, item)
+        overridden = position in overrides
+        name = self._view_model.line_addressee(position)
+        if overridden and not name:
+            text = self._tr("addressee_nobody")
+        else:
+            text = self._dubbing.display_name(name) if name else ""
+        item.setText(text)
+        item.setToolTip(self._tr("addressee_tip_manual" if overridden else "addressee_tip_auto"))
+        font = item.font()
+        font.setBold(overridden)
+        item.setFont(font)
+
+    def build_addressee_menu(self, positions: list[int]) -> QMenu:
+        """[v3.23.654] Menu chọn "nói với ai" cho các dòng ``positions``."""
+        menu = QMenu(self._tr("menu_addressee"), self._table)
+        choices = self._dubbing.role_choices()
+        overrides = self._view_model.addressee_overrides
+        current = {overrides.get(p) for p in positions}
+        any_overridden = any(p in overrides for p in positions)
+        autos = sorted({
+            self._dubbing.display_name(self._view_model.auto_line_addressee(p)) or "?" for p in positions
+        })
+        auto_text = ", ".join(autos)
+        if len(auto_text) > _AUTO_LABEL_MAX:
+            auto_text = auto_text[: _AUTO_LABEL_MAX - 1] + "…"
+        action = menu.addAction(self._tr("menu_addressee_auto").replace("{auto}", auto_text))
+        action.setCheckable(True)
+        action.setChecked(bool(positions) and not any_overridden)
+        action.triggered.connect(partial(self.apply_addressee, positions, None))
+        menu.addSeparator()
+        for member in choices:
+            action = menu.addAction(member.display_name)
+            action.setCheckable(True)
+            action.setChecked(any_overridden and current == {member.name})
+            action.setToolTip(member.name)
+            action.triggered.connect(partial(self.apply_addressee, positions, member.name))
+        menu.addSeparator()
+        nobody = menu.addAction(self._tr("addressee_nobody"))
+        nobody.setCheckable(True)
+        nobody.setChecked(any_overridden and current == {""})
+        nobody.triggered.connect(partial(self.apply_addressee, positions, ""))
+        other = menu.addAction(self._tr("menu_speaker_other"))
+        other.triggered.connect(partial(self._ask_addressee, positions))
+        menu.setToolTipsVisible(True)
+        return menu
+
+    def apply_addressee(self, positions: list[int], addressee: str | None, _checked: bool = False) -> int:
+        """[v3.23.654] Đổi "nói với ai" của các dòng (``None`` = theo Visual Cues, ``""`` = không nói với ai)."""
+        if not positions:
+            return 0
+        self._commit_edit()
+        changed = self._view_model.set_addressee_override(positions, addressee)
+        if changed:
+            if addressee is None:
+                label = self._tr("addressee_auto_short")
+            elif addressee == "":
+                label = self._tr("addressee_nobody")
+            else:
+                label = self._dubbing.display_name(addressee) or addressee
+            self._show_status(
+                self._tr("line_addressee_done").replace("{count}", str(changed)).replace("{addressee}", label)
+            )
+        return changed
+
+    def _ask_addressee(self, positions: list[int], _checked: bool = False) -> int:
+        name, accepted = ask_text(
+            self._table.window(), self._tr("dlg_addressee_title"), self._tr("dlg_addressee_label"),
+        )
+        if not accepted or not str(name).strip():
+            return 0
+        return self.apply_addressee(positions, str(name).strip())
 
     @staticmethod
     def _paint_edited(item: QTableWidgetItem, edited: bool, tooltip: str) -> None:
@@ -1026,6 +1322,17 @@ class TTSLineEditsController(QObject):
         self._btn_timing.setEnabled(len(positions) == 1 and not busy)
         self._btn_split.setEnabled(len(positions) == 1 and not busy)
         self._btn_merge.setEnabled(self._can_merge(positions) and not busy)
+        structure = self._view_model.line_structure_changed
+        self._btn_restore_deleted.setEnabled(
+            structure and not busy and bool(self._view_model.missing_original_lines())
+        )
+        self._btn_restore_original.setEnabled(
+            (structure or self._view_model.has_line_edits()) and not busy and self._view_model.has_source
+        )
+        self._btn_history.setEnabled(
+            self._edits_store is not None and not busy and self._view_model.has_source
+            and not self._view_model.has_result
+        )
 
     def _row_position(self, row: int) -> int | None:
         head = self._table.item(row, COLUMN_INDEX)
@@ -1090,7 +1397,7 @@ class TTSLineEditsController(QObject):
         menu.exec(self._table.viewport().mapToGlobal(point))
 
     def _on_cell_double_clicked(self, row: int, column: int) -> None:
-        if column != COLUMN_SPEAKER or self._view_model.is_busy:
+        if column not in (COLUMN_SPEAKER, COLUMN_ADDRESSEE) or self._view_model.is_busy:
             return
         position = self._row_position(row)
         positions = self.selected_positions()
@@ -1098,8 +1405,13 @@ class TTSLineEditsController(QObject):
             return
         if position not in positions:
             positions = [position]
-        rect = self._table.visualItemRect(self._table.item(row, column))
-        menu = self.build_speaker_menu(positions)
+        item = self._table.item(row, column)
+        if item is None:
+            return
+        rect = self._table.visualItemRect(item)
+        menu = (
+            self.build_speaker_menu(positions) if column == COLUMN_SPEAKER else self.build_addressee_menu(positions)
+        )
         menu.exec(self._table.viewport().mapToGlobal(rect.bottomLeft()))
 
     def _on_dubbing_enabled(self, enabled: bool) -> None:
@@ -1120,21 +1432,65 @@ class TTSLineEditsController(QObject):
             return {}
         return dict(loaded) if isinstance(loaded, dict) else {}
 
+    def _import_legacy_store(self) -> None:
+        """[v3.23.654] Chuyển sửa tay cũ trong QSettings (registry) sang tệp một lần rồi xoá khoá cũ."""
+        legacy = self._load_store()
+        if not legacy:
+            return
+        moved, failed = self._edits_store.import_legacy(legacy)
+        if failed:
+            # Không xoá kho cũ khi chưa chép được hết — thử lại lần mở sau, không mất sửa tay.
+            logger.warning("Còn %d phụ đề chưa chuyển được sửa tay TTS sang tệp — giữ bản trong registry.", failed)
+            return
+        self._settings.remove(SETTINGS_LINE_EDITS_KEY)
+        logger.info("Chuyển sửa tay TTS của %d phụ đề từ registry sang tệp (%s).", moved, self._edits_store.directory)
+
     def _restore(self) -> tuple[int, int]:
         fingerprint = self._view_model.subtitle_fingerprint
-        raw = self._load_store().get(fingerprint) if fingerprint else None
+        if self._edits_store is not None:
+            raw = self._edits_store.load(fingerprint) if fingerprint else None
+        else:
+            raw = self._load_store().get(fingerprint) if fingerprint else None
         if raw is None:
             return 0, 0
         restored = self._view_model.restore_line_edits(decode_line_edits(raw))
+        structure = self._view_model.restored_structure
         logger.info(
-            "Khôi phục sửa tay của phụ đề %s: %d dòng người nói, %d dòng lời thoại.",
+            "Khôi phục sửa tay của phụ đề %s: %d dòng người nói, %d dòng lời thoại%s.",
             fingerprint, *restored,
+            f", áp lại danh sách dòng (bớt {structure[0]}, thêm {structure[1]} dòng)" if structure else "",
         )
         return restored
+
+    def _schedule_save(self) -> None:
+        """[v3.23.654] Chụp (dấu phụ đề, sửa tay) NGAY lúc đổi, ghi tệp sau ~0,4 s (gom các lần đổi liền nhau)."""
+        if self._edits_store is None:
+            self._save()
+            return
+        fingerprint = self._view_model.subtitle_fingerprint
+        if not fingerprint:
+            return
+        if self._pending_save is not None and self._pending_save[0] != fingerprint:
+            self.flush_pending_save()
+        self._pending_save = (fingerprint, self._view_model.line_edits())
+        self._save_timer.start()
+
+    def flush_pending_save(self) -> None:
+        """[v3.23.654] Ghi ngay sửa tay đang chờ (hết giờ gom / đổi phụ đề / rời trang / đóng app)."""
+        self._save_timer.stop()
+        pending, self._pending_save = self._pending_save, None
+        if pending is None or self._edits_store is None:
+            return
+        fingerprint, edits = pending
+        self._edits_store.save(fingerprint, None if edits.is_empty else encode_line_edits(edits))
 
     def _save(self) -> None:
         fingerprint = self._view_model.subtitle_fingerprint
         if not fingerprint:
+            return
+        if self._edits_store is not None:
+            self._pending_save = (fingerprint, self._view_model.line_edits())
+            self.flush_pending_save()
             return
         store = self._load_store()
         updated = remember_line_edits(store, fingerprint, self._view_model.line_edits())
@@ -1147,6 +1503,7 @@ class TTSLineEditsController(QObject):
 __all__ = [
     "COLUMN_COUNT",
     "COLUMN_INDEX",
+    "COLUMN_ADDRESSEE",
     "COLUMN_SPEAKER",
     "COLUMN_STATUS",
     "COLUMN_TEXT",

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import functools
 import logging
+import time
+import os
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -72,6 +74,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _rewritten_since(path: str, started: float) -> bool:
+    """[v3.23.659] Tệp audio từng dòng đã bị ghi lại kể từ ``started`` (giây epoch)."""
+    if not path:
+        return False
+    try:
+        return os.path.getmtime(path) >= started - 1.0
+    except OSError:
+        return False
+
+
 #: [v3.23.627] Số bước hoàn tác tối đa giữ lại.
 MAX_UNDO_STEPS = 100
 
@@ -102,6 +115,7 @@ class _EditState:
     speakers: tuple[tuple[int, str], ...]
     texts: tuple[tuple[int, TextEdit], ...]
     edited: frozenset[int]
+    addressees: tuple[tuple[int, str], ...] = ()
 
 
 def _undoable(method):
@@ -146,6 +160,7 @@ class TTSPageViewModel(QObject):
         self._last_output_path: Path | None = None
         self._last_request: "TTSRequest | None" = None
         self._last_engine_name: str = ""
+        self._run_rewrites_line_audio: bool = False  # [v3.23.659]
         self._worker = None
         self._is_busy = False
         self._last_adapter = None  # [v3.23.450] adapter lần TTS gần nhất (để TTS lại dòng chọn)
@@ -166,6 +181,8 @@ class TTSPageViewModel(QObject):
         self._dubbing_prepared = False
         self._auto_speakers: list[str] = []
         self._speaker_overrides: dict[int, str] = {}
+        # [v3.23.654] "Nói với ai" chọn tay theo vị trí dòng ("" = không nói với ai / độc thoại).
+        self._addressee_overrides: dict[int, str] = {}
         self._text_edits: dict[int, TextEdit] = {}
         #: Dòng sửa tay SAU lần tổng hợp gần nhất của dòng đó (cần TTS lại).
         self._edited_since_synthesis: set[int] = set()
@@ -175,6 +192,8 @@ class TTSPageViewModel(QObject):
         #: [v3.23.625] Phụ đề lúc nạp + vị trí gốc của từng dòng hiện tại (-1 = dòng thêm).
         self._original_events: list["SubtitleEvent"] = []
         self._origins: list[int] = []
+        # [v3.23.652] (số dòng gốc bớt, số dòng thêm) của ảnh chụp vừa áp khi nạp phụ đề; ``None`` = không áp.
+        self._restored_structure: tuple[int, int] | None = None
         #: [v3.23.627] Hoàn tác / làm lại chỉnh sửa dòng — CHỈ khi chưa có kết quả TTS (audio
         #: từng dòng không khôi phục được nguyên vẹn sau khi tổng hợp lại).
         self._undo_stack: list[_EditState] = []
@@ -239,6 +258,110 @@ class TTSPageViewModel(QObject):
         """[v3.23.598] Đã tìm người nói cho phụ đề ĐANG nạp chưa (nạp vai sau khi nạp)."""
         return self._dubbing_prepared
 
+    def auto_line_addressee(self, position: int) -> str:
+        """[v3.23.654] "Nói với ai" của dòng theo Visual Cues (chưa áp sửa tay); rỗng nếu không biết."""
+        if not self._dubbing_prepared or not (0 <= position < len(self._source_positions)):
+            return ""
+        source_position = self._source_positions[position]
+        return self._addressees.get(source_position + 1, "") if source_position is not None else ""
+
+    def line_addressee(self, position: int) -> str:
+        """[v3.23.654] "Nói với ai" đang dùng của dòng (sửa tay thắng Visual Cues)."""
+        if position in self._addressee_overrides:
+            return self._addressee_overrides[position]
+        return self.auto_line_addressee(position)
+
+    @property
+    def addressee_overrides(self) -> dict[int, str]:
+        """[v3.23.654] "Nói với ai" chọn tay ``{vị trí dòng: người nghe}``."""
+        return dict(self._addressee_overrides)
+
+    @_undoable
+    def set_addressee_override(self, positions: Iterable[int], addressee: str | None) -> int:
+        """[v3.23.654] Chọn tay "nói với ai" cho các dòng.
+
+        Không đổi giọng đọc (giọng theo người nói) nên KHÔNG đánh dấu cần TTS lại; dùng cho xưng hô ở lần dịch sau
+        (đồng bộ về Visual Cues của trang Dịch).
+
+        Args:
+            positions: Vị trí dòng.
+            addressee: Tên người nghe; ``""`` = không nói với ai (độc thoại / nói chung); ``None`` = bỏ chọn tay.
+
+        Returns:
+            Số dòng thay đổi.
+        """
+        changed = 0
+        for position in self._valid_positions(positions):
+            if addressee is None:
+                if self._addressee_overrides.pop(position, None) is not None:
+                    changed += 1
+            elif self._addressee_overrides.get(position) != addressee:
+                self._addressee_overrides[position] = addressee
+                changed += 1
+        if changed:
+            self.line_edits_changed.emit()
+        return changed
+
+    def speaker_corrections(self) -> dict[int, str]:
+        """[v3.23.653] Người nói chọn tay quy về câu GỐC của trang Dịch: ``{id cue (1-based): tên vai}``.
+
+        Chỉ khi đã nạp vai cho phụ đề này và phụ đề TTS ghép được với câu gốc (cùng phim — xem ``align_to_source``).
+        Bỏ "giọng chung" (không phải một người nói) và câu gốc nhận hai người nói khác nhau (dòng đã tách).
+        """
+        if not self._dubbing_prepared or not self._source_positions:
+            return {}
+        corrections: dict[int, str] = {}
+        conflicts: set[int] = set()
+        for position, speaker in self._speaker_overrides.items():
+            speaker = (speaker or "").strip()
+            if not speaker or not (0 <= position < len(self._source_positions)):
+                continue
+            source_position = self._source_positions[position]
+            if source_position is None:
+                continue
+            line_no = source_position + 1
+            if corrections.get(line_no, speaker) != speaker:
+                conflicts.add(line_no)
+            corrections[line_no] = speaker
+        for line_no in conflicts:
+            corrections.pop(line_no, None)
+        return corrections
+
+    def cue_corrections(self) -> dict[int, tuple[str | None, str | None]]:
+        """[v3.23.654] Sửa tay quy về câu gốc: ``{id cue: (người nói | None, người nghe | None)}`` (``None`` = không sửa).
+
+        Câu gốc nhận hai giá trị khác nhau từ các dòng TTS (dòng đã tách) bị bỏ phần mâu thuẫn.
+        """
+        if not self._dubbing_prepared or not self._source_positions:
+            return {}
+        result: dict[int, list[str | None]] = {
+            line_no: [speaker, None] for line_no, speaker in self.speaker_corrections().items()
+        }
+        conflicts: set[int] = set()
+        seen: dict[int, str] = {}
+        for position, addressee in self._addressee_overrides.items():
+            if not (0 <= position < len(self._source_positions)):
+                continue
+            source_position = self._source_positions[position]
+            if source_position is None:
+                continue
+            line_no = source_position + 1
+            addressee = (addressee or "").strip()
+            if seen.get(line_no, addressee) != addressee:
+                conflicts.add(line_no)
+            seen[line_no] = addressee
+        for line_no, addressee in seen.items():
+            if line_no in conflicts:
+                continue
+            result.setdefault(line_no, [None, None])[1] = addressee
+        return {line_no: (pair[0], pair[1]) for line_no, pair in result.items()}
+
+    @property
+    def dubbing_source_spans(self) -> tuple[tuple[float, float], ...]:
+        """[v3.23.653] Mốc câu gốc của ngữ cảnh phân vai đang dùng (để biết còn khớp trang Dịch không)."""
+        source = self._dubbing_source
+        return tuple(source.source_spans) if self._dubbing_prepared and source is not None else ()
+
     @property
     def speaker_overrides(self) -> dict[int, str]:
         """[v3.23.598] Người nói chọn tay ``{vị trí dòng: vai}`` (rỗng: giọng chung)."""
@@ -258,7 +381,7 @@ class TTSPageViewModel(QObject):
     def can_resynthesize(self) -> bool:
         """[v3.23.598] Lần TTS gần nhất có giữ audio từng dòng (TTS lại được dòng chọn).
 
-        Chỉ VieNeu ghi audio từng dòng. Bản trước vẫn cho bấm "TTS lại dòng chọn" sau khi
+        [v3.23.655] Edge/Gemini nay cũng ghi audio từng dòng; kết quả cũ (trước 655) thì không. Bản trước vẫn cho bấm "TTS lại dòng chọn" sau khi
         chạy Edge/Gemini: tổng hợp xong các dòng chọn rồi mới báo lỗi "Không có segment
         nào để ghép lại master".
         """
@@ -266,11 +389,60 @@ class TTSPageViewModel(QObject):
             getattr(result, "segment_audio_path", "") for result in self._last_results
         )
 
+    def _line_audio_dirs(self) -> list[Path]:
+        """[v3.23.657] Thư mục audio từng dòng của lần TTS gần nhất.
+
+        Lấy từ đường dẫn segment THỰC trong kết quả (đúng cả khi ``segments_dir`` bị chỉ định
+        riêng); thêm thư mục mặc định cạnh output để dọn cả phần còn sót của lượt trước.
+        """
+        dirs: list[Path] = []
+        if not self._last_results:
+            return dirs  # chưa có lượt TTS cho phụ đề đang nạp (nạp phụ đề mới xoá kết quả cũ)
+        for result in self._last_results:
+            path = getattr(result, "segment_audio_path", "")
+            if path and Path(path).parent not in dirs:
+                dirs.append(Path(path).parent)
+        if self._last_output_path is not None:
+            from subtitles_extractor.infrastructure.tts.segment_store import segments_dir_for
+
+            override = getattr(self._last_request, "segments_dir", "") if self._last_request else ""
+            default = segments_dir_for(self._last_output_path, override or "")
+            if default not in dirs:
+                dirs.append(default)
+        return dirs
+
+    def line_audio_usage(self) -> int:
+        """[v3.23.657] Số byte audio từng dòng đang chiếm đĩa (0 nếu không có)."""
+        from subtitles_extractor.infrastructure.tts.segment_store import line_audio_usage
+
+        return sum(line_audio_usage(d)[0] for d in self._line_audio_dirs())
+
+    def clean_line_audio(self) -> int:
+        """[v3.23.657] Người dùng bấm "Dọn": xoá audio từng dòng, giữ master + SRT.
+
+        Sau khi dọn, "Nghe/TTS lại dòng chọn" cần chạy lại cả phim (``can_resynthesize`` = False).
+
+        Returns:
+            Số byte đã giải phóng; ``-1`` nếu đang bận (không dọn).
+        """
+        if self._is_busy:
+            return -1
+        from dataclasses import replace as _replace
+
+        from subtitles_extractor.infrastructure.tts.segment_store import clean_line_audio
+
+        freed = sum(clean_line_audio(d) for d in self._line_audio_dirs())
+        self._last_results = [
+            _replace(r, segment_audio_path="") if getattr(r, "segment_audio_path", "") else r
+            for r in self._last_results
+        ]
+        return freed
+
     def line_edits(self) -> LineEdits:
         """[v3.23.598] Chỉnh sửa tay hiện có (để lưu theo phụ đề)."""
         return LineEdits(
             speakers=dict(self._speaker_overrides), texts=dict(self._text_edits),
-            lines=self._line_snapshot(),
+            lines=self._line_snapshot(), addressees=dict(self._addressee_overrides),
         )
 
     def _line_snapshot(self) -> tuple[LineSnapshot, ...] | None:
@@ -309,7 +481,7 @@ class TTSPageViewModel(QObject):
 
     def has_line_edits(self, positions: Iterable[int] | None = None) -> bool:
         """[v3.23.598] Có chỉnh sửa tay nào (trong ``positions`` nếu có) không."""
-        edited = set(self._speaker_overrides) | set(self._text_edits)
+        edited = set(self._speaker_overrides) | set(self._text_edits) | set(self._addressee_overrides)
         if positions is None:
             return bool(edited)
         return any(position in edited for position in positions)
@@ -404,6 +576,8 @@ class TTSPageViewModel(QObject):
         for position in self._valid_positions(positions):
             if self._speaker_overrides.pop(position, None) is not None:
                 changed.append(position)
+            if self._addressee_overrides.pop(position, None) is not None and position not in changed:
+                changed.append(position)
             edit = self._text_edits.pop(position, None)
             if edit is not None:
                 self._replace_event_text(position, edit.original)
@@ -428,8 +602,15 @@ class TTSPageViewModel(QObject):
         Returns:
             ``(số dòng áp người nói, số dòng áp lời sửa)``.
         """
-        structural = self._restore_structure(edits.lines)
+        before = len(self._source_events)
+        structural = self._restore_structure(edits.lines, edits.texts)
         count = len(self._source_events)
+        # [v3.23.652] Trang báo rõ việc áp lại danh sách dòng (trước đây lặng lẽ, log ghi "0 dòng").
+        kept = {origin for origin in self._origins if origin >= 0}
+        self._restored_structure = (
+            (sum(1 for origin in range(before) if origin not in kept), self._origins.count(-1))
+            if structural else None
+        )
         speakers = {
             position: speaker
             for position, speaker in edits.speakers.items()
@@ -445,8 +626,12 @@ class TTSPageViewModel(QObject):
             }
         else:
             texts = restorable_text_edits(self._source_events, edits.texts)
+        addressees = {
+            position: addressee for position, addressee in edits.addressees.items() if 0 <= position < count
+        }
+        self._addressee_overrides.update(addressees)
         if not speakers and not texts:
-            if structural:
+            if structural or addressees:
                 self.line_edits_changed.emit()
             return 0, 0
         self._speaker_overrides.update(speakers)
@@ -530,6 +715,7 @@ class TTSPageViewModel(QObject):
         return voices_for_lines(speakers, casting)
 
     def set_source_events(self, events: list["SubtitleEvent"]) -> None:
+        self._restored_structure = None
         self._source_events = list(events)
         self._original_events = list(events)
         self._origins = list(range(len(events)))
@@ -538,6 +724,7 @@ class TTSPageViewModel(QObject):
         # phụ đề mới (theo dấu phụ đề) khi nhận source_changed.
         self._fingerprint = subtitle_fingerprint(self._source_events)
         self._speaker_overrides = {}
+        self._addressee_overrides = {}
         self._text_edits = {}
         self._edited_since_synthesis = set()
         self._synthesizing = set()
@@ -646,8 +833,22 @@ class TTSPageViewModel(QObject):
             sample_rate = int(info.samplerate)
             total_length_samples = int(info.frames)
         except (OSError, RuntimeError) as exc:
-            self.error_occurred.emit(f"Không đọc được file audio để ghép lại: {exc}")
-            return False
+            # [v3.23.659] libsndfile không đọc được M4A/AAC (và có bản không đọc MP3/Opus): trước đây "TTS lại dòng chọn"
+            # / ghép lại sau xoá-thêm-tách-gộp dòng LUÔN lỗi với các định dạng đó. Lấy tần số từ audio từng dòng và độ
+            # dài master theo đúng công thức của lượt đầy đủ.
+            from subtitles_extractor.application.services.tts_incremental_run import (
+                _detect_sample_rate,
+                _master_samples,
+            )
+
+            sample_rate = _detect_sample_rate(self._last_results)
+            total_length_samples = (
+                _master_samples(replace(self._last_request, events=list(self._source_events)), sample_rate)
+                if sample_rate > 0 and self._last_request is not None else 0
+            )
+            if sample_rate <= 0 or total_length_samples <= 0:
+                self.error_occurred.emit(f"Không đọc được file audio để ghép lại: {exc}")
+                return False
 
         # Yêu cầu ghép nội dung MỚI (source_events đã cập nhật qua update_event_text).
         # [v3.23.598] Bản SAO danh sách dòng: luồng nền không được thấy sửa tay giữa chừng.
@@ -681,6 +882,7 @@ class TTSPageViewModel(QObject):
             int(i) for i in selected_indices
         }
         self._run = None
+        self._run_rewrites_line_audio = False  # [v3.23.659] TTS lại dòng chọn ghi vào thư mục tạm — huỷ không hỏng gì
         self._reuse_summary = None
         self._manual_run = (
             None if remerge_only
@@ -695,17 +897,37 @@ class TTSPageViewModel(QObject):
 
     # ── [v3.23.625] Thêm / xoá dòng ───────────────────────────────────────────
 
-    def _restore_structure(self, lines: tuple[LineSnapshot, ...] | None) -> bool:
-        """Dựng lại danh sách dòng đã thêm/xoá từ ảnh chụp đã lưu. ``True`` nếu đã áp."""
+    def _restore_structure(
+        self, lines: tuple[LineSnapshot, ...] | None, texts: dict[int, TextEdit] | None = None,
+    ) -> bool:
+        """Dựng lại danh sách dòng đã thêm/xoá từ ảnh chụp đã lưu. ``True`` nếu đã áp.
+
+        [v3.23.652] Dòng gốc lấy chữ của phụ đề VỪA NẠP; chữ trong ảnh chụp chỉ dùng cho dòng thêm tay và dòng người
+        dùng đã sửa lời trên ĐÚNG chữ gốc đó. Trước đây chữ cũ trong ảnh chụp đè cả bản dịch mới (dịch lại không đổi mốc
+        giờ → cùng dấu phụ đề).
+        """
         original = self._original_events
-        if lines is None or not original or not valid_snapshot(lines, len(original)):
+        if lines is None or not original:
             return False
+        if not valid_snapshot(lines, len(original)):
+            logger.warning(
+                "Danh sách dòng TTS đã lưu (%d dòng) không khớp phụ đề %d dòng — bỏ qua, dùng phụ đề gốc.",
+                len(lines), len(original),
+            )
+            return False
+        texts = texts or {}
         rebuilt: list["SubtitleEvent"] = []
-        for line in lines:
+        for position, line in enumerate(lines):
             base = original[line.origin] if line.origin >= 0 else None
+            text = line.text
+            if base is not None:
+                base_text = str(getattr(base, "text", "") or "")
+                edit = texts.get(position)
+                if edit is None or edit.original.strip() != base_text.strip():
+                    text = base_text
             rebuilt.append(self._make_event(
                 base or original[0], len(rebuilt) + 1, line.start_sec, line.end_sec,
-                line.text, keep_identity=base is not None,
+                text, keep_identity=base is not None,
             ))
         self._source_events = rebuilt
         self._origins = [line.origin for line in lines]
@@ -736,6 +958,7 @@ class TTSPageViewModel(QObject):
     def _after_structure_change(self, mapping: dict[int, int]) -> None:
         """Đưa mọi trạng thái đánh theo vị trí sang vị trí mới rồi báo trang."""
         self._speaker_overrides = remap_keys(self._speaker_overrides, mapping)
+        self._addressee_overrides = remap_keys(self._addressee_overrides, mapping)
         self._text_edits = remap_keys(self._text_edits, mapping)
         self._edited_since_synthesis = remap_set(self._edited_since_synthesis, mapping)
         self._synthesizing = set()
@@ -764,6 +987,7 @@ class TTSPageViewModel(QObject):
             speakers=tuple(sorted(self._speaker_overrides.items())),
             texts=tuple(sorted(self._text_edits.items())),
             edited=frozenset(self._edited_since_synthesis),
+            addressees=tuple(sorted(self._addressee_overrides.items())),
         )
 
     def _record_history(self, before: _EditState) -> None:
@@ -778,6 +1002,7 @@ class TTSPageViewModel(QObject):
         self._source_events = list(state.events)
         self._origins = list(state.origins)
         self._speaker_overrides = dict(state.speakers)
+        self._addressee_overrides = dict(state.addressees)
         self._text_edits = dict(state.texts)
         self._edited_since_synthesis = set(state.edited)
         self._synthesizing = set()
@@ -832,12 +1057,13 @@ class TTSPageViewModel(QObject):
         if not removed or len(removed) >= count:
             return 0
         mapping = delete_mapping(count, removed)
+        origins_before = dict(enumerate(self._origins))
         self._source_events = [
             event for position, event in enumerate(self._source_events)
             if position in mapping
         ]
         self._origins = [o for position, o in enumerate(self._origins) if position in mapping]
-        self._remap_results(mapping, removed=len(removed))
+        self._remap_results(mapping, removed=len(removed), origins_before=origins_before)
         self._after_structure_change(mapping)
         return len(removed)
 
@@ -873,6 +1099,209 @@ class TTSPageViewModel(QObject):
         self._mark_edited([position])
         return position
 
+    # ── [v3.23.652] Khôi phục dòng gốc ────────────────────────────────────────
+
+    @property
+    def restored_structure(self) -> tuple[int, int] | None:
+        """``(dòng gốc bớt, dòng thêm)`` nếu lúc nạp phụ đề vừa áp lại danh sách dòng đã sửa lưu trước."""
+        return self._restored_structure
+
+    def missing_original_lines(self) -> list[tuple[int, float, float, str]]:
+        """Các dòng của phụ đề gốc đang không có trong danh sách: ``(origin, bắt đầu, kết thúc, lời)``."""
+        present = {origin for origin in self._origins if origin >= 0}
+        return [
+            (origin, float(event.start_sec), float(event.end_sec), str(getattr(event, "text", "") or ""))
+            for origin, event in enumerate(self._original_events)
+            if origin not in present
+        ]
+
+    @_undoable
+    def restore_original_lines(self, origins: Iterable[int] | None = None) -> int:
+        """Chèn lại các dòng gốc đã xoá (``None`` = mọi dòng đang thiếu), theo thứ tự thời gian; dòng chèn lại cần TTS.
+
+        Dựng lại danh sách MỘT lượt (một lần đánh số lại kết quả/tệp audio, một lần báo trang): chèn từng dòng một
+        từng làm treo giao diện ~25 s với 600 dòng (vẽ lại bảng + ghi QSettings mỗi dòng).
+
+        Returns:
+            Số dòng đã chèn lại (0 nếu đang bận).
+        """
+        if self._is_busy or not self._original_events:
+            return 0
+        present = {origin for origin in self._origins if origin >= 0}
+        total = len(self._original_events)
+        wanted = range(total) if origins is None else origins
+        chosen = sorted({o for o in wanted if 0 <= o < total and o not in present})
+        if not chosen:
+            return 0
+        # Dòng hiện có giữ nguyên thứ tự; dòng chèn lại đặt theo mốc bắt đầu (sau các dòng cùng mốc).
+        current_starts = [float(event.start_sec) for event in self._source_events]
+        order_ok = all(a <= b for a, b in zip(current_starts, current_starts[1:], strict=False))
+        merged: list[tuple[str, int]] = []
+        if order_ok:
+            import bisect
+
+            inserts = sorted(
+                (float(self._original_events[o].start_sec), o) for o in chosen
+            )
+            cursor = 0
+            for start, origin in inserts:
+                stop = bisect.bisect_right(current_starts, start, lo=cursor)
+                merged.extend(("old", p) for p in range(cursor, stop))
+                merged.append(("new", origin))
+                cursor = stop
+            merged.extend(("old", p) for p in range(cursor, len(current_starts)))
+        else:  # danh sách hiện tại đã lệch thứ tự (dữ liệu cũ): xếp theo dòng gốc như trước
+            pending = list(chosen)
+            for position, origin in enumerate(self._origins):
+                while pending and 0 <= origin and pending[0] < origin:
+                    merged.append(("new", pending.pop(0)))
+                merged.append(("old", position))
+            merged.extend(("new", o) for o in pending)
+        events: list["SubtitleEvent"] = []
+        new_origins: list[int] = []
+        mapping: dict[int, int] = {}
+        inserted: list[int] = []
+        for kind, key in merged:
+            if kind == "old":
+                mapping[key] = len(events)
+                events.append(self._source_events[key])
+                new_origins.append(self._origins[key])
+            else:
+                base = self._original_events[key]
+                inserted.append(len(events))
+                events.append(self._make_event(
+                    base, len(events) + 1, float(base.start_sec), float(base.end_sec),
+                    str(getattr(base, "text", "") or ""), keep_identity=True,
+                ))
+                new_origins.append(key)
+        self._source_events = events
+        self._origins = new_origins
+        self._remap_results(mapping)
+        recovered: list[int] = []
+        if self._last_results:
+            for position in inserted:
+                event = events[position]
+                result = self._placeholder_result(
+                    position, float(event.start_sec), float(event.end_sec), str(getattr(event, "text", "") or ""),
+                )
+                if not result.was_skipped:
+                    recovered.append(position)
+                self._last_results.append(result)
+            self._last_results.sort(key=lambda r: r.event_index)
+        self._after_structure_change(mapping)
+        self._mark_edited([position for position in inserted if position not in recovered])
+        return len(chosen)
+
+    def _segments_dir(self) -> Path | None:
+        for result in self._last_results:
+            if result.segment_audio_path:
+                return Path(result.segment_audio_path).parent
+        return None
+
+    def _placeholder_result(self, position: int, start: float, end: float, text: str) -> TTSSegmentResult:
+        """[v3.23.654] Kết quả cho dòng chèn lại: lấy lại audio cũ từ thùng rác nếu có (khỏi TTS lại), không thì chờ TTS."""
+        from subtitles_extractor.infrastructure.tts.segment_store import recover_from_trash
+
+        folder = self._segments_dir()
+        origin = self._origins[position] if 0 <= position < len(self._origins) else -1
+        found = recover_from_trash(folder, text, position, origin) if folder is not None and origin >= 0 else None
+        if found is not None:
+            path, duration = found
+            return TTSSegmentResult(
+                event_index=position, start_sec=start, end_sec=end, text=text, subtitle_text=text,
+                segment_audio_path=str(path), audio_duration_s=duration,
+            )
+        return TTSSegmentResult(
+            event_index=position, start_sec=start, end_sec=end, text=text, subtitle_text=text, was_skipped=True,
+        )
+
+    @_undoable
+    def apply_saved_edits(self, edits: LineEdits) -> bool:
+        """[v3.23.654] Thay mọi sửa tay hiện tại bằng một phiên bản đã lưu (lịch sử); hoàn tác được.
+
+        Chỉ khi chưa có kết quả TTS (audio từng dòng gắn với danh sách dòng hiện tại).
+        """
+        if self._is_busy or self._last_results or not self._original_events:
+            return False
+        self._source_events = list(self._original_events)
+        self._origins = list(range(len(self._original_events)))
+        self._speaker_overrides, self._addressee_overrides, self._text_edits = {}, {}, {}
+        self._edited_since_synthesis, self._synthesizing = set(), set()
+        self.restore_line_edits(edits)
+        self._renumber_events()
+        self._rederive_speakers()
+        self.structure_changed.emit()
+        self.line_edits_changed.emit()
+        return True
+
+    @_undoable
+    def reset_to_original(self, *, keep_speakers: bool = True) -> bool:
+        """Trả danh sách dòng về đúng phụ đề nguồn: đủ dòng gốc theo thứ tự gốc, bỏ dòng thêm tay, mốc và lời về gốc.
+
+        Args:
+            keep_speakers: Giữ người nói đã chọn tay cho các dòng gốc.
+
+        Returns:
+            ``True`` nếu có thay đổi.
+        """
+        if self._is_busy or not self._original_events:
+            return False
+        original = self._original_events
+        if (
+            self._origins == list(range(len(original))) and not self._text_edits
+            and not self._timing_changed()
+            and (keep_speakers or not (self._speaker_overrides or self._addressee_overrides))
+        ):
+            return False
+        old_events = self._source_events
+        mapping = {position: origin for position, origin in enumerate(self._origins) if origin >= 0}
+        present = set(mapping.values())
+        self._source_events = [
+            self._make_event(base, index + 1, float(base.start_sec), float(base.end_sec),
+                             str(getattr(base, "text", "") or ""), keep_identity=True)
+            for index, base in enumerate(original)
+        ]
+        self._origins = list(range(len(original)))
+        self._text_edits = {}
+        if not keep_speakers:
+            self._speaker_overrides = {}
+            self._addressee_overrides = {}
+        self._remap_results(mapping)
+        changed_lines = [o for o in range(len(original)) if o not in present]
+        for position, origin in mapping.items():
+            before, base = old_events[position], original[origin]
+            if (
+                (before.start_sec, before.end_sec) != (base.start_sec, base.end_sec)
+                or str(getattr(before, "text", "") or "") != str(getattr(base, "text", "") or "")
+            ):
+                changed_lines.append(origin)
+        if self._last_results:
+            by_index = {int(r.event_index): i for i, r in enumerate(self._last_results)}
+            for origin in list(changed_lines):
+                base = original[origin]
+                text = str(getattr(base, "text", "") or "")
+                fresh = (
+                    self._placeholder_result(origin, float(base.start_sec), float(base.end_sec), text)
+                    if origin not in by_index else TTSSegmentResult(
+                        event_index=origin, start_sec=float(base.start_sec), end_sec=float(base.end_sec),
+                        text=text, subtitle_text=text, was_skipped=True,
+                    )
+                )
+                if not fresh.was_skipped:
+                    changed_lines.remove(origin)
+                if origin in by_index:
+                    self._last_results[by_index[origin]] = replace(
+                        self._last_results[by_index[origin]], text=text, subtitle_text=text,
+                        start_sec=fresh.start_sec, end_sec=fresh.end_sec,
+                        adjusted_start_sec=-1.0, adjusted_end_sec=-1.0,
+                    )
+                else:
+                    self._last_results.append(fresh)
+            self._last_results.sort(key=lambda r: r.event_index)
+        self._after_structure_change(mapping)
+        self._mark_edited(changed_lines)
+        return True
+
     def suggested_line_timing(self, after_position: int | None) -> tuple[float, float]:
         """[v3.23.625] Mốc gợi ý cho dòng mới đặt ngay sau dòng ``after_position``."""
         duration = getattr(self._last_request, "media_duration_s", None)
@@ -885,6 +1314,7 @@ class TTSPageViewModel(QObject):
     def _remap_results(
         self, mapping: dict[int, int], removed: int = 0,
         inserted: tuple[int, float, float, str] | None = None,
+        origins_before: dict[int, int] | None = None,
     ) -> None:
         """Đánh số lại kết quả TTS (và giọng từng dòng của lần chạy gần nhất)."""
         if not self._last_results:
@@ -892,7 +1322,8 @@ class TTSPageViewModel(QObject):
         old_voices = (
             self._last_request.line_voices if self._last_request is not None else ()
         )
-        self._last_results = renumber_results(self._last_results, mapping)
+        # [v3.23.654] Audio dòng bị xoá vào thùng rác kèm dòng GỐC của nó (khôi phục đúng dòng, không lẫn hai câu "好").
+        self._last_results = renumber_results(self._last_results, mapping, trash_keys=origins_before)
         if (
             self._last_adapter is not None and self._last_request is not None
             and self._last_output_path is not None
@@ -1020,6 +1451,10 @@ class TTSPageViewModel(QObject):
         if new_position is not None and speaker is not None:
             self._speaker_overrides[new_position] = speaker
             self.line_edits_changed.emit()
+        addressee = self._addressee_overrides.get(position)
+        if new_position is not None and addressee is not None:
+            self._addressee_overrides[new_position] = addressee
+            self.line_edits_changed.emit()
         self._mark_edited([position])
         return new_position
 
@@ -1053,8 +1488,7 @@ class TTSPageViewModel(QObject):
             source.source_texts[source_pos]
             if source_pos is not None and 0 <= source_pos < len(source.source_texts) else ""
         )
-        addressee = self._addressees.get(source_pos + 1, "") if source_pos is not None else ""
-        return text, speaker, addressee
+        return text, speaker, self.line_addressee(position)
 
     def speaker_review_lines(self) -> list[ReviewLine]:
         """[v3.23.630] Mọi dòng kèm ngữ cảnh người nói (cho hộp thoại duyệt nhanh).
@@ -1078,9 +1512,7 @@ class TTSPageViewModel(QObject):
                 position=position, start_sec=float(event.start_sec),
                 end_sec=float(event.end_sec), text=str(getattr(event, "text", "") or ""),
                 source=origin, speaker=speakers[position] if position < len(speakers) else "",
-                addressee=(
-                    self._addressees.get(source_pos + 1, "") if source_pos is not None else ""
-                ),
+                addressee=self.line_addressee(position),
             ))
         return lines
 
@@ -1193,6 +1625,10 @@ class TTSPageViewModel(QObject):
         fmt = (output_format or "wav").lower()
         if output_path.suffix.lower() != f".{fmt}":
             output_path = output_path.with_suffix(f".{fmt}")
+        # [v3.23.654] Lượt TTS mới (giọng/phân vai/tốc độ có thể đã đổi): audio trong thùng rác không còn đáng tin.
+        from subtitles_extractor.infrastructure.tts.segment_store import clear_trash, segments_dir_for
+
+        clear_trash(segments_dir_for(output_path))
 
         request = TTSRequest(
             # [v3.23.598] Bản SAO: người dùng sửa lời/người nói trong lúc đang chạy thì luồng
@@ -1284,6 +1720,8 @@ class TTSPageViewModel(QObject):
         use_case = self._container.make_generate_tts_use_case(adapter)
         from subtitles_extractor.presentation.workers.tts_worker import TTSWorker
         self._worker = TTSWorker(use_case, request, output_path)
+        self._run_rewrites_line_audio = True  # [v3.23.659] xem _forget_stale_line_audio
+        self._run_started_at = time.time()
         self._last_request = request  # snapshot cấu hình để xuất debug
         self._last_engine_name = adapter.get_engine_name()
         self._last_adapter = adapter  # [v3.23.450] để TTS lại dòng chọn không phải tạo lại
@@ -1341,6 +1779,8 @@ class TTSPageViewModel(QObject):
             ),
         )
         self._run = run
+        self._run_rewrites_line_audio = not unchanged  # [v3.23.659] xem _forget_stale_line_audio
+        self._run_started_at = time.time()
         self._reuse_summary = (plan.reused_count, plan.total, len(plan.stale))
         self._last_request = run.request
         self._last_engine_name = adapter.get_engine_name()  # type: ignore[attr-defined]
@@ -1397,6 +1837,7 @@ class TTSPageViewModel(QObject):
             logger.warning("Không cập nhật được cache TTS từng dòng: %s", exc)
 
     def _on_worker_finished(self, results: object) -> None:
+        self._run_rewrites_line_audio = False
         self._last_results = list(results)  # type: ignore[arg-type]
         self._record_line_cache(self._last_results)
         self._undo_stack, self._redo_stack = [], []
@@ -1408,14 +1849,34 @@ class TTSPageViewModel(QObject):
         if finished_edits:
             self.line_edits_changed.emit()
 
+    def _forget_stale_line_audio(self) -> None:
+        """[v3.23.659] Lượt TTS cả phim bị huỷ / lỗi giữa chừng: audio từng dòng trên đĩa ĐÃ là của lượt mới.
+
+        Kết quả cũ (mốc thời gian, thời lượng của lượt trước) mà ghép với tệp mới thì "TTS lại dòng chọn" / xoá dòng
+        / khôi phục dòng đặt audio mới vào mốc cũ (giọng có thể đổi giữa phim). Bỏ liên kết audio từng dòng — muốn
+        sửa từng dòng thì chạy TTS lại (lượt sau tự dùng lại các dòng đã xong qua điểm kiểm tra).
+        """
+        if not getattr(self, "_run_rewrites_line_audio", False):
+            return
+        self._run_rewrites_line_audio = False
+        started = float(getattr(self, "_run_started_at", 0.0))
+        # Chỉ bỏ liên kết khi tệp từng dòng THẬT SỰ bị lượt này ghi lại (huỷ sớm / ghi ra thư mục khác → giữ nguyên).
+        if any(_rewritten_since(getattr(r, "segment_audio_path", ""), started) for r in self._last_results):
+            self._last_results = [
+                replace(r, segment_audio_path="") if r.segment_audio_path else r for r in self._last_results
+            ]
+            logger.info("TTS bị dừng giữa chừng — bỏ liên kết audio từng dòng của lượt trước (không còn khớp).")
+
     def _on_worker_failed(self, message: str) -> None:
         self._run, self._manual_run = None, None
         self._clear_checkpoint_callback()
+        self._forget_stale_line_audio()
         self.error_occurred.emit(message)
 
     def _on_worker_cancelled(self) -> None:
         self._run, self._manual_run = None, None
         self._clear_checkpoint_callback()
+        self._forget_stale_line_audio()
         self.tts_cancelled.emit()
 
     def _on_thread_finished(self) -> None:

@@ -622,9 +622,14 @@ class ApplicationContainer:
             retry_count = tr.retry_count
         if request_timeout_s is None:
             request_timeout_s = float(tr.request_timeout_sec)
+        # [v3.23.666] Nhà cung cấp tuỳ chỉnh (OxionAI…): dùng key của nhà cung cấp, không áp hạn
+        # mức free-tier của Google, sức khoẻ model riêng (tên model khác Gemini).
+        custom = self.custom_text_provider
         return GeminiSubtitleTranslator(
-            api_key=api_key, retry_count=retry_count, request_timeout_s=request_timeout_s,
-            quota_manager=self.gemini_quota_manager,
+            api_key=custom.api_key if custom is not None else api_key,
+            retry_count=retry_count, request_timeout_s=request_timeout_s,
+            quota_manager=None if custom is not None else self.gemini_quota_manager,
+            custom_provider=custom,
             analysis_media_resolution=getattr(tr, "analysis_media_resolution", "medium"),
             analysis_thinking_level=getattr(tr, "analysis_thinking_level", "medium"),
             parallel_batches=getattr(tr, "translation_parallel_batches", 1),
@@ -637,9 +642,44 @@ class ApplicationContainer:
             # [v3.23.564] Tiến độ phân tích theo đoạn — chạy tiếp khi hết hạn mức ngày.
             analysis_checkpoint_dir=self._user_data_dir / "analysis_checkpoints",
             token_ledger=self.token_usage_ledger,
-            model_health=self.gemini_model_health,
+            model_health=self.custom_model_health if custom is not None else self.gemini_model_health,
             clip_video_to_batch=bool(getattr(tr, "clip_video_to_batch", True)),
         )
+
+    # ── [v3.23.666] Nhà cung cấp AI tuỳ chỉnh (API kiểu OpenAI) ──────────────────
+
+    def set_custom_text_provider(self, config) -> None:
+        """Bật (``CustomProviderConfig`` đủ địa chỉ + key) hoặc tắt (``None``) nhà cung cấp tuỳ chỉnh.
+
+        Áp cho MỌI bộ dịch tạo sau đó (trang Dịch, rút gọn câu ở trang Lồng tiếng, dây chuyền phim bộ).
+        """
+        previous = getattr(self, "_custom_text_provider", None)
+        self._custom_text_provider = config
+        if config != previous and getattr(self, "_custom_model_health", None) is not None:
+            self._custom_model_health = None  # đổi nhà cung cấp → danh sách model cũ vô nghĩa
+
+    @property
+    def custom_text_provider(self):
+        """Cấu hình nhà cung cấp tuỳ chỉnh đang bật và đủ thông tin, hoặc ``None`` (dùng Gemini)."""
+        config = getattr(self, "_custom_text_provider", None)
+        if config is None or not getattr(config, "is_complete", False):
+            return None
+        return config
+
+    @property
+    def custom_model_health(self):
+        """Sức khoẻ model của nhà cung cấp tuỳ chỉnh: không gieo model Gemini, dự phòng cùng họ."""
+        existing = getattr(self, "_custom_model_health", None)
+        if existing is None:
+            from subtitles_extractor.infrastructure.translation.model_health import (
+                ModelHealth,
+            )
+
+            existing = ModelHealth(same_family_only=True)
+            preferred = self.gemini_model_health.preferred_fallback
+            existing.set_preferred_fallback(preferred)
+            self._custom_model_health = existing
+        return existing
 
     @property
     def token_usage_ledger(self):
@@ -750,6 +790,17 @@ class ApplicationContainer:
             video_tokens_per_sec,
         )
 
+        # [v3.23.666] Chốt chặn: key của nhà cung cấp tuỳ chỉnh không bao giờ được gửi tới Google
+        # (caller lỡ truyền key "hiện hành" của trang Dịch khi đang ở chế độ tuỳ chỉnh).
+        custom = getattr(self, "_custom_text_provider", None)
+        custom_key = (getattr(custom, "api_key", "") or "").strip()
+        if custom_key:
+            import re as _re
+
+            api_key = "\n".join(
+                k.strip() for k in _re.split(r"[\n,]+", api_key or "")
+                if k.strip() and k.strip() != custom_key
+            )
         cache_db = self._user_data_dir / "gemini_video_uploads.db"
         # [v3.23.39] Đọc tham số video ngữ cảnh từ Cài đặt (người dùng chỉnh được):
         # độ phân giải/fps/chất lượng nén + token mỗi đoạn. Phân tích chạy TUẦN TỰ nên
@@ -858,6 +909,15 @@ class ApplicationContainer:
 
         translator = self.make_subtitle_translator(api_key=api_key, retry_count=3)
         return CompleteSpeakersUseCase(translator=translator)
+
+    def make_recheck_cues_use_case(self, api_key: str):
+        """[v3.23.655] Use case hỏi lại CHỈ các dòng Visual Cues đáng nghi (Gemini + video)."""
+        from subtitles_extractor.application.use_cases.complete_speakers import (
+            RecheckSuspiciousCuesUseCase,
+        )
+
+        translator = self.make_subtitle_translator(api_key=api_key, retry_count=3)
+        return RecheckSuspiciousCuesUseCase(translator=translator)
 
     # ── TTS ──────────────────────────────────────────────────────────────────
 
@@ -1058,7 +1118,7 @@ class ApplicationContainer:
         return SubtitleBuilderConfig(
             similarity_threshold=min(post.similarity_threshold, threshold.text_similarity),
             min_duration_sec=post.min_duration_sec, max_duration_sec=post.max_duration_sec,
-            min_confidence=threshold.ocr_min_confidence, merge_gap_sec=post.merge_gap_sec,
+            min_confidence=threshold.ocr_min_confidence, merge_gap_sec=post.merge_gap_sec, merge_progressive=bool(getattr(post, "merge_progressive", False)),
             use_viterbi=post.use_viterbi, viterbi_open_penalty=post.viterbi_open_penalty,
             min_text_chars=threshold.drop_short_text_chars, line_similarity_threshold=threshold.line_similarity,
             sample_step_sec=snapshot.frame.sample_step_sec,

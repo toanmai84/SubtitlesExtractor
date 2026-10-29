@@ -14,7 +14,7 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -395,6 +395,9 @@ def parse_quota_rows(
 class TranslatePage(QWidget):
     """Trang dịch phụ đề đa giai đoạn bằng AI."""
 
+    #: [v3.23.658] Dây chuyền phim bộ: khâu Dịch chạy xong (``StageRunResult``).
+    series_batch_finished = Signal(object)
+
     def __init__(
         self, container: ApplicationContainer, parent: QWidget | None = None
     ) -> None:
@@ -426,6 +429,7 @@ class TranslatePage(QWidget):
                 chuẩn hoá về ``str`` để các hàm tầng TM (vốn khai báo ``video_path: str``)
                 không nhận nhầm ``WindowsPath`` rồi gọi ``.strip()`` gây lỗi.
         """
+        self._flush_context_save()  # [v3.23.652] lưu sửa tay ngữ cảnh của video CŨ trước khi đổi
         self._source_video_path = str(video_path) if video_path else ""
 
     def set_editor_event_provider(
@@ -560,7 +564,14 @@ class TranslatePage(QWidget):
         api_row.addWidget(self._api_key_edit)
         api_row.addWidget(self._btn_eye)
         api_row.addWidget(self._btn_multi_key)
-        form.addRow("API Key Gemini:", self._wrap_layout(api_row))
+        # [v3.23.666] Nhà cung cấp AI: Gemini (key Google) hoặc API tuỳ chỉnh kiểu OpenAI (OxionAI…).
+        self._build_provider_rows(form)
+        self._gemini_key_row = self._wrap_layout(api_row)
+        form.addRow("API Key Gemini:", self._gemini_key_row)
+        form.addRow(self._translator.translate("translate.custom_url_label"), self._custom_url_edit)
+        form.addRow(self._translator.translate("translate.custom_key_label"), self._custom_key_row)
+        form.addRow(self._custom_note_label)
+        self._ai_form = form
 
         self._lang_combo = QComboBox()
         self._lang_combo.addItems(_TARGET_LANGUAGES)
@@ -677,10 +688,7 @@ class TranslatePage(QWidget):
         form.addRow(self._translator.translate("translate.tr_parallel"), self._parallel_combo)
         # Nút tải danh sách model từ API
         self._btn_refresh_models = PushButton(self._translator.translate("translate.btn_load_models"))
-        self._btn_refresh_models.setToolTip(
-            "Kết nối Gemini API và lấy danh sách tất cả model có sẵn\n"
-            "để điền vào các ô lựa chọn model bên dưới."
-        )
+        self._btn_refresh_models.setToolTip(self._translator.translate("translate.load_models_tip"))
         self._btn_refresh_models.clicked.connect(self._on_refresh_models_clicked)
         form.addRow(self._btn_refresh_models)
         # [v3.23.122] Nút sửa/thêm hạn mức quota của model (khi Google đổi giới hạn).
@@ -745,6 +753,21 @@ class TranslatePage(QWidget):
         self._visual_cues_edit.setMaximumHeight(100)
         self._visual_cues_edit.setAcceptRichText(False)
         form.addRow(self._translator.translate("translate.ctx_visual"), self._visual_cues_edit)
+        # [v3.23.654] Bảng sửa cues (thay khối JSON) + số dòng nghi (chấm không tốn request).
+        cue_row = QHBoxLayout()
+        self._btn_cue_table = PushButton(self._translator.translate("translate.btn_cue_table"))
+        self._btn_cue_table.setToolTip(self._translator.translate("translate.btn_cue_table_tip"))
+        self._btn_cue_table.clicked.connect(lambda _checked=False: self._open_cue_table())
+        cue_row.addWidget(self._btn_cue_table)
+        # [v3.23.655] Hỏi lại AI chỉ các dòng nghi (cần API key + video).
+        self._btn_cue_recheck = PushButton(self._translator.translate("translate.btn_cue_recheck"))
+        self._btn_cue_recheck.setToolTip(self._translator.translate("translate.btn_cue_recheck_tip"))
+        self._btn_cue_recheck.setEnabled(False)
+        self._btn_cue_recheck.clicked.connect(lambda _checked=False: self._on_cue_recheck_clicked())
+        cue_row.addWidget(self._btn_cue_recheck)
+        self._cue_issue_label = QLabel("")
+        cue_row.addWidget(self._cue_issue_label, 1)
+        form.addRow("", cue_row)
 
         # Hàng nút phân tích AI + model chọn + xoá cache
         btn_row = QHBoxLayout()
@@ -799,6 +822,15 @@ class TranslatePage(QWidget):
         self._btn_complete_speakers.setEnabled(False)
         self._btn_complete_speakers.clicked.connect(self._on_complete_speakers_clicked)
         self._visual_cues_edit.textChanged.connect(self._update_speaker_button)
+        # [v3.23.652] Sửa tay bảng nhân vật / tóm tắt / thuật ngữ / gợi ý hình ảnh từng KHÔNG được lưu vào phiên dịch
+        # (tắt app là mất). Tự lưu sau 1,5 s ngừng gõ.
+        self._context_save_timer = QTimer(self)
+        self._context_save_timer.setSingleShot(True)
+        self._context_save_timer.setInterval(1500)
+        self._context_save_timer.timeout.connect(self._save_context_edits)
+        self._context_edit_path = ""
+        for _edit in (self._characters_edit, self._overview_edit, self._glossary_edit, self._visual_cues_edit):
+            _edit.textChanged.connect(self._on_context_text_changed)
         # [v3.23.624] Tự đối chiếu phân tích hiện có với phụ đề rồi vá khiếm khuyết.
         self._btn_refine_analysis = PushButton(
             self._translator.translate("translate.btn_refine_analysis")
@@ -1325,6 +1357,14 @@ class TranslatePage(QWidget):
         extra_raw = s.value("api_keys_extra", "", type=str)
         self._extra_keys = [k.strip() for k in extra_raw.splitlines() if k.strip()]
         self._refresh_multi_key_badge()
+        # [v3.23.666] Nhà cung cấp AI đã chọn lần trước.
+        self._custom_url_edit.setText(s.value("custom_base_url", "", type=str))
+        self._custom_key_edit.setText(s.value("custom_api_key", "", type=str))
+        provider_index = self._provider_combo.findData(s.value("ai_provider", "gemini", type=str))
+        self._provider_combo.blockSignals(True)
+        self._provider_combo.setCurrentIndex(max(0, provider_index))
+        self._provider_combo.blockSignals(False)
+        self._sync_custom_provider()
         saved_lang = s.value("target_lang", "Vietnamese", type=str)
         if self._lang_combo.findText(saved_lang) >= 0:
             self._lang_combo.setCurrentText(saved_lang)
@@ -1357,6 +1397,9 @@ class TranslatePage(QWidget):
         s = self._settings
         s.setValue("api_key", self._api_key_edit.text().strip())
         s.setValue("api_keys_extra", "\n".join(self._extra_keys))
+        s.setValue("ai_provider", self._provider_combo.currentData() or "gemini")
+        s.setValue("custom_base_url", self._custom_url_edit.text().strip())
+        s.setValue("custom_api_key", self._custom_key_edit.text().strip())
         s.setValue("target_lang", self._lang_combo.currentText())
         s.setValue("retry_count", self._retry_spin.value())
         s.setValue("source_lang", self._source_lang_edit.text().strip())
@@ -1384,6 +1427,7 @@ class TranslatePage(QWidget):
                 đây video của dự án mở TRƯỚC vẫn được coi là video của phụ đề mới.
         """
         # [#2] Nạp phụ đề mới = dự án mới → tẩy sạch TOÀN BỘ ngữ cảnh phim cũ.
+        self._flush_context_save()  # [v3.23.652] lưu sửa tay ngữ cảnh của video CŨ trước khi đổi
         self._reset_context_and_video()
         self._source_video_path = str(video_path) if video_path else ""
         self._view_model.set_source_events(events)
@@ -1442,9 +1486,11 @@ class TranslatePage(QWidget):
     def _clear_analysis(self) -> None:
         """[1.5] Xoá bảng nhân vật + tóm tắt cũ khi đổi nguồn phụ đề (tránh dữ liệu
         của phim cũ dính sang phim mới)."""
+        self._flush_context_save()  # [v3.23.652] lưu sửa tay ngữ cảnh của video CŨ trước khi đổi
         self._characters_edit.clear()
         self._overview_edit.clear()
         self._glossary_edit.clear()
+        self._visual_cues_edit.document().setModified(False)  # [v3.23.652] cues của phim cũ không được lưu sang phim mới
 
     # ── Slot xử lý sự kiện UI ─────────────────────────────────────────────
     def clear_context_fields(self) -> None:
@@ -1452,9 +1498,11 @@ class TranslatePage(QWidget):
 
         Dùng khi chuyển sang dự án/phụ đề khác để chống rò rỉ ngữ cảnh giữa các phim.
         """
+        self._flush_context_save()  # [v3.23.652] lưu sửa tay ngữ cảnh của video CŨ trước khi đổi
         self._characters_edit.clear()
         self._overview_edit.clear()
         self._glossary_edit.clear()
+        self._visual_cues_edit.document().setModified(False)  # [v3.23.652] cues của phim cũ không được lưu sang phim mới
 
     def set_context_fields(
         self, characters: str, overview: str, glossary: str = "", visual_cues: str = ""
@@ -1480,6 +1528,7 @@ class TranslatePage(QWidget):
         )
 
     def _on_load_file_clicked(self) -> None:
+        self._flush_context_save()  # [v3.23.652] lưu sửa tay ngữ cảnh của video CŨ trước khi đổi
         path_str, _ = QFileDialog.getOpenFileName(
             self, "Chọn tệp phụ đề nguồn", "", "Phụ đề (*.srt *.ass)",
             options=QFileDialog.Option.DontUseNativeDialog,
@@ -1509,11 +1558,13 @@ class TranslatePage(QWidget):
         if sibling_video is not None:
             self._video_path = str(sibling_video)
             self._video_path_label.setText(sibling_video.name)
-            if getattr(self, "_attach_video_check", None) is not None:
+            # [v3.23.666] Nhà cung cấp tuỳ chỉnh không xem video: không tự tick ô (đang bị khoá).
+            if getattr(self, "_attach_video_check", None) is not None and not self._custom_mode():
                 self._attach_video_check.setChecked(True)
         self._view_model.set_source_events(events)
 
     def _on_pull_editor_clicked(self) -> None:
+        self._flush_context_save()  # [v3.23.652] lưu sửa tay ngữ cảnh của video CŨ trước khi đổi
         if self._editor_event_provider is None:
             self._show_info(self._translator.translate("translate.toast_hint_title"), self._translator.translate("translate.toast_no_editor_source"))
             return
@@ -1542,7 +1593,7 @@ class TranslatePage(QWidget):
             attached_name = Path(editor_video).name
             if getattr(self, "_video_path_label", None) is not None:
                 self._video_path_label.setText(attached_name)
-            if getattr(self, "_attach_video_check", None) is not None:
+            if getattr(self, "_attach_video_check", None) is not None and not self._custom_mode():
                 self._attach_video_check.setChecked(True)
         self._view_model.set_source_events(events)
 
@@ -1572,6 +1623,10 @@ class TranslatePage(QWidget):
         """
         # [v3.23.44] Validate sớm tại UI để báo lỗi rõ ràng (thay vì lẫn lộn ở tầng dưới).
         # [v3.23.121] Gộp tất cả API key (chính + dự phòng) -> adapter tự xoay khi hết quota.
+        if not self._visual_cues_valid():
+            return False
+        if self._warn_custom_incomplete():
+            return False
         api_key = self._combined_keys_text()
         if not api_key:
             self._show_warning(
@@ -1663,6 +1718,114 @@ class TranslatePage(QWidget):
         mode = QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
         self._api_key_edit.setEchoMode(mode)
 
+    # ── [v3.23.666] Nhà cung cấp AI tuỳ chỉnh ────────────────────────────
+    def _build_provider_rows(self, form: QFormLayout) -> None:
+        """Ô chọn nhà cung cấp + địa chỉ API + key của nhà cung cấp tuỳ chỉnh."""
+        from subtitles_extractor.infrastructure.translation.openai_compat_client import (
+            EXAMPLE_BASE_URL,
+        )
+
+        tr = self._translator.translate
+        self._provider_combo = QComboBox()
+        self._provider_combo.addItem(tr("translate.provider_gemini"), "gemini")
+        self._provider_combo.addItem(tr("translate.provider_custom"), "custom")
+        self._provider_combo.setToolTip(tr("translate.provider_tip"))
+        set_accessible_name(self._provider_combo, tr("translate.provider_label"))
+        form.addRow(tr("translate.provider_label"), self._provider_combo)
+        self._custom_url_edit = QLineEdit()
+        self._custom_url_edit.setPlaceholderText(EXAMPLE_BASE_URL)
+        self._custom_url_edit.setToolTip(tr("translate.custom_url_tip"))
+        set_accessible_name(self._custom_url_edit, tr("translate.custom_url_label"))
+        self._custom_key_edit = QLineEdit()
+        self._custom_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._custom_key_edit.setPlaceholderText(tr("translate.custom_key_ph"))
+        set_accessible_name(self._custom_key_edit, tr("translate.custom_key_label"))
+        self._btn_custom_eye = ToolButton()
+        self._btn_custom_eye.setIcon(self.style().standardIcon(
+            self.style().StandardPixmap.SP_FileDialogDetailedView))
+        self._btn_custom_eye.setToolTip(tr("translate.api_key_toggle_tip"))
+        self._btn_custom_eye.setCheckable(True)
+        self._btn_custom_eye.toggled.connect(self._on_custom_eye_toggled)
+        key_row = QHBoxLayout()
+        key_row.addWidget(self._custom_key_edit)
+        key_row.addWidget(self._btn_custom_eye)
+        self._custom_key_row = self._wrap_layout(key_row)
+        self._custom_note_label = QLabel(tr("translate.custom_note"))
+        self._custom_note_label.setWordWrap(True)
+        self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        self._custom_url_edit.editingFinished.connect(self._on_custom_provider_edited)
+        self._custom_key_edit.editingFinished.connect(self._on_custom_provider_edited)
+
+    def _on_custom_eye_toggled(self, checked: bool) -> None:
+        mode = QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+        self._custom_key_edit.setEchoMode(mode)
+
+    def _custom_mode(self) -> bool:
+        """Người dùng đang chọn nhà cung cấp tuỳ chỉnh."""
+        combo = getattr(self, "_provider_combo", None)
+        return combo is not None and combo.currentData() == "custom"
+
+    def _custom_provider_ready(self) -> bool:
+        """Đang chọn "Tuỳ chỉnh" VÀ đủ địa chỉ + key (đã áp xuống bộ dịch)."""
+        return self._custom_mode() and self._view_model.custom_provider_active()
+
+    def _sync_custom_provider(self) -> None:
+        """Áp lựa chọn nhà cung cấp xuống view-model / container và cập nhật giao diện."""
+        custom = self._custom_mode()
+        self._view_model.set_custom_provider(
+            custom, self._custom_url_edit.text().strip(), self._custom_key_edit.text().strip(),
+        )
+        form = getattr(self, "_ai_form", None)
+        if form is not None:
+            form.setRowVisible(self._gemini_key_row, not custom)
+            form.setRowVisible(self._custom_url_edit, custom)
+            form.setRowVisible(self._custom_key_row, custom)
+            form.setRowVisible(self._custom_note_label, custom)
+        # Đính video cần Gemini xem video (nhà cung cấp tuỳ chỉnh chỉ nhận chữ/ảnh).
+        attach = getattr(self, "_attach_video_check", None)
+        if attach is not None:
+            if custom and attach.isChecked():
+                # Bỏ tick qua tín hiệu thường để các ô phụ thuộc video (Visual Cues quét video, tag
+                # cảm xúc, giai đoạn đính video) cũng tắt theo — không còn ô "tick mà xám".
+                attach.setChecked(False)
+            attach.setEnabled(not custom)
+        button = getattr(self, "_btn_refresh_models", None)
+        if button is not None:
+            button.setToolTip(self._translator.translate(
+                "translate.load_models_custom_tip" if custom else "translate.load_models_tip"))
+
+    def _on_provider_changed(self, _index: int) -> None:
+        self._sync_custom_provider()
+        self._persist_inputs()
+
+    def _on_custom_provider_edited(self) -> None:
+        self._sync_custom_provider()
+        self._persist_inputs()
+
+    def shorten_model(self) -> str:
+        """[v3.23.666] Model cho bước rút gọn câu ở trang Lồng tiếng.
+
+        Gemini: model rẻ cố định như trước. Nhà cung cấp tuỳ chỉnh: model phân tích đang chọn — tên
+        Gemini cố định có thể không có ở nhà cung cấp (404).
+        """
+        if self._custom_mode():
+            chosen = self._analyze_model_combo.currentText().strip()
+            if chosen:
+                return chosen
+        return "gemini-3.1-flash-lite"
+
+    def _warn_custom_incomplete(self) -> bool:
+        """Đang chọn "Tuỳ chỉnh" mà thiếu địa chỉ/key → cảnh báo, trả True (caller dừng)."""
+        if not self._custom_mode() or self._custom_provider_ready():
+            return False
+        self._show_warning(
+            self._translator.translate("translate.warn_custom_incomplete_t"),
+            self._translator.translate("translate.warn_custom_incomplete_b"),
+        )
+        target = self._custom_url_edit if not self._custom_url_edit.text().strip() else self._custom_key_edit
+        target.setFocus()
+        return True
+
     # ── Nhiều API key ────────────────────────────────────────────────────
     def _all_keys(self) -> list[str]:
         """Key hiệu lực: key chính + key dự phòng, bỏ trùng/rỗng."""
@@ -1676,7 +1839,12 @@ class TranslatePage(QWidget):
         return out
 
     def _combined_keys_text(self) -> str:
-        """Chuỗi tất cả key (nối xuống dòng) để truyền xuống adapter (adapter tự tách)."""
+        """Chuỗi tất cả key (nối xuống dòng) để truyền xuống adapter (adapter tự tách).
+
+        [v3.23.666] Đang dùng nhà cung cấp tuỳ chỉnh: key của nhà cung cấp (bộ dịch dùng key này).
+        """
+        if self._custom_mode():
+            return self._custom_key_edit.text().strip() if self._custom_provider_ready() else ""
         return "\n".join(self._all_keys())
 
     @staticmethod
@@ -2385,6 +2553,48 @@ class TranslatePage(QWidget):
         self._batch_token_mark = self._view_model.token_usage_mark()
         self._run_next_batch_translate()
 
+    def start_series_batch(self, videos: list[Path]) -> str:
+        """[v3.23.658] Dây chuyền phim bộ: dịch các tập với cấu hình đang đặt (giai đoạn, model, key), không hộp thoại.
+
+        Returns:
+            ``""`` nếu đã bắt đầu (kết quả về qua ``series_batch_finished``), ngược lại lý do không chạy được.
+        """
+        from subtitles_extractor.application.services.batch_translate_plan import build_translate_plan
+        from subtitles_extractor.presentation.view_models.series_pipeline_controller import StageRunResult
+
+        if self._view_model.is_busy or getattr(self, "_batch_items", None):
+            return self._translator.translate("series.err_page_busy")
+        if not self._collect_enabled_stages():
+            return "Chưa bật giai đoạn dịch nào ở trang Dịch."
+        videos = [Path(v) for v in videos]
+        self._backfill_original_from_db(videos)
+        plan = build_translate_plan(videos, skip_existing=True)
+        runnable = [item for item in plan if item.will_run]
+        invalid = {
+            item.video_path.name: item.note or "" for item in plan
+            if not item.will_run and item.source_path is None
+        }
+        if not runnable:
+            QTimer.singleShot(0, lambda: self.series_batch_finished.emit(StageRunResult(failed=invalid)))
+            return ""
+        self._series_batch = True
+        self._series_invalid = invalid
+        self._batch_items = runnable
+        self._batch_index = 0
+        self._batch_failures = []
+        self._batch_done = 0
+        self._batch_cancelled = False
+        self._batch_quota_stopped = False
+        self._batch_stop_message = ""
+        self._batch_token_mark = self._view_model.token_usage_mark()
+        QTimer.singleShot(0, self._run_next_batch_translate)
+        return ""
+
+    def cancel_series_batch(self) -> None:
+        """[v3.23.658] Dừng khâu Dịch của dây chuyền (như bấm Huỷ)."""
+        if getattr(self, "_series_batch", False):
+            self._on_cancel_clicked()
+
     def _batch_request_estimate(
         self, plan: list, stages: list[TranslationStageConfig]
     ) -> str:
@@ -2421,6 +2631,8 @@ class TranslatePage(QWidget):
         keys = self._all_keys()
         for model_name, requests in per_model.items():
             lines.append(f"• {model_name}: ~{requests} request")
+            if self._custom_mode():
+                continue  # [v3.23.666] hạn mức miễn phí Google không áp cho nhà cung cấp tuỳ chỉnh
             remaining = self._remaining_daily_requests(keys, model_name)
             warning = quota_warning(requests, remaining)
             if warning:
@@ -2471,6 +2683,7 @@ class TranslatePage(QWidget):
         kèm nếu ô đính video đang bật); bước nạp phụ đề tự lấy lại phân tích đã lưu của
         CHÍNH tập đó hoặc ngữ cảnh chung của phim bộ.
         """
+        self._flush_context_save()  # [v3.23.652] lưu sửa tay ngữ cảnh của video CŨ trước khi đổi
         video_path = str(getattr(item, "video_path", "") or "")
         self._clear_context_inputs()
         self._source_video_path = video_path
@@ -2513,6 +2726,8 @@ class TranslatePage(QWidget):
             return  # lỗi đã được xử lý qua error_occurred (chuyển tập / dừng)
         name = self._batch_items[min(index, len(self._batch_items) - 1)].video_path.name
         self._batch_cancelled = True
+        # [v3.23.658] Không bắt đầu được (thiếu key, cấu hình…) — lý do đã hiện ở cảnh báo của trang Dịch.
+        self._batch_stop_message = self._translator.translate("series.err_translate_start").replace("{name}", name)
         self._advance_batch_translate(failed=name)
 
     def _on_error_for_batch(self, message: str) -> bool:
@@ -2537,6 +2752,7 @@ class TranslatePage(QWidget):
             logger.warning("Cả bộ: hết hạn mức tại tập %s — dừng hàng đợi.", name)
             self._batch_quota_stopped = True
             self._batch_cancelled = True
+            self._batch_stop_message = message  # [v3.23.658] lý do dừng cho dây chuyền phim bộ
             self._advance_batch_translate(failed=name)
             return True
         # [v3.23.609] Lỗi cấu hình chung (thiếu thư viện, key sai) áp cho MỌI tập: dừng,
@@ -2546,6 +2762,7 @@ class TranslatePage(QWidget):
                 "Cả bộ: lỗi cấu hình tại tập %s — dừng hàng đợi: %s", name, message
             )
             self._batch_cancelled = True
+            self._batch_stop_message = message  # [v3.23.658]
             self._advance_batch_translate(failed=name)
             return True
 
@@ -2586,8 +2803,29 @@ class TranslatePage(QWidget):
         self._batch_cancelled = False
         self._batch_quota_stopped = False
         self._batch_pending_run = False
+        stop_message = getattr(self, "_batch_stop_message", "")
+        self._batch_stop_message = ""
 
         remaining = max(0, total - done - len(failures))
+        if getattr(self, "_series_batch", False):
+            # [v3.23.658] Dây chuyền phim bộ: báo về bộ điều phối, không hiện hộp thoại tổng kết.
+            from subtitles_extractor.presentation.view_models.series_pipeline_controller import StageRunResult
+
+            self._series_batch = False
+            failed = dict(getattr(self, "_series_invalid", {}) or {})
+            failed.update({name: "Dịch lỗi — xem Nhật ký" for name in failures})
+            if quota_stopped:
+                stop_reason = self._translator.translate("series.stop_quota")
+            elif stop_message:
+                stop_reason = stop_message
+            else:
+                stop_reason = ""
+            self._stage_label.setText(f"Phim bộ — dịch xong {done}/{total} tập.")
+            self._update_action_states()
+            self.series_batch_finished.emit(StageRunResult(
+                failed=failed, cancelled=cancelled and not stop_reason, stop_reason=stop_reason,
+            ))
+            return
         if quota_stopped:
             # Tập vướng hạn mức cũng là tập "chưa dịch" sẽ chạy lại vào hôm sau.
             message = (
@@ -2631,12 +2869,18 @@ class TranslatePage(QWidget):
 
     def _on_busy_changed(self, busy: bool) -> None:
         if busy:
+            # [v3.23.655] Bug #9: chụp ô cues lúc lượt chạy bắt đầu — kết quả quét bổ sung được gộp 3 chiều với sửa tay
+            # trong lúc chạy thay vì ghi đè.
+            self._cues_run_base = self._visual_cues_edit.toPlainText()
             # Reset tiến độ ngay khi bắt đầu để không hiện 100% của lần dịch cũ
             self._progress.setValue(0)
             self._stage_label.setText(self._translator.translate("translate.status_starting"))
         self._apply_run_locks(busy)
         if busy:
             self._btn_complete_speakers.setEnabled(False)
+            self._btn_cue_recheck.setEnabled(False)  # [v3.23.655]
+        else:
+            self.refresh_cue_issues()
         self._btn_clear_cache.setEnabled(not busy)
         if hasattr(self, "_btn_stage_cache") and busy:
             self._btn_stage_cache.setEnabled(False)
@@ -2654,7 +2898,11 @@ class TranslatePage(QWidget):
 
     def _on_refresh_models_clicked(self) -> None:
         """[fix B4/U2] Validate API key + disable button + hiển thị trạng thái."""
-        api_key = self._api_key_edit.text().strip()
+        if self._warn_custom_incomplete():
+            return
+        api_key = (
+            self._combined_keys_text() if self._custom_mode() else self._api_key_edit.text().strip()
+        )
         if not api_key:
             self._show_warning(self._translator.translate("translate.warn_no_apikey_title"), self._translator.translate("translate.warn_apikey_models"))
             return
@@ -2727,6 +2975,8 @@ class TranslatePage(QWidget):
 
     def _on_analyze_context_clicked(self) -> None:
         self._sync_text_cues()
+        if self._warn_custom_incomplete():
+            return
         api_key = self._combined_keys_text()
         if not api_key:
             self._show_warning(self._translator.translate("translate.warn_no_apikey_title"), self._translator.translate("translate.warn_apikey_analyze"))
@@ -2758,7 +3008,8 @@ class TranslatePage(QWidget):
 
         self._show_success(
             "Danh sách model cập nhật",
-            f"Đã tải {len(models)} model từ Gemini API.",
+            f"Đã tải {len(models)} model từ "
+            f"{'nhà cung cấp tuỳ chỉnh' if self._custom_mode() else 'Gemini API'}.",
         )
 
     def _on_column_resized(self, _col: int, _old: int, _new: int) -> None:
@@ -2984,9 +3235,21 @@ class TranslatePage(QWidget):
             self._glossary_edit.setPlainText(result.glossary)
         if getattr(result, "visual_cues", ""):
             self._visual_cues_edit.setPlainText(result.visual_cues)
+            self.refresh_cue_issues()  # [v3.23.654]
 
     def _on_analyze_context_ready(self, result) -> None:
         """Điền kết quả phân tích toàn diện vào các trường ngữ cảnh."""
+        new_cues = getattr(result, "visual_cues", "") or ""
+        if new_cues:
+            # [v3.23.653] Phân tích lại không được đè người nói bạn đã chọn (vd sửa ở trang TTS).
+            merged = self._with_user_cues(new_cues)
+            if merged != new_cues:
+                import dataclasses
+
+                try:
+                    result = dataclasses.replace(result, visual_cues=merged)
+                except (TypeError, ValueError):
+                    pass
         self._fill_context_fields(result)
         char_count = (
             len([ln for ln in result.characters.splitlines() if ln.strip()])
@@ -3024,7 +3287,24 @@ class TranslatePage(QWidget):
         Args:
             visual_cues: JSON Visual Cues đã gộp.
         """
+        base = getattr(self, "_cues_run_base", None)
+        current = self._visual_cues_edit.toPlainText()
+        user_edited = base is not None and current.strip() != base.strip()
+        if user_edited:
+            from subtitles_extractor.application.services.visual_cue_serializer import merge_cues_three_way
+
+            visual_cues = merge_cues_three_way(base, current, visual_cues)  # [v3.23.655] giữ sửa tay trong lúc chạy
+            logger.info("Gộp Visual Cues của lượt chạy với sửa tay trong lúc chạy (giữ sửa tay).")
+        else:
+            visual_cues = self._with_user_cues(visual_cues)  # [v3.23.653]
+        self._cues_run_base = visual_cues        # lượt gộp kế tiếp của cùng lượt chạy lấy bản này làm gốc
         self._visual_cues_edit.setPlainText(visual_cues)
+        if user_edited:
+            # setPlainText xoá cờ "đã sửa" → đánh dấu lại để bản ĐÃ GỘP được lưu đè bản chưa gộp view model vừa lưu.
+            self._visual_cues_edit.document().setModified(True)
+            self._context_edit_path = self._context_edit_path or self._session_video_path()
+            self._flush_context_save()
+        self.refresh_cue_issues()  # [v3.23.654]
         speakers = self._view_model.speaker_coverage_message(visual_cues)
         if speakers:
             logger.info("Sau khi dịch — %s", speakers)
@@ -3193,7 +3473,9 @@ class TranslatePage(QWidget):
             return
         # [v3.23.609] Đủ MỌI key (chính + dự phòng): video được tải bằng key còn hạn mức,
         # và file Gemini chỉ xoá được bằng key (cùng dự án) đã tải nó.
-        api_key = self._combined_keys_text()
+        # [v3.23.666] Tệp cloud nằm ở Gemini: luôn dùng key Google, KHÔNG BAO GIỜ gửi key của nhà
+        # cung cấp tuỳ chỉnh sang Google.
+        api_key = "\n".join(self._all_keys())
         if not api_key:
             self._show_warning(self._translator.translate("translate.warn_no_apikey_title"), self._translator.translate("translate.warn_apikey_cloud"))
             return
@@ -3253,6 +3535,10 @@ class TranslatePage(QWidget):
 
     def _on_refine_analysis_clicked(self) -> None:
         """[v3.23.624] Tự kiểm tra & vá phân tích hiện có (cần API key, không cần video)."""
+        if not self._visual_cues_valid():
+            return
+        if self._warn_custom_incomplete():
+            return
         api_key = self._combined_keys_text()
         if not api_key:
             self._show_warning(
@@ -3300,6 +3586,10 @@ class TranslatePage(QWidget):
 
     def _on_complete_speakers_clicked(self) -> None:
         """[v3.23.601] Hỏi lại người nói các dòng còn thiếu (cần API key + video)."""
+        if not self._visual_cues_valid():
+            return
+        if self._warn_custom_incomplete():
+            return
         api_key = self._combined_keys_text()
         if not api_key:
             self._show_warning(
@@ -3429,6 +3719,10 @@ class TranslatePage(QWidget):
 
     def _on_retranslate_rows(self, rows: list[int]) -> None:
         """[v3.23.46] Dịch lại các dòng đã chọn bằng cấu hình hiện tại trên trang."""
+        if not self._visual_cues_valid():
+            return
+        if self._warn_custom_incomplete():
+            return
         api_key = self._combined_keys_text()
         if not api_key:
             self._show_warning(
@@ -3482,6 +3776,222 @@ class TranslatePage(QWidget):
 
     def _show_info(self, title: str, content: str) -> None:
         _feedback.show_info(self, title, content)
+
+    def _on_context_text_changed(self) -> None:
+        # Nhớ video ở LÚC GÕ (không phải lúc hẹn giờ chạy).
+        if not self._context_save_timer.isActive():
+            self._context_edit_path = self._session_video_path()
+        self._context_save_timer.start()
+
+    def _flush_context_save(self) -> None:
+        """[v3.23.652] Lưu ngay sửa tay ngữ cảnh đang chờ (đổi video / rời trang / đóng app)."""
+        timer = getattr(self, "_context_save_timer", None)
+        if timer is None:
+            return
+        timer.stop()
+        self._save_context_edits(force=True)
+
+    def hideEvent(self, event) -> None:  # noqa: N802 — rời trang hoặc đóng cửa sổ: không mất 1,5 s gõ cuối
+        self._flush_context_save()
+        super().hideEvent(event)
+
+    def _save_context_edits(self, *, force: bool = False) -> None:
+        video_path = self._context_edit_path or self._session_video_path()
+        if not video_path:
+            return
+        from subtitles_extractor.application.services.visual_cue_serializer import visual_cues_syntax_error
+
+        edits = (self._characters_edit, self._overview_edit, self._glossary_edit, self._visual_cues_edit)
+        # Chỉ lưu khi NGƯỜI DÙNG đã sửa (setPlainText lúc nạp phiên/đổi video xoá cờ modified) — không ghi ngược
+        # trạng thái trung gian lúc đang nạp đè lên phiên của video khác.
+        if not any(edit.document().isModified() for edit in edits):
+            self._context_edit_path = ""
+            return
+        if self._view_model.is_busy and not force:
+            # Lượt dịch đang chạy có thể tự lưu thêm cues vào phiên: đợi xong mới ghi (tránh ghi bản UI cũ đè lên).
+            self._context_save_timer.start()
+            return
+        cues = self._visual_cues_edit.toPlainText().strip()
+        if visual_cues_syntax_error(cues) is not None:
+            return  # đang gõ dở JSON: chờ lần lưu sau, không ghi bản hỏng đè bản tốt
+        for edit in edits:
+            edit.document().setModified(False)
+        self._context_edit_path = ""
+        self.refresh_cue_issues()  # [v3.23.654] sửa tay JSON cues → cập nhật số dòng nghi
+        self._view_model.save_context_edits(
+            video_path,
+            characters=self._characters_edit.toPlainText().strip(),
+            overview=self._overview_edit.toPlainText().strip(),
+            glossary=self._glossary_edit.toPlainText().strip(),
+            visual_cues=cues,
+        )
+
+    def _cue_source_rows(self) -> list[tuple[float, str]]:
+        return [
+            (float(event.start_sec), str(getattr(event, "text", "") or ""))
+            for event in self._view_model.source_events
+        ]
+
+    def _on_cue_recheck_clicked(self) -> bool:
+        """[v3.23.655] Hỏi lại AI chỉ các dòng Visual Cues bị chấm nghi."""
+        if not self._visual_cues_valid():
+            return False
+        if self._warn_custom_incomplete():
+            return False
+        api_key = self._combined_keys_text()
+        if not api_key:
+            self._show_warning(
+                self._translator.translate("translate.warn_no_apikey_title"),
+                self._translator.translate("translate.warn_apikey_analyze"),
+            )
+            return False
+        video_path = self._selected_video_path()
+        if not video_path:
+            self._show_warning(
+                self._translator.translate("translate.toast_speakers_title"),
+                self._translator.translate("translate.tip_complete_speakers_need_video"),
+            )
+            return False
+        self._flush_context_save()
+        return self._view_model.start_cue_recheck(
+            api_key=api_key,
+            model_name=self._analyze_model_combo.currentText().strip() or "gemini-3.1-flash-lite",
+            video_path=video_path,
+            visual_cues=self._visual_cues_edit.toPlainText().strip(),
+            characters=self._characters_edit.toPlainText().strip(),
+            target_lang=self._lang_combo.currentText() or "Vietnamese",
+            session_path=self._session_video_path(),
+        )
+
+    def refresh_cue_issues(self) -> int:
+        """[v3.23.654] Đếm dòng Visual Cues đáng nghi (hiện cạnh nút "Bảng gợi ý"); -1 nếu chưa có cues/JSON hỏng."""
+        from subtitles_extractor.application.services.cue_review import review_cues
+        from subtitles_extractor.application.services.visual_cue_serializer import (
+            deserialize_visual_cues,
+            visual_cues_syntax_error,
+        )
+
+        raw = self._visual_cues_edit.toPlainText()
+        rows = self._cue_source_rows()
+        if not raw.strip() or not rows or visual_cues_syntax_error(raw) is not None:
+            self._cue_issue_label.setText("")
+            self._btn_cue_recheck.setEnabled(False)
+            return -1
+        issues = review_cues(deserialize_visual_cues(raw), [text for _start, text in rows],
+                             self._characters_edit.toPlainText())
+        self._cue_issue_label.setText(
+            self._translator.translate("translate.cue_issue_count").replace("{count}", str(len(issues)))
+            if issues else self._translator.translate("translate.cue_issue_none")
+        )
+        self._btn_cue_recheck.setEnabled(bool(issues) and not self._view_model.is_busy)
+        return len(issues)
+
+    def _open_cue_table(self) -> bool:
+        """[v3.23.654] Mở bảng sửa Visual Cues; OK thì ghi lại ô cues và lưu phiên."""
+        from subtitles_extractor.presentation.widgets.cue_table_dialog import CueTableDialog
+
+        if self._view_model.is_busy:
+            self._show_warning(
+                self._translator.translate("translate.cue_table_title"),
+                self._translator.translate("translate.cue_table_busy"),
+            )
+            return False
+        if not self._visual_cues_valid():
+            return False
+        rows = self._cue_source_rows()
+        if not rows:
+            self._show_warning(
+                self._translator.translate("translate.cue_table_title"),
+                self._translator.translate("translate.cue_table_no_source"),
+            )
+            return False
+        translated = [str(getattr(e, "text", "") or "") for e in getattr(self._view_model, "translated_events", []) or []]
+        dialog = CueTableDialog(
+            self, self._visual_cues_edit.toPlainText(), rows, translated,
+            self._characters_edit.toPlainText(), self._translator.translate,
+        )
+        try:
+            accepted = self._exec_cue_dialog(dialog)
+            changed = dialog.changed_lines
+            merged = dialog.merged_into(self._visual_cues_edit.toPlainText()) if accepted and changed else ""
+        finally:
+            dialog.deleteLater()  # bảng ~33 nghìn ô: không giữ lại sau khi đóng
+        if not accepted or not changed:
+            return False
+        self._flush_context_save()
+        self._visual_cues_edit.setPlainText(merged)
+        self._visual_cues_edit.document().setModified(True)
+        self._context_edit_path = self._session_video_path()
+        self._flush_context_save()
+        self.refresh_cue_issues()
+        logger.info("Sửa Visual Cues bằng bảng: %d dòng.", len(changed))
+        return True
+
+    @staticmethod
+    def _exec_cue_dialog(dialog) -> bool:
+        from PySide6.QtWidgets import QDialog
+
+        return dialog.exec() == QDialog.DialogCode.Accepted
+
+    def _with_user_cues(self, new_cues: str) -> str:
+        """[v3.23.653] ``new_cues`` (kết quả tự động) mà giữ nguyên cue người dùng chọn đang có trong ô."""
+        from subtitles_extractor.application.services.visual_cue_serializer import (
+            keep_user_cues_json,
+            visual_cues_syntax_error,
+        )
+
+        current = self._visual_cues_edit.toPlainText()
+        if visual_cues_syntax_error(current) is not None:
+            return new_cues
+        return keep_user_cues_json(new_cues, current)
+
+    def apply_user_speakers(self, speakers: dict[int, str]) -> int:
+        """[v3.23.653] Như :meth:`apply_user_cues`, chỉ người nói."""
+        return self.apply_user_cues({line_no: (speaker, None) for line_no, speaker in speakers.items()})
+
+    def apply_user_cues(self, corrections: dict) -> int:
+        """[v3.23.653] Ghi người nói / [v3.23.654] "nói với ai" người dùng chọn (``id`` câu gốc → (người nói, người
+        nghe), ``None`` = giữ nguyên) vào Visual Cues rồi lưu phiên.
+
+        Không tự dịch lại: lần bấm "Dịch" sau, bộ nhớ đệm nhận ra các dòng đổi người nói và chỉ dịch lại lô chứa chúng.
+
+        Returns:
+            Số dòng đã đổi; ``-1`` nếu ô cues đang hỏng JSON; ``-2`` nếu đang dịch/phân tích (chưa ghi gì).
+        """
+        from subtitles_extractor.application.services.visual_cue_serializer import (
+            apply_user_cues,
+            visual_cues_syntax_error,
+        )
+
+        if self._view_model.is_busy:
+            return -2
+        raw = self._visual_cues_edit.toPlainText()
+        if visual_cues_syntax_error(raw) is not None:
+            return -1
+        new_raw, changed = apply_user_cues(raw, corrections)
+        if not changed:
+            return 0
+        self._flush_context_save()  # sửa tay đang chờ của ô khác được lưu trước
+        self._visual_cues_edit.setPlainText(new_raw)
+        self._visual_cues_edit.document().setModified(True)
+        self._context_edit_path = self._session_video_path()
+        self._flush_context_save()
+        logger.info("Đồng bộ người nói/người nghe từ trang TTS vào Visual Cues: %d dòng.", len(changed))
+        self.refresh_cue_issues()
+        return len(changed)
+
+    def _visual_cues_valid(self) -> bool:
+        """[v3.23.652] Ô Visual Cues sửa tay phải là JSON hợp lệ trước khi dịch/phân tích (nếu hỏng: báo vị trí lỗi)."""
+        from subtitles_extractor.application.services.visual_cue_serializer import visual_cues_syntax_error
+
+        error = visual_cues_syntax_error(self._visual_cues_edit.toPlainText())
+        if error is None:
+            return True
+        self._show_warning(
+            self._translator.translate("translate.warn_cues_invalid_t"),
+            self._translator.translate("translate.warn_cues_invalid_b").replace("{error}", error),
+        )
+        return False
 
     def _show_warning(self, title: str, content: str) -> None:
         _feedback.show_warning(self, title, content)

@@ -22,10 +22,17 @@ class NlpSettings(BaseSettings):
 class OcrSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SE_OCR_", extra="ignore")
 
-    version: str = Field(default="PP-OCRv6_medium")
+    # [v3.23.661] Mặc định small: đo thật 4 tập (164 câu) @0,12 s — 0 câu sai chữ (medium: 3 câu đọc thành chữ phồn), CPU
+    # nhanh ~7× so với medium cùng bước lấy mẫu.
+    version: str = Field(default="PP-OCRv6_small")
     language: str = Field(default="ch")
-    detection_model: str = Field(default="PP-OCRv6_medium_det")
-    recognition_model: str = Field(default="PP-OCRv6_medium_rec")
+    detection_model: str = Field(default="PP-OCRv6_small_det")
+    recognition_model: str = Field(default="PP-OCRv6_small_rec")
+    # [v3.23.657] Bộ DÒ CHỮ riêng (rỗng = theo phiên bản). Vd v6 medium nhận dạng + v6 small dò chữ: dò chữ là phần
+    # chậm nhất trên GPU, phụ đề cứng chữ to rõ nên bộ dò nhỏ thường cho cùng kết quả — đo bằng "Đo tốc độ OCR".
+    detection_model_override: str = Field(default="")
+    # [v3.23.661] Đã chuyển model mặc định cũ (medium) sang small cho cấu hình lưu từ bản cũ (một lần).
+    defaults_v661: bool = Field(default=True)
     # [v3.23.619] 0.75 → 0.5. Ngưỡng này lọc ô chữ NGAY trong PaddleOCR, trước bước gộp
     # câu; các quy tắc tin cậy của bước gộp câu (0.55 cho câu hai chữ đứng yên ≥ 0.4s,
     # 0.65 cho mảnh chớp…) vì thế không bao giờ chạy với mặc định 0.75. Phim mẫu tập 1:
@@ -104,13 +111,19 @@ class ThresholdSettings(BaseSettings):
 class FrameSamplingSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SE_FRAME_", extra="ignore")
 
-    sample_step_sec: float = Field(default=0.04, ge=0.01, le=5.0)
+    # [v3.23.661] 0,04 → 0,12 s: đo thật 15 tập (864 câu) giữ đủ mọi câu thật, lệch mốc ~40 ms, chỉ 1/3 số khung phải OCR.
+    sample_step_sec: float = Field(default=0.12, ge=0.01, le=5.0)
     phash_distance: int = Field(default=5, ge=0, le=64)
     pixel_diff_ratio: float = Field(default=0.01, ge=0.0, le=1.0)
     skip_intro_sec: float = Field(default=0.0, ge=0.0, le=600.0)
     skip_outro_sec: float = Field(default=0.0, ge=0.0, le=600.0)
-    # [v3.23.644] Lọc khung theo CHỮ TRẮNG/SÁNG (xem ``frame_dedupe``): mặc định TẮT vì giả định phụ đề sáng.
-    white_text_gate: bool = Field(default=False)
+    # [v3.23.644] Lọc khung theo CHỮ TRẮNG/SÁNG (xem ``frame_dedupe``). [v3.23.654] Mặc định BẬT (đo trên phim mẫu chữ
+    # trắng: nhanh 2,2×, 95/95 câu giống hệt); tắt trong Cài đặt nếu phim có phụ đề tối màu.
+    white_text_gate: bool = Field(default=True)
+    # [v3.23.654] Đã áp mặc định mới cho cấu hình lưu từ bản cũ (chỉ một lần — sau đó tôn trọng lựa chọn của bạn).
+    white_text_gate_v654: bool = Field(default=True)
+    # [v3.23.661] Đã nâng bước lấy mẫu mặc định cũ (0,04 s) lên 0,12 s cho cấu hình lưu từ bản cũ (một lần).
+    defaults_v661: bool = Field(default=True)
     white_text_luma: int = Field(default=200, ge=100, le=250)
 
 class PostProcessSettings(BaseSettings):
@@ -120,6 +133,8 @@ class PostProcessSettings(BaseSettings):
     min_duration_sec: float = Field(default=0.15, ge=0.0, le=60.0)
     max_duration_sec: float = Field(default=5.0, ge=0.1, le=600.0)
     merge_gap_sec: float = Field(default=0.20, ge=0.0, le=10.0)
+    # [v3.23.654] Gộp phụ đề "hiện dần" (我 → 我只是) thành một câu. Mặc định TẮT (có thể là nói lắp thật).
+    merge_progressive: bool = Field(default=False)
     output_format: SubtitleFormat = SubtitleFormat.SRT
     use_viterbi: bool = Field(default=True)
     viterbi_open_penalty: float = Field(default=0.35, ge=0.0, le=2.0)

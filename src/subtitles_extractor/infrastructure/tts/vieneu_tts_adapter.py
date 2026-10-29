@@ -62,6 +62,7 @@ from subtitles_extractor.infrastructure.tts.audio_utils import (
     shorter_take,
     speech_seconds,
     trim_edge_silence,
+    trim_repeated_reading,
 )
 from subtitles_extractor.infrastructure.tts.line_placement import (
     comfort_speed,
@@ -69,7 +70,9 @@ from subtitles_extractor.infrastructure.tts.line_placement import (
     place_line,
 )
 from subtitles_extractor.infrastructure.tts.text_prep import (
+    count_internal_breaks,
     dem_am_tiet,
+    has_repeated_word,
     has_speakable_content,
 )
 from subtitles_extractor.infrastructure.tts.text_prep import (
@@ -97,6 +100,7 @@ from subtitles_extractor.infrastructure.tts.timing_math import (
     generation_time_cap_seconds,
     is_abnormally_long,  # noqa: F401  (re-export cho test)
     is_abnormally_long_vs_floor,
+    is_short_line_overlong,
     lead_in_seconds,
     master_length_samples,
     stretch_ratio_cap,
@@ -537,6 +541,28 @@ def normalize_mode(mode: str) -> str:
     """
     normalized = (mode or "").strip().lower()
     return normalized if normalized in _VALID_MODES else "standard"
+
+
+_LENGTH_CAP_KEYS = ("max_new_frames", "max_duration_s", "max_duration", "max_length_s", "max_seconds")
+
+
+def _scale_length_caps(kwargs: dict, own_text: str, group_texts: list[str]) -> dict:  # type: ignore[type-arg]
+    """[v3.23.655] Trần độ dài của lô theo câu DÀI NHẤT trong lô (trần vốn tính theo câu ``idx``).
+
+    Gom lô toàn cục kéo câu dài ở xa vào cùng lô; giữ trần của câu ngắn thì audio câu dài bị cắt cụt.
+    """
+    own = max(1, dem_am_tiet((own_text or "").strip()))
+    longest = max((dem_am_tiet((text or "").strip()) for text in group_texts), default=own)
+    if longest <= own:
+        return kwargs
+    ratio = longest / own
+    scaled = dict(kwargs)
+    for key in _LENGTH_CAP_KEYS:
+        value = scaled.get(key)
+        if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+            continue
+        scaled[key] = value * ratio if isinstance(value, float) else int(value * ratio) + 1
+    return scaled
 
 
 class VieNeuTtsAdapter(SubtitleTTSPort):
@@ -1224,6 +1250,11 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             dem_am_tiet(text.strip()),
             min_base_s=VIENEU_MIN_BASE_S,
             min_per_syllable_s=VIENEU_MIN_PER_SYLLABLE_S,
+        ) or is_short_line_overlong(  # [v3.23.663] câu ngắn còn đọc lặp (không cắt được) cũng báo trên bảng
+            voice_duration,
+            dem_am_tiet(text.strip()),
+            min_base_s=VIENEU_MIN_BASE_S,
+            min_per_syllable_s=VIENEU_MIN_PER_SYLLABLE_S,
         )
         return TTSSegmentResult(
             event_index=idx, start_sec=start_sec, end_sec=end_sec,
@@ -1306,6 +1337,8 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         # KHÔNG đổi kết quả (vẫn bản ngắn nhất), chỉ bỏ các lần thử thừa.
         _overlong_best_size: int | None = None
         _overlong_stall = 0
+        # [v3.23.663] Câu ngắn đọc lặp mà không cắt được (hai lần đọc dính liền): các lần sau bỏ mã tham chiếu.
+        drop_ref_codes = False
         for attempt in range(retry_count):
             if cancel_cb and cancel_cb():
                 raise TTSCancelledError("Huỷ trong khi tổng hợp VieNeu-TTS.")
@@ -1313,6 +1346,7 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                 raw_audio = self._infer_once(
                     engine, text, voice_data,
                     idx=idx if attempt == 0 else -1,
+                    **({"use_ref_codes": False} if drop_ref_codes else {}),
                 )
                 audio = self._to_mono_pipeline_rate(
                     raw_audio, getattr(engine, "sample_rate", None)
@@ -1335,12 +1369,55 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                     # [v3.23.261] Đo theo BIÊN DƯỚI THEO ÂM TIẾT (R²=0.98) với hằng số
                     # engine VieNeu, thay lưới cũ theo ký tự (R²=0.07 -> báo động sai với
                     # câu nhiều dấu câu như "Chú...", "Ồ,"). "Ừm." 1 âm -> ngưỡng đúng.
-                    if not is_abnormally_long_vs_floor(
+                    # [v3.23.663] Câu ngắn (≤3 tiếng) có lưới riêng: lỗi chính là ĐỌC LẠI cả câu, luôn ngắn hơn
+                    # sàn 1,8 s của lưới chung nên trước đây lọt hết. Có khoảng ngừng giữa hai lần đọc thì cắt
+                    # bỏ lần đọc lại (bản đầu đọc đủ lời) — sinh lại thường vô ích vì câu hỏng hay hỏng mọi lần.
+                    short_overlong = is_short_line_overlong(
+                        duration_s, syllable_count,
+                        min_base_s=VIENEU_MIN_BASE_S,
+                        min_per_syllable_s=VIENEU_MIN_PER_SYLLABLE_S,
+                    )
+                    general_overlong = is_abnormally_long_vs_floor(
                         duration_s,
                         syllable_count,
                         min_base_s=VIENEU_MIN_BASE_S,
                         min_per_syllable_s=VIENEU_MIN_PER_SYLLABLE_S,
-                    ):
+                    )
+                    if short_overlong:
+                        # Lời tự lặp ("Hả? Hả?") thì khoảng ngừng là thật — không cắt.
+                        trimmed = (
+                            None if has_repeated_word(text)
+                            else trim_repeated_reading(
+                                audio, engine_sr, syllable_count, count_internal_breaks(text),
+                            )
+                        )
+                        if trimmed is not None and not is_short_line_overlong(
+                            speech_seconds(trimmed, engine_sr), syllable_count,
+                            min_base_s=VIENEU_MIN_BASE_S,
+                            min_per_syllable_s=VIENEU_MIN_PER_SYLLABLE_S,
+                        ):
+                            logger.info(
+                                "VieNeu-TTS: '%s' bị đọc lặp (%.2fs tiếng cho %d âm tiết) — cắt bỏ lần đọc "
+                                "lại, còn %.2fs.",
+                                text[:25], duration_s, syllable_count,
+                                speech_seconds(trimmed, engine_sr),
+                            )
+                            return trimmed
+                        if not general_overlong:
+                            # Không cắt được (hai lần đọc dính liền, hoặc giọng đọc chậm hợp lệ): chỉ sinh lại
+                            # MỘT lần, bỏ mã tham chiếu, rồi lấy bản ít tiếng hơn — không đốt cả chuỗi retry.
+                            overlong_best = shorter_take(overlong_best, audio, sr=engine_sr)
+                            if drop_ref_codes:
+                                return overlong_best
+                            drop_ref_codes = True
+                            logger.info(
+                                "VieNeu-TTS: '%s' nghi đọc lặp (%.2fs tiếng cho %d âm tiết) — sinh lại một lần "
+                                "không dùng mã tham chiếu.",
+                                text[:25], duration_s, syllable_count,
+                            )
+                            continue
+                        drop_ref_codes = True
+                    if not short_overlong and not general_overlong:
                         return audio
                     # [v3.23.601] "Ngắn nhất" theo phần TIẾNG: bản thô dài vì im lặng biên
                     # vẫn là bản đọc gọn.
@@ -1719,7 +1796,8 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
             return frozenset()
 
     def _infer_once(
-        self, engine: Any, text: str, voice_data: Any, idx: int = -1
+        self, engine: Any, text: str, voice_data: Any, idx: int = -1,
+        use_ref_codes: bool = True,
     ) -> Any:
         """Gọi một lần ``engine.infer`` với voice data dict đã giải quyết.
 
@@ -1774,6 +1852,11 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         # temperature). Nâng nhẹ 1.2 -> 1.3.
         if "repetition_penalty" in supported:
             kwargs["repetition_penalty"] = _VIENEU_REPETITION_PENALTY
+        # [v3.23.663] Bỏ mã tham chiếu trong ngữ cảnh (chỉ giữ speaker embedding) cho lần sinh lại câu ngắn bị đọc
+        # lặp. Đo thật (71 câu 1–3 tiếng × 3 lần, giọng Ngọc Huyền): tỉ lệ đọc lặp 23% → 9,4%; độ giống giọng
+        # (cosine speaker embedding) 0,684 → 0,687 — không đổi.
+        if not use_ref_codes and "use_ref_codes" in supported:
+            kwargs["use_ref_codes"] = False
         # ``temperature`` tuỳ chọn: None -> GIỮ mặc định SDK (0.8). KHÔNG ép thấp vô
         # điều kiện — bài học v249: temperature quá thấp khiến câu ngắn ("Ơ.", "Hả?")
         # bị model từ chối đọc (trả rỗng). Chỉ truyền khi người dùng chủ động đặt.
@@ -1838,7 +1921,7 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
                     name: kwargs[name]
                     for name in (
                         "max_new_frames", "style", "repetition_penalty", "temperature",
-                        "voice_preset",
+                        "voice_preset", "use_ref_codes",
                     )
                     if name in kwargs
                 },
@@ -1934,17 +2017,24 @@ class VieNeuTtsAdapter(SubtitleTTSPort):
         texts = self._batch_texts
         if not texts or idx >= len(texts):
             return None
-        end = min(idx + self._batch_size, len(texts))
-        # [v3.23.593] Một lô = MỘT giọng (worker gọi infer_batch với một voice): khi lồng
-        # tiếng, chỉ gom các câu cùng giọng với câu hiện tại và chưa có trong cache.
+        # [v3.23.593] Một lô = MỘT giọng (worker gọi infer_batch với một voice).
+        # [v3.23.655] Gom TOÀN CỤC: lấy ``batch_size`` câu cùng giọng kế tiếp ở BẤT KỲ đâu phía sau (trước đây chỉ
+        # trong cửa sổ ``batch_size`` câu kế tiếp → phim nhiều vai nói xen kẽ làm lô co còn 1–2 câu, GPU chạy gần
+        # như từng câu). Câu sau lấy từ cache khi tới lượt.
         known_voices: list[str] = getattr(self, "_batch_voices", [])
-        voices = known_voices + [""] * max(0, end - len(known_voices))
+        voices = known_voices + [""] * max(0, len(texts) - len(known_voices))
         voice = voices[idx]
-        group_idx = [
-            j for j in range(idx, end)
-            if j == idx or (j not in self._batch_cache and voices[j] == voice)
-        ]
+        group_idx = [idx]
+        for j in range(idx + 1, len(texts)):
+            if len(group_idx) >= self._batch_size:
+                break
+            if j not in self._batch_cache and voices[j] == voice and texts[j]:
+                group_idx.append(j)
+        # [v3.23.655] Sắp theo độ dài chữ: GPU chia lô thành các chunk — câu dài ngắn trộn lẫn thì câu ngắn phải chờ
+        # (đệm) theo câu dài nhất trong chunk.
+        group_idx.sort(key=lambda j: len(texts[j]))
         group_texts = [texts[j] for j in group_idx]
+        kwargs = _scale_length_caps(kwargs, texts[idx], group_texts)
         audios = self._infer_batch_via_gpu_worker(
             group_texts, {**kwargs, "voice_preset": voice} if voice else kwargs
         )

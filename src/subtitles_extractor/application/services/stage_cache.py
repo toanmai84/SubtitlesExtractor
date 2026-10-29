@@ -115,6 +115,8 @@ class StageCacheScope:
     stages: tuple[TranslationStageConfig, ...]
     attach_video_stages: frozenset[TranslationStageKind] = frozenset()
     context_fingerprint: str = ""
+    #: [v3.23.656] Visual Cues của yêu cầu — dòng có người nói NGƯỜI DÙNG chọn là đầu vào khác (như lượt dịch thật).
+    visual_cues: str = ""
 
     @property
     def key(self) -> str:
@@ -371,6 +373,12 @@ class StageCacheService:
                     StageReason.NONE, 0, current, chain_intact,
                 )
             else:
+                if current is not None and scope.visual_cues:
+                    # [v3.23.656] B8: lượt dịch thật gắn người nói người dùng chọn vào dòng ở MỖI giai đoạn trước khi
+                    # so vân tay — dự đoán phải làm y hệt, không thì báo "dùng lại hết" dù lượt tới sẽ dịch lại vài lô.
+                    from subtitles_extractor.application.services.visual_cue_serializer import tag_user_cues
+
+                    current = tag_user_cues(current, scope.visual_cues)
                 prediction = self._predict(
                     checkpoint, scope, stage, lines, current,
                     chain_intact=chain_intact, context_changed=context_changed,

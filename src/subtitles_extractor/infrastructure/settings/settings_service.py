@@ -126,6 +126,7 @@ class SettingsService:
         if raw is None:
             logger.info("Chưa có cấu hình lưu trữ — dùng mặc định.")
             return ApplicationSettings()
+        raw = self._migrate(raw)
         try:
             stored = ApplicationSettings.model_validate(raw)
         except ValidationError as exc:
@@ -135,6 +136,47 @@ class SettingsService:
             )
             return ApplicationSettings()
         return self._apply_env_overrides(stored)
+
+    @staticmethod
+    def _migrate(raw: object) -> object:
+        """[v3.23.654] Nâng cấu hình lưu từ bản cũ.
+
+        * Lọc chữ trắng: bản ≤ 3.23.653 mặc định TẮT và luôn ghi ``white_text_gate=false`` vào tệp, nên không phân biệt
+          được "chưa từng chọn" với "đã tắt". Áp mặc định mới (BẬT) đúng MỘT lần, đánh dấu ``white_text_gate_v654``;
+          sau đó lựa chọn của bạn trong Cài đặt được giữ nguyên.
+        """
+        if not isinstance(raw, dict):
+            return raw
+        frame = raw.get("frame")
+        if isinstance(frame, dict) and "white_text_gate_v654" not in frame:
+            frame = dict(frame)
+            if frame.get("white_text_gate") is False:
+                logger.info("Bật lọc chữ trắng theo mặc định mới (một lần; tắt được trong Cài đặt).")
+            frame["white_text_gate"] = True
+            frame["white_text_gate_v654"] = True
+            raw = {**raw, "frame": frame}
+        # [v3.23.661] Mặc định mới đo thật trên phim mẫu (bước 0,12 s + model small). Chỉ đổi khi cấu hình đang giữ ĐÚNG
+        # mặc định cũ (người dùng chưa tự chọn), đúng một lần.
+        frame = raw.get("frame")
+        if isinstance(frame, dict) and "defaults_v661" not in frame:
+            frame = dict(frame)
+            if abs(float(frame.get("sample_step_sec", 0.04)) - 0.04) < 1e-9:
+                frame["sample_step_sec"] = 0.12
+                logger.info("Bước lấy mẫu OCR: 0,04 s → 0,12 s (mặc định mới, một lần; đổi được trong Cài đặt).")
+            frame["defaults_v661"] = True
+            raw = {**raw, "frame": frame}
+        ocr = raw.get("ocr")
+        if isinstance(ocr, dict) and "defaults_v661" not in ocr:
+            ocr = dict(ocr)
+            if ocr.get("version", "PP-OCRv6_medium") == "PP-OCRv6_medium" and ocr.get(
+                "detection_model", "PP-OCRv6_medium_det"
+            ) == "PP-OCRv6_medium_det" and ocr.get("recognition_model", "PP-OCRv6_medium_rec") == "PP-OCRv6_medium_rec":
+                ocr.update(version="PP-OCRv6_small", detection_model="PP-OCRv6_small_det",
+                           recognition_model="PP-OCRv6_small_rec")
+                logger.info("Model OCR: PP-OCRv6 medium → small (mặc định mới, một lần; đổi được trong Cài đặt).")
+            ocr["defaults_v661"] = True
+            raw = {**raw, "ocr": ocr}
+        return raw
 
     @staticmethod
     def _apply_env_overrides(stored: ApplicationSettings) -> ApplicationSettings:

@@ -31,6 +31,7 @@ from subtitles_extractor.application.services.subtitle_pipeline.constants import
     WHITESPACE_RUN_REGEX,
 )
 from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
+    current_centering_reference,
     clean_edge_noise,
     correct_hallucination_typos,
     restore_dropped_yi_prefix,
@@ -178,6 +179,31 @@ def select_anchor_text(texts_with_confidences: list[tuple[str, float]]) -> str:
     return sorted_by_composite_score[0][0]
 
 
+def _text_geometry(
+    frames: list[OcrFrameResult], y_tolerance_ratio: float, y_tolerance_min_px: float,
+) -> dict[str, tuple[float, float]] | None:
+    """[v3.23.657] Tâm & bề rộng TB của hộp chữ theo từng cách đọc (một dòng) — để kiểm căn giữa khi khôi phục ký tự.
+
+    Chỉ tính khi đang có tâm phụ đề tham chiếu (phụ đề căn giữa); câu nhiều dòng bỏ qua.
+    """
+    if current_centering_reference() is None:
+        return None
+    sums: dict[str, list[float]] = {}
+    for frame in frames:
+        text = extract_joined_text_from_frame(frame, y_tolerance_ratio, y_tolerance_min_px)
+        if not text or "\n" in text:
+            continue
+        xs = [point[0] for box in frame.text_boxes for point in (box.polygon or ())]
+        if not xs:
+            continue
+        left, right = min(xs), max(xs)
+        bucket = sums.setdefault(text, [0.0, 0.0, 0.0])
+        bucket[0] += (left + right) / 2.0
+        bucket[1] += right - left
+        bucket[2] += 1
+    return {text: (c / n, w / n) for text, (c, w, n) in sums.items() if n}
+
+
 def vote_best_text_rover(
     target_frames: list[OcrFrameResult],
     y_tolerance_ratio: float,
@@ -214,6 +240,8 @@ def vote_best_text_rover(
     if len(texts_with_confidences) == 1:
         return clean_edge_noise(texts_with_confidences[0][0])
 
+    geometry = _text_geometry(valid_frames, y_tolerance_ratio, y_tolerance_min_px)  # [v3.23.657]
+
     text_frequencies: Counter[str] = Counter(
         text for text, _ in texts_with_confidences
     )
@@ -223,7 +251,7 @@ def vote_best_text_rover(
     if most_common_frequency / total_valid_frames >= _MAJORITY_SHORT_CIRCUIT_RATIO:
         voted_text = most_common_text
         voted_text = correct_hallucination_typos(voted_text)
-        voted_text = restore_dropped_yi_prefix(voted_text, texts_with_confidences)
+        voted_text = restore_dropped_yi_prefix(voted_text, texts_with_confidences, geometry)
         return clean_edge_noise(voted_text)
 
     anchor_sequence = select_anchor_text(texts_with_confidences)
@@ -231,7 +259,7 @@ def vote_best_text_rover(
     if is_predominantly_cjk(anchor_sequence):
         anchor_sequence = correct_hallucination_typos(anchor_sequence)
         anchor_sequence = restore_dropped_yi_prefix(
-            anchor_sequence, texts_with_confidences
+            anchor_sequence, texts_with_confidences, geometry
         )
         return clean_edge_noise(anchor_sequence)
 
@@ -332,7 +360,7 @@ def vote_best_text_rover(
     # Box-level correction trong pre_filter không bắt được cross-box pattern này.
     consensus_result_string = correct_hallucination_typos(consensus_result_string)
     consensus_result_string = restore_dropped_yi_prefix(
-        consensus_result_string, texts_with_confidences
+        consensus_result_string, texts_with_confidences, geometry
     )
     return clean_edge_noise(consensus_result_string)
 

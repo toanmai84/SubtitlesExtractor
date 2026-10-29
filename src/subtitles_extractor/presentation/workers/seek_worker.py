@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -44,6 +45,31 @@ def _get_av_errors() -> tuple[type[Exception], ...]:
     return tuple(errors)
 
 
+
+# [v3.23.659] Trước đây chỉ quét tối đa 60 khung sau keyframe: video GOP dài (keyframe cách 5–10s) không bao giờ tới
+# mốc cần xem → khung sai hoặc "Không thể đọc được khung hình". Nay quét tới khi qua mốc, chặn bằng thời gian chạy.
+_SEEK_SCAN_BUDGET_SEC = 8.0
+
+
+def _scan_to_timestamp(frames, timestamp_sec: float, should_stop=None):
+    """Giải mã tuần tự tới khung đầu tiên có mốc ≥ ``timestamp_sec``; trả (khung gần nhất, độ lệch giây)."""
+    best = None
+    minimal_diff = float("inf")
+    deadline = time.monotonic() + _SEEK_SCAN_BUDGET_SEC
+    for frame in frames:
+        if frame.pts is None:
+            continue
+        frame_ts = float(frame.pts * frame.time_base)
+        diff = abs(frame_ts - timestamp_sec)
+        if diff < minimal_diff:
+            minimal_diff = diff
+            best = frame
+        if frame_ts >= timestamp_sec or time.monotonic() > deadline:
+            break
+        if should_stop is not None and should_stop():
+            break  # đang đóng video (đổi tệp / tắt trang) — đừng giữ khoá thêm
+    return best, minimal_diff
+
 class PersistentVideoReader:
     """Giữ PyAV container (hoặc OpenCV capture) + decoder mở liên tục.
 
@@ -60,6 +86,7 @@ class PersistentVideoReader:
         self._last_seek_timestamp_sec: float = -1.0
 
         self._cv2_capture: cv2.VideoCapture | None = None
+        self._closing = False  # [v3.23.659] close() báo cho lượt quét seek dừng sớm, khỏi chờ khoá lâu
 
         self._open_video()
 
@@ -112,10 +139,16 @@ class PersistentVideoReader:
     def seek(self, timestamp_sec: float) -> np.ndarray | None:
         """Seek đến timestamp và trả frame RGB gần nhất."""
         with self._thread_lock:
+            if self._closing:
+                return None  # [v3.23.659] đã đóng — không mở lại OpenCV (rò capture)
             if self._av_container is None or self._av_stream is None:
                 return self._fallback_opencv_seek(timestamp_sec)
             try:
-                return self._seek_with_pyav(timestamp_sec)
+                frame = self._seek_with_pyav(timestamp_sec)
+                if frame is not None or self._closing:
+                    return frame
+                # [v3.23.659] PyAV không tới được mốc (GOP dài, pts lạ…) → thử OpenCV thay vì báo lỗi khung hình.
+                return self._fallback_opencv_seek(timestamp_sec)
             except _get_av_errors() as exc:
                 logger.debug(
                     "PyAV seek lỗi (%s) — fallback OpenCV.", exc
@@ -172,24 +205,9 @@ class PersistentVideoReader:
         self._frame_iterator = self._av_container.decode(self._av_stream)
         self._last_seek_timestamp_sec = timestamp_sec
 
-        best_matched_frame = None
-        minimal_diff = float("inf")
-        MAX_SCAN_LIMIT_FRAMES = 60
-
-        for i, frame in enumerate(self._frame_iterator):
-            if frame.pts is None:
-                continue
-
-            frame_timestamp_sec = float(frame.pts * frame.time_base)
-            time_difference = abs(frame_timestamp_sec - timestamp_sec)
-
-            if time_difference < minimal_diff:
-                minimal_diff = time_difference
-                best_matched_frame = frame
-
-            if frame_timestamp_sec >= timestamp_sec or i >= MAX_SCAN_LIMIT_FRAMES:
-                break
-
+        best_matched_frame, minimal_diff = _scan_to_timestamp(
+            self._frame_iterator, timestamp_sec, should_stop=lambda: self._closing
+        )
         if best_matched_frame is not None and minimal_diff < 2.0:
             try:
                 return best_matched_frame.to_ndarray(format="rgb24")
@@ -217,6 +235,7 @@ class PersistentVideoReader:
 
     def close(self) -> None:
         """Đóng container/capture. Idempotent — gọi nhiều lần không lỗi."""
+        self._closing = True
         with self._thread_lock:
             if hasattr(self._frame_iterator, 'close'):
                 self._frame_iterator.close()
@@ -311,23 +330,7 @@ class SeekWorker(QObject):
                             seek_pts, backward=True, stream=av_stream
                         )
 
-                    best_frame = None
-                    min_diff = float("inf")
-                    MAX_SCAN_LIMIT = 60
-
-                    for i, frame in enumerate(av_container.decode(av_stream)):
-                        if frame.pts is None:
-                            continue
-
-                        frame_time = float(frame.pts * frame.time_base)
-                        diff = abs(frame_time - self._timestamp_sec)
-
-                        if diff < min_diff:
-                            min_diff = diff
-                            best_frame = frame
-
-                        if frame_time >= self._timestamp_sec or i >= MAX_SCAN_LIMIT:
-                            break
+                    best_frame, min_diff = _scan_to_timestamp(av_container.decode(av_stream), self._timestamp_sec)
 
                     if best_frame is not None and min_diff < 2.0:
                         return best_frame.to_ndarray(format="rgb24")

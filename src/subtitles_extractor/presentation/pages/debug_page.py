@@ -809,7 +809,7 @@ class DebugPage(QWidget):
             if total > 0:
                 self._slider.setEnabled(True); self._slider.setRange(0, total - 1)
                 self._btn_build.setEnabled(True); self._btn_save_frame.setEnabled(True)
-                self._btn_reset_frame.setEnabled(True); self._btn_reocr_frame.setEnabled(True)
+                self._btn_reset_frame.setEnabled(True); self._set_reocr_frame_enabled(True)
 
             meta = self._view_model._meta
             if meta and hasattr(meta, 'video_name') and self._current_json_path:
@@ -830,7 +830,7 @@ class DebugPage(QWidget):
             InfoBar.error(self._translator.translate("debug.ib_fail"), message, parent=self)
             self._slider.setEnabled(False); self._btn_build.setEnabled(False)
             self._btn_save_frame.setEnabled(False); self._btn_reset_frame.setEnabled(False)
-            self._btn_reocr_frame.setEnabled(False)
+            self._set_reocr_frame_enabled(False)
             self._video_widget.release_player()
 
     def _on_slider_moved_by_user(self, value: int) -> None:
@@ -934,7 +934,20 @@ class DebugPage(QWidget):
             self._txt_json.setStyleSheet(_mono_style(error=True))
             self._btn_save_frame.setEnabled(False)
 
+    def set_extraction_running(self, running: bool) -> None:
+        """[v3.23.656] Đang trích xuất → khoá chạy thử OCR một khung (cùng engine OCR)."""
+        self._extraction_running = bool(running)
+        self._btn_reocr_frame.setToolTip(self._translator.translate("editor.ed_tt_reocr_locked") if running else "")
+        self._set_reocr_frame_enabled(getattr(self, "_reocr_frame_want", False))
+
+    def _set_reocr_frame_enabled(self, want: bool) -> None:
+        """Bật nút chạy thử OCR khi trang muốn bật VÀ không có lượt trích xuất đang chạy."""
+        self._reocr_frame_want = bool(want)
+        self._btn_reocr_frame.setEnabled(self._reocr_frame_want and not getattr(self, "_extraction_running", False))
+
     def _on_reocr_frame_clicked(self) -> None:
+        if getattr(self, "_extraction_running", False):
+            return
         tweaks = {
             "model_override": self._cb_model.currentData(),
             "limit_side_len": self._spin_limit_side.value(),
@@ -957,7 +970,7 @@ class DebugPage(QWidget):
         self._view_model.reocr_current_frame(tweaks)
 
     def _on_busy_state_changed(self, is_busy: bool) -> None:
-        self._btn_reocr_frame.setEnabled(not is_busy)
+        self._set_reocr_frame_enabled(not is_busy)
         self._btn_save_frame.setEnabled(not is_busy)
         self._btn_reset_frame.setEnabled(not is_busy)
 

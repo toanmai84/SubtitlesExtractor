@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -90,6 +90,14 @@ _ENCODER_CHOICES: tuple[tuple[str, str], ...] = (
 )
 
 
+def _mtime(path: str) -> float:
+    """[v3.23.655] mtime của tệp (0 nếu không có) — khoá bộ nhớ đệm so số dòng."""
+    try:
+        return Path(path).stat().st_mtime if path else 0.0
+    except OSError:
+        return 0.0
+
+
 class PublishPage(QWidget):
     """Trang tổng hợp và xuất bản phim hoàn chỉnh.
 
@@ -98,6 +106,8 @@ class PublishPage(QWidget):
     """
 
     publish_completed = Signal(object)
+    #: [v3.23.658] Dây chuyền phim bộ: khâu Xuất bản chạy xong (``StageRunResult``).
+    series_batch_finished = Signal(object)
 
     def __init__(self, container: object, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -238,6 +248,7 @@ class PublishPage(QWidget):
         for key, _am in _AUDIO_CHOICES:
             self._audio_combo.addItem(self._translator.translate(key))
         self._audio_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self._restore_mode_choices()
 
         self._duck_combo = ComboBox()
         for key, _level in _DUCK_CHOICES:
@@ -369,8 +380,28 @@ class PublishPage(QWidget):
         """Tên tệp xuất thử: ``<tên>_xemthu<đuôi>`` — không ghi đè bản xuất đầy đủ."""
         return output.with_name(f"{output.stem}_xemthu{output.suffix}")
 
+    def _restore_mode_choices(self) -> None:
+        """[v3.23.659] Nhớ cặp chế độ xuất qua lần mở app.
+
+        Trước đây luôn về "phụ đề rời + tiếng gốc": dây chuyền phim bộ chạy tới Xuất bản sau khi mở lại app xuất ra bản
+        KHÔNG có thuyết minh dù TTS đã xong.
+        """
+        settings = QSettings()
+        for key, combo in (("publish/subtitle_mode", self._subtitle_combo), ("publish/audio_mode", self._audio_combo)):
+            try:
+                index = int(str(settings.value(key, -1)))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < combo.count():
+                combo.blockSignals(True)
+                combo.setCurrentIndex(index)
+                combo.blockSignals(False)
+
     def _on_mode_changed(self) -> None:
         """Bật/tắt các ô không liên quan và cập nhật gợi ý theo cặp chế độ đang chọn."""
+        settings = QSettings()
+        settings.setValue("publish/subtitle_mode", self._subtitle_combo.currentIndex())
+        settings.setValue("publish/audio_mode", self._audio_combo.currentIndex())
         subtitle_mode = self._selected_subtitle_mode
         audio_mode = self._selected_audio_mode
         needs_subtitle = subtitle_mode is not SubtitleMode.NONE
@@ -413,6 +444,8 @@ class PublishPage(QWidget):
         self._cancel_button.setEnabled(busy)
         self._progress.setVisible(busy)
         self._batch_button.setEnabled(not busy)
+        # [v3.23.659] Không nối cả bộ khi đang xuất (từng nối lẫn tệp .partial của tập đang ghi).
+        self._concat_button.setEnabled(not busy and getattr(self, "_concat_thread", None) is None)
         self._subtitle_combo.setEnabled(not busy)
         self._audio_combo.setEnabled(not busy)
 
@@ -483,11 +516,65 @@ class PublishPage(QWidget):
         )
         prefix = f"  ⚠ {styling}" if styling else ""
 
+        mismatch = self._line_mismatch()
+        if mismatch is not None:  # [v3.23.655] bug #12
+            prefix += "  " + self._mismatch_text("publish.warn_line_mismatch", mismatch)
         if is_synced:
             return f"{prefix}  {self._translator.translate('publish.sync_matched')}"
         if has_audio:
             return f"{prefix}  {self._translator.translate('publish.sync_original')}"
         return prefix
+
+    def _line_mismatch(self):
+        """[v3.23.655] Bug #12: phụ đề đang chọn lệch số dòng với phụ đề đồng bộ của audio TTS (``None`` = khớp/không so được)."""
+        if self._selected_subtitle_mode is SubtitleMode.NONE or self._selected_audio_mode is AudioMode.ORIGINAL:
+            return None
+        from subtitles_extractor.application.services.publish_line_check import tts_line_mismatch
+
+        subtitle, audio = self._subtitle_edit.text().strip(), self._audio_edit.text().strip()
+        key = (subtitle, audio, _mtime(subtitle), _mtime(audio))
+        cached = getattr(self, "_mismatch_cache", None)
+        if cached is not None and cached[0] == key:   # trạng thái làm mới liên tục: không đọc lại tệp mỗi lần
+            return cached[1]
+        try:
+            result = tts_line_mismatch(subtitle, audio)
+        except (OSError, ValueError) as exc:
+            logger.debug("Bỏ qua so số dòng phụ đề/audio: %s", exc)
+            result = None
+        self._mismatch_cache = (key, result)
+        return result
+
+    def _mismatch_text(self, key: str, mismatch) -> str:
+        return (
+            self._translator.translate(key)
+            .replace("{sub}", str(mismatch.subtitle_lines))
+            .replace("{tts}", str(mismatch.tts_lines))
+            .replace("{n}", str(abs(mismatch.missing_audio)))
+            .replace("{name}", mismatch.tts_subtitle.name)
+        )
+
+    def _confirm_line_mismatch(self) -> bool:
+        """[v3.23.655] Hỏi trước khi xuất khi phụ đề lệch số dòng với audio TTS. ``False`` = người dùng huỷ."""
+        mismatch = self._line_mismatch()
+        if mismatch is None:
+            return True
+        if getattr(self, "_batch_items", None):          # xuất cả bộ: không chặn bằng hộp thoại, chỉ ghi nhật ký
+            logger.warning("Xuất bản: %s", self._mismatch_text("publish.warn_line_mismatch", mismatch))
+            return True
+        from PySide6.QtWidgets import QMessageBox
+
+        buttons = QMessageBox.StandardButton
+        answer = QMessageBox.question(
+            self, self._translator.translate("publish.warn_line_mismatch_title"),
+            self._mismatch_text("publish.warn_line_mismatch_body", mismatch),
+            buttons.Yes | buttons.No | buttons.Cancel, buttons.Yes,
+        )
+        if answer == buttons.Cancel:
+            return False
+        if answer == buttons.Yes:
+            self._subtitle_edit.setText(str(mismatch.tts_subtitle))
+            self._update_readiness()
+        return True
 
     def _browse_into(self, edit: LineEdit, caption: str, file_filter: str) -> None:
         path, _ = QFileDialog.getOpenFileName(self, caption, "", file_filter)
@@ -632,7 +719,9 @@ class PublishPage(QWidget):
             self._warn(self._translator.translate("publish.warn_nothing_selected"))
             return None
 
-        preview = self._preview_check.isChecked()
+        # [v3.23.659] Xuất cả bộ / dây chuyền phim bộ luôn xuất ĐỦ phim: ô "Xuất thử" quên tắt từng làm cả 86 tập chỉ
+        # ra đoạn 90 s, báo "xong" mà lần sau vẫn làm lại (không có tệp đủ tên).
+        preview = self._preview_check.isChecked() and not getattr(self, "_batch_items", None)
         output_path = Path(output_text)
         if preview:
             output_path = self._preview_output_path(output_path)
@@ -727,6 +816,10 @@ class PublishPage(QWidget):
         """Khởi chạy worker nối video trên QThread riêng."""
         if getattr(self, "_concat_thread", None) is not None:
             return
+        if self._thread is not None or getattr(self, "_batch_items", None):
+            # [v3.23.659] Đang xuất: chờ xong (nút Nối cũng đã khoá — chặn cả đường gọi khác, vd "Nén lại").
+            self._status.setText(self._translator.translate("series.err_page_busy"))
+            return
         from subtitles_extractor.presentation.workers.concat_video_worker import (
             ConcatVideoWorker,
         )
@@ -737,6 +830,8 @@ class PublishPage(QWidget):
         self._concat_button.setEnabled(False)
         self._batch_button.setEnabled(False)
         self._start_button.setEnabled(False)
+        self._concat_cancel_requested = False
+        self._cancel_button.setEnabled(True)  # [v3.23.659] nối chuẩn hoá có thể chạy hàng chục phút — phải huỷ được
 
         thread = QThread(self)
         worker = ConcatVideoWorker(videos, output_path, 0.0, reencode=reencode)
@@ -766,6 +861,9 @@ class PublishPage(QWidget):
     def _on_concat_failed(self, message: str) -> None:
         from PySide6.QtWidgets import QMessageBox
 
+        if getattr(self, "_concat_cancel_requested", False):
+            self._status.setText(self._translator.translate("publish.status_cancelled"))  # [v3.23.659] người dùng huỷ
+            return
         # Nếu sao chép luồng lỗi do lệch thông số, mời người dùng NÉN LẠI (chắc chắn hơn).
         if not getattr(self, "_concat_reencode_offered", False) and (
             "copy" in message.lower() or "codec" in message.lower()
@@ -800,9 +898,11 @@ class PublishPage(QWidget):
             thread.deleteLater()
         self._concat_thread = None
         self._concat_worker = None
-        self._concat_button.setEnabled(True)
-        self._batch_button.setEnabled(True)
-        self._start_button.setEnabled(True)
+        rendering = self._thread is not None or bool(getattr(self, "_batch_items", None))
+        self._concat_button.setEnabled(not rendering)
+        self._batch_button.setEnabled(not rendering)
+        self._start_button.setEnabled(not rendering)
+        self._cancel_button.setEnabled(rendering)
         self._start_pending_reencode()
 
     def _start_pending_reencode(self) -> None:
@@ -816,6 +916,9 @@ class PublishPage(QWidget):
 
     def _on_batch_publish_clicked(self) -> None:
         """Quét thư mục phim bộ rồi xuất lần lượt các tập đã sẵn sàng."""
+        if getattr(self, "_batch_items", None) or self._thread is not None:
+            # [v3.23.658] Nút bật lại một nhịp giữa hai tập: bấm lúc đó từng THAY hàng đợi đang chạy (dây chuyền treo).
+            return
         from PySide6.QtWidgets import QFileDialog, QMessageBox
 
         from subtitles_extractor.application.services.batch_publish_plan import (
@@ -876,6 +979,46 @@ class PublishPage(QWidget):
         self._batch_failures = []
         self._batch_cancelled = False
         self._run_next_publish()
+
+    def start_series_batch(self, videos: list[Path]) -> str:
+        """[v3.23.658] Dây chuyền phim bộ: xuất các tập với chế độ phụ đề/âm thanh đang chọn, không hộp thoại.
+
+        Returns:
+            ``""`` nếu đã bắt đầu (kết quả về qua ``series_batch_finished``), ngược lại lý do không chạy được.
+        """
+        from subtitles_extractor.application.services.batch_publish_plan import build_publish_plan
+        from subtitles_extractor.presentation.view_models.series_pipeline_controller import StageRunResult
+
+        if self._thread is not None or getattr(self, "_batch_items", None):
+            return self._translator.translate("series.err_page_busy")
+        subtitle_mode = self._selected_subtitle_mode
+        audio_mode = self._selected_audio_mode
+        plan = build_publish_plan(
+            [Path(v) for v in videos], output_suffix=self._current_output_suffix(),
+            needs_subtitle=subtitle_mode is not SubtitleMode.NONE,
+            needs_audio=audio_mode is not AudioMode.ORIGINAL, skip_existing=True,
+        )
+        runnable = [item for item in plan if item.will_run]
+        invalid = {
+            item.video_path.name: item.note or "" for item in plan
+            if not item.will_run and item.status.value != "already_done"
+        }
+        if not runnable:
+            QTimer.singleShot(0, lambda: self.series_batch_finished.emit(StageRunResult(failed=invalid)))
+            return ""
+        self._series_batch = True
+        self._series_invalid = invalid
+        self._batch_items = runnable
+        self._batch_index = 0
+        self._batch_failures = []
+        self._batch_cancelled = False
+        QTimer.singleShot(0, self._run_next_publish)
+        return ""
+
+    def cancel_series_batch(self) -> None:
+        """[v3.23.658] Dừng khâu Xuất bản của dây chuyền (như bấm Huỷ)."""
+        if getattr(self, "_series_batch", False):
+            self._cancel_render()
 
     def _current_output_suffix(self) -> str:
         """Hậu tố tên tệp đích ứng với cặp chế độ đang chọn."""
@@ -946,6 +1089,17 @@ class PublishPage(QWidget):
         self._batch_failures = []
         self._batch_cancelled = False
 
+        if getattr(self, "_series_batch", False):
+            # [v3.23.658] Dây chuyền phim bộ: báo về bộ điều phối, không hiện hộp thoại tổng kết.
+            from subtitles_extractor.presentation.view_models.series_pipeline_controller import StageRunResult
+
+            self._series_batch = False
+            failed = dict(getattr(self, "_series_invalid", {}) or {})
+            failed.update({name: "Xuất bản lỗi — xem Nhật ký" for name in failures})
+            self._status.setText(f"Phim bộ — xuất bản xong {done}/{total} tập.")
+            self.series_batch_finished.emit(StageRunResult(failed=failed, cancelled=cancelled))
+            return
+
         if cancelled:
             message = (self._translator.translate("publish.batch_done_cancelled")
                        .replace("{done}", str(done)).replace("{total}", str(total))
@@ -973,6 +1127,8 @@ class PublishPage(QWidget):
     def _start_render(self) -> None:
         """Bắt đầu xuất trên luồng riêng."""
         if self._thread is not None:
+            return
+        if not self._confirm_line_mismatch():  # [v3.23.655] bug #12
             return
         request = self._build_request()
         if request is None:
@@ -1013,6 +1169,13 @@ class PublishPage(QWidget):
         self._thread.start()
 
     def _cancel_render(self) -> None:
+        concat_worker = getattr(self, "_concat_worker", None)
+        if concat_worker is not None:
+            # [v3.23.659] Huỷ cả lượt nối cả bộ (trước đây chỉ tắt app mới dừng được). Lượt "Nén lại" đã hẹn bỏ luôn.
+            self._pending_reencode = None
+            self._concat_cancel_requested = True
+            concat_worker.cancel()
+            self._status.setText(self._translator.translate("publish.status_cancelling"))
         if getattr(self, "_batch_items", None):
             self._batch_cancelled = True
             remaining = len(self._batch_items) - self._batch_index - 1
@@ -1038,7 +1201,7 @@ class PublishPage(QWidget):
     def _on_render_finished(self, output_path: object) -> None:
         # [v3.23.329] Đang chạy hàng loạt -> sang tập kế, không hiện hộp thoại từng tập.
         if getattr(self, "_batch_items", None):
-            self.publish_completed.emit(output_path)
+            # [v3.23.659] KHÔNG phát publish_completed: cửa sổ chính ghi nó vào dự án ĐANG MỞ (86 lần, kèm 86 thông báo).
             self._advance_batch_publish()
             return
         self._progress.setValue(100)

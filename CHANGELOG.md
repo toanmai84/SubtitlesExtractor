@@ -1,5 +1,684 @@
 # Changelog
 
+## [3.23.666] — 🔌 Nhà cung cấp AI tuỳ chỉnh (API kiểu OpenAI, vd OxionAI)
+
+### Tính năng
+* **Trang Dịch → Cấu hình AI → "Nhà cung cấp AI"**: chọn *Google Gemini* (như cũ) hoặc *Tuỳ chỉnh — API kiểu OpenAI*.
+  * Nhập **Địa chỉ API** (vd `https://oxionai.com/v1`; dán nhầm cả `/chat/completions` cũng được) và **API Key nhà cung cấp**.
+  * Bấm **Tải danh sách model** → lấy `GET /models` của nhà cung cấp, giữ mọi model sinh chữ (cả bản *pro*: `gemini-3.1-pro`, `gpt-5.5`, `claude-opus-5.5`…), bỏ embedding/TTS/ảnh.
+  * Lựa chọn được lưu, mở lại ứng dụng vẫn còn.
+* **Áp cho mọi khâu văn bản**: phân tích ngữ cảnh, các giai đoạn dịch, tự kiểm tra, vá dòng thiếu, rút gọn câu ở trang Lồng tiếng.
+* **Cách làm**: module mới `openai_compat_client.py` đóng vai client Gemini, chuyển lời gọi `generate_content` thành `POST /chat/completions`, đọc phản hồi về đúng dạng Gemini.
+  * Vì vậy toàn bộ vòng thử lại, sửa JSON, kiểm lô, sổ token… giữ nguyên.
+  * Chỉ dùng thư viện chuẩn (`urllib`), không thêm phụ thuộc cho bản exe; không cần cả `google-genai`.
+* **Ánh xạ request**:
+  * Lời dặn hệ thống → tin nhắn `system`.
+  * Schema JSON được chép vào cuối tin nhắn này kèm yêu cầu chỉ trả một đối tượng JSON, và gửi `response_format: json_object`.
+  * `temperature`/`top_p`; `max_tokens` mặc định 32 768 (OxionAI mặc định 8 192 — dễ cắt cụt lô dịch dài).
+  * Cấu hình suy nghĩ của Gemini bị bỏ; khối `<think>…</think>` trong câu trả lời được gỡ.
+* **Tự thích nghi**: máy chủ chê `response_format` hoặc `max_tokens` (400) thì bỏ trường đó, gửi lại ngay và nhớ cho model ấy.
+* **Phân loại lỗi đúng**:
+  * 429/5xx/hết thời hạn/mất mạng → thử lại như Gemini.
+  * 401 (key sai) → dừng ngay với thông báo key bị từ chối.
+  * 402 hết tiền (`insufficient_quota`), 403, 404 model không có → dừng ngay, không đốt 5 lượt thử (trước đó chữ "quota" sẽ khớp nhầm nhóm thử lại).
+* **Không áp hạn mức miễn phí của Google** cho nhà cung cấp tuỳ chỉnh.
+* **Model dự phòng**: sức khoẻ model riêng; dự phòng *tự động* chỉ trong cùng họ (`gemini-*` → `gemini-*`), không lặng lẽ chuyển sang model đắt khác hãng khi quá tải. Model dự phòng người dùng tự chọn vẫn được dùng.
+
+### Giới hạn (do API kiểu OpenAI chỉ nhận chữ và ảnh)
+* Đính video, quét Visual Cues bằng video, "Bổ sung người nói", "Kiểm lại dòng nghi" và tách giọng cần Gemini xem/nghe tệp.
+  * Ở chế độ tuỳ chỉnh: ô đính video bị khoá; dịch/phân tích chạy bằng phụ đề (Visual Cues đã có vẫn dùng).
+  * Hai nút cần video báo rõ "chuyển về Google Gemini để dùng".
+  * Lỡ có đoạn video đi tới lời gọi thì nó bị bỏ, không làm hỏng lời gọi.
+
+### Rà soát độc lập (agent) — 8 lỗi tìm được và đã sửa trước khi giao
+1. **Sai địa chỉ API (quên `/v1` → trang HTML / JSON lạ) bị coi là "quá tải".** Mỗi lô chờ ~11 phút (đo: 11 request, 664 giây chờ) rồi báo "Gemini đang quá tải".
+   * Nay là lỗi không thử lại, báo ngay "kiểm tra lại Địa chỉ API… thường phải kết thúc bằng /v1".
+   * Lỗi nhà cung cấp chỉ là "quá tải" khi mã HTTP thật là 499/503/504.
+2. **"Xoá file cloud" ở chế độ tuỳ chỉnh gửi key OxionAI sang Google.**
+   * Nay nút này luôn dùng key Gemini.
+   * Thêm chốt chặn: bộ tải video lên Gemini lọc bỏ key nhà cung cấp tuỳ chỉnh.
+3. **Dự phòng tự động có thể nhảy lên bản đắt hơn cùng họ** (`gemini-3.7-flash` → `gemini-3.8-pro`, `gpt-5.6` → `gpt-5.6-pro`).
+   * Nay dự phòng tự động phải cùng họ VÀ cùng bậc giá (pro/max/opus ≠ thường ≠ lite/mini).
+   * Lựa chọn dự phòng chỉ dùng khi nhà cung cấp có model đó; trước đây một tên Gemini cũ được thử → 404 hỏng lời gọi.
+4. **Tên model Gemini cố định gửi tới nhà cung cấp tuỳ chỉnh.**
+   * Rút gọn câu ở trang Lồng tiếng luôn dùng `gemini-3.1-flash-lite`.
+   * Tự kiểm tra / dự phòng phân tích "tự động" cũng dùng tên Gemini cố định.
+   * Nay dùng model phân tích đang chọn, không tự đoán tên.
+5. **Lỗi "maximum context length" (prompt quá dài) làm bỏ hẳn `max_tokens` cho mọi lô sau** → máy chủ về 8192, lô dài bị cắt.
+   * Nay chỉ xử lý khi lỗi nêu đúng tên trường.
+   * Hạ xuống đúng giới hạn máy chủ nêu (vd 32768 → 16384) thay vì bỏ.
+6. **Lỗi truyền tải lọt phân loại.**
+   * Thân bị cắt (`IncompleteRead`) nay được thử lại.
+   * Địa chỉ có khoảng trắng / cổng sai, và key dính ký tự lạ khi dán (khoảng trắng rộng 0…), bị chặn ngay từ ô nhập ("thiếu cấu hình").
+7. **Ô "đính video" có thể tick mà xám** (nạp phụ đề có video cạnh bên ở chế độ tuỳ chỉnh). Nay chuyển sang tuỳ chỉnh thì bỏ tick (kéo theo các ô phụ thuộc video) và không tự tick lại.
+8. **"Tải danh sách model" sai key/địa chỉ thì im lặng.**
+   * Nay báo đúng lý do (401/404/sai giao thức).
+   * Ước tính request không cảnh báo hạn mức ngày của Google.
+   * Thông báo key sai / tải model không còn nói "Gemini".
+
+### Kiểm chứng
+* `test_custom_provider_v323666.py` (35 ca): chạy bộ dịch THẬT trên máy chủ HTTP giả nói đúng giao thức OpenAI.
+  * Request đúng đường dẫn, Bearer, model, system, json_object.
+  * JSON bọc ```` ```json ```` được sửa.
+  * Bỏ `response_format`/`max_tokens` khi bị chê.
+  * 429→503→OK thử lại 3 lượt; 401/402/404 chỉ 1 request.
+  * Video bị bỏ; danh sách model; không tách giọng.
+  * Chạy được khi không có `google-genai`.
+  * Container bật/tắt; dự phòng cùng họ.
+* Các ca thêm sau rà soát: sai địa chỉ (3 dạng) chỉ 1 request, 0 lần chờ; hạ max_tokens đúng 16384; lỗi prompt quá dài giữ max_tokens; cấu hình hỏng (5 dạng); IncompleteRead thử lại; key tuỳ chỉnh không tới Google; dự phòng không lên bản pro.
+* `test_custom_provider_page_v323666.py` (3 ca): trang Dịch ẩn/hiện ô nhập, bỏ tick + khoá đính video, cảnh báo khi thiếu địa chỉ/key, khôi phục sau khi mở lại, nút cần video báo rõ, model rút gọn / tự kiểm tra theo model đang chọn.
+* Toàn bộ test: 7983 qua, 61 bỏ qua (thiếu tài nguyên/thư viện tuỳ chọn), 0 hỏng.
+* Chưa thử với key OxionAI thật (không có key trong môi trường kiểm thử). Không có key thì máy chủ trả `401 missing_api_key`; ứng dụng báo lỗi key và dừng ngay.
+
+## [3.23.665] — 🛠️ Sửa crash khi kéo thanh seek video (Windows)
+
+### Lỗi (fault.log của người dùng 29/10)
+* **Kéo thanh seek ở trang Trích xuất → ứng dụng tắt đột ngột.**
+  * `fault.log` có hàng chục dòng `Windows fatal exception: code 0xe24c4a02`.
+  * Cuối cùng là `access violation`, chen giữa lúc đang in ngăn xếp luồng chính (`mpv_player_adapter.seek` → `mpv.command`).
+
+### Nguyên nhân gốc (3 yếu tố cộng hưởng)
+1. **Lua vẫn chạy trong mpv.**
+   * 0xe24c4a02 là mã ngoại lệ nội bộ của LuaJIT ("LJ"); LuaJIT tự bắt nên bình thường vô hại.
+   * Bản 3.23.651 tắt script bằng 4 tuỳ chọn, nhưng libmpv đời mới (shinchiro, nhánh master) còn nạp sẵn `select`, `positioning`, `commands`, `auto_profiles` và `console` (đổi tên từ `osd-console`).
+   * Hậu quả: mỗi lần seek, Lua sinh ngoại lệ.
+2. **faulthandler đọc ngăn xếp mọi luồng mà không khoá.**
+   * Trên Windows, faulthandler chạy cho MỌI ngoại lệ, kể cả loại đã được bắt.
+   * Với `all_threads=True`, mỗi lần nó đọc ngăn xếp mọi luồng Python không giữ GIL trong khi luồng chính đang chạy.
+   * Lặp hàng trăm lần thì có lần đọc trúng lúc dữ liệu đang đổi → access violation thật.
+3. **Mỗi pixel kéo thanh gửi một lệnh `seek exact`** đồng bộ trên luồng giao diện, nhân số sự kiện lên hàng trăm lần mỗi giây.
+
+### Sửa
+* **Tắt đủ mọi script Lua dựng sẵn của mpv** (11 tuỳ chọn, gồm cả tên cũ lẫn tên mới).
+  * Trước khi tạo trình phát, app hỏi libmpv xem bản đó có tuỳ chọn nào (lõi thăm dò không cửa sổ, chạy một lần) và chỉ truyền đúng các tuỳ chọn ấy.
+  * Trước đây một tên lạ làm cả bộ tắt-script bị bỏ. Tệ hơn, python-mpv vẫn khởi tạo lõi đó rồi mới báo lỗi, để lại một lõi mồ côi gắn vào cửa sổ video.
+* **Windows: faulthandler chỉ ghi luồng đang lỗi** (`all_threads=False`). Crash trên luồng chính vẫn có đủ ngăn xếp.
+* **Gộp lệnh seek khi kéo thanh:** tối đa 1 lệnh mỗi 40 ms (~25 lệnh/giây).
+  * Vị trí cuối khi buông tay luôn được áp dụng; nhãn thời gian vẫn cập nhật từng bước.
+  * Giải phóng trình phát thì huỷ lệnh đang chờ.
+* Thăm dò không trả lời được thì lùi về bộ tắt-script tối thiểu của 3.23.651 (không bao giờ kém hơn trước).
+* Test `test_mpv_seek_crash_v323665.py` (6 ca); mã cũ trượt 4. Ví dụ: kéo 200 bước → trước 200 lệnh seek, nay ≤3.
+
+## [3.23.664] — 🩹 VieNeu: "Sư huynh, em..." không còn mất chữ "em"
+
+### Lỗi (do bước cắt-lặp của 3.23.663)
+* **Câu "Sư huynh, em..." bị TTS thành "Sư huynh".**
+* **Đo thật 20 lần (giọng Ngọc Huyền): cả 20 lần model nói thêm sau "em".**
+  * Ví dụ: "em em", "em em sư huynh", "em em mệt mỏi".
+  * Câu bị đánh dấu "dài bất thường" nên đi vào bước cắt-lặp.
+* **Cấu trúc âm:** "sư huynh" 0,05–0,47 s | ngừng 0,25 s (dấu phẩy) | "em" 0,70–0,95 s | ngừng | nói thêm 1,2–1,84 s.
+* **Nguyên nhân:** bước cắt chọn khoảng ngừng đầu tiên sau khi đã có ≥0,15 s/tiếng lời.
+  * Khi "sư huynh" dài ≥0,45 s thì chỗ cắt rơi đúng dấu phẩy.
+  * Kết quả: **4/20 bản mất chữ "em"**.
+
+### Sửa
+* **Phần bị cắt bỏ phải giống một "lần đọc lại":** dài không quá 1,6 lần phần giữ lại.
+  * Đọc lặp thật: 0,6–1,3 lần.
+  * Cắt ở dấu phẩy của câu trên: 2,3–2,5 lần → bị loại.
+  * Câu 1 tiếng không áp luật này (không có ngừng bên trong; lần đọc lại "con" có khi dài gấp đôi).
+* **Kiểm chứng trên 20 bản thật:** cả 20 giữ đủ "Sư huynh, em" (0,96–1,09 s tiếng; trước: 4 bản còn 0,57–0,59 s).
+* **Mọi ca đọc lặp thật đã cắt ở 3.23.663 (33 bản) vẫn được cắt y như cũ.**
+* **Thử nghiệm lớn phát hiện thêm "Sư muội, ta..." → "Sư muội".**
+  * 20 lần sinh: model hiếm khi nói thêm (4/20), nhưng đuôi "ta..." kéo dài nhỏ dần làm câu vượt ngưỡng.
+  * Phần sau dấu phẩy chỉ có "ta" (0,2 s), ngắn nên lọt luật tỉ lệ ở trên.
+* **Sửa gốc: bước cắt biết dấu câu của lời thoại (`count_internal_breaks`).**
+  * Câu có bao nhiêu chỗ ngắt bên trong (phẩy, "...", "?"… còn chữ phía sau) thì bỏ qua bấy nhiêu khoảng ngừng đầu tiên (≥0,1 s), vì đó là ngắt tự nhiên của lần đọc đầu.
+  * Kiểm chứng trên bản gốc thật:
+    * "Sư huynh, em...": 20/20 giữ đủ hai chữ.
+    * "Sư muội, ta...": 0/20 mất "ta".
+    * 33 ca đọc lặp thật vẫn được cắt y như cũ.
+* Test `test_vieneu_comma_trim_v323664.py` (8 ca). Trên mã 3.23.663: "Sư huynh, em" còn 0,58 s (mất "em"); mã mới giữ 0,99 s.
+
+### Thử nghiệm lớn (mã cuối, đúng đường gọi của app)
+* **Bộ thử:** 836 câu không trùng, gom từ mọi bản dịch thử của tập 1–3 — 586 câu ngắn ≤3 tiếng, 150 câu vừa, 100 câu dài.
+
+| Giọng | Câu | Lượt gọi model | Câu sinh lại | Câu cắt-lặp | Câu ngắn còn dài bất thường |
+|---|---|---|---|---|---|
+| Ngọc Huyền (câu ngắn) | 586 | 600 (+2,4%) | 14 | 83 | 5 |
+| Thanh Bình | 836 | 867 (+3,7%) | 31 | 27 | 5 |
+| Hải Đăng | 836 | 840 (+0,5%) | 4 | 0 | 2 |
+
+* Câu còn dài bất thường được báo trên bảng TTS, ví dụ "Huynh đi đi." (lời tự lặp nên cố ý không cắt).
+* **Bước cắt mới chỉ thận trọng hơn 3.23.663:** chỗ cắt bằng hoặc muộn hơn, hoặc không cắt; không thể mất chữ ở chỗ mà bản cũ không mất.
+* **Nghe kiểm chứng riêng từng câu bị cắt:**
+  * 20/20 "Sư huynh, em...", 20/20 "Sư muội, ta..." và 8/8 câu cắt của lượt lớn đã chấm đều đủ lời.
+  * Phần còn lại chưa chấm xong: Gemini quá tải (503) suốt buổi chiều 28/10.
+* **Giọng Thanh Bình phát âm câu ngắn kém hơn hẳn,** ví dụ "Sư muội ơi" nghe thành "sự mọi người". Đây là lỗi của model, không do bước cắt.
+
+### Đo thêm: cách viết câu (10 lần mỗi cách)
+* **Ngọc Huyền:**
+  * Dấu ngắt BÊN TRONG câu ngắn gây nói thêm 90–100% ("Sư huynh, em." / "…em!" / "Sư huynh... em.").
+  * "Sư huynh em." (không phẩy) chỉ 30%; nếu tắt mã tham chiếu thì 0%.
+* **Hải Đăng:** 0–10% với mọi cách viết.
+* **Không tự bỏ dấu phẩy:** sẽ mất khoảng ngắt tự nhiên của lời thoại. Bước cắt đã giữ đúng lời kèm khoảng ngắt ở 20/20 lần.
+
+## [3.23.663] — 🗣️ VieNeu: hết đọc lặp câu ngắn ("Đúng vậy, đúng vậy"), hết đuôi cụt lạ
+
+### Điều tra (đo thật, VieNeu 3.8.3 v3 Turbo — bản mới nhất, tài liệu/mã nguồn tới 19/10)
+* **Cách đo:**
+  * Tập 1–3: 296 câu, giọng Ngọc Huyền, đúng đường gọi của app.
+  * Gemini nghe lại từng câu và đánh dấu: lặp lời / tiếng lạ / kéo dài.
+* **Lỗi chính: câu ngắn 1–3 tiếng bị đọc HAI lần.**
+  * Ví dụ: "Hóa Thần" → "hóa thần hóa thần", "Đúng vậy" → "Đúng vậy, đúng vậy".
+  * Có 17 câu như vậy; câu từ 4 tiếng trở lên không có ca nào.
+  * Cấu trúc luôn là: đọc đủ → ngừng 0,25–0,5 s → đọc lại.
+  * Lần đọc lại thường bị SDK cắt cụt ở trần khung (1,04 / 1,44 / 1,84 s cho 1/2/3 tiếng), nên nghe như **tiếng lạ / ngân cụt ở cuối**.
+  * Không thấy ca "ngân dài" hay tạp âm nào khác.
+* **Vì sao app không bắt được:** lưới "dài bất thường" có sàn tuyệt đối 1,8 s (v3.23.458). Trần SDK luôn thấp hơn sàn đó, nên mọi bản lặp đều lọt.
+* **Tỉ lệ hỏng gốc của model** (71 câu ngắn × 3 lần, tắt lưới babble của SDK):
+  * 23% số lần sinh; 9 câu hỏng cả 3/3 lần — sinh lại không cứu được.
+  * Đổi tham số không giúp: nhiệt độ 0,6 / 0,7, phạt lặp 1,0 / 1,1 / 1,3, top_k 10 → 21,6–29,6%.
+  * Bỏ mã tham chiếu trong ngữ cảnh (`use_ref_codes=False`) → 9,4%.
+* **Phụ thuộc giọng** (khảo sát 25 giọng preset, 24 câu ngắn × 2 lần):
+  * Ngọc Huyền 31%, Thanh Bình 23%, Mỹ Duyên 23%.
+  * Phần lớn giọng còn lại 0–4%; Hải Đăng 0/213 lần.
+  * Không do khoảng lặng cuối clip mẫu: bỏ 4 khung lặng cuối của Ngọc Huyền vẫn 26%.
+
+### Sửa
+* **Lưới riêng cho câu ≤3 tiếng (`is_short_line_overlong`):**
+  * Ngưỡng là 1,5 lần mức đọc gọn nhất.
+  * Đo thật, câu đúng dài nhất: 0,52 / 0,76 / 1,10 s; bản lặp ngắn nhất: 0,94 / 1,18 / 1,46 s.
+* **Cắt bỏ lần đọc lại (`trim_repeated_reading`):**
+  * Cắt ở khoảng ngừng ≥0,2 s đầu tiên sau khi đã đọc đủ lời.
+  * Bỏ qua tiếng "tách" ở đầu câu; không cắt khi chính lời thoại có từ lặp ("Hả? Hả?").
+  * Nghe lại 33 bản đã cắt: 32 hết lặp. Bản còn lại dính liền nên không cắt được. Các lỗi chữ còn sót là phát âm câu 1 tiếng ("Hừ" → "hư"), có sẵn từ model.
+* **Không cắt được thì sinh lại MỘT lần, bỏ mã tham chiếu** (tham số được chuyển qua cả worker GPU), rồi lấy bản ít tiếng hơn.
+* Câu ngắn còn dài bất thường được báo trên bảng TTS.
+
+### Kết quả toàn trình (296 câu, cùng giọng, đi qua vòng sinh lại thật của app; mã cũ → mã mới)
+* Câu đọc lặp lọt ra bản lồng tiếng: 15 → **0**.
+* Giám khảo nghe — câu bị lặp: 13 → **0**; câu thừa lời: 15 → **4**; câu sai lời (CER > 0,15): 33 → **20**.
+* CER trung bình: 0,055 → **0,036**.
+* Độ giống giọng (cosine speaker embedding với giọng mẫu) không đổi: 0,684 → 0,690.
+* Không thêm lần sinh nào: 296 lần gọi model ở cả hai bản.
+
+### Giữ nguyên (đã đo)
+* Mã tham chiếu vẫn bật mặc định. Tắt toàn bộ cho 296 câu thì lặp còn 4 câu, CER 0,047 — kém bản cắt-lặp (0, 0,036).
+* Phạt lặp 1,3 của app giữ nguyên. Trên câu ngắn 1,3 kém 1,2 (29,6% so với 23%), nhưng trên cả 296 câu lại tốt hơn (13 so với 18 câu lặp); chưa đủ bằng chứng để đổi.
+
+## [3.23.662] — 🔊 Sửa bộ đo độ to (mọi engine TTS) + Gemini Live đọc theo khung từng dòng
+
+### Sửa lỗi: lồng tiếng nhỏ hơn mục tiêu ~0,9 LU (nguyên nhân gốc)
+* **Bộ đo LUFS của ứng dụng dùng hệ số lọc K-weighting của 48 kHz cho mọi tần số lấy mẫu.**
+  * Edge/Gemini xuất 24 kHz nên bị đo to hơn thật 0,9 LU (tập 1: ứng dụng đo −15,1, pyloudnorm đo −16,0).
+  * Hệ quả: Edge ra −16,91 LUFS khi mục tiêu −16 (tập 1–2).
+  * Tập dài trên 5 phút của mọi engine (đi đường đo theo khối) cũng hụt tương tự.
+  * Nay hệ số được tính theo đúng tần số lấy mẫu (công thức BS.1770 / libebur128). Ở 48 kHz trùng bảng cũ tới 1e-15.
+* **Block đo 400 ms nay chồng 75% theo chuẩn BS.1770.** Bản cũ dùng block rời, lệch tới 0,3 LU với thoại nhiều khoảng lặng.
+* **Edge có đường master riêng nên bước bù độ to của 3.23.660 không tới.** Nay dùng chung hàm bù `compensate_lufs_shortfall`.
+* **Kiểm chứng thật:**
+  * Edge tập 1 và tập 2: −16,91 → −16,09 LUFS (pyloudnorm). Đỉnh −0,72 dBTP; nhịp và độ trễ không đổi.
+  * Bộ đo của ứng dụng lệch pyloudnorm ≤0,09 LU ở 24/44,1/48 kHz, cả audio dài (trước: 0,9 LU).
+* **Sửa crash (rà độc lập phát hiện): master ngắn hơn 0,4 s làm pyloudnorm ném `ValueError`.**
+  * Gặp khi TTS lại một câu rất ngắn, hoặc phụ đề chỉ có một dòng ngắn.
+  * Có từ 3.23.660 trong `master_finalize` (VieNeu/Gemini), và trong `normalize_to_lufs` từ trước nữa.
+  * Nay mọi phép đo độ to đi qua `_integrated_lufs`; audio ngắn dùng bộ đo của ứng dụng.
+* Test `test_edge_master_loudness_v323662.py` (11 ca); mã cũ trượt 10/11.
+
+### Gemini Live (miễn phí không giới hạn lượt) — so sánh và mặc định
+* **Bảng so sánh model Live làm TTS** (đo thật, 3 key miễn phí):
+  * Tập 1+2: 238 dòng.
+  * Chấm đọc đúng: 40 câu, gemini-3.1-flash-lite nghe lại.
+  * "Nén >1,5×" = tỉ lệ dòng phải tăng tốc trên 1,5× mới vừa khung.
+
+  | Model | Sai chữ (CER) | Câu sai /40 | Nén >1,5× | Giây/dòng | Lỗi |
+  |---|---|---|---|---|---|
+  | **3.8-live + nhịp theo khung (mặc định mới)** | 0,040 (238 dòng) | — | **13,7% / 15,4%** | **0,39–0,42** | 0 |
+  | 3.8-live (3.23.661) | 0,021 | 2 | 34,7% / 30,8% | 0,45–0,48 | 0 |
+  | 3.8-live-extended-thinking | 0,010 | 0 | 32,6% / 32,2% | 0,46–0,47 | 0 |
+  | 3.1-flash-live-preview | 0,033 | 2 | 17,9% / 18,2% | 0,40–0,43 | 0 |
+  | 2.5-flash-native-audio | 0,395 | 24 | — | — | — |
+  | Edge (tham chiếu) | 0,000 | 0 | 2,1% / 0,0% | 0,11–0,14 | 0 |
+
+  * Ngưỡng nhiễu của bộ chấm là CER ~0,06, nên 0,010–0,040 coi như đọc đúng.
+* **Mới: nhịp đọc theo khung từng dòng** (`_live_style_for`).
+  * Dòng cần trên 3,2 âm tiết/giây mới vừa khung thì dặn model "đọc rất nhanh, liền mạch"; dòng đủ chỗ giữ nhịp tự nhiên.
+  * Kết quả: dòng phải nén >1,5× giảm từ 31–35% xuống 14–15%. Nén âm thanh ít hơn nên giọng ít méo hơn.
+* **Thêm model:**
+  * `gemini-3.8-live-extended-thinking`: tự gửi `thinking_level=LOW`; thiếu thì lỗi 1007.
+  * `gemini-3.1-flash-live-preview`.
+  * Cả hai cùng đọc nguyên văn như 3.8 Live.
+  * Đời 2.5 xếp sau: phát âm sai 24/40 câu, ví dụ "không có ta" → "không có bà".
+* **Mặc định:** model Gemini TTS là `gemini-3.8-live` (kèm nhịp theo khung).
+  * Engine mặc định vẫn là Edge: nhanh gấp ~3–4 lần và gần như không phải nén.
+  * Gemini Live là lựa chọn giọng diễn cảm, miễn phí không giới hạn lượt.
+* Test `test_gemini_live_pace_v323662.py` (5 ca).
+
+### Đã thử, KHÔNG áp dụng
+* **Dịch chữ qua model Live** (lấy bản chép lời của audio trả về). Chấm MQM, điểm càng thấp càng tốt:
+  * 3.8-live: 19 điểm lỗi; 3.8-live-extended-thinking: 42.
+  * Mặc định gemini-3.1-flash-lite: 3–12.
+  * Chậm hơn ~6 lần.
+  * Giữ 3.1-flash-lite cho Phân tích/Dịch.
+* **Chép lời/dịch giọng nói qua Live:** như 3.23.661 (`3.5-transcribe-live` chỉ nhận 17/121 chữ trên tiếng phim).
+
+## [3.23.661] — ⚡ Mặc định mới theo số đo thật + Gemini 3.8 Live làm TTS (miễn phí không giới hạn lượt)
+
+### Mặc định mới (đo thật trên phim mẫu, xem 3.23.660)
+* **Trích xuất: bước lấy mẫu 0,04 → 0,12 s, model OCR PP-OCRv6 medium → small.**
+  * Bước 0,12 s giữ đủ mọi câu thật trên 15 tập (864 câu).
+  * Model small: 0 câu sai chữ trên 4 tập (164 câu); medium cùng bước sai 3 câu (đọc thành chữ phồn thể).
+  * Tập 22 trên CPU: 1229 s → 65 s.
+  * Lần chạy đầu ứng dụng tự tải model small.
+* **TTS: tốc độ tối đa 2,0× → 1,5×.** Đo trên Edge (tập 1–3) với giới hạn 1,5×: hết dòng đọc quá nhanh, chỉ thêm 1 dòng chồng tiếng.
+* **Xuất bản: chất lượng (CRF/CQ) 20 → 23.** Tệp nhỏ hơn 25%, SSIM 0,990 so với 0,992.
+* **Cấu hình đã lưu từ bản cũ:**
+  * Chỉ đổi khi đang giữ đúng giá trị mặc định cũ, và chỉ đổi đúng một lần.
+  * Lựa chọn riêng của bạn được giữ nguyên.
+  * Đổi lại được trong Cài đặt / trang TTS.
+
+### Gemini 3.8 Live làm TTS
+* **Model đầu danh sách Gemini TTS là `gemini-3.8-live`** (Live API).
+  * Đo thật với key miễn phí: không giới hạn lượt/ngày (TTS thường chỉ 10 lượt/ngày/key).
+  * Đọc đúng nguyên văn câu tiếng Việt.
+  * Tập 1 (95 dòng): 95/95 dòng, 0 lỗi, 80 s với 3 key.
+* **Chia phiên song song theo key** (3 phiên/key, trần 10).
+  * Giới hạn thật của Live là số phiên đồng thời mỗi key: 4 ổn, 5 → 3/40 lỗi, 6 → 19/40 lỗi "1011 … exceeded your current quota".
+  * Trước đây 10 phiên cùng MỘT key → 76 lỗi, 9/95 dòng câm.
+* **Gửi nguyên câu kèm chỉ dẫn "đọc nguyên văn, nhịp thoại phim".** Giọng ngắn hơn 12% so với chỉ dẫn cũ; không dùng affective dialog với 3.8.
+* **Hạn chế:**
+  * Giọng Gemini vẫn dài hơn khung phụ đề: 38% dòng phải nén trên 1,5× (Edge: 0,7%).
+  * Edge vẫn là engine mặc định cho đồng bộ khớp hình.
+
+### Đã thử, KHÔNG áp dụng (số đo thật)
+* `gemini-3.5-transcribe-live` (chép lời): trên tiếng phim có nhạc nền chỉ nhận 17/121 chữ (60 s đầu tập 1); không có phân biệt người nói.
+* `gemini-3.5-live-translate-preview` (dịch giọng nói Trung → Việt):
+  * Nghe và dịch được.
+  * Nhưng không giữ mốc thời gian từng câu hay giọng từng nhân vật, đổi xưng hô ("tôi"), 60 s phim ra 76 s tiếng.
+  * Kém quy trình Phân tích → Dịch → TTS hiện tại.
+* `gemini-3.8-live` để dịch chữ: chỉ trả âm thanh (chữ qua bản chép lời), không có structured output.
+* `gemini-4-argon` (GA 13/10): hạn mức key miễn phí = 0.
+
+### Theo dõi thay đổi Gemini API (changelog tới 27/10/2026)
+* 3.5-flash / 3.7-flash đã ngừng: ứng dụng vốn tự chuyển sang 3.6 / 3.8-flash (`model_alias`).
+* 26/10 "lưu request mặc định" chỉ áp cho dự án mới thuộc gói trả phí.
+* 27/10 Gemini API CLI không liên quan ứng dụng.
+
+### Test
+* `test_defaults_v323661.py` (4), `test_gemini_live_tts_v323661.py` (2); cập nhật 4 test cũ theo mặc định mới. Toàn bộ: 7891 đạt, 61 bỏ qua. Quét giao diện: 10 trang, 210 nút, không lỗi mới.
+
+## [3.23.660] — 📊 Đo thật cả 5 khâu trên phim mẫu (3 key Gemini) + 2 lỗi tìm được khi đo
+
+Chạy ứng dụng thật trên phim mẫu (OCR 15 tập, dịch 3 tập × 34 cấu hình, TTS 3 tập × 16 cấu hình, xuất bản 10 cấu hình) để tìm thông số tốt nhất từng khâu. Báo cáo đầy đủ gửi kèm; bản này KHÔNG đổi mặc định nào, chỉ sửa 2 lỗi lộ ra khi đo.
+
+### Lỗi đã sửa (có test tái hiện thất bại trên mã 3.23.659)
+* **Gemini TTS bỏ trống hàng loạt dòng với key miễn phí.**
+  * Đo thật: gemini-3.8-flash-lite-tts miễn phí chỉ cho **3 lượt/phút và 10 lượt/ngày mỗi key**.
+  * Adapter chỉ dùng key đầu, thử lại 3 lần cách 1–2 s rồi bỏ dòng, nên **11/20 dòng mất tiếng** mà không báo gì.
+  * Nay:
+    * Dùng mọi key nhập (cách nhau bằng dấu phẩy hoặc xuống dòng); key chạm hạn mức thì chuyển sang key khác.
+    * Mọi key đều chạm hạn mức theo phút thì chờ đúng `retryDelay` máy chủ báo (không tính vào số lần thử của dòng).
+    * Hết hạn mức NGÀY trên mọi key thì dừng và báo rõ, thay vì lặng lẽ bỏ các dòng còn lại.
+* **Master TTS nhỏ hơn mục tiêu ~0,9 LU.**
+  * Đo thật Edge tập 1–3: −16,9 LUFS khi mục tiêu −16. Nguyên nhân: nén đỉnh mềm (từ 0,85) cắt bớt năng lượng sau khi chuẩn hoá.
+  * Nay bù phần hụt (tối đa +3 dB, 2 vòng) rồi ghìm đỉnh lại. VieNeu tập 1 đo được −16,01 LUFS; đỉnh vẫn ≤ 0,95.
+
+### Số liệu chính (chi tiết trong báo cáo)
+* **Trích xuất:**
+  * Bước lấy mẫu 0,12 s giữ đủ mọi câu thật trên 15 tập (864 câu; câu duy nhất "mất" là rác OCR), lệch mốc ~40 ms.
+  * Model PP-OCRv6 small @0,12 s: 0 câu sai chữ trên 4 tập (164 câu), trong khi medium @0,12 s sai 3 câu (đọc thành chữ phồn thể).
+  * Trên CPU, tập 22 mất 65 s, so với 1229 s ở mặc định medium @0,04 s.
+* **Dịch:**
+  * Yếu tố quyết định là Visual Cues (người nói theo video). Có nó, mọi cấu hình đúng 13–14/14 dòng bẫy; không có thì 8–11/14.
+  * Mặc định hiện tại (3.1-flash-lite, lô 50, ngữ cảnh 10, nhiệt độ 0,1, suy nghĩ low) chấm mù tốt nhất.
+  * Bật thêm Bản địa hoá làm tệ đi rõ (5 lỗi nặng/296 dòng).
+  * Dịch song song 3 lô nhanh gấp 2,2 lần, chất lượng gần như ngang.
+* **TTS Edge:** chiến lược "lipsync" mặc định tốt nhất; giới hạn tốc độ tối đa 1,5× xoá hết dòng đọc quá nhanh.
+* **Xuất bản (x264):**
+  * Nguồn chỉ 0,71 Mbps HEVC, nhưng CRF 20 ra 2,6 Mbps.
+  * CRF 23 nhỏ hơn 25% mà SSIM vẫn 0,990.
+
+### Test
+* `test_gemini_tts_quota_v323660.py` (5), `test_master_loudness_v323660.py` (4).
+* Toàn bộ test: 7885 đạt, 61 bỏ qua.
+  * Một lượt chạy trước đó bị Qt crash (SIGSEGV) quanh `test_stage_cache_ui_v323608` ở 89%; chạy riêng 3 lần và chạy lại toàn bộ đều đạt, chưa tái hiện được.
+
+## [3.23.659] — 🛠️ Rà BUG/CRASH toàn ứng dụng: Trích xuất → Chỉnh sửa → Dịch → TTS → Xuất bản
+
+Rà lại cả 5 khâu (đọc mã + chạy thử). Mỗi lỗi dưới đây có test tái hiện, chạy **thất bại trên mã 3.23.658** và đạt trên bản này.
+
+### Trích xuất
+* **Nhiều ROI ghi chung một tệp cache OCR:** ROI 2 ghi đè cache của ROI 1, và tiếp tục sau khi tắt app dùng nhầm checkpoint. Nay mỗi ROI một tệp; ROI 1 giữ tên cũ nên cache cũ vẫn dùng được.
+* **"Dựng lại từ cache OCR" chạy ở luồng giao diện:** tệp cache 27 nghìn khung làm app đứng vài giây, phim ghép 2h24m đứng hơn 15 giây. Nay chạy ở luồng nền và dựng đủ mọi ROI.
+* **Hàng loạt:**
+  * Khung xem trước và bộ đọc khung nhanh giờ theo đúng tập đang chạy.
+  * ETA được đặt lại ở mỗi tập.
+  * Huỷ giữa tập không còn bị tính là "tập lỗi".
+  * Tập chưa có ROI mẫu (khi bật tự dò lúc mở video) được dò ROI chính ngay, không treo chờ hộp kiểm duyệt.
+* **Dò ROI tự động** sau lần dò "ROI chính" không còn kẹt ở chế độ ROI chính.
+* **Đo tốc độ OCR** nạp đúng model của từng kịch bản trước khi bấm giờ. Trước đây kịch bản thứ hai trở đi đo nhầm model cũ.
+* **Phụ đề nhúng dạng ảnh (PGS/VobSub):**
+  * Đọc được ảnh trong thư mục có chữ Hán / tiếng Việt có dấu (Windows).
+  * Thư mục ảnh tạm được xoá sau mỗi lần trích (trước đây rò mỗi lần).
+* **Lưu khung gỡ lỗi** ghi được vào đường dẫn Unicode.
+
+### Chỉnh sửa
+* **Chữ đang gõ bị mất** khi bấm nút (Lưu, Tách, Gộp…) hoặc chuyển dòng khác. Chữ có lúc còn bị ghi vào nhầm dòng. Nay luôn ghi vào đúng dòng đang sửa, trước khi nút chạy.
+* **Nút "Lưu tệp" kẹt tắt** sau khi xuất lỗi, hoặc sau khi Re-OCR xong lúc trang còn bận.
+* **Re-OCR có một đoạn lỗi** (giải mã hỏng, hết VRAM): dòng gốc trong đoạn đó bị xoá mà không có bản thay. Nay giữ nguyên.
+* **Auto-Fix thời gian / Gộp câu trùng / cắt chồng sau Re-OCR** làm mất ghi chú OCR, nên câu rơi khỏi bộ lọc "Nghi ngờ OCR".
+* **Gõ giờ sai** (kết thúc trước bắt đầu) bị từ chối nhưng vẫn xoá toàn bộ lịch sử "Làm lại".
+* **SRT xuất ra đánh số nhảy cóc / trùng** khi danh sách đã lọc hoặc nhập từ tệp có số lạ. Nay luôn đánh 1..N.
+* **Xem khung trên video GOP dài** (keyframe cách 5–10 s): trước đây chỉ quét 60 khung nên trả khung sai hoặc báo "Không thể đọc được khung hình". Nay quét tới đúng mốc (giới hạn 8 s, dừng ngay khi đổi video) và rơi về OpenCV nếu PyAV thất bại.
+* **Trang Gỡ lỗi – OCR lại 1 khung:** bấm Trước/Sau trong lúc chờ làm kết quả ghi đè lên khung đang xem. Nay ghi vào đúng khung đã chọn, và bỏ kết quả nếu đã nạp tệp khác.
+
+### Dịch phụ đề
+* **Phản hồi Gemini sai hình dạng** (mảng trần, `subtitles` là đối tượng, phần tử không phải đối tượng) làm lô lỗi/crash. Nay được chuẩn hoá trước khi đọc.
+* **Lô thiếu dòng không được chia đôi để dịch lại:** dòng thiếu nằm lại bản gốc. Nay chia đôi, và lô con dùng schema theo đúng số dòng của nó. Trước đây nửa lô vẫn mang ràng buộc số dòng của cả lô nên luôn lệch.
+* **Lô bị máy chủ chặn** (PROHIBITED_CONTENT, RECITATION…) được xử lý đúng như trước. Phản hồi rỗng vì lý do khác nay được thử lại thay vì bỏ qua.
+* **Dịch song song** thiếu lưới an toàn của dịch tuần tự: không hoàn tác giai đoạn làm hỏng bản dịch, không cảnh báo dòng dịch thiếu. Nay có cả hai.
+* **Bộ nhớ dịch:** CSDL bị khoá lúc mở (chưa thêm được cột `video_key`) khiến mọi lần tra lỗi. Nay dùng câu SQL không có cột đó.
+
+### TTS
+* **Huỷ giữa lượt (Edge, Gemini):** audio chính bị ghi đè bằng bản câm/thiếu trước khi báo huỷ. Nay dừng ngay.
+* **Huỷ / lỗi giữa lượt cả phim:** audio từng dòng đã là của lượt mới nhưng bảng vẫn trỏ tới, nên "TTS lại dòng" ghép lẫn hai lượt. Nay bỏ tham chiếu audio từng dòng cũ.
+* **"TTS lại dòng chọn" với audio M4A/AAC:** trước đây lỗi vì libsndfile không đọc được.
+* **Xuất Opus với bitrate mặc định 320 kbps luôn lỗi.** Nay kẹp bitrate theo giới hạn bộ mã hoá (Opus ≤ 256 kbps/kênh, MP3 ≤ 320).
+* **Ducking (Edge)** chỉ áp lên audio chính. Audio từng dòng nay được ghi lại khớp, nên "TTS lại dòng" không làm lộ đoạn chưa duck.
+* **TTS cả bộ:**
+  * Không còn ghi giọng đọc của 86 tập vào dự án đang mở.
+  * Số "tập xong" đếm đúng khi có tập không khởi động được.
+
+### Xuất bản
+* **Nối cả bộ:**
+  * Ghi ra tệp `.partial` rồi mới đổi tên: huỷ, lỗi hay tắt app không còn phá bản trọn bộ cũ.
+  * Giữ mọi track tiếng (trước đây ffmpeg chỉ giữ một track) và track phụ đề (mkv).
+  * Khi mọi tập có phụ đề mà tệp nối chưa có, phụ đề được nối riêng (lệch đúng thời lượng từng tập) rồi gắn vào.
+  * Lọc tập theo đúng hậu tố: `_phude` không còn khớp nhầm `_phude_thuyetminh`, `_phude_xemthu`.
+  * Bỏ qua tệp `.partial` và bản xem thử.
+  * Huỷ được (trước đây chỉ tắt app mới dừng).
+  * Không chạy được khi đang xuất.
+* **Xuất có phụ đề/âm thanh** bị từ chối nhầm theo trường `mode` cũ thay vì cặp chế độ thật.
+* **Đường dẫn có dấu nháy `'`** (vd thư mục `it's`) làm ffmpeg lỗi bộ lọc phụ đề. Đã kiểm bằng ffmpeg thật.
+* **Xuất cả bộ:**
+  * Không còn ghi "đã xuất bản" 86 lần vào dự án đang mở.
+  * Luôn xuất đủ phim, kể cả khi ô "Xuất thử" đang bật.
+* **Bản xuất thử 90 s** không còn được ghi nhận là "đã xuất bản".
+* **Đổi video / mở dự án khác:** "Lấy giọng đọc từ app" không còn lấy nhầm giọng của dự án trước.
+* **Ghi nhớ cặp chế độ xuất** (phụ đề / âm thanh) qua các lần mở app.
+* **Dây chuyền phim bộ:** khâu Xuất bản được coi là xong theo hậu tố của chế độ đang chọn.
+
+### Test
+* Thêm 59 test mới (58 trong 10 tệp `test_*_v323659.py` + 1 ở trang Phim bộ); sửa 1 test cũ theo hành vi mới (cửa sổ vá trùm cả lô → chia đôi).
+* Chạy các test mới trên mã 3.23.658 (trước lượt rà độc lập):
+  * **43 test thất bại.**
+  * 2 tệp (8 test) treo vì lỗi gốc làm trang chờ mãi.
+  * Số còn lại là ca đối chứng, đạt trên cả hai bản.
+* Tốn kém khi lô bị chặn hoàn toàn: **26 lượt gọi** cho lô 50 dòng (bản đầu của đợt này là 297).
+* Toàn bộ test: **7876 đạt**, 61 bỏ qua, 0 lỗi (8 phút 24 giây).
+* Quét giao diện tự động: 10 trang, 206 nút, 54 hộp chọn; không lỗi mới.
+* Sửa rò cấu hình giữa các test: chế độ xuất được nhớ từng làm 3 test xuất thử hỏng tuỳ thứ tự chạy. Nay đặt lại sau mỗi test.
+
+### Rà độc lập trước khi giao (đã sửa)
+* **Lô bị chặn hoàn toàn** (thứ bị chặn nằm ở chỉ dẫn chung) chia đôi tới từng dòng: 297 lượt gọi cho 50 dòng, đủ cạn hạn mức miễn phí. Nay:
+  * Bị chặn chỉ thử 2 lần mỗi lượt gọi.
+  * Mỗi lô gốc chỉ chia đôi vì bị chặn tối đa 8 lần.
+* **Huỷ TTS trước khi ghi dòng nào** vẫn bỏ liên kết audio từng dòng của lượt trước. Nay chỉ bỏ khi tệp thật sự bị ghi lại.
+* **Nút Huỷ khi "Dựng lại từ OCR"** không dừng được việc dựng lại. Nay dừng giữa các ROI.
+* **Huỷ trong bước gắn phụ đề** của lượt nối cả bộ bị bỏ qua (bước này chép lại cả tệp trọn bộ). Nay dừng ngay và giữ bản trọn bộ cũ.
+* **Đổi video trong lúc đang tìm khung trên video GOP dài** có thể làm cửa sổ chờ lâu. Nay việc quét dừng ngay khi đóng video.
+
+## [3.23.658] — 🎬 Đợt C: Dây chuyền phim bộ (mặc định dừng sau khâu Dịch)
+
+### Tính năng mới: trang "Phim bộ"
+* **Bảng trạng thái:** mỗi tập một hàng, mỗi khâu (Trích xuất / Dịch / TTS / Xuất bản) một cột: ✓ xong · ▶ sẵn sàng · · chờ khâu trước · ⚠ lỗi lượt trước · ⏳ đang chạy.
+  * Đọc từ tệp có sẵn cạnh video, cùng quy ước tên với các chế độ "cả bộ"; không cần CSDL.
+  * Rê chuột lên ô để xem tệp kết quả.
+* **"▶ Chạy tiếp tất cả"** chạy **theo khâu**: trích xuất mọi tập còn thiếu → dịch mọi tập đã có phụ đề gốc → …
+  * Dùng chính chế độ "cả bộ" của từng trang, với cấu hình bạn đang đặt (ROI, giai đoạn dịch, giọng, chế độ xuất bản).
+  * Model OCR / TTS chỉ nạp một lần cho cả bộ. Tập đã xong được bỏ qua.
+  * Không có hộp thoại xác nhận hay tổng kết ở từng khâu; chỉ có một tổng kết cuối lượt.
+* **Điểm dừng — theo yêu cầu của bạn, mặc định "Dừng sau khâu Dịch":** để bạn soát người nói / bản dịch trước khi lồng tiếng, rồi chọn "Xuất bản (chạy hết)" và bấm lại.
+* **Dừng êm:**
+  * Hết hạn mức API trong ngày → dừng cả dây chuyền và nói rõ lý do; hôm sau bấm lại, các tập đã dịch được bỏ qua.
+  * Lỗi cấu hình (khoá API, engine TTS…) → dừng và chỉ ra trang cần xem.
+  * Tập lỗi được ghi ở cột Ghi chú và sẽ chạy lại ở lượt sau.
+* **Chạy tiếp sau khi tắt app:** trạng thái lượt chạy được lưu trong thư mục phim bộ (`.subtitles_extractor_series.json`, ghi kiểu tệp tạm + đổi tên nên không hỏng khi mất điện). Mở lại app, trang nhớ thư mục và nhắc "Chạy tiếp tất cả".
+* Tập đã trích xuất ở bản cũ (phụ đề chỉ có trong CSDL) được ghi bù `.original.srt` trước khi quét, không bị OCR lại.
+
+### Lỗi đã sửa (có test tái hiện thất bại trên mã cũ)
+* Bấm **Huỷ đúng lúc trang Trích xuất đang nạp tập kế** của lượt hàng loạt: tập đó vẫn bị trích xuất rồi mới dừng.
+* Bấm **Bắt đầu / Hàng loạt (Trích xuất), Tổng hợp cả bộ (TTS), Xuất cả bộ (Xuất bản) giữa hai tập** của một lượt hàng loạt (nút được bật lại trong một nhịp): hàng đợi đang chạy bị thay bằng hàng đợi mới. Test tái hiện: luồng TTS và xuất bản thật khởi động chồng lên lượt cũ.
+* Trích xuất hàng loạt một tập ra **0 câu** không ghi tệp mà cũng không tính là lỗi. Nay báo lỗi ("kiểm ROI").
+* Giọng đọc xuất ra **.opus / .ogg** không được TTS / Xuất bản "cả bộ" nhận ra, nên bị tổng hợp lại ở mỗi lượt.
+
+### Rà soát độc lập trước khi giao (đã sửa)
+* Bấm Dừng đúng lúc một khâu vừa xong: khâu kế (Dịch, tốn hạn mức) vẫn chạy.
+* Trang ném lỗi khi bắt đầu khâu thì dây chuyền kẹt ở trạng thái "đang chạy" tới khi tắt app.
+* TTS không khởi động được (engine, khoá) bị báo nhầm là "Đã dừng theo yêu cầu".
+* Đóng app giữa lượt: trang báo "xong khâu" trong lúc dọn dẹp không còn kích hoạt khâu kế.
+
+### Test
+* Thêm 27 test: lõi trạng thái + lưu/đọc trạng thái (4), bộ điều phối (8), các trang ở chế độ dây chuyền + các lỗi trên (15).
+* Quét giao diện tự động: 10 trang, 208 nút, không lỗi mới.
+
+## [3.23.657] — 🧹 Đợt B: khôi phục chữ theo vị trí căn giữa, nút dọn audio từng dòng, đo bộ dò chữ nhỏ, lý do "Nghi ngờ OCR"
+
+### Chất lượng trích xuất
+* **Khôi phục chữ OCR làm rơi (vd `一` đầu câu, `吧` cuối câu) nay kiểm thêm vị trí căn giữa.**
+  * **Vấn đề:** khâu dựng phụ đề thêm lại chữ mà PaddleOCR đôi khi bỏ sót, nhưng có lúc thêm nhầm (tập 8: `一小小教训你们一下吧` — thừa `一`).
+  * **Cách làm:** phụ đề căn giữa thì câu đúng phải nằm giữa khung. Đo trên hộp chữ tập 8: có `一` thì câu lệch tâm 18 px (0,58 bề rộng chữ), không có thì lệch 0,5 px. Quy tắc: chỉ khôi phục khi chữ thêm vào không làm câu lệch tâm thêm quá 0,25 bề rộng một chữ. Chỉ áp dụng khi ROI căn giữa (hoặc chưa rõ), ROI căn trái/phải giữ như cũ.
+  * **Kiểm chứng trên 12 tập mẫu (837 dòng), so với phụ đề bản trước:** chỉ đổi 2 dòng, cả 2 đều là sửa đúng:
+    * tập 3 `…吧天` → `…吧`;
+    * tập 8 `一小小教训你们一下吧` → `小小教训你们一下吧`.
+
+### Lồng tiếng (TTS)
+* **Nút "🧹 Dọn audio từng dòng (X MB)" (theo yêu cầu của bạn: không tự dọn sau khi xuất bản).**
+  * Xoá audio riêng từng dòng (`seg_*.wav`), thùng rác audio dòng đã xoá và cache dòng. File audio chính và SRT đồng bộ **giữ nguyên**.
+  * Chỉ xoá tệp do ứng dụng tạo: thư mục audio dòng trùng thư mục video thì video và tệp khác không bị đụng tới.
+  * Hỏi xác nhận trước khi xoá, cảnh báo rằng sau đó muốn nghe/TTS lại một dòng phải chạy lại cả phim. Nút khoá khi đang chạy TTS hoặc không còn gì để dọn; dung lượng được đo lại sau mỗi lượt chạy.
+
+### Trích xuất: Đo tốc độ OCR
+* **Thêm kịch bản "Bộ dò chữ v6 small"** (nhận dạng giữ model hiện tại). Trên GPU, dò chữ là phần chậm nhất; phụ đề cứng chữ to rõ nên bộ dò nhỏ thường cho cùng kết quả.
+  * Như các kịch bản khác, chỉ được đề xuất khi cho **cùng tập câu phụ đề** với cấu hình hiện tại.
+  * Lần đo đầu sẽ tải model (máy thử không tải được model, nên tốc độ phải đo trên máy của bạn).
+* **Cài đặt mới "Bộ dò chữ"** (Cài đặt → OCR): "Theo phiên bản OCR" (mặc định, như cũ) hoặc chọn riêng v6 small / tiny / medium. Bấm áp dụng đề xuất thì ứng dụng ghi vào ô này.
+
+### Chỉnh sửa
+* **Lọc "Nghi ngờ OCR" hiện lý do** ở cột cảnh báo và tooltip: ít khung, hiện dần, gần trùng câu kề, lẫn chữ Latin/số, tin cậy thấp, chữ được khôi phục. Cột tự nới rộng khi bật lọc này.
+
+### Rà soát độc lập trước khi giao (đã sửa, mỗi lỗi có test tái hiện thất bại trên mã trước khi sửa)
+* Re-OCR (Nâng cao) bỏ qua bộ dò chữ chọn riêng: trích xuất dùng `small_det`, Re-OCR dùng `medium_det` → engine dùng chung nạp lại model 7–19 s mỗi lần đổi qua lại. Nay Re-OCR cùng phiên bản với Cài đặt dùng đúng bộ dò chữ đã chọn; chọn hẳn phiên bản khác thì như cũ.
+* Luật căn giữa chạy cả với ROI phụ đề **dọc** (bề rộng hộp ≈ 1 chữ → ngưỡng còn ~1 px, loại nhầm chữ khôi phục đúng). Nay chỉ áp dụng cho phụ đề ngang.
+* Nạp phụ đề mới ở trang TTS: nút Dọn vẫn hiện dung lượng và nhắm vào audio dòng của lượt TTS trước. Nay bỏ theo kết quả cũ.
+* Thư mục tạm `resynth_seg_*` sót lại (sau khi sập lúc "TTS lại dòng chọn") nay cũng được đếm và dọn.
+* Đổi phiên bản OCR trong Cài đặt thì "Bộ dò chữ" về "Theo phiên bản", tránh ghép âm thầm bộ dò v6 với bộ nhận dạng phiên bản khác.
+
+### Test
+* Thêm 19 test: khôi phục chữ theo căn giữa (6), dọn audio từng dòng (6), ô "Bộ dò chữ" của Cài đặt (1), bộ dò chữ nhỏ + Re-OCR (4), lý do nghi OCR (2).
+
+## [3.23.656] — 🔒 Đợt A: các việc OCR không còn phá nhau (Re-OCR / Cài đặt khi đang trích xuất), huỷ xuất bản khi ffmpeg treo, sửa nhỏ
+
+### Lỗi nghiêm trọng đã sửa
+* **Re-OCR, đo tốc độ, chạy thử OCR hay đổi Cài đặt trong lúc đang trích xuất làm hỏng lượt trích xuất** (tìm ra khi quét giao diện tự động).
+  * **Nguyên nhân:** mọi việc OCR dùng chung một engine, và mỗi lượt bắt đầu bằng việc áp cấu hình của nó *lên chính engine đó*.
+  * **Hậu quả:** lượt trích xuất đang chạy âm thầm bị đổi ngưỡng / tiền xử lý. Đo trên tập 22: cùng 40 khung, số ô chữ **17 → 4**, không báo gì. Đổi model thì model bị giải phóng giữa chừng: lượt quét giao diện ghi được *cả tập* trích xuất hàng loạt lỗi (`TypeError` trong PaddleX), và trên GPU có nguy cơ crash.
+  * **Sửa tận gốc:**
+    * Cấu hình OCR đi theo **từng lượt chạy**, không đổi trạng thái engine dùng chung.
+    * Mỗi lúc chỉ chạy một lô.
+    * Lượt cần model khác thì model được nạp lại *giữa hai lô*.
+    * Đổi ngưỡng dò chữ / giới hạn cạnh không còn nạp lại model (trước đây mất 7–19 s mỗi lần).
+  * **Kiểm chứng trên PaddleOCR thật:** cùng 40 khung, số ô chữ giữ nguyên 17 dù có lượt khác áp cấu hình riêng.
+* **Theo lựa chọn của bạn: khi đang trích xuất (kể cả khoảng giữa hai tập của lượt hàng loạt) thì khoá:**
+  * Re-OCR (Nâng cao + Nhanh) ở trang Chỉnh sửa;
+  * chạy thử OCR ở trang Gỡ lỗi;
+  * Tự dò ROI / Đo tốc độ OCR / Dò thử ở trang Trích xuất.
+  Có tooltip và thông báo lý do; mở khoá ngay khi trích xuất xong, bị huỷ hoặc lỗi.
+
+### Xuất bản
+* **Nút Huỷ hoạt động cả khi ffmpeg treo im lặng.** Trước đây lệnh huỷ chỉ được kiểm khi ffmpeg in một dòng, nên ffmpeg treo thì Huỷ vô tác dụng và luồng xuất kẹt mãi.
+  * Nay đọc log ở luồng riêng và kiểm huỷ mỗi 0,25 s. Test: ffmpeg giả im lặng 30 s → bản cũ treo đủ 30 s, bản mới dừng trong ~1 s.
+  * ffmpeg im lặng **10 phút** (bình thường in tiến độ ~2 lần/giây) thì tự dừng và báo rõ.
+  * Thoát giữa chừng vì bất kỳ lỗi nào cũng kill ffmpeg, không để chạy mồ côi.
+* Tệp **mp4/m4v/mov** thêm `-movflags +faststart` (xem được ngay khi đang tải lên / phát qua mạng).
+
+### Sửa nhỏ
+* Trang Gỡ lỗi dựng lại từ cache OCR thô cũ (trước 655) mà ROI vượt mép khung: nay kẹp ROI theo video như lúc trích xuất.
+* "Quản lý giai đoạn" dự đoán "lần dịch tới" nay tính cả dòng đổi người nói (trước báo "dùng lại hết" trong khi lượt dịch thật dịch lại lô đó).
+
+### Rà soát độc lập trước khi giao (đã sửa)
+* Sau lượt trích xuất hàng loạt, các nút Dò thử / Đo tốc độ / Tự dò ROI **kẹt khoá** tới khi nạp video khác → nay mở khoá ngay khi lượt hàng loạt xong.
+* Re-OCR có model riêng chạy cùng lúc với trích xuất → nạp lại model ở *mỗi lô* (7–19 s/lô). Nay khoá cả chiều ngược lại: đang Re-OCR thì nút Bắt đầu / Hàng loạt / Tự dò ROI / Đo tốc độ ở trang Trích xuất tạm khoá, kèm lý do.
+* Tự dò ROI / OCR phụ đề nhúng (không có cấu hình riêng) dùng model **đang nạp**, không ép về Cài đặt (tránh nạp lại qua lại khi chọn ngôn ngữ OCR riêng ở trang Trích xuất).
+* Khởi động lạnh với ngôn ngữ/model riêng không còn nạp model hai lần.
+* Chạy thử OCR ở trang Gỡ lỗi dựng từ cấu hình đầy đủ của ứng dụng (trước đây thiếu batch/luồng CPU → nạp lại model).
+* Lưu Cài đặt không còn đứng giao diện khi một lượt đang nạp model.
+* Đóng app giữa lúc đang suy luận: giải phóng model/VRAM được hoãn tới khi lô đang chạy xong (không giải phóng dưới chân nó).
+
+### Giới hạn
+* Kiểm trên CPU. Trên GPU của bạn, nạp lại model khi đổi model vẫn mất 7–19 s như trước, nhưng giờ chỉ xảy ra khi thật sự đổi model.
+
+## [3.23.655] — ⚙️ Đợt 3: giải mã song song OCR, gom lô VieNeu theo giọng, kiểm lại dòng nghi bằng AI, TTS lại từng dòng cho Edge/Gemini, 4 lỗi tồn + "Tự động" gỡ cue, cờ chữ khôi phục
+
+### Hiệu năng
+* **Giải mã khung chạy song song với OCR** (luồng giải mã riêng + hàng đợi 256 khung): trước đây giải mã/lọc trùng và OCR chạy nối tiếp nên GPU OCR đứng chờ CPU. Thứ tự khung giữ nguyên, lỗi giải mã vẫn báo ra, huỷ thì luồng giải mã dừng và đóng bộ giải mã. Đo tập 22 (58 s, OCR bằng **CPU** trong máy thử): 408,0 s → 391,8 s (−4%), 1461 khung / 27 câu, **SRT giống hệt từng byte**. Lợi ích chính dành cho máy GPU (OCR nhanh, giải mã chiếm phần lớn hơn) — chưa đo được trên GPU thật. Tắt bằng biến môi trường `SUBTITLES_EXTRACTOR_NO_PREFETCH=1`; bộ giải mã mpv giữ chạy nối tiếp.
+* **VieNeu gom lô toàn cục theo giọng**: lô không còn dừng ở dòng đổi giọng — gom các dòng CÙNG giọng phía sau (chưa có trong bộ đệm) rồi xếp theo độ dài. Lồng tiếng 2 vai xen kẽ, 16 dòng, lô 4: 8 → **4** lần gọi GPU.
+
+### Gợi ý hình ảnh (trang Dịch)
+* Nút **"🔍 Kiểm lại dòng nghi bằng AI"** (bật khi có "⚠ N dòng nghi"): chỉ gửi các dòng bị chấm nghi cho AI xem lại kèm đoạn video tương ứng; nhãn mới chỉ được nhận khi KHÁC nhãn cũ VÀ hết bị chấm nghi; cue bạn đã chọn tay không bị đụng. Báo "sửa X, giữ nguyên Y, còn Z dòng nghi". (Kiểm bằng test với model giả; chưa chạy trên API thật trong bản này.)
+
+### TTS
+* **Edge và Gemini cũng giữ audio từng dòng** → "TTS lại dòng chọn" dùng được với cả hai (trước đây chỉ VieNeu; sửa một chữ phải chạy lại cả phim). Audio lưu đúng đoạn đã đặt vào bản trộn (sau nén/cắt). Kết quả Edge/Gemini tạo trước bản này vẫn không TTS lại riêng được (thiếu audio từng dòng) — chạy Tổng hợp một lần.
+* **Chọn lại "Tự động"** cho người nói / nói với ai → cue người dùng đã đồng bộ sang trang Dịch được **trả về nhãn AI gốc** và bỏ dấu "Bạn" (trước đây vẫn ở lại, lần dịch sau theo người nói cũ). Nhãn AI gốc được cất (khoá JSON `ai`) từ lần đầu bạn sửa; cue sửa trước bản này không có bản cất nên giữ giá trị hiện tại, chỉ bỏ dấu người dùng khi khớp.
+
+### Sửa lỗi tồn (từ bản phân tích v651)
+* **#9 Sửa ô Gợi ý hình ảnh trong lúc đang dịch bị ghi đè khi dịch xong**: kết quả quét bổ sung nay được **gộp 3 chiều** (bản lúc bắt đầu chạy / ô của bạn / kết quả): dòng bạn sửa, thêm, xoá giữ nguyên; dòng bạn không đụng nhận kết quả mới; ô đang lỗi JSON thì giữ nguyên ô. Phiên dịch được lưu lại bản đã gộp.
+* **#12 Xuất bản không cảnh báo phụ đề lệch số dòng với audio TTS** (vd đã xoá dòng ở trang TTS): so với phụ đề đồng bộ `<audio>.tts*.srt` cạnh audio; dòng trạng thái báo "Phụ đề N dòng ≠ audio TTS M dòng", bấm Xuất thì hỏi: Có = dùng phụ đề đồng bộ, Không = vẫn xuất, Huỷ. Xuất cả bộ chỉ ghi nhật ký (không chặn bằng hộp thoại).
+* **#15 Hai lượt tự lưu trang Chỉnh sửa xong ngược thứ tự → bản cũ đè bản mới**: các lượt ghi tuần tự, lượt có ảnh chụp cũ hơn lượt đã yêu cầu sau (cùng video) tự bỏ.
+* **#16 ROI vượt mép khung**: bộ giải mã cắt theo ROI đã kẹp, nhưng tỉ lệ upscale và lọc căn giữa dùng ROI gốc → toạ độ ô chữ lệch (ví dụ ROI cao 200 chỉ 80 px trong khung: điểm (100,40) về (125,50) thay vì (50,20)), dòng căn giữa có thể bị lọc oan. Nay kẹp ROI một lần lúc bắt đầu.
+  **NVDEC**: gói giải mã lỗi từng phát "khung lỗi" với mốc giờ của GÓI (thứ tự giải mã: −1 khi thiếu PTS, lùi/tiến với khung B) và dời lịch lấy mẫu theo đó → khung rỗng chen sai chỗ. Nay mốc không bao giờ lùi, gói thiếu PTS không chen khung; PTS = 0 (khung đầu phim) không còn bị coi là "thiếu".
+* **Cờ chữ khôi phục**: câu được Yi-Restorer thêm ký tự OCR làm rơi (vd `一` đầu câu) mang ghi chú `restored_char` (lưu cùng phụ đề) và hiện trong bộ lọc **"Nghi ngờ OCR"**; sửa chữ câu đó thì bỏ cờ. 12 tập mẫu: 1/837 câu — `一小小教训你们一下吧` (tập 8), chính là một ca khôi phục SAI (đúng: `小小教训你们一下吧`).
+
+### Rà soát độc lập trước khi giao (đã sửa)
+* Gộp 3 chiều ô Gợi ý hình ảnh hiện đúng trên màn hình nhưng bản LƯU vào phiên vẫn là bản chưa gộp (view model lưu sau khi báo trang; `setPlainText` xoá cờ "đã sửa" nên trang không lưu) → mở lại app mất sửa tay. Nay view model lưu trước, trang lưu bản đã gộp.
+* Hàng đợi giải mã 256 khung có thể chiếm 1,5–6 GB RAM khi không đặt ROI / ROI lớn trên 1080p–4K → thêm trần **256 MB** (giới hạn nào chạm trước thì dừng giải mã chờ OCR).
+* Luồng giải mã được đóng ngay khi OCR ném lỗi (trước đây chờ GC → giữ phiên NVDEC/VRAM; thử lại có thể mở phiên NVDEC thứ hai).
+* `@lru_cache` lỡ gắn nhầm sang hàm mốc giờ NVDEC (bảng codec mất bộ nhớ đệm) — đã trả về đúng chỗ.
+* Tự lưu trang Chỉnh sửa: khoá ghi giữ suốt lúc ghi CSDL làm luồng giao diện chờ khi xin số thứ tự → tách khoá bộ đếm riêng.
+* "Dựng lại từ cache" ở trang Trích xuất dùng ROI chưa kẹp → khác kết quả lần trích xuất (cache mới đã lưu ROI kẹp; trang Gỡ lỗi dùng ROI trong cache).
+* Cờ chữ khôi phục khớp CHUỖI CON → câu khôi phục ngắn (`一个`) đánh dấu oan mọi câu chứa nó; nay khớp nguyên câu / nguyên một dòng (12 tập: vẫn 1/837).
+* Sửa người nói ở 📋 Bảng người nói nay cũng cất nhãn AI gốc → chọn lại "Tự động" ở trang TTS trả về được.
+* VieNeu gom lô toàn cục: trần độ dài (`max_new_frames`) tính theo câu đầu lô → câu dài kéo vào lô bị cắt cụt; nay trần theo câu nhiều âm tiết nhất trong lô (đổi lại câu ngắn trong lô có trần rộng hơn — lưới "ngân dài" sau tổng hợp vẫn bắt).
+* Trang Xuất bản không đọc lại hai tệp phụ đề mỗi lần làm mới trạng thái (nhớ theo đường dẫn + thời điểm sửa tệp).
+
+### Giới hạn còn lại
+* TTS lại dòng chọn với Edge: bản trộn ghép lại không còn "dìm tiếng" (ducking) ở đoạn chồng tiếng như lượt đầy đủ, và qua chuỗi master chung thay vì chuỗi riêng của Edge.
+* Giải mã song song chưa đo được trên GPU thật; cache OCR thô tạo trước bản này mà ROI vượt mép thì trang Gỡ lỗi vẫn dựng với ROI chưa kẹp.
+
+## [3.23.654] — 🧩 Đợt 2: sửa "nói với ai" ở TTS, bảng sửa Gợi ý hình ảnh + chấm dòng nghi, lịch sử TTS bằng tệp + thùng rác audio, lọc chữ sáng mặc định, gộp phụ đề hiện dần, bộ nhớ dịch, lọc "Nghi ngờ OCR"
+
+### Theo yêu cầu của bạn
+* **Trang TTS sửa được "nói với ai"**: cột **Nói với** cạnh cột người nói (nhấp đúp hoặc chuột phải → "🗣 Nói với ai": tự động theo gợi ý / chọn vai / "không nói với ai – độc thoại" / tên khác). Lưu theo phụ đề, hoàn tác được, đi theo dòng khi thêm/xoá/gộp/tách. Không đánh dấu TTS lại (giọng theo người nói).
+  Cùng người nói, giá trị này được **đồng bộ về Gợi ý hình ảnh của trang Dịch** (cue người dùng — AI không đè); bấm Dịch chỉ dịch lại lô có dòng đổi. **Không tự dịch lại** (theo lựa chọn của bạn).
+* **Lọc chữ sáng BẬT mặc định**, tắt được trong Cài đặt (ô "Chỉ OCR khi chữ sáng đổi"). Cấu hình lưu từ bản cũ (luôn ghi `false`) được bật **một lần**; sau đó lựa chọn của bạn được giữ.
+* **Gộp phụ đề hiện dần** (`我` → `我只是`): tuỳ chọn mới trong Cài đặt › thuật toán, **mặc định TẮT** (có thể là nhân vật nói lắp thật). Đo trên 12 tập mẫu: 9/837 câu (1,1%); kiểm bằng ảnh khung thật tập 12 (`我` rồi `我只是` cùng cảnh).
+
+### Gợi ý hình ảnh (trang Dịch)
+* **"📋 Bảng người nói / nói với ai…"**: mỗi câu gốc một hàng (giờ, câu gốc, bản dịch, người nói, nói với, bối cảnh, nguồn, ⚠). Gõ tên Việt ("Lâm Dật") hay tên gốc đều được; gán hàng loạt; ⇄ đảo người nói ↔ người nghe; lọc "chỉ dòng nghi" / theo chữ. Dòng sửa ghi nguồn "Bạn". JSON thô vẫn giữ.
+* **Chấm dòng nghi không tốn request** (hiện "⚠ N dòng nghi" cạnh nút): người nói = người nghe; câu gốc gọi đúng tên người nói; tự xưng trái giới (本姑娘/妾身… với vai nam, 老夫/本王… với vai nữ); thiếu người nói; tên lạ chỉ xuất hiện ≤ 2 câu. Trên 3 bộ cues thật của 12 tập: 0 dòng báo nhầm (bản đầu báo nhầm 60 câu của vai "Hệ thống" — đã siết luật tên lạ).
+
+### TTS
+* **Sửa tay lưu ở TỆP** (`<dữ liệu người dùng>/dubbing_edits/<dấu phụ đề>.json`, ghi an toàn) thay registry Windows; dữ liệu cũ tự chuyển sang (chỉ xoá khoá registry khi đã chép đủ). Ghi gom 0,4 s, ghi ngay khi đổi phụ đề / rời trang.
+* **"🕘 Lịch sử…"**: 20 phiên bản gần nhất (cất khi danh sách dòng đổi, khi bớt/xoá sửa tay, hoặc mỗi ≥ 30 s), còn qua lần mở lại app; chọn để áp lại, hoàn tác được.
+* **Thùng rác audio**: xoá dòng sau TTS → WAV dời vào `.trash` (kèm dòng gốc); "Khôi phục dòng đã xoá" / "Khôi phục bản gốc" **dùng lại audio, không phải TTS lại**. Chỉ khớp đúng dòng gốc + lời; lượt TTS mới thì dọn thùng rác (giọng/tốc độ có thể đã đổi).
+
+### Bộ nhớ dịch
+* Không lấy câu của **chính video đang dịch** làm tham chiếu (bộ nhớ tự nuôi chính nó, kể cả lỗi). Bộ nhớ bản cũ (không ghi video): nếu ≥ 30% câu của phụ đề nằm nguyên văn trong bộ nhớ thì bỏ các câu trùng đó.
+* Truy hồi gộp (rapidfuzz `cdist`, đa luồng, theo khúc 50 câu, dừng sớm): đo 5000 mục ít khớp 0,93 → 0,24 s; khớp nhiều 0,030 → 0,035 s; kết quả giống hệt cách cũ.
+
+### Trang Chỉnh sửa
+* Bộ lọc mới **"Nghi ngờ OCR"**: dòng ≤ 3 khung, phần đầu của câu hiện dần, gần giống câu liền kề, chữ Latin/số lẫn trong câu chữ Hán, độ tin cậy thấp (PP-OCRv6 báo ~1,0 gần như mọi dòng nên lọc "Lỗi OCR" ít bắt được). 12 tập mẫu: 10/837 dòng — 9 cặp hiện dần + 1 dòng rác thật (`200 2a1s wses`, tập 5).
+
+### Rà soát độc lập trước khi giao (đã sửa)
+* Chuyển dữ liệu registry → tệp lỗi mà vẫn xoá registry → mất mọi sửa tay (đã: chỉ xoá khi chép đủ).
+* Lọc "Nghi ngờ OCR" dùng danh sách cũ sau khi sửa/xoá dòng → lọc sai hàng (đã: bỏ danh sách trước khi proxy lọc lại; tô hàng đang phát không tính lại).
+* Xoá hết sửa tay trong vòng 30 s làm mất phiên bản trước khỏi lịch sử (đã: luôn cất khi bớt sửa tay).
+* Ghi tệp lịch sử (tới 6,5 MB) trên luồng giao diện 2–3 lần mỗi thao tác (đã: gom 0,4 s).
+* Bảng cues bấm OK ghi đè người nói vừa đồng bộ từ TTS trong lúc bảng mở (đã: chỉ áp các dòng sửa lên bản hiện tại).
+* Thùng rác khớp chỉ theo lời → hai câu "好" của hai vai lấy nhầm audio; audio cũ sau khi đổi giọng (đã: khớp dòng gốc, dọn khi TTS lượt mới; dọn tệp mồ côi).
+* `ALTER TABLE` bộ nhớ dịch khi CSDL bị khoá → treo 5 s mỗi lần + rò kết nối (đã: lùi về kiểu cũ, đóng kết nối khi lỗi).
+* Hộp thoại không được giải phóng (bảng ~33 nghìn ô); áp phiên bản lịch sử còn giữ cờ "đã sửa" cũ.
+
+### Giới hạn (nói thẳng)
+* Chọn lại "Tự động" cho người nói/người nghe ở trang TTS không gỡ cue đã đồng bộ ở trang Dịch (sửa trong bảng người nói).
+* Chưa làm (Đợt 3): phân tích lại có chọn lọc chỉ cho dòng nghi (gọi API), tham chiếu bộ nhớ dịch theo từng lô, Edge/Gemini lưu audio từng dòng.
+* Ca `小小教训` → `一小小教训` (khôi phục chữ "一") vẫn chưa bắt được: bộ lọc "Nghi ngờ OCR" chưa biết dòng nào đã được khôi phục chữ.
+* Chưa chạy trên Windows/GPU của bạn.
+
+### Kiểm thử
+* Test mới: `test_tts_addressee_v323654` (4), `test_progressive_and_white_gate_v323654` (4), `test_cue_review_v323654` (3), `test_cue_table_v323654` (5), `test_tts_history_trash_v323654` (8), `test_translation_memory_v323654` (5), `test_ocr_suspect_filter_v323654` (3).
+* Toàn bộ: **7704 passed, 61 skipped**, 0 failed (6 phút 52 giây).
+
+## [3.23.653] — 🔁 Người nói chọn đúng ở trang TTS được đưa ngược về Gợi ý hình ảnh của trang Dịch
+
+### Trước đây
+* Sửa người nói ở trang TTS chỉ dùng để chọn giọng; Visual Cues của phiên dịch (đầu vào quyết định xưng hô ta/ngươi, con/sư phụ…) vẫn giữ người nói sai → dịch lại vẫn sai.
+* Kể cả khi sửa cues bằng tay, bộ nhớ đệm giai đoạn chỉ băm CHỮ của dòng nên bấm "Dịch" dùng lại nguyên bản dịch cũ (lỗi #8 trong báo cáo 3.23.651).
+
+### Nay (theo lựa chọn của bạn: chỉ đồng bộ, không tự dịch lại)
+* **Tự đồng bộ**: 1,5 s sau lần đổi người nói cuối ở trang TTS, các dòng đã chọn tay được quy về câu gốc (dùng ánh xạ dòng TTS ↔ câu gốc sẵn có) và ghi vào Visual Cues của trang Dịch, lưu luôn vào phiên dịch. Dòng trạng thái TTS báo số câu đã cập nhật.
+* **Cue người dùng được đánh dấu** (`"src":"user"` trong JSON; cue AI giữ nguyên định dạng cũ) và **không bị đè** bởi: vá phân tích tự động, lưới sửa tiếng gọi (vocative guard), phân tích lại, quét bổ sung cues khi dịch.
+* **Bấm "Dịch" chỉ dịch lại lô có câu đổi người nói**: người nói/người nghe của cue người dùng nằm trong vân tay đầu vào của bộ nhớ đệm. Dòng không có cue người dùng giữ vân tay cũ → **bộ nhớ đệm đã có không bị mất**.
+  Đo bằng test (10 dòng, lô 2, 2 giai đoạn): lần đầu 10 lượt gọi; chạy lại không đổi gì 0 lượt; đổi người nói 1 câu → 2 lượt (đúng 1 lô × 2 giai đoạn).
+* **An toàn**: không đồng bộ khi chưa nạp vai, khi phụ đề TTS không ghép được với câu gốc (khác phim), khi trang Dịch đã mở phụ đề khác lúc nạp vai, khi ô cues hỏng JSON, hoặc khi trang Dịch đang chạy (báo rõ; lần sửa kế tiếp gửi lại). "Giọng chung" không được ghi thành người nói; câu gốc nhận hai người nói khác nhau (dòng đã tách) bị bỏ qua.
+
+### Giới hạn (nói thẳng)
+* Chỉ đồng bộ NGƯỜI NÓI (trang TTS không sửa "nói với ai"); người nghe cũ được giữ, trừ khi trùng đúng người nói mới (nhãn đảo) thì để trống.
+* Bỏ người nói chọn tay ở trang TTS ("Bỏ sửa tay") không gỡ cue đã đồng bộ — sửa lại trong ô Gợi ý hình ảnh nếu cần.
+* Sửa cues trực tiếp trong ô JSON không tự gắn `"src":"user"` (thêm tay nếu muốn khoá dòng đó).
+* Màn "Quản lý giai đoạn" dự đoán "lần dịch tới" chưa tính dòng đổi người nói (lượt dịch thật thì có).
+* Chưa chạy với Gemini thật — kiểm bằng use case dịch thật + adapter thật với bước gọi API giả.
+
+### Kiểm thử
+* `test_user_speaker_sync_v323653.py` (5): định dạng JSON cũ không đổi, ghi người nói người dùng, phân tích lại/vá AI không đè, vân tay không đổi với dòng không có cue người dùng, chạy lại chỉ dịch 1 lô (thất bại trên mã cũ: 0 lượt dịch lại).
+* `test_tts_speaker_sync_v323653.py` (6): quy dòng TTS → câu gốc, chưa nạp vai thì không gửi, trang Dịch ghi + lưu + từ chối khi JSON hỏng/đang chạy, quét bổ sung không đè, cửa sổ chính từ chối khi khác phụ đề, trang TTS gom lần sửa và không gửi trùng.
+  Bắt được một lỗi trong lúc viết: `Signal(dict)` của Qt làm mất khoá số (gửi `{}`) → dùng `Signal(object)`.
+* Toàn bộ: **7668 passed, 61 skipped**, 0 failed (10 phút 14 giây).
+
+## [3.23.652] — 🧹 Đợt 1 theo báo cáo phân tích 3.23.651: báo crash giả, mất sửa tay, TTS xoá nhầm không lấy lại được, các lỗi trích xuất/xuất bản
+
+### Hệ thống
+* **Hết báo "phiên trước bị crash" khi bạn đã đóng app đúng cách.** Nguyên nhân: mọi `fault.log` không rỗng đều bị coi là crash — kể cả hàng chục ngoại lệ LuaJIT `0xe24c4a02` vô hại, và lỗi native lúc Python dọn dẹp SAU khi cửa sổ đã đóng.
+  Nay: (1) phân loại `fault.log` theo chữ ký lỗi chết thật (access violation, stack overflow, Fatal Python error, Qt FATAL, mã `0xC…`, page error, chia cho 0…); (2) đóng app ghi dấu `[clean-exit …]` rồi tắt faulthandler; lỗi sau dấu này chỉ ghi cảnh báo, không báo crash.
+  Chỉ ghi dấu khi thoát có kiểm soát — lỗi khác trào ra lúc khởi động vẫn được báo lần mở sau.
+* **Cờ tự tắt mpv chỉ bật khi crash nằm trong mpv thật**: chỉ xét khối `Current thread` (luồng gây lỗi). Trước đó (bản nháp của chính bản này) luồng sự kiện mpv luôn có mặt trong log `all_threads` nên crash Qt/paddle cũng làm tắt mpv oan.
+* `[Qt] QWidgetWindow(...translatePageWindow) must be a top level window`: bật `AA_DontCreateNativeWidgetSiblings` (cửa sổ native của mpv từng kéo mọi trang anh em thành cửa sổ native).
+* `QTextCursor::setPosition: Position out of range`: thông báo vô hại của Qt (trợ năng/IME hỏi vị trí con trỏ cũ sau `setPlainText` ngắn hơn) — hạ xuống DEBUG.
+* mpv phụ (lấy khung OCR) cũng dùng cấu hình gọn tắt script Lua như trình phát.
+
+### Dịch
+* **Ô Visual Cues sửa tay hỏng JSON không còn bị lặng lẽ coi là rỗng** (thiếu một dấu phẩy = mất cả 3648 cues, lượt dịch quét lại toàn video rồi ghi đè ô). Dịch / dịch lại dòng / vá phân tích / bổ sung người nói giờ dừng lại và báo "JSON lỗi ở dòng X, cột Y".
+* **Sửa tay bảng nhân vật / tóm tắt / thuật ngữ / cues được lưu vào phiên dịch** (trước đây tắt app là mất): tự lưu 1,5 s sau khi ngừng gõ, lưu ngay khi đổi video / rời trang / đóng app; nhớ video lúc gõ (không ghi nhầm sang video khác); chỉ lưu khi chính bạn sửa; JSON đang gõ dở thì chờ; đang dịch thì đợi xong; xoá trắng các ô cũng được lưu.
+
+### TTS
+* **"⟲ Khôi phục bản gốc"** (nút + chuột phải): trả danh sách dòng về đúng phụ đề vừa nạp — chèn lại dòng đã xoá, bỏ dòng thêm tay, lời và mốc giờ về gốc, giữ người nói đã chọn. Có xác nhận; hoàn tác được nếu chưa TTS.
+* **"Khôi phục dòng đã xoá…"**: danh sách dòng gốc đang thiếu (giờ + lời), tick để chèn lại đúng chỗ theo thời gian. Đã TTS thì dòng chèn lại được đánh dấu cần TTS lại.
+  Dựng lại danh sách một lượt: 1200 dòng mất 0,46 s, một lần vẽ bảng (bản nháp chèn từng dòng: ~25 s cho 600 dòng — rà soát độc lập phát hiện, đã sửa trước khi giao).
+* **Ảnh chụp danh sách dòng không còn đè bản dịch mới**: dòng gốc lấy chữ của phụ đề vừa nạp; chữ trong ảnh chụp chỉ dùng cho dòng thêm tay và dòng bạn đã sửa lời trên đúng chữ gốc đó.
+* **Không còn áp lại lặng lẽ**: nạp phụ đề có danh sách dòng đã sửa → dòng trạng thái báo "đã áp lại (bớt N, thêm M dòng) … bấm Khôi phục bản gốc"; log ghi đúng việc đã làm (trước ghi "0 dòng người nói, 0 dòng lời thoại"); ảnh chụp không hợp lệ thì ghi cảnh báo thay vì bỏ qua im lặng.
+* **Xoá nhiều dòng (≥ 20 hoặc ≥ 5%) hỏi kỹ hơn**: số dòng/tổng, số phút thoại, vài dòng mẫu, cách khôi phục; mặc định "Không".
+* **Hết treo khi mở trang TTS / tick "Ép CPU"**: dò GPU (`pip list` môi trường riêng, tới 120 s khi env hỏng) chạy nền, nhớ kết quả; nút cài GPU dùng kết quả đó.
+
+### Trích xuất
+* **Bộ khôi phục chữ rơi không chèn chữ lạ nữa**: chữ khác "一" phải xuất hiện ở ≥ 20% số khung của nhóm (ca thật `终于被我逮到了吧` → `…吧天`, 4/31 khung, nay giữ nguyên). Ca `小小教训` → `一小小教训` (chữ "一", 2/20 khung) **chưa sửa**: phân biệt được cần vị trí hộp chữ so với mép vùng chọn, sẽ làm ở đợt sau.
+* **Khung trùng chép kết quả của khung ảnh thật gần nhất**, không phải khung ngay trước — một khung lỗi giải mã xen giữa từng làm cả chuỗi khung trùng sau nó mất chữ (câu bị cắt/tách).
+* **Cache khung Re-OCR khoá theo đường dẫn đầy đủ + thời điểm sửa + kích thước** (trước: chỉ tên tệp → hai `tap01.mp4` khác thư mục dùng chung cache, chèn phụ đề của video khác).
+
+### Xuất bản
+* **Lỗi/huỷ khi xuất không còn xoá bản xuất cũ của bạn**: ffmpeg ghi vào `<tên>.partial.<đuôi>`, xong mới thay tệp đích. Tệp đích đang bị mở (trình phát, xem trước, diệt virus) → thử lại ~10 s; vẫn không được thì GIỮ bản vừa xuất và báo đường dẫn.
+* Tệp đích trùng video/phụ đề/audio nguồn → từ chối (đi qua tệp tạm sẽ đè mất video gốc).
+
+### Giới hạn (nói thẳng)
+* Chưa chạy trên Windows: phần phân loại `fault.log` dựa trên định dạng faulthandler; AA_DontCreateNativeWidgetSiblings chưa kiểm được việc hết cảnh báo "top level window" trên máy bạn.
+* Sau khi đã TTS, xoá dòng vẫn xoá WAV của dòng đó (khôi phục = TTS lại dòng đó); lịch sử sửa vẫn nằm trong registry, mất hoàn tác khi nạp phụ đề khác — để Đợt 2 (thùng rác audio, lịch sử ra tệp).
+* Sửa ô ngữ cảnh trong lúc đang dịch: tự lưu chờ dịch xong, nhưng lượt dịch vẫn có thể ghi đè ô (lỗi #9 trong báo cáo) — Đợt 2.
+
+### Kiểm thử
+* Test mới (`*_v323652.py`): phân loại fault.log (15 ca, gồm log all-threads thật), ngữ cảnh dịch (13), khôi phục chữ rơi (3), khung trùng sau lỗi giải mã (1), khoá cache (3), xuất bản giữ tệp cũ/tệp khoá/trùng nguồn (4), dò GPU nền (1), TTS khôi phục (8, gồm 1200 dòng và dòng chèn lại cạnh dòng đã đổi giờ).
+  Đã kiểm thất bại trên mã cũ: chữ rơi `…吧天`, khung trùng sau lỗi, xuất bản lỗi xoá tệp cũ.
+* Sửa 1 test cũ ghi nhận hành vi sai (khung trùng sau khung lỗi ra rỗng) và 1 bố cục (2 nút khôi phục sang hàng riêng — đo ở 1500 px nút bị cắt chữ).
+* Toàn bộ: **7657 passed, 61 skipped**, 0 failed (9 phút 01 giây).
+
 ## [3.23.651] — 🧯 Crash thật từ 3 `fault.log` trên Windows: `access violation` trong mpv (dò mpv lúc khởi động + nạp video)
 
 ### Đọc 3 log bạn gửi (đây là dữ liệu thật đầu tiên, nhờ `fault.log` của 3.23.650)
