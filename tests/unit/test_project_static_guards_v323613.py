@@ -139,10 +139,17 @@ def test_every_self_attribute_exists() -> None:
             if not inspect.isclass(cls):
                 continue
             known = _known_attributes(cls)
+            # [v3.23.689] Lớp trộn (``…Mixin``) đọc thuộc tính của lớp DÙNG nó (vd ``TranslateBatchMixin`` → trang Dịch):
+            # kiểm theo các lớp con — thuộc tính phải tồn tại trên MỌI lớp dùng mixin, nên lỗi gõ sai tên vẫn bị bắt.
+            hosts = [sub for sub in cls.__subclasses__()] if cls.__name__.endswith("Mixin") else []
             for item in class_node.body:
                 if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
                 for read in _self_reads(item):
+                    if hosts and all(
+                        read.attr in _known_attributes(host) or hasattr(host, read.attr) for host in hosts
+                    ):
+                        continue
                     if read.attr not in known and not hasattr(cls, read.attr):
                         missing.append(f"{_where(path, read)} {cls.__name__}.{read.attr}")
     report = "\n".join(sorted(set(missing)))

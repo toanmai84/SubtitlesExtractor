@@ -115,8 +115,10 @@ def _coordinator(
     panel = DubbingCastPanel(translator)
     view_model = TTSPageViewModel(SimpleNamespace())
     view_model.set_source_events(events if events is not None else _film_events())
+    # [v3.23.679] Có cha như trong ứng dụng (trang TTS): bộ điều phối KHÔNG cha + bảng phân vai do Python giữ tạo vòng
+    # tham chiếu; gc huỷ theo thứ tự tuỳ ý → huỷ trùng (SIGSEGV trong ~QObject) ở test SAU.
     coordinator = TTSDubbingCoordinator(
-        panel, view_model, settings, translator.translate, lambda: (ENGINE_KEY, EDGE),
+        panel, view_model, settings, translator.translate, lambda: (ENGINE_KEY, EDGE), parent=panel,
     )
     coordinator.set_source_provider(_source)
     return coordinator, panel, view_model

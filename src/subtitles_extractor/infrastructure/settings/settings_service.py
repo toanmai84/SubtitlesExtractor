@@ -176,6 +176,19 @@ class SettingsService:
                 logger.info("Model OCR: PP-OCRv6 medium → small (mặc định mới, một lần; đổi được trong Cài đặt).")
             ocr["defaults_v661"] = True
             raw = {**raw, "ocr": ocr}
+        # [v3.23.674] "Thời lượng tối đa" nay mới có tác dụng; mặc định cũ 5 s (chưa từng dùng) → 7 s, đúng một lần.
+        post = raw.get("post_process")
+        if isinstance(post, dict) and "defaults_v674" not in post:
+            post = dict(post)
+            try:
+                old_max = float(post.get("max_duration_sec", 5.0))
+            except (TypeError, ValueError):
+                old_max = 5.0
+            if abs(old_max - 5.0) < 1e-9 or old_max < 0.5:
+                post["max_duration_sec"] = 7.0
+                logger.info("Thời lượng tối đa: 5 s → 7 s (mặc định mới, một lần; đổi được trong Cài đặt).")
+            post["defaults_v674"] = True
+            raw = {**raw, "post_process": post}
         return raw
 
     @staticmethod

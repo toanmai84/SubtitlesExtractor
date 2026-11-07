@@ -100,11 +100,13 @@ class TestPage:
 
         return _page()
 
-    def test_combo_has_automatic_none_and_models_and_defaults_to_automatic(self, app) -> None:
+    def test_combo_has_automatic_and_models_and_defaults_to_automatic(self, app) -> None:
+        # [v3.23.667] "Không chuyển model" nay là ô "Bật" riêng bên cạnh ô chọn.
         page, container = self._page()
         combo = page._fallback_model_combo
-        assert combo.itemData(0) == "" and combo.itemData(1) == "-"
-        assert combo.count() > 3 and page._fallback_choice() == ""
+        assert combo.itemData(0) == "" and combo.findData("-") < 0
+        assert page._fallback_enabled_check.isChecked()
+        assert combo.count() > 2 and page._fallback_choice() == ""
         assert container.gemini_model_health.preferred_fallback == ""
 
     def test_choosing_a_model_reaches_the_shared_health_and_the_analysis_fallback(self, app) -> None:
@@ -113,9 +115,12 @@ class TestPage:
         combo.setCurrentIndex(combo.findData("gemini-3.5-flash-lite"))
         assert container.gemini_model_health.preferred_fallback == "gemini-3.5-flash-lite"
         assert page._view_model.analysis_fallback_model() == "gemini-3.5-flash-lite"
-        combo.setCurrentIndex(1)                                  # Không chuyển model
+        page._fallback_enabled_check.setChecked(False)            # tắt model dự phòng
         assert container.gemini_model_health.preferred_fallback == "-"
         assert page._view_model.analysis_fallback_model() == ""
+        assert not combo.isEnabled()
+        page._fallback_enabled_check.setChecked(True)
+        assert container.gemini_model_health.preferred_fallback == "gemini-3.5-flash-lite"
         combo.setCurrentIndex(0)
         assert page._view_model.analysis_fallback_model() == "gemini-3.1-flash-lite"
 
@@ -135,9 +140,14 @@ class TestPage:
             "sync": lambda self: None,
         })()
         page._fallback_model_combo.setCurrentIndex(1)
+        page._fallback_enabled_check.blockSignals(True)
+        page._fallback_enabled_check.setChecked(False)
+        page._fallback_enabled_check.blockSignals(False)
         from subtitles_extractor.presentation.pages.translate_page import TranslatePage
         TranslatePage._persist_inputs(page)
-        assert saved["fallback_model"] == "-"
+        # Lưu RIÊNG lựa chọn model và trạng thái bật — bật lại thì model đã chọn vẫn còn.
+        assert saved["fallback_model"] == page._fallback_model_combo.itemData(1)
+        assert saved["fallback_enabled"] is False
 
 
 class TestKeyStatusText:
@@ -164,14 +174,18 @@ class TestAuditModelChoice:
     """[v3.23.640] Ô "Model tự kiểm tra" + chuỗi dự phòng + dòng trạng thái nói đúng model."""
 
     def test_default_chain_is_the_cheap_model(self, app) -> None:
-        from subtitles_extractor.application.services.analysis_audit import DEFAULT_AUDIT_MODEL
+        from subtitles_extractor.application.services.analysis_audit import (
+            DEFAULT_AUDIT_MODEL,
+        )
 
         page, _ = TestPage()._page()
         assert page._audit_choice() == ""
         assert page._view_model.audit_chain() == (DEFAULT_AUDIT_MODEL, ())
 
     def test_chosen_model_and_backup_form_the_chain(self, app) -> None:
-        from subtitles_extractor.application.services.analysis_audit import DEFAULT_AUDIT_MODEL
+        from subtitles_extractor.application.services.analysis_audit import (
+            DEFAULT_AUDIT_MODEL,
+        )
 
         page, _ = TestPage()._page()
         page._audit_model_combo.setCurrentIndex(page._audit_model_combo.findData("gemini-3.8-flash"))
@@ -222,3 +236,54 @@ class TestAuditModelChoice:
         vm.start_analysis_refinement("k", "Vietnamese", "gemini-3.8-flash", "zh", "a", "b", "", "")
         assert started["audit_model"] == "gemini-3.8-flash"
         assert any("gemini-3.8-flash" in m and "tự kiểm tra" in m for m in messages)
+
+
+class TestFallbackToggleV323667:
+    """[v3.23.667] Ô bật/tắt model dự phòng: tắt = không đổi model ở mọi khâu."""
+
+    def _page_with_settings(self, values: dict):
+        from tests.unit.presentation.test_translate_page_bugs_v323609 import _page
+
+        page, container = _page()
+
+        class S:
+            def value(self, key, default=None, type=None):
+                return values.get(key, default)
+
+            def contains(self, key):
+                return key in values
+
+            def setValue(self, key, value):  # noqa: N802
+                values[key] = value
+
+            def sync(self):
+                pass
+
+        page._settings = S()
+        return page, container
+
+    def test_ban_cu_luu_khong_chuyen_model_thi_o_bat_bi_tat(self, app) -> None:
+        page, container = self._page_with_settings({"fallback_model": "-"})
+        page._restore_persisted_inputs()
+        assert not page._fallback_enabled_check.isChecked()
+        assert not page._fallback_model_combo.isEnabled()
+        assert page._fallback_choice() == "-" and page._fallback_selection() == ""
+        assert container.gemini_model_health.preferred_fallback == "-"
+
+    def test_tat_du_phong_thi_tu_kiem_tra_khong_doi_model(self, app) -> None:
+        page, _ = self._page_with_settings({})
+        vm = page._view_model
+        vm.set_audit_model("gemini-3.6-flash")
+        page._fallback_enabled_check.setChecked(False)
+        assert vm.audit_chain("gemini-3.8-flash")[1] == ()
+        page._fallback_enabled_check.setChecked(True)
+        assert vm.audit_chain("gemini-3.8-flash")[1] != ()
+
+    def test_khoi_phuc_trang_thai_bat_va_model_da_chon(self, app) -> None:
+        page, container = self._page_with_settings(
+            {"fallback_model": "gemini-3.5-flash-lite", "fallback_enabled": False})
+        page._restore_persisted_inputs()
+        assert page._fallback_selection() == "gemini-3.5-flash-lite"
+        assert page._fallback_choice() == "-"
+        page._fallback_enabled_check.setChecked(True)
+        assert container.gemini_model_health.preferred_fallback == "gemini-3.5-flash-lite"

@@ -28,23 +28,25 @@ from subtitles_extractor.application.dtos.extract_subtitles_dto import (
     ExtractSubtitlesRequest,
     ExtractSubtitlesResponse,
 )
+from subtitles_extractor.application.services.frame_prefetch import (
+    DEFAULT_PREFETCH,
+    prefetched,
+)
 from subtitles_extractor.application.services.subtitle_builder import (
     SubtitleBuilder,
 )
-from subtitles_extractor.application.services.frame_prefetch import DEFAULT_PREFETCH, prefetched
 from subtitles_extractor.application.use_cases.load_video_metadata import (
     LoadVideoMetadataUseCase,
 )
 from subtitles_extractor.domain.entities.ocr_frame_result import OcrFrameResult
-from subtitles_extractor.domain.value_objects.roi import Roi
 from subtitles_extractor.domain.exceptions import (
     OcrInferenceError,
     OcrModelLoadError,
     SubtitlesExtractorError,
 )
 from subtitles_extractor.domain.ports.frame_sampler_port import (
-    FrameSamplerPort,
     SAMPLE_TIME_TOLERANCE_SEC,
+    FrameSamplerPort,
     FrameSamplingConfig,
     SampledFrame,
 )
@@ -59,10 +61,14 @@ from subtitles_extractor.domain.ports.subtitle_exporter_port import (
 from subtitles_extractor.domain.ports.video_metadata_reader_port import (
     VideoMetadataReaderPort,
 )
+from subtitles_extractor.domain.value_objects.boundary_track import BoundaryTrack
+from subtitles_extractor.domain.value_objects.roi import Roi
 
 if TYPE_CHECKING:
     from subtitles_extractor.domain.entities.video_metadata import VideoMetadata
-    from subtitles_extractor.infrastructure.serializers.ocr_checkpoint import OcrCheckpoint
+    from subtitles_extractor.infrastructure.serializers.ocr_checkpoint import (
+        OcrCheckpoint,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -330,9 +336,11 @@ class ExtractSubtitlesUseCase:
             debug_frames_directory.mkdir(parents=True, exist_ok=True)
 
         checkpoint = self._open_checkpoint(request, video_metadata)
+        # [v3.23.680] Dải ranh giới do bộ giải mã ghi (chỉ có khi giải mã TRỌN lượt, không lấy từ cache khung).
+        boundary_sink: list[BoundaryTrack] = []
         try:
             ocr_frame_results = self._execute_ocr_inference_loop(
-                video_metadata, request, progress_reporter, debug_frames_directory, checkpoint,
+                video_metadata, request, progress_reporter, debug_frames_directory, checkpoint, boundary_sink,
             )
         finally:
             gc.collect()
@@ -344,16 +352,20 @@ class ExtractSubtitlesUseCase:
 
         progress_reporter.report(95, 100, "Đang tối ưu không gian và gộp câu phụ đề…")
 
+        boundary_track = boundary_sink[-1] if boundary_sink else None
         raw_ocr_file_path: Path | None = None
         if request.raw_ocr_output_path is not None:
             raw_ocr_file_path = self._save_raw_ocr_payload(
                 ocr_results=ocr_frame_results, output_file_path=request.raw_ocr_output_path,
-                request=request, metadata=video_metadata,
+                request=request, metadata=video_metadata, boundary_track=boundary_track,
             )
             if raw_ocr_file_path is not None and checkpoint is not None:
                 checkpoint.discard()   # [v3.23.632] kết quả đầy đủ đã nằm trong cache → hết cần điểm dừng
 
-        built_subtitle_events = self._subtitle_builder.build(ocr_frame_results, roi=request.roi)
+        built_subtitle_events = (
+            self._subtitle_builder.build(ocr_frame_results, roi=request.roi, boundary_track=boundary_track)
+            if boundary_track is not None else self._subtitle_builder.build(ocr_frame_results, roi=request.roi)
+        )
         final_output_path = request.output_path
 
         if not request.skip_export and subtitle_exporter is not None:
@@ -384,6 +396,7 @@ class ExtractSubtitlesUseCase:
         reporter: ProgressReporterPort,
         debug_dir: Path | None,
         checkpoint: OcrCheckpoint | None = None,
+        boundary_sink: list[BoundaryTrack] | None = None,
     ) -> list[OcrFrameResult]:
         """Vòng OCR. ``checkpoint`` có thì chạy TIẾP từ phần đã OCR và ghi điểm dừng định kỳ.
 
@@ -432,7 +445,7 @@ class ExtractSubtitlesUseCase:
         try:
             self._ocr_loop_body(
                 metadata, request, sampling_request, reporter, debug_dir,
-                accumulated_results, frame_offset, save_checkpoint,
+                accumulated_results, frame_offset, save_checkpoint, boundary_sink,
             )
         finally:
             save_checkpoint(force=True)   # huỷ/lỗi giữa chừng vẫn giữ phần đã xong
@@ -448,6 +461,7 @@ class ExtractSubtitlesUseCase:
         accumulated_results: list[OcrFrameResult],
         frame_offset: int,
         save_checkpoint: Callable[[], None],
+        boundary_sink: list[BoundaryTrack] | None = None,
     ) -> None:
         """Gom khung theo THỨ TỰ, OCR theo lô, rồi trả kết quả đúng thứ tự khung.
 
@@ -517,7 +531,7 @@ class ExtractSubtitlesUseCase:
         # Luồng giải mã không tự hỏi "huỷ chưa": luồng OCR hỏi mỗi khung và khi huỷ thì dừng hẳn luồng giải mã.
         producer_reporter = _NoCancelReporter(reporter) if prefetch > 0 else reporter
         frames = prefetched(
-            lambda: self._iterate_sampled_frames(metadata, sampling_request, producer_reporter),
+            lambda: self._iterate_sampled_frames(metadata, sampling_request, producer_reporter, boundary_sink),
             prefetch,
         )
         # [v3.23.655] Đóng chắc chắn (kể cả khi OCR ném lỗi): luồng giải mã dừng, trả NVDEC/VRAM ngay — không chờ GC.
@@ -604,6 +618,7 @@ class ExtractSubtitlesUseCase:
 
     def _iterate_sampled_frames(
         self, metadata: VideoMetadata, request: ExtractSubtitlesRequest, reporter: ProgressReporterPort,
+        boundary_sink: list[BoundaryTrack] | None = None,
     ) -> Iterator[SampledFrame]:
 
         is_reocr_task = (
@@ -647,6 +662,10 @@ class ExtractSubtitlesUseCase:
 
         if is_reocr_task and collected_frames_for_cache and not cache_overflow:
             _GLOBAL_FRAME_CACHE.put(cache_key, collected_frames_for_cache)
+        # [v3.23.680] Bộ lấy mẫu chỉ đặt dải khi lặp trọn lượt; đọc ngay tại đây (cùng luồng giải mã).
+        track = getattr(self._frame_sampler_port, "last_boundary_track", None)
+        if boundary_sink is not None and isinstance(track, BoundaryTrack) and not track.is_empty:
+            boundary_sink.append(track)
 
     def _execute_ocr_inference_on_batch(
         self, batch_queue: list[SampledFrame], debug_dir: Path | None, request: ExtractSubtitlesRequest, metadata: VideoMetadata
@@ -853,6 +872,7 @@ class ExtractSubtitlesUseCase:
     @staticmethod
     def _save_raw_ocr_payload(
         ocr_results: list[OcrFrameResult], output_file_path: Path, request: ExtractSubtitlesRequest, metadata: VideoMetadata,
+        boundary_track: BoundaryTrack | None = None,
     ) -> Path | None:
         try:
             from datetime import datetime
@@ -893,6 +913,7 @@ class ExtractSubtitlesUseCase:
                 roi_xywh=roi_coordinates_list,
                 preprocess=preprocess_dict,
                 advanced_ocr=advanced_ocr_dict,
+                boundary=boundary_track.to_dict() if boundary_track is not None else None,
             )
             save_raw_ocr(frames=ocr_results, output_path=output_file_path, meta=metadata_payload)
             return output_file_path

@@ -25,7 +25,6 @@ from PySide6.QtCore import QObject, QPoint, QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractButton,
-    QHBoxLayout,
     QInputDialog,
     QMenu,
     QMessageBox,
@@ -1089,10 +1088,9 @@ class TTSLineEditsController(QObject):
         return self._translate(f"tts.{key}")
 
     def _build_buttons(self) -> None:
-        # [v3.23.625] Hai hàng: sáu nút một hàng bị cắt chữ ở cửa sổ 1500 px.
+        # [v3.23.677] Bộ điều khiển chỉ TẠO nút; trang TTS xếp chúng (nút hay dùng hiện ra, còn lại vào menu
+        # "Sửa dòng ▾ / Chọn ▾ / Khác ▾") — xem ``action_buttons``. ``button_row`` giữ cho tương thích (rỗng).
         self._button_row = QVBoxLayout()
-        first_row, second_row, third_row = QHBoxLayout(), QHBoxLayout(), QHBoxLayout()
-        restore_row = QHBoxLayout()  # [v3.23.652] hàng riêng: thêm vào hàng 2 làm cắt chữ ở 1500 px
         self._btn_speaker = PushButton(self._tr("btn_speaker"))
         self._btn_speaker.setToolTip(self._tr("btn_speaker_tip"))
         self._btn_speaker.clicked.connect(self._on_speaker_button)
@@ -1145,19 +1143,20 @@ class TTSLineEditsController(QObject):
         self._btn_history = PushButton(self._tr("btn_history"))
         self._btn_history.setToolTip(self._tr("btn_history_tip"))
         self._btn_history.clicked.connect(lambda _checked=False: self.show_history())
-        for row, buttons in (
-            (first_row, (self._btn_speaker, self._btn_quick_review, self._btn_review,
-                         self._btn_select_edited, self._btn_revert)),
-            (second_row, (self._btn_add_line, self._btn_delete_lines, self._btn_undo,
-                          self._btn_redo)),
-            (restore_row, (self._btn_restore_deleted, self._btn_restore_original, self._btn_history)),
-            (third_row, (self._btn_timing, self._btn_merge, self._btn_split, self._btn_shorten)),
-        ):
-            for button in buttons:
-                button.setEnabled(False)
-                row.addWidget(button)
-            row.addStretch()
-            self._button_row.addLayout(row)
+        for button in self.action_buttons().values():
+            button.setEnabled(False)
+
+    def action_buttons(self) -> dict[str, PushButton]:
+        """[v3.23.677] Các nút thao tác dòng theo tên (trang TTS tự xếp chỗ)."""
+        return {
+            "speaker": self._btn_speaker, "quick_review": self._btn_quick_review, "review": self._btn_review,
+            "select_edited": self._btn_select_edited, "revert": self._btn_revert,
+            "add_line": self._btn_add_line, "delete_lines": self._btn_delete_lines,
+            "undo": self._btn_undo, "redo": self._btn_redo,
+            "restore_deleted": self._btn_restore_deleted, "restore_original": self._btn_restore_original,
+            "history": self._btn_history, "timing": self._btn_timing, "merge": self._btn_merge,
+            "split": self._btn_split, "shorten": self._btn_shorten,
+        }
 
     def _prepare_table(self) -> None:
         table = self._table

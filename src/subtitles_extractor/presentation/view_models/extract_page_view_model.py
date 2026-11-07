@@ -28,6 +28,7 @@ from subtitles_extractor.domain.entities.video_state import VideoState
 from subtitles_extractor.domain.exceptions import SubtitlesExtractorError
 from subtitles_extractor.domain.ports.frame_sampler_port import FrameSamplingConfig
 from subtitles_extractor.domain.ports.hardsub_detector_port import HardsubDetectionResult
+from subtitles_extractor.domain.value_objects.boundary_track import BoundaryTrack
 from subtitles_extractor.domain.ports.ocr_engine_port import OcrEngineConfig
 from subtitles_extractor.domain.value_objects.device_kind import (
     DeviceKind,
@@ -38,6 +39,7 @@ from subtitles_extractor.domain.value_objects.roi import Roi
 from subtitles_extractor.presentation.workers.detection_workers import (
     DetectAutoRoiWorker,
     DetectHardsubWorker,
+    DetectSeriesRoiWorker,
 )
 from subtitles_extractor.presentation.workers.extract_subtitles_worker import (
     ExtractSubtitlesWorker,
@@ -95,8 +97,11 @@ class RebuildFromCacheWorker(QObject):
                     break
                 if not Path(path).is_file():
                     continue
-                frames, _meta = load_raw_ocr(Path(path))
-                events = SubtitleBuilder(config=builder_config).build(frames, roi=clipped_roi)
+                frames, meta = load_raw_ocr(Path(path))
+                # [v3.23.680] Dải ranh giới lưu kèm cache → dựng lại vẫn đặt mốc đúng khung như lúc trích xuất.
+                events = SubtitleBuilder(config=builder_config).build(
+                    frames, roi=clipped_roi, boundary_track=BoundaryTrack.from_dict(meta.boundary),
+                )
                 # Toạ độ ô chữ tính trong ROI → đổi về toạ độ video như lúc trích xuất (khung OCR vẽ đúng chỗ).
                 _shift_event_coordinates(events, roi)
                 per_roi.append(events)
@@ -304,20 +309,7 @@ class ExtractPageViewModel(QObject):
         self._primary_roi_mode = primary
         settings = self._container.settings_service.current
         step_ms = getattr(settings.roi, "auto_detect_step_ms", 1000)
-
-        is_nvdec = (getattr(settings.hardware, "frame_decoder_backend", "") == "pynvvideocodec")
-        if is_nvdec:
-            # [SỬA LỖI TỌA ĐỘ VRAM]: Tắt Upscale và Border trên VRAM để bảo vệ hệ tọa độ
-            vram_flags = FrameSamplingConfig(
-                vram_upscale_small_text=False,
-                vram_upscale_target_height_px=settings.preprocess.upscale_target_height_px,
-                vram_add_border=False,
-                vram_border_thickness_px=settings.preprocess.border_thickness_px,
-                vram_sharpen=settings.preprocess.apply_sharpen,
-                vram_contrast_factor=settings.preprocess.contrast_factor if settings.preprocess.apply_contrast_boost else 1.0,
-            )
-        else:
-            vram_flags = None
+        vram_flags = self._auto_roi_vram_flags()
 
         worker = DetectAutoRoiWorker(
             use_case=self._container.make_detect_auto_roi_use_case(),
@@ -331,6 +323,47 @@ class ExtractPageViewModel(QObject):
         worker.failed.connect(self.detection_failed)
         worker.analysis_ready.connect(self._on_analysis_ready_show_dialog, type=Qt.ConnectionType.QueuedConnection)
         self._start_detection_worker(worker)
+
+    def _auto_roi_vram_flags(self) -> FrameSamplingConfig | None:
+        settings = self._container.settings_service.current
+        if getattr(settings.hardware, "frame_decoder_backend", "") != "pynvvideocodec":
+            return None
+        # [SỬA LỖI TỌA ĐỘ VRAM]: Tắt Upscale và Border trên VRAM để bảo vệ hệ tọa độ
+        return FrameSamplingConfig(
+            vram_upscale_small_text=False,
+            vram_upscale_target_height_px=settings.preprocess.upscale_target_height_px,
+            vram_add_border=False,
+            vram_border_thickness_px=settings.preprocess.border_thickness_px,
+            vram_sharpen=settings.preprocess.apply_sharpen,
+            vram_contrast_factor=settings.preprocess.contrast_factor if settings.preprocess.apply_contrast_boost else 1.0,
+        )
+
+    def detect_series_roi(self, previous_roi: Roi | None) -> bool:
+        """[v3.23.686] Hàng loạt phim bộ: kiểm nhanh ROI tập trước (≈ 24 khung), không khớp thì dò đầy đủ — một tác vụ.
+
+        Returns:
+            ``False`` nếu không chạy được (đang bận / chưa có video / adapter không hỗ trợ) → người gọi dò như cũ.
+        """
+        if self._video is None or self._is_busy:
+            return False
+        use_case = self._container.make_detect_auto_roi_use_case()
+        supports = getattr(use_case, "supports_series_roi", None)
+        if not callable(supports) or not supports():
+            return False
+        settings = self._container.settings_service.current
+        worker = DetectSeriesRoiWorker(
+            use_case=use_case,
+            metadata=self._video,
+            previous_roi=previous_roi,
+            step_ms=getattr(settings.roi, "auto_detect_step_ms", 1000),
+            batch_size=settings.hardware.batch_size_roi,
+            vram_flags=self._auto_roi_vram_flags(),
+        )
+        worker.progress.connect(self.progress_changed)
+        worker.finished.connect(self._on_auto_roi_detected)
+        worker.failed.connect(self.detection_failed)
+        self._start_detection_worker(worker)
+        return True
 
     def detect_primary_subtitle_roi(self) -> None:
         """[Phần 6] Tự nhận diện rồi chọn DUY NHẤT vùng phụ đề chính (không review).

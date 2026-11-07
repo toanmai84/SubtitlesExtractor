@@ -121,6 +121,8 @@ QUY TẮC AN TOÀN khi thêm mapping mới:
 # loại trừ để tránh sai sót.
 HAN_TRADITIONAL_TO_SIMPLIFIED: dict[str, str] = {
     # Đã quan sát trong test data:
+    # [v3.23.682] Phim nối 86 tập: OCR đọc 毁/别 thành dạng phồn ở vài khung giữa câu.
+    "毀": "毁", "別": "别",
     "純": "纯", "內": "内", "並": "并", "煙": "烟", "沒": "没",
     "吶": "呐", "謝": "谢", "強": "强", "決": "决", "恆": "恒",
     "繼": "继", "脈": "脉", "屍": "尸", "瑤": "瑶", "於": "于",

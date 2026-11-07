@@ -55,6 +55,8 @@ from subtitles_extractor.presentation.fluent_compat import (
 )
 from subtitles_extractor.presentation.workers.render_video_worker import RenderVideoWorker
 
+from subtitles_extractor.presentation.utils.task_notifier import notify_task_finished
+
 logger = logging.getLogger(__name__)
 
 # Nhãn hiển thị cho từng kiểu xuất, kèm gợi ý ngắn về tốc độ.
@@ -73,6 +75,8 @@ _AUDIO_CHOICES: tuple[tuple[str, AudioMode], ...] = (
     ("publish.audio_original", AudioMode.ORIGINAL),
     ("publish.audio_voiceover", AudioMode.VOICE_OVER),
     ("publish.audio_replace", AudioMode.REPLACE_TRACK),
+    # [v3.23.678] Cuối danh sách: chỉ số đã lưu của các lựa chọn cũ không đổi.
+    ("publish.audio_clean_dub", AudioMode.CLEAN_DUB),
 )
 
 _DUCK_CHOICES: tuple[tuple[str, DuckLevel], ...] = (
@@ -407,7 +411,7 @@ class PublishPage(QWidget):
         needs_subtitle = subtitle_mode is not SubtitleMode.NONE
         needs_audio = audio_mode is not AudioMode.ORIGINAL
         needs_encoder = subtitle_mode is SubtitleMode.BURNED
-        needs_duck = audio_mode is AudioMode.VOICE_OVER
+        needs_duck = audio_mode in (AudioMode.VOICE_OVER, AudioMode.CLEAN_DUB)
 
         self._subtitle_edit.setEnabled(needs_subtitle)
         self._audio_edit.setEnabled(needs_audio)
@@ -435,6 +439,8 @@ class PublishPage(QWidget):
             parts.append(self._translator.translate("publish.hint_audio_voiceover"))
         elif audio_mode is AudioMode.REPLACE_TRACK:
             parts.append(self._translator.translate("publish.hint_audio_replace"))
+        elif audio_mode is AudioMode.CLEAN_DUB:
+            parts.append(self._translator.translate("publish.hint_audio_clean_dub"))
         if not parts:
             parts.append(self._translator.translate("publish.hint_default"))
         return " ".join(parts)
@@ -607,6 +613,7 @@ class PublishPage(QWidget):
             AudioMode.ORIGINAL: "",
             AudioMode.VOICE_OVER: "_thuyetminh",
             AudioMode.REPLACE_TRACK: "_tiengviet",
+            AudioMode.CLEAN_DUB: "_longtieng",
         }[self._selected_audio_mode]
         suffix = f"{subtitle_tag}{audio_tag}" or "_xuatban"
         return str(video.with_name(f"{video.stem}{suffix}.mkv"))
@@ -648,7 +655,7 @@ class PublishPage(QWidget):
             return set()
         video = Path(video_text)
         subtitle_tags = ("", "_phude", "_phudechay")
-        audio_tags = ("", "_thuyetminh", "_tiengviet")
+        audio_tags = ("", "_thuyetminh", "_tiengviet", "_longtieng")
         results = {
             str(video.with_name(f"{video.stem}{subtitle}{audio}.mkv"))
             for subtitle in subtitle_tags
@@ -738,6 +745,8 @@ class PublishPage(QWidget):
             audio_path=Path(audio_text) if audio_text else None,
             video_encoder=_ENCODER_CHOICES[self._encoder_combo.currentIndex()][1],
             duck_level=_DUCK_CHOICES[self._duck_combo.currentIndex()][1],
+            # [v3.23.678] Model tách giọng + phần nền đã tách (dùng lại giữa các lần xuất).
+            separation_dir=Path(self._container.user_data_dir) / "separation",
         )
 
     def _probe_duration_sec(self, video_path: Path) -> float:
@@ -1031,6 +1040,7 @@ class PublishPage(QWidget):
             AudioMode.ORIGINAL: "",
             AudioMode.VOICE_OVER: "_thuyetminh",
             AudioMode.REPLACE_TRACK: "_tiengviet",
+            AudioMode.CLEAN_DUB: "_longtieng",
         }[self._selected_audio_mode]
         return f"{subtitle_tag}{audio_tag}" or "_xuatban"
 
@@ -1075,6 +1085,10 @@ class PublishPage(QWidget):
         return True
 
     def _finish_batch_publish(self) -> None:
+        notify_task_finished(self, self._translator.translate("common.task_done_publish"), "")  # [v3.23.682]
+        self._finish_batch_publish_report()
+
+    def _finish_batch_publish_report(self) -> None:
         """Báo tổng kết và dọn trạng thái hàng đợi."""
         from PySide6.QtWidgets import QMessageBox
 
@@ -1206,6 +1220,7 @@ class PublishPage(QWidget):
             return
         self._progress.setValue(100)
         self._status.setText(f"Xong: {output_path}")
+        notify_task_finished(self, self._translator.translate("common.task_done_publish"), str(output_path))  # [v3.23.682]
         InfoBar.success(
             title="Xuất bản thành công",
             content=str(output_path),
@@ -1223,6 +1238,7 @@ class PublishPage(QWidget):
             self._advance_batch_publish(failed=failed)
             return
         self._status.setText(message)
+        notify_task_finished(self, self._translator.translate("common.task_failed_publish"), message, failed=True)
         InfoBar.error(
             title="Xuất bản thất bại",
             content=message,

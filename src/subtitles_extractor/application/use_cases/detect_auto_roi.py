@@ -96,6 +96,30 @@ class DetectAutoRoiUseCase:
                 return delegate(metadata, step_ms, batch_size, progress_callback)
         return None
 
+    def detect_series_roi(
+        self,
+        metadata: VideoMetadata,
+        previous_roi: object | None,
+        step_ms: int = 1000,
+        batch_size: int = 8,
+        progress_callback: ProgressCallback | None = None,
+        vram_flags: FrameSamplingConfig | None = None,
+    ) -> object | None:
+        """[v3.23.686] ROI một tập phim bộ: kiểm nhanh ROI tập trước, không khớp thì dò đầy đủ.
+
+        Adapter không hỗ trợ → ``None`` (người gọi giữ đường dò cũ).
+        """
+        delegate = getattr(self._detector, "detect_series_roi", None)
+        if not callable(delegate):
+            return None
+        return delegate(
+            metadata, previous_roi, step_ms, batch_size, progress_callback, vram_flags=vram_flags,
+        )
+
+    def supports_series_roi(self) -> bool:
+        """[v3.23.686] ``True`` nếu adapter kiểm nhanh được ROI phim bộ."""
+        return callable(getattr(self._detector, "detect_series_roi", None))
+
     def supports_analyze_only(self) -> bool:
         """``True`` nếu adapter hỗ trợ tách analyze khỏi review."""
         return callable(getattr(self._detector, "analyze_only", None))

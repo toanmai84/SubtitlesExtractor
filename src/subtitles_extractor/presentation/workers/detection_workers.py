@@ -113,4 +113,49 @@ class DetectAutoRoiWorker(QObject):
         finally:
             self.done.emit()
 
-__all__ = ["DetectAutoRoiWorker", "DetectHardsubWorker"]
+class DetectSeriesRoiWorker(QObject):
+    """[v3.23.686] Phim bộ: kiểm nhanh ROI tập trước, không khớp thì dò đầy đủ — MỘT tác vụ nền."""
+
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+    failed = Signal(str)
+    done = Signal()
+
+    def __init__(
+        self,
+        use_case: DetectAutoRoiUseCase,
+        metadata: VideoMetadata,
+        previous_roi: object | None,
+        step_ms: int = 1000,
+        batch_size: int = 8,
+        vram_flags: object | None = None,
+    ) -> None:
+        super().__init__()
+        self._use_case = use_case
+        self._metadata = metadata
+        self._previous_roi = previous_roi
+        self._step_ms = step_ms
+        self._batch_size = batch_size
+        self._vram_flags = vram_flags
+
+    def _on_progress(self, current: int, total: int, msg: str) -> None:
+        self.progress.emit(current, total, msg)
+
+    def run(self) -> None:
+        try:
+            roi = self._use_case.detect_series_roi(
+                self._metadata, self._previous_roi, step_ms=self._step_ms, batch_size=self._batch_size,
+                progress_callback=self._on_progress, vram_flags=self._vram_flags,
+            )
+            self.finished.emit(roi)
+        except SubtitlesExtractorError as exc:
+            logger.error("Kiểm ROI phim bộ thất bại: %s", exc)
+            self.failed.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001 — như DetectAutoRoiWorker: luôn phát tín hiệu kết thúc
+            logger.exception("Kiểm ROI phim bộ gặp lỗi không lường trước.")
+            self.failed.emit(f"Lỗi không xác định: {exc}")
+        finally:
+            self.done.emit()
+
+
+__all__ = ["DetectAutoRoiWorker", "DetectHardsubWorker", "DetectSeriesRoiWorker"]

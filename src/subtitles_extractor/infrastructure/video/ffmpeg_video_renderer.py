@@ -31,6 +31,7 @@ from subtitles_extractor.infrastructure.video.video_encoder_selector import (
 from subtitles_extractor.infrastructure.video.subtitle_clip import clip_subtitle_file
 from subtitles_extractor.infrastructure.video.video_render_command import (
     AUTO_VIDEO_ENCODER,
+    AudioMode,
     RenderRequest,
     SubtitleMode,
     VideoRenderError,
@@ -105,6 +106,10 @@ def render_video(
     if ffmpeg is None:
         raise VideoRenderError(missing_ffmpeg_message(feature="Xuất video kèm phụ đề"))
 
+    # [v3.23.678] Lồng tiếng sạch: tách lời thoại khỏi nền TRƯỚC (lâu: CPU ~1× thời lượng), rồi mới dựng lệnh.
+    if resolve_modes(request)[1] is AudioMode.CLEAN_DUB and request.background_path is None:
+        request, on_progress = _prepare_clean_background(ffmpeg, request, on_progress, is_cancelled)
+
     # [v3.23.630] Xuất thử một đoạn: cắt phụ đề về mốc 0 (hình/tiếng bắt đầu từ 0 sau -ss).
     if request.is_clip:
         temp_dir = Path(tempfile.mkdtemp(prefix="subext_clip_"))
@@ -120,6 +125,50 @@ def render_video(
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
     return _render_resolved(ffmpeg, request, total_duration_sec, on_progress, is_cancelled)
+
+
+#: Phần tiến độ dành cho bước tách giọng (phần còn lại cho ffmpeg trộn + ghép).
+_SEPARATION_SHARE: Final[float] = 0.8
+
+
+def _prepare_clean_background(
+    ffmpeg: str,
+    request: RenderRequest,
+    on_progress: ProgressCallback | None,
+    is_cancelled: CancelCallback | None,
+) -> tuple[RenderRequest, ProgressCallback | None]:
+    """Tách (hoặc lấy từ bộ nhớ đệm) phần nền; trả request có ``background_path`` + callback tiến độ đã dời."""
+    from subtitles_extractor.infrastructure.audio.voice_separator import SeparationError, prepare_background
+
+    if request.separation_dir is None:
+        raise VideoRenderError("Lồng tiếng sạch: chưa có thư mục lưu model tách giọng.")
+    share = _SEPARATION_SHARE
+
+    def sep_progress(fraction: float) -> None:
+        if on_progress is not None:
+            on_progress(share * fraction)
+
+    try:
+        background = prepare_background(
+            ffmpeg, request.video_path, request.separation_dir,
+            progress=sep_progress, cancelled=is_cancelled,
+            start_sec=request.clip_start_sec if request.is_clip else 0.0,
+            duration_sec=request.clip_duration_sec if request.is_clip else 0.0,
+        )
+    except SeparationError as exc:
+        raise VideoRenderError(str(exc)) from exc
+    except (OSError, RuntimeError, ValueError) as exc:  # onnxruntime / tệp âm thanh hỏng
+        raise VideoRenderError(f"Không tách được lời thoại khỏi nền: {exc}") from exc
+    if background is None:
+        raise VideoRenderError("Đã huỷ xuất video theo yêu cầu.")
+    request = replace(
+        request, background_path=background,
+        background_offset_sec=request.clip_start_sec if request.is_clip else 0.0,
+    )
+    if on_progress is None:
+        return request, None
+    outer = on_progress
+    return request, lambda fraction: outer(share + (1.0 - share) * fraction)
 
 
 def _render_resolved(
@@ -152,7 +201,8 @@ def _refuse_overwriting_inputs(request: RenderRequest) -> None:
     """[v3.23.652] Tệp đích trùng tệp nguồn: ffmpeg tự từ chối, nhưng qua tệp tạm rồi ``os.replace`` sẽ đè mất nguồn."""
     try:
         target = request.output_path.resolve()
-        inputs = [p for p in (request.video_path, request.subtitle_path, getattr(request, "audio_path", None)) if p]
+        inputs = [p for p in (request.video_path, request.subtitle_path, getattr(request, "audio_path", None),
+                              getattr(request, "background_path", None)) if p]
         clash = any(Path(p).resolve() == target for p in inputs)
     except OSError:
         return

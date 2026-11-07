@@ -39,7 +39,16 @@ def absorb_flickers(
     min_duration_sec: float,
     similarity_threshold: float,
     merge_gap_sec: float,
+    max_duration_sec: float | None = None,
 ) -> list[SubtitleEvent]:
+    """Hấp thụ khung chớp; dòng ngắn hơn ``min_duration_sec`` được kéo dài tới mức đó.
+
+    [v3.23.674] ``max_duration_sec``: CHỈ phần kéo dài không vượt "Thời lượng tối đa" (khi người dùng đặt tối thiểu > tối
+    đa thì tối đa thắng). Việc phân loại khung chớp / ngưỡng loại vẫn theo ``min_duration_sec`` như cũ.
+    """
+    extend_to_sec = min_duration_sec
+    if max_duration_sec is not None and max_duration_sec > 0:
+        extend_to_sec = min(min_duration_sec, max_duration_sec)
     if not events or min_duration_sec <= 0:
         return list(events)
 
@@ -128,7 +137,7 @@ def absorb_flickers(
             i += 1
             continue
 
-        extended_event = _extend_duration(current, min_duration_sec, next_event)
+        extended_event = _extend_duration(current, extend_to_sec, next_event)
 
         if extended_event.duration_sec > 0:
             result.append(extended_event)

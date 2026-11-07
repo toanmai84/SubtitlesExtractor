@@ -36,7 +36,7 @@ MIN_REUSE_RATIO = 0.30
 #: Trường ``TTSRequest`` KHÔNG ảnh hưởng audio từng dòng (chỉ ảnh hưởng master/ghi file, hoặc
 #: được tính riêng theo từng dòng). Đổi các trường này KHÔNG làm mất cache.
 _NEUTRAL_FIELDS = frozenset({
-    "events", "line_voices", "neighbors", "segments_dir", "keep_line_audio",
+    "events", "line_voices", "line_styles", "neighbors", "segments_dir", "keep_line_audio",
     "output_format", "output_bitrate_kbps", "wav_subtype",
     "normalize", "target_lufs", "voice_clarity", "high_quality",
     "edge_concurrency", "retry_count", "retry_delay_s", "media_duration_s",
@@ -143,14 +143,17 @@ def line_signatures(
             if position + 1 < len(events)
             else (None if boundary is None else round(float(boundary), 3))
         )
-        blob = json.dumps(
-            [
-                str(getattr(event, "text", "") or ""),
-                round(float(event.start_sec), 3), round(float(event.end_sec), 3),
-                request.voice_at(position, request.speaker), following,
-            ],
-            ensure_ascii=False,
-        )
+        parts: list[object] = [
+            str(getattr(event, "text", "") or ""),
+            round(float(event.start_sec), 3), round(float(event.end_sec), 3),
+            request.voice_at(position, request.speaker), following,
+        ]
+        # [v3.23.688] Chỉ dẫn cách đọc đổi audio → vào chữ ký; dòng không có chỉ dẫn giữ NGUYÊN chữ ký cũ (cache cũ
+        # vẫn dùng được sau khi nâng cấp).
+        style = request.style_at(position) if hasattr(request, "style_at") else ""
+        if style:
+            parts.append(style)
+        blob = json.dumps(parts, ensure_ascii=False)
         signatures.append(hashlib.sha1(blob.encode("utf-8")).hexdigest()[:20])
     return tuple(signatures)
 

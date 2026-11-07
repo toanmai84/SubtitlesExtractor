@@ -14,6 +14,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
+    QLabel,
     QMainWindow,
     QPushButton,
     QStackedWidget,
@@ -38,6 +39,15 @@ class _NavButton(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setProperty("navButton", True)
         self.setMinimumHeight(40)
+        #: [v3.23.682] Nhãn gốc (không kèm số việc cần duyệt).
+        self.base_text = text
+        self.badge_count = 0
+
+    def set_badge(self, count: int, tooltip: str = "") -> None:
+        """[v3.23.682] Số việc cần duyệt hiện sau nhãn ("✏️  Chỉnh sửa  ● 12"); 0 = ẩn."""
+        self.badge_count = max(0, int(count))
+        self.setText(f"{self.base_text}  ● {self.badge_count}" if self.badge_count else self.base_text)
+        self.setToolTip(tooltip if self.badge_count else "")
 
 
 class FluentWindow(QMainWindow):
@@ -85,6 +95,8 @@ class FluentWindow(QMainWindow):
         self._nav_group = QButtonGroup(self)
         self._nav_group.setExclusive(True)
         self._button_for_widget: dict[QWidget, _NavButton] = {}
+        #: [v3.23.674] Nhóm cuối cùng đã chèn tiêu đề ở khu TOP (để chèn tiêu đề nhóm mới).
+        self._last_section: str | None = None
 
     def addSubInterface(  # noqa: N802 — giữ tên API qfluentwidgets
         self,
@@ -92,6 +104,7 @@ class FluentWindow(QMainWindow):
         icon: object = None,
         text: str = "",
         position: NavigationItemPosition = NavigationItemPosition.TOP,
+        section: str | None = None,
     ) -> None:
         """Thêm một trang vào stack + nút điều hướng vào sidebar.
 
@@ -100,6 +113,8 @@ class FluentWindow(QMainWindow):
             icon: FluentIcon hoặc QIcon (gọi ``.icon()`` nếu có).
             text: Nhãn nút điều hướng.
             position: TOP (mặc định) hay BOTTOM trong sidebar.
+            section: [v3.23.674] Tên nhóm (vd "QUY TRÌNH") — mục đầu của một nhóm mới ở khu TOP được
+                đặt dưới một tiêu đề nhóm.
         """
         # widget cần objectName để switchTo/route hoạt động ổn định.
         if not widget.objectName():
@@ -115,12 +130,30 @@ class FluentWindow(QMainWindow):
         if position == NavigationItemPosition.BOTTOM:
             self._bottom_slot.addWidget(button)
         else:
+            if section and section != self._last_section:
+                header = QLabel(section, self._sidebar)
+                header.setObjectName("navSection")
+                if self._last_section is not None:
+                    self._top_slot.addSpacing(10)
+                self._top_slot.addWidget(header)
+                self._last_section = section
             self._top_slot.addWidget(button)
 
         # Trang đầu tiên được chọn mặc định.
         if self.stackedWidget.count() == 1:
             button.setChecked(True)
             self.stackedWidget.setCurrentWidget(widget)
+
+    def set_nav_badge(self, widget: QWidget, count: int, tooltip: str = "") -> None:
+        """[v3.23.682] Đặt số việc cần duyệt cho nút điều hướng của ``widget`` (trang chưa đăng ký thì bỏ qua)."""
+        button = self._button_for_widget.get(widget)
+        if button is not None:
+            button.set_badge(count, tooltip)
+
+    def nav_badge(self, widget: QWidget) -> int:
+        """[v3.23.682] Số việc cần duyệt đang hiện cho trang ``widget``."""
+        button = self._button_for_widget.get(widget)
+        return button.badge_count if button is not None else 0
 
     def switchTo(self, widget: QWidget) -> None:  # noqa: N802 — giữ tên API
         """Chuyển sang trang cho trước + cập nhật trạng thái nút nav."""

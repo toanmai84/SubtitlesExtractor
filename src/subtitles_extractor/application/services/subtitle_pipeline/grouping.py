@@ -276,6 +276,14 @@ def group_using_viterbi(
                 aggregated_bounding_box=extract_aggregated_bounding_box(
                     frames_in_current_bucket
                 ),
+                # [v3.23.672] Text từng frame — như nhánh greedy. Thiếu trường này thì pass
+                # "Stable Variant Split" (tách 2 câu thật bị gộp nhầm) KHÔNG BAO GIỜ chạy ở chế
+                # độ Viterbi (mặc định): tập 5 phim mẫu "师叔" (0,8s) + "哎呦师叔" (0,9s) liền
+                # nhau bị merge_adjacent_duplicates gộp làm một và không ai tách lại.
+                member_texts=[
+                    (f.timestamp_sec, extract_joined_text_from_frame(f, y_ratio, y_min_px))
+                    for f in frames_in_current_bucket
+                ],
             )
         )
     return final_constructed_groups

@@ -625,7 +625,7 @@ class ApplicationContainer:
         # [v3.23.666] Nhà cung cấp tuỳ chỉnh (OxionAI…): dùng key của nhà cung cấp, không áp hạn
         # mức free-tier của Google, sức khoẻ model riêng (tên model khác Gemini).
         custom = self.custom_text_provider
-        return GeminiSubtitleTranslator(
+        translator = GeminiSubtitleTranslator(
             api_key=custom.api_key if custom is not None else api_key,
             retry_count=retry_count, request_timeout_s=request_timeout_s,
             quota_manager=None if custom is not None else self.gemini_quota_manager,
@@ -645,6 +645,8 @@ class ApplicationContainer:
             model_health=self.custom_model_health if custom is not None else self.gemini_model_health,
             clip_video_to_batch=bool(getattr(tr, "clip_video_to_batch", True)),
         )
+        translator.name_readings = self.name_readings  # [v3.23.673] cứu thuật ngữ dịch dở
+        return translator
 
     # ── [v3.23.666] Nhà cung cấp AI tuỳ chỉnh (API kiểu OpenAI) ──────────────────
 
@@ -840,7 +842,7 @@ class ApplicationContainer:
         )
 
     def make_translate_subtitles_use_case(
-        self, api_key: str, retry_count: int = 5, *, use_stage_cache: bool = True
+        self, api_key: str, retry_count: int | None = None, *, use_stage_cache: bool = True
     ):
         """Tạo use case dịch phụ đề với adapter Gemini đã cấu hình.
 
@@ -849,7 +851,7 @@ class ApplicationContainer:
 
         Args:
             api_key: Khoá API (nhiều khoá cách nhau xuống dòng).
-            retry_count: Số lần thử lại khi lỗi tạm thời.
+            retry_count: Số lần thử lại khi lỗi tạm thời; ``None`` = theo Cài đặt.
             use_stage_cache: [v3.23.608] ``False`` cho lượt dịch lại vài dòng chọn tay —
                 bộ nhớ đệm nay được giữ sau khi xong, mỗi tập dòng con sẽ thành một file
                 riêng chiếm chỗ của bộ nhớ đệm các phim.
@@ -866,6 +868,7 @@ class ApplicationContainer:
             cache_max_files=translation_settings.stage_cache_max_files,
             cache_max_age_days=translation_settings.stage_cache_max_age_days,
             native_address=bool(getattr(translation_settings, "native_address", False)),
+            name_readings=self.name_readings,
         )
 
     @property

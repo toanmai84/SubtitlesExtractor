@@ -43,7 +43,7 @@ class TestShortenButton:
         page._view_model.set_source_events(_tight_events())
         page.set_shorten_provider(lambda: ("", "m", "Vietnamese"))
         assert page._line_edits.shorten_lines() == 1
-        assert "khoá API Gemini" in page._stage_lbl.text()
+        assert "key Gemini" in page._stage_lbl.text()  # [v3.23.677] chỉ chỗ thêm key: Cài đặt → Khoá API và AI
 
     def test_preview_then_apply_edits_the_lines(self, page, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
         from subtitles_extractor.presentation.pages import tts_line_edits

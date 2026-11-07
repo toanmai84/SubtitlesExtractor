@@ -39,6 +39,10 @@ class _WorkerStopped(Exception):
     """[v3.23.601] Worker đã phát tín hiệu huỷ/lỗi trong lúc chuẩn bị video — dừng êm."""
 
 
+#: [v3.23.667] Cỡ lô mặc định của bộ quét người nói (khớp ``visual_cues_batch_size`` của use case).
+_SCAN_BATCH_LINES = 150
+
+
 class AnalyzeContextWorker(QThread):
     """Chạy phân tích ngữ cảnh trên thread nền, phát kết quả qua signal.
 
@@ -74,8 +78,11 @@ class AnalyzeContextWorker(QThread):
         voice_source_path: str = "",
         audit_model: str = "",
         audit_fallbacks: tuple[str, ...] = (),
+        voice_roster_path: str = "",
     ) -> None:
         super().__init__(parent)
+        #: [v3.23.671] Video cạnh phụ đề để NGHE giọng bổ sung bảng nhân vật (rỗng = tắt).
+        self._voice_roster_path = voice_roster_path
         #: [v3.23.640] Model tự kiểm tra (rỗng = mặc định rẻ) và các model dự phòng của nó.
         self._audit_model = audit_model
         self._audit_fallbacks = tuple(audit_fallbacks)
@@ -189,12 +196,18 @@ class AnalyzeContextWorker(QThread):
 
         extra = SPEAKER_COMPLETION_PASSES if self._enable_visual_cues else 0
         estimator = getattr(self._video_provider, "estimate_chunk_count", None)
-        if estimator is None:
-            return 1 + extra
-        try:
-            return int(estimator(Path(self._video_path))) + extra
-        except (OSError, ValueError, TypeError):
-            return 1 + extra
+        chunks = 1
+        if estimator is not None:
+            try:
+                chunks = max(1, int(estimator(Path(self._video_path))))
+            except (OSError, ValueError, TypeError):
+                chunks = 1
+        if not self._enable_visual_cues:
+            return chunks
+        # [v3.23.667] Phân tích tách bước: 2 lời gọi chữ (nhân vật, tóm tắt/thuật ngữ) + bộ quét
+        # người nói ~1 lời gọi mỗi lô 150 dòng (cắt thêm tại ranh giới đoạn video) + bổ sung.
+        batches = max(chunks, -(-len(self._source_lines) // _SCAN_BATCH_LINES))
+        return 2 + batches + extra
 
     def _prepare_video_refs(self) -> list | None:
         """Chọn key còn hạn mức rồi nén/tải video ngữ cảnh (hoặc dùng lại bản đã tải).
@@ -282,6 +295,7 @@ class AnalyzeContextWorker(QThread):
             voice_source_path=self._voice_source_path,
             audit_model=self._audit_model,
             audit_fallbacks=self._audit_fallbacks,
+            voice_roster_path=getattr(self, "_voice_roster_path", ""),
         )
         return result
 

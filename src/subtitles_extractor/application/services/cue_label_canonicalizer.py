@@ -25,6 +25,7 @@ from subtitles_extractor.application.services.roster_format import (
 from subtitles_extractor.domain.ports.subtitle_translator_port import VisualCue
 from subtitles_extractor.domain.value_objects.speaker_label import (
     canonical_fallback_speaker,
+    is_fallback_speaker,
 )
 
 _ALIAS_SPLIT_RE = re.compile(r"\s*[/|]\s*")
@@ -231,3 +232,75 @@ def roster_dialogue_cues_json(visual_cues: str, characters: str) -> str:
         and is_roster_label(cue.addressee, label_map)
     ]
     return serialize_visual_cues(kept)
+
+
+#: [v3.23.667] Số dòng tối thiểu một nhãn lạ phải có mới được thêm vào bảng nhân vật.
+MIN_LINES_FOR_NEW_SPEAKER = 2
+
+
+#: Nhãn không phải một NGƯỜI cụ thể (dù bộ quét có thể ghi) — không thêm vào bảng nhân vật.
+_NON_PERSON_LABELS = frozenset({
+    "thuyết minh", "lời thuyết minh", "người kể", "lời kể", "hệ thống", "mọi người", "tất cả",
+    "cả nhóm", "nhiều người", "ai đó", "không rõ", "chưa rõ", "narrator", "system", "everyone",
+})
+#: Dấu tách trong nhãn cho thấy GỘP nhiều người / nhãn có chú thích (vd "苏晴 / 林逸", "A - B").
+_MULTI_LABEL_RE = re.compile(r"[/|,，、&＆]|\s[-–—:]\s|\s和\s|\s(?:và|and)\s")
+
+
+def _addable_speaker(label: str, label_map: dict[str, str]) -> bool:
+    """[v3.23.667] Nhãn người nói có được thêm thành nhân vật mới không.
+
+    Bỏ: rỗng, nhãn giọng/đám đông/dẫn chuyện, nhãn KHỚP bảng, nhãn không phải một người, và nhãn
+    gộp nhiều người — thêm "苏晴 / 林逸" sẽ bị bộ đọc bảng gộp vào mục 苏晴 (đổi tên + mất quy tắc
+    xưng hô của cô) và làm hai phiên âm thuộc hai người nên bảng quy đổi tên bỏ cả hai.
+    """
+    if not label or is_fallback_speaker(label) or is_roster_label(label, label_map):
+        return False
+    if _MULTI_LABEL_RE.search(label) or len(label) > 24:
+        return False
+    key = _label_key(label)
+    return bool(key) and key not in _NON_PERSON_LABELS and not any(
+        word in key for word in ("chưa rõ", "không rõ")
+    )
+
+
+def add_cue_speakers_to_roster(
+    characters: str, cues: list[VisualCue], *, min_lines: int = MIN_LINES_FOR_NEW_SPEAKER
+) -> tuple[str, list[str]]:
+    """[v3.23.667] Thêm vào bảng nhân vật những người nói mà bước nhận diện người nói tìm ra.
+
+    Phân tích tách bước lập bảng nhân vật từ CHỮ trước, rồi mới nhận diện người nói (video hoặc
+    chữ). Đo trên tập 3 phim mẫu: 2/12 lượt bảng sót "魔修" → bước người nói không có tên để gán.
+    Nay bước đó được ghi danh xưng của người lạ, và danh xưng nào dùng cho ≥ ``min_lines`` dòng
+    được thêm thành một dòng nhân vật để lưới xưng hô, bảng quy đổi tên và tự kiểm tra thấy họ.
+    Nhãn giọng / đám đông / dẫn chuyện không phải nhân vật nên bị bỏ qua (hàm thuần).
+
+    Args:
+        characters: Bảng nhân vật hiện có.
+        cues: Nhãn người nói vừa nhận diện.
+        min_lines: Số dòng tối thiểu.
+
+    Returns:
+        ``(bảng nhân vật mới, các nhãn đã thêm)``.
+    """
+    label_map = roster_label_map(characters)
+    counts: dict[str, int] = {}
+    first_seen: dict[str, str] = {}
+    for cue in cues:
+        label = (cue.speaker or "").strip()
+        if not _addable_speaker(label, label_map):
+            continue
+        key = _label_key(label)
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        first_seen.setdefault(key, label)
+    added = [first_seen[k] for k, n in counts.items() if n >= min_lines]
+    if not added:
+        return characters, []
+    lines = [
+        f"{label} — người nói bổ sung từ bước nhận diện người nói ({counts[_label_key(label)]} dòng)"
+        for label in added
+    ]
+    base = (characters or "").rstrip()
+    return (f"{base}\n" if base else "") + "\n".join(lines), added

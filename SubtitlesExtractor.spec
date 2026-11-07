@@ -480,9 +480,15 @@ excludes = [
     # CÁCH KIỂM CHỨNG trong build_env trước khi bật (phải in ra OK):
     #     build_env\Scripts\python.exe -c "import sys; sys.modules['gradio']=None; from vieneu import Vieneu; print('OK - khong can gradio')"
     # Nếu in "OK" -> bỏ dấu # ở 3 dòng dưới để giảm dung lượng bundle.
-    # "gradio",
-    # "gradio_client",
-    # "uvicorn",
+    # [v3.23.675] ĐÃ KIỂM CHỨNG và BẬT: chặn hẳn gradio/gradio_client/uvicorn/fastapi/starlette rồi chạy THẬT
+    # VieNeu (tổng hợp giọng 3 s, 48 kHz), PaddleOCR (đọc đúng "HELLO 2026"), google-genai, edge-tts — đều chạy.
+    # vieneu chỉ khai báo gradio trong metadata (demo web), mã không import.
+    "gradio",
+    "gradio_client",
+    "hf_gradio",
+    "uvicorn",
+    "fastapi",
+    "starlette",
 ]
 
 # [v3.23.387] Khi KHÔNG nhúng paddle (mặc định): LOẠI hẳn 'paddle' khỏi bundle để phân tích
@@ -511,6 +517,42 @@ a = Analysis(
 )
 
 pyz = PYZ(a.pure)
+
+# [v3.23.675] Thông tin phiên bản Windows (VERSIONINFO): trước đây exe KHÔNG có ("Copying 0 resources") → Trình quản lý
+# tác vụ / Thuộc tính tệp / nhóm nút thanh tác vụ chỉ hiện tên tệp. Nay có "Subtitle Studio" + số bản lấy từ pyproject.
+def _make_version_info():
+    import re as _re
+
+    try:
+        _text = __import__("pathlib").Path("pyproject.toml").read_text(encoding="utf-8")
+        _ver = _re.search(r'^version\s*=\s*"([^"]+)"', _text, _re.M).group(1)
+        _nums = tuple(int(x) for x in _ver.split(".")[:4])
+        _nums = (_nums + (0, 0, 0, 0))[:4]
+        from PyInstaller.utils.win32.versioninfo import (
+            FixedFileInfo, StringFileInfo, StringStruct, StringTable, VarFileInfo, VarStruct, VSVersionInfo,
+        )
+    except Exception as exc:  # noqa: BLE001 — thiếu thông tin phiên bản không được làm hỏng build
+        print(f"[spec] Bỏ qua thông tin phiên bản Windows: {exc}")
+        return None
+    print(f"[spec] Thông tin phiên bản Windows: Subtitle Studio {_ver}.")
+    return VSVersionInfo(
+        ffi=FixedFileInfo(filevers=_nums, prodvers=_nums),
+        kids=[
+            StringFileInfo([StringTable("040904B0", [
+                StringStruct("CompanyName", "Subtitle Studio"),
+                StringStruct("FileDescription", "Subtitle Studio"),
+                StringStruct("FileVersion", _ver),
+                StringStruct("InternalName", "SubtitlesExtractor"),
+                StringStruct("OriginalFilename", "SubtitlesExtractor.exe"),
+                StringStruct("ProductName", "Subtitle Studio"),
+                StringStruct("ProductVersion", _ver),
+            ])]),
+            VarFileInfo([VarStruct("Translation", [1033, 1200])]),
+        ],
+    )
+
+
+_version_info = _make_version_info()
 
 # [v3.23.387] Icon dùng chung cho cả hai chế độ (PyInstaller bỏ qua nếu thiếu).
 _icon_path = (
@@ -552,6 +594,7 @@ if _ONEFILE:
         codesign_identity=None,
         entitlements_file=None,
         icon=_icon_path,
+        version=_version_info,
     )
     # KHÔNG COLLECT ở chế độ onefile — EXE đã tự chứa hết.
 else:
@@ -573,6 +616,7 @@ else:
         codesign_identity=None,
         entitlements_file=None,
         icon=_icon_path,
+        version=_version_info,
     )
 
     coll = COLLECT(

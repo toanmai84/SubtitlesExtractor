@@ -22,25 +22,32 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from itertools import count
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
+from itertools import count
 from pathlib import Path
 from typing import Any
 
+from subtitles_extractor.application.services.address_gloss import address_pronoun_gloss
 from subtitles_extractor.application.services.analysis_audit import (
     AUDIT_MAX_PROMPT_LINES,
     AUDIT_THINKING_LEVEL,
     AUDIT_WINDOW_LINES,
 )
 from subtitles_extractor.application.services.batch_resume import BatchResume
+from subtitles_extractor.application.services.token_usage import (
+    TokenUsage,
+    TokenUsageLedger,
+)
 from subtitles_extractor.application.services.under_translation_guard import (
     find_regressions,
     find_under_translated,
     log_under_translated,
 )
-from subtitles_extractor.application.services.address_gloss import address_pronoun_gloss
 from subtitles_extractor.domain.ports.subtitle_translator_port import (
+    ANALYSIS_FIELDS_ALL,
+    ANALYSIS_FIELDS_CONTEXT,
+    ANALYSIS_FIELDS_ROSTER,
     ANALYSIS_STOP_DAILY_QUOTA,
     ANALYSIS_STOP_OVERLOAD,
     BatchDoneCallback,
@@ -62,18 +69,9 @@ from subtitles_extractor.domain.value_objects.speaker_label import (
     NARRATOR_SPEAKER,
     VOICE_ONLY_SPEAKERS,
 )
-from subtitles_extractor.application.services.token_usage import (
-    TokenUsage,
-    TokenUsageLedger,
-)
 from subtitles_extractor.infrastructure.gemini_model_family import (
     gemini_model_version,
     uses_thinking_level,
-)
-from subtitles_extractor.infrastructure.translation.key_selection import KeyView, choose_key
-from subtitles_extractor.infrastructure.translation.model_health import (
-    FAILOVER_AFTER_IN_CALL,
-    ModelHealth,
 )
 from subtitles_extractor.infrastructure.translation.analysis_checkpoint import (
     SHARED_PROGRESS_MODEL,
@@ -95,11 +93,23 @@ from subtitles_extractor.infrastructure.translation.gemini_quota_manager import 
 from subtitles_extractor.infrastructure.translation.key_rotation_policy import (
     should_switch_for_viability,
 )
+from subtitles_extractor.infrastructure.translation.key_selection import (
+    KeyView,
+    choose_key,
+)
+from subtitles_extractor.infrastructure.translation.model_health import (
+    FAILOVER_AFTER_IN_CALL,
+    ModelHealth,
+)
 from subtitles_extractor.infrastructure.translation.openai_compat_client import (
     FALLBACK_TYPES as _CUSTOM_FALLBACK_TYPES,
+)
+from subtitles_extractor.infrastructure.translation.openai_compat_client import (
     CustomProviderConfig,
     CustomProviderError,
     OpenAICompatModule,
+)
+from subtitles_extractor.infrastructure.translation.openai_compat_client import (
     is_text_model as _is_custom_text_model,
 )
 from subtitles_extractor.infrastructure.translation.overload_retry_policy import (
@@ -427,6 +437,81 @@ _TRANSLATE_NO_DESC_SCHEMA: dict[str, Any] = {
 }
 """Schema rút gọn không có ``description`` — dùng khi ``context.include_desc=False``."""
 
+#: [v3.23.681] Chế độ "chỉ trả dòng cần sửa" (STYLE/LOCALIZE): mảng ``edits`` chỉ gồm dòng ĐỔI chữ.
+_EDITS_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "edits": {
+            "type": "ARRAY",
+            "description": "CHỈ các dòng cần sửa chữ; dòng giữ nguyên thì KHÔNG đưa vào. Không có gì cần sửa → mảng rỗng.",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "line_no": {"type": "NUMBER", "description": "line_no của dòng được sửa."},
+                    "text": {"type": "STRING", "description": "Toàn bộ câu MỚI của dòng đó (không phải phần chênh)."},
+                },
+                "required": ["line_no", "text"],
+            },
+        }
+    },
+    "required": ["edits"],
+}
+
+EDITS_ONLY_RULE = (
+    "\n\n## CHẾ ĐỘ CHỈ TRẢ DÒNG CẦN SỬA\n"
+    "- Trả trong mảng 'edits' CHỈ những dòng bạn ĐỔI chữ so với 'text' hiện có; mỗi mục gồm line_no và "
+    "TOÀN BỘ câu mới của dòng đó.\n"
+    "- Dòng không có trong 'edits' được GIỮ NGUYÊN như 'text' hiện có — đừng chép lại dòng không đổi.\n"
+    "- Không có dòng nào cần sửa → trả \"edits\": [].\n"
+    "- Mọi quy tắc ở trên vẫn áp dụng cho từng dòng bạn sửa."
+)
+
+
+def is_edits_schema(schema: Any) -> bool:
+    """[v3.23.681] Schema của lời gọi là chế độ "chỉ trả dòng cần sửa"."""
+    return isinstance(schema, dict) and "edits" in (schema.get("properties") or {})
+
+
+def expand_edits_payload(data: dict[str, Any], batch: list[Any], start_idx: int) -> int:
+    """[v3.23.681] Đổi ``{"edits": [...]}`` thành ``{"subtitles": [...]}`` ĐỦ dòng của lô (tại chỗ).
+
+    Dòng không sửa giữ ``text``/``speaker``/``description`` của khâu trước, nên mọi bước kiểm sau đó (căn dòng,
+    vá dòng thiếu, chia đôi lô) chạy như chế độ trả đủ dòng. Trả số dòng được sửa thật.
+
+    Raises:
+        _BatchValidationError: line_no nằm ngoài lô (model đánh số lại) — thử lại thay vì gán nhầm dòng.
+    """
+    edits = data.get("edits")
+    if isinstance(edits, dict):
+        edits = [edits]
+    if not isinstance(edits, list):
+        raise _BatchValidationError("Trường 'edits' không phải danh sách.")
+    expected = {start_idx + offset + 1: line for offset, line in enumerate(batch)}
+    changed: dict[int, str] = {}
+    for item in edits:
+        if not isinstance(item, dict):
+            continue
+        line_no = _safe_int(item.get("line_no"), -1)
+        text = str(item.get("text") or "").strip()
+        if line_no not in expected:
+            raise _BatchValidationError(
+                f"Mục sửa line_no={item.get('line_no')!r} nằm ngoài lô {min(expected)}-{max(expected)}."
+            )
+        if text:
+            changed[line_no] = text
+    subtitles = []
+    for line_no, line in expected.items():
+        subtitles.append({
+            "line_no": line_no,
+            "speaker": getattr(line, "speaker", "") or "",
+            "text": changed.get(line_no, getattr(line, "text", "")),
+            "description": getattr(line, "description", "") or "",
+        })
+    data.pop("edits", None)
+    data["subtitles"] = subtitles
+    return sum(1 for line_no, text in changed.items() if text != (getattr(expected[line_no], "text", "") or "").strip())
+
+
 _PREPROCESS_TEXT_SCHEMA: dict[str, Any] = {
     "type": "OBJECT",
     "properties": {
@@ -700,6 +785,59 @@ GLOSSARY_WORDING_RULE = (
     "dùng (vd 'công an', 'cục trưởng')."
 )
 
+
+#: [v3.23.671] Bước NGHE GIỌNG sau khi bảng nhân vật đã chốt bằng chữ. Tập 1 phim mẫu: cảnh
+#: đệ tử chế giễu có một nam đệ tử, một nữ đệ tử và giọng đám đông phụ hoạ — chỉ đọc chữ thì
+#: model gộp thành một mục "Đệ tử" (giới đoán) hoặc bỏ hẳn (giọng nữ: 0/3 lượt). Đưa âm thanh
+#: thẳng vào lượt lập bảng thì model nhỏ bịa tên ("林风"), đổi giới Nam Cung Mộng, gọi nhân vật
+#: chính là "phản diện" → bước này CHỈ ĐƯỢC THÊM người không tên. (Điền giới cho người đã có
+#: cũng bị bỏ: 3 lượt cho "师父" — không hề nói, đang bế quan — lúc 'nam' lúc 'nữ'; Nam Cung
+#: Mộng bị điền 'nam'.)
+VOICE_ROSTER_SYSTEM = (
+    "<role>\nBạn NGHE âm thanh lời thoại của một tập phim để bổ sung BẢNG NHÂN VẬT đã lập từ "
+    "phụ đề. Bảng đã đúng tên — KHÔNG đổi, không bỏ, không đặt lại tên ai.\n</role>\n"
+    "<viec_can_lam>\n"
+    "1. voices: đi hết phụ đề từ đầu đến cuối; mỗi lần GIỌNG người nói đổi thì ghi một phần tử "
+    "{lines: 'từ-đến', gender: nam/nữ/nhiều người, speaker: TÊN GỐC đúng như bảng, hoặc nhãn mô "
+    "tả nếu là người không có trong bảng}. Nghe đúng khoảng [giây] của từng dòng.\n"
+    "2. new_characters: mỗi người KHÔNG có trong bảng mà có giọng nói riêng (đệ tử, binh lính, "
+    "người qua đường, dẫn chuyện, đám đông cùng hô) → một mục. Hai giọng khác nhau (vd một nam "
+    "một nữ cùng chế giễu) là HAI mục. name là nhãn MÔ TẢ chữ gốc kèm phe/nơi chốn (vd "
+    "'灵霄宗男弟子', '灵霄宗女弟子', '灵霄宗众弟子', '旁白'), aka là nhãn tiếng Việt tương ứng "
+    "('Nam đệ tử Linh Tiêu Tông'); role = vai trò + nói với ai + cách xưng hô dạng 'xưng hô: "
+    "với <Tên đúng như bảng> tự xưng '…' gọi '…''. TUYỆT ĐỐI KHÔNG đặt tên riêng không có "
+    "trong phụ đề.\n"
+    "</viec_can_lam>\n"
+    "<luu_y>Nhãn '[giọng N]' do bộ tách giọng tự động gán: cùng N thường là một người, nhưng nó "
+    "có thể gộp nhầm hai người có giọng giống nhau (vd một nữ đệ tử chung N với nữ chính) — đoạn "
+    "mà người nói gọi chính người kia, hay nói về họ ở ngôi thứ ba, là của người KHÁC. Không chắc "
+    "thì không thêm.</luu_y>"
+)
+_VOICE_ROSTER_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "voices": {"type": "ARRAY", "items": {
+            "type": "OBJECT",
+            "properties": {"lines": {"type": "STRING"}, "gender": {"type": "STRING"},
+                           "speaker": {"type": "STRING"}},
+            "required": ["lines", "gender", "speaker"]}},
+        "new_characters": {"type": "ARRAY", "items": {
+            "type": "OBJECT",
+            "properties": {"name": {"type": "STRING"}, "aka": {"type": "STRING"},
+                           "gender": {"type": "STRING"}, "age": {"type": "STRING"},
+                           "role": {"type": "STRING"}},
+            "required": ["name", "aka", "gender", "role"]}},
+    },
+    "required": ["voices", "new_characters"],
+    "propertyOrdering": ["voices", "new_characters"],
+}
+#: Ước lượng token âm thanh/giây (tài liệu Gemini: 32 token/giây).
+VOICE_AUDIO_TOKENS_PER_SEC = 32
+#: Bitrate ước lượng của âm thanh lời thoại đã tách (để đổi kích thước → thời lượng).
+VOICE_AUDIO_EST_BITRATE = 64_000
+#: Trần kích thước âm thanh gửi INLINE: yêu cầu Gemini tối đa ~20 MB và dữ liệu inline mã hoá
+#: base64 (+33%) → ~14 MB thô (~29 phút lời thoại, khớp trần tách giọng 28 phút).
+VOICE_AUDIO_MAX_BYTES = 14_000_000
 
 #: [v3.23.612] Tuỳ chọn "Xưng hô thuần Việt" — khâu PHÂN TÍCH (bảng nhân vật, tóm tắt,
 #: thuật ngữ). Bản phân tích thật phim "灭门惨案II" ghi ``甄劍聲 / 劍哥 (Chân Kiếm Thanh /
@@ -1043,7 +1181,9 @@ def _clean_speaker_label(value: Any) -> str:
     Returns:
         Nhãn đã làm sạch (có thể rỗng).
     """
-    from subtitles_extractor.application.services.roster_format import normalize_punctuation
+    from subtitles_extractor.application.services.roster_format import (
+        normalize_punctuation,
+    )
 
     text = normalize_punctuation(str(value or "")).strip()
     if not text:
@@ -1200,7 +1340,12 @@ def _visual_cues_system_instruction(target_lang: str, characters: str) -> str:
             "\"spk\"/\"to\" PHẢI ghi đúng TÊN GỐC như đầu dòng của bảng (vd '宋钱'), "
             "không ghi phiên âm, không thêm chức danh. Chỉ người KHÔNG có trong bảng mới "
             f"dùng nhãn vai trò ngắn bằng {target_lang}, và giữ nguyên nhãn đó ở mọi "
-            "dòng."
+            "dòng. "
+            # [v3.23.667] Phân tích tách bước: bảng nhân vật lập từ CHỮ có thể sót một người
+            # (đo: 2/12 lượt sót "魔修" → ~40 dòng thành "giọng nam chưa rõ").
+            "Bảng có thể THIẾU người: một người không có trong bảng nhưng được lời thoại gọi "
+            "bằng một danh xưng/tên rõ ràng (vd 'ma tu', 'tiền bối', 'chưởng môn') thì ghi "
+            "đúng danh xưng/tên đó bằng chữ gốc như phụ đề, KHÔNG ghi nhãn giọng."
         )
     else:
         parts.append(
@@ -1342,14 +1487,18 @@ def _normalize_roster(value: Any) -> str:
     đoán định dạng tự do như trước.
     """
     from subtitles_extractor.application.services.roster_format import (
-        parse_roster, render_roster,
+        parse_roster,
+        render_roster,
     )
 
     return render_roster(parse_roster(value))
 
 
-def _normalize_glossary(value: Any) -> str:
-    """[v3.23.488] Chuẩn hoá bảng thuật ngữ về quy cách cố định — mỗi mục MỘT DÒNG ``gốc = dịch``."""
+def _normalize_glossary(value: Any, name_readings: Any = None) -> str:
+    """[v3.23.488] Chuẩn hoá bảng thuật ngữ về quy cách cố định — mỗi mục MỘT DÒNG ``gốc = dịch``.
+
+    [v3.23.673] ``name_readings``: mục DỊCH DỞ được cứu bằng âm Hán-Việt trước khi bị loại.
+    """
     from subtitles_extractor.application.services.roster_format import (
         drop_subsumed_glossary_entries,
         drop_variant_glossary_entries,
@@ -1360,19 +1509,50 @@ def _normalize_glossary(value: Any) -> str:
 
     # [v3.23.506] Khử BIẾN THỂ cùng nghĩa ngay khi nhận: hai mục cho cùng một khái niệm khiến
     # khâu dịch nhận chỉ thị mâu thuẫn (dữ liệu thật: 9 cặp).
-    entries = drop_subsumed_glossary_entries(parse_glossary(value))
-    entries = drop_variant_glossary_entries(entries)
+    entries = parse_glossary(value)
     # [v3.23.549] Loại mục DỊCH DỞ (vế dịch lẫn chữ Hán, vd ``生死道消 = "thân tử đạo消"``). Giữ
     # lại thì prompt dịch mang một ví dụ DẠY MODEL để sót chữ Hán trong bản tiếng Việt — sai về
     # đúng thứ mà cờ ``cjk_leftover`` sinh ra để chặn.
     healthy, broken = split_half_translated_entries(entries)
+    if broken and name_readings is not None:
+        # [v3.23.673] Chạy thật (tập 3): "九转烈阳蛊 = Cửu Chuyển Liệt Dương C蛊" bị loại hẳn →
+        # khâu dịch mất cách dịch chuẩn của thuật ngữ, bản dịch còn sót "C蛊". Đổi chữ Hán sót
+        # sang âm Hán-Việt ("… Cổ"); chỉ loại mục còn hỏng sau khi đổi.
+        from dataclasses import replace as _replace
+
+        from subtitles_extractor.application.services.cjk_transliteration import (
+            transliterate_leftover_cjk,
+        )
+        from subtitles_extractor.application.services.roster_format import is_half_translated
+
+        fixed_by_id: dict[int, Any] = {}
+        still_broken = []
+        for entry in broken:
+            fixed = transliterate_leftover_cjk(entry.translation, name_readings)
+            if fixed != entry.translation and not is_half_translated(fixed):
+                fixed_by_id[id(entry)] = _replace(entry, translation=fixed)
+            else:
+                still_broken.append(entry)
+        if fixed_by_id:
+            logger.info(
+                "Bảng thuật ngữ: cứu %d mục dịch dở bằng âm Hán-Việt: %s", len(fixed_by_id),
+                ", ".join(f"{e.term}={e.translation}" for e in list(fixed_by_id.values())[:5]))
+            healthy_ids = {id(e) for e in healthy}
+            # Giữ thứ tự gốc: mục lành + mục vừa cứu.
+            healthy = [
+                fixed_by_id.get(id(e), e) for e in entries
+                if id(e) in healthy_ids or id(e) in fixed_by_id
+            ]
+        broken = still_broken
     if broken:
         logger.warning(
             "Bảng thuật ngữ có %d mục DỊCH DỞ (vế dịch còn chữ Hán) — đã loại khỏi prompt: %s",
             len(broken),
             ", ".join(f"{e.term}={e.translation}" for e in broken[:5]),
         )
-    return render_glossary(healthy)
+    # [v3.23.673] Khử trùng SAU khi cứu: mục vừa cứu cũng phải qua lọc biến thể/bao hàm.
+    healthy = drop_subsumed_glossary_entries(healthy)
+    return render_glossary(drop_variant_glossary_entries(healthy))
 
 
 _CONTEXT_ANALYSIS_SCHEMA: dict[str, Any] = {
@@ -1414,6 +1594,16 @@ _CONTEXT_ANALYSIS_SCHEMA: dict[str, Any] = {
     },
     "required": ["source_lang", "characters", "overview"],
 }
+
+def _staged_analysis_schema(fields: str) -> dict[str, Any]:
+    """[v3.23.667] Schema thu hẹp cho phân tích tách bước (hàm thuần)."""
+    props = _CONTEXT_ANALYSIS_SCHEMA["properties"]
+    if fields == ANALYSIS_FIELDS_ROSTER:
+        keys, required = ("source_lang", "characters"), ["source_lang", "characters"]
+    else:
+        keys, required = ("source_lang", "overview", "glossary"), ["source_lang", "overview"]
+    return {"type": "OBJECT", "properties": {k: props[k] for k in keys}, "required": required}
+
 
 # [v3.23.37] Schema phân tích ngữ cảnh KÈM Visual Cues — dùng khi bật phân tích hình
 # ảnh, để LẤY LUÔN "ai nói/nói với ai" trong CÙNG request phân tích tuần tự (đã gửi
@@ -1574,6 +1764,15 @@ def _audit_system_instruction(target_lang: str) -> str:
         "'xưng hô: với <Tên người nghe> tự xưng '…' gọi '…'' (tên người nghe viết ĐÚNG như bảng, "
         "KHÔNG pinyin/chữ Hán xen vào câu tiếng Việt). Quy tắc chọn đại từ: "
         f"{ANALYSIS_ADDRESS_REGISTER_RULE}"
+        # [v3.23.670] Thiếu người phát hiện từ CHỮ (không cần nhãn người nói).
+        "- Khiếm khuyết 'unlisted_mention': một cách gọi lặp lại trong phụ đề chưa khớp ai. Đọc "
+        "các dòng quanh đó, xác định nó chỉ AI: người/thực thể biết nói chưa có → thêm dòng mới "
+        "(tên gốc là chính cách gọi nếu không biết tên, vd '师父 (Sư phụ)'); cách gọi của người "
+        "đã có → trả lại dòng người đó, phần tên GIỮ tên chính ở đầu rồi ' / ' cách gọi mới, phần "
+        "phiên âm thêm cách đọc tương ứng. Cách gọi chỉ NGƯỜI ĐƯỢC GỌI/NHẮC TỚI, không phải "
+        "người nói dòng đó; nhân vật có thể chưa biết danh tính thật của người họ gọi (gọi người "
+        "cứu mình là 前辈) — ghép theo danh tính THẬT nếu phụ đề/ngữ cảnh phim bộ cho thấy, không "
+        "chắc thì thêm mục riêng. Giới tính/quan hệ suy từ cách xưng hô trong chữ.\n"
         "- Không bịa nhân vật/chi tiết không có trong phụ đề.\n"
         "</nguyen_tac>"
     )
@@ -1780,6 +1979,17 @@ class GeminiSubtitleTranslator:
         request_timeout_s: Thời gian chờ tối đa mỗi request (giây); áp qua
             ``http_options.timeout`` để một request treo không làm đứng worker.
     """
+
+    #: [v3.23.673] Bảng âm Hán-Việt (container gán) — cứu mục thuật ngữ dịch dở.
+    name_readings: Any = None
+
+    def _readings_for(self, target_lang: str) -> Any:
+        """[v3.23.673] Bảng âm Hán-Việt chỉ dùng khi đích là tiếng Việt (đích khác: không cứu)."""
+        from subtitles_extractor.application.services.cjk_transliteration import (
+            is_vietnamese_target,
+        )
+
+        return self.name_readings if is_vietnamese_target(target_lang) else None
 
     def __init__(
         self,
@@ -2912,6 +3122,25 @@ class GeminiSubtitleTranslator:
         # Phải nhắc tới 'thinking' để tránh nuốt nhầm lỗi khác.
         return "thinking" in message and any(m in message for m in markers)
 
+    @property
+    def edits_stats(self) -> dict[str, int]:
+        """[v3.23.681] Đếm chế độ "chỉ trả dòng cần sửa": số lô, số dòng gửi, số dòng AI sửa (cộng dồn)."""
+        stats = self.__dict__.get("_edits_stats")
+        if stats is None:
+            stats = self.__dict__.setdefault("_edits_stats", {"batches": 0, "lines": 0, "edited": 0})
+        return stats
+
+    @staticmethod
+    def uses_edits_only(stage: TranslationStageConfig, has_prior_translation: bool) -> bool:
+        """[v3.23.681] Giai đoạn này chạy chế độ "chỉ trả dòng cần sửa"?
+
+        Chỉ STYLE/LOCALIZE khi ĐÃ có bản dịch trước (không có thì phải dịch đủ từng dòng).
+        """
+        return (
+            bool(getattr(stage, "edits_only", False)) and has_prior_translation
+            and stage.kind in (TranslationStageKind.STYLE, TranslationStageKind.LOCALIZE)
+        )
+
     def _response_schema_for(
         self, stage: TranslationStageConfig, context: TranslationContext
     ) -> dict[str, Any]:
@@ -3342,8 +3571,13 @@ class GeminiSubtitleTranslator:
         est_tokens: int = 0,
         video_refs: list[Any] | None = None,
         reject_truncated: bool = False,
+        require_media: bool = False,
     ) -> dict[str, Any]:
         """Gọi Gemini với retry cho lỗi tạm thời và lỗi sai cấu trúc batch.
+
+        ``require_media``: [v3.23.676] lời gọi CHỈ có nghĩa khi model nhận được tệp đính kèm (lượt nghe giọng). Khi
+        tệp bị bỏ (nhà cung cấp tuỳ chỉnh, hoặc phương án "bỏ video rồi thử lại" khi trả rỗng) thì trả ``{}`` thay vì
+        để model trả lời không có âm thanh — trước đây model bịa nhân vật mô tả ("…男弟子", "旁白").
 
         ``reject_truncated``: [v3.23.622] khâu PHÂN TÍCH (không có validator đếm dòng) đặt
         True để phản hồi ``MAX_TOKENS`` không bị vá thành kết quả đầy đủ mà bị hạ mức suy
@@ -3363,6 +3597,9 @@ class GeminiSubtitleTranslator:
         # [v3.23.666] Nhà cung cấp tuỳ chỉnh không đọc được tệp video đã tải lên Gemini: gửi
         # phần chữ (ngữ cảnh, cues đã có) thay vì hỏng cả lời gọi.
         if self.uses_custom_provider and (video_files or video_refs):
+            if require_media:
+                logger.info("Nhà cung cấp tuỳ chỉnh không nhận tệp âm thanh/video → bỏ qua bước cần nghe/xem.")
+                return {}
             logger.info(
                 "Nhà cung cấp tuỳ chỉnh không nhận video → bỏ %d đoạn video, chỉ gửi văn bản.",
                 len(video_files or video_refs or []),
@@ -3683,6 +3920,12 @@ class GeminiSubtitleTranslator:
                 if not exc.diagnosis.blocked:
                     unexplained_empties += 1
                 if current_handles and not video_dropped_for_empty:
+                    if require_media and should_drop_video(exc.diagnosis, unexplained_empties):
+                        logger.warning(
+                            "Gemini trả rỗng khi đính tệp (%s) — bước này cần tệp nên bỏ qua (không thử lại "
+                            "không đính tệp).", exc.diagnosis.describe(),
+                        )
+                        return {}
                     if should_drop_video(exc.diagnosis, unexplained_empties):
                         video_dropped_for_empty = True
                         current_handles = []
@@ -4776,6 +5019,8 @@ class GeminiSubtitleTranslator:
         _MAX_DEPTH = 12
         if not batch:
             return []
+        # [v3.23.681] Chế độ theo schema của CHÍNH lời gọi → lô con (chia đôi, cửa sổ vá) tự cùng chế độ.
+        edits_mode = is_edits_schema(getattr(config, "response_schema", None))
 
         # [v3.23.222] Truyền mốc dòng KẾ TIẾP để ngân sách ``max_chars`` tính theo KHUNG
         # HIỆU DỤNG (khung gốc + gap mà TTS thật sự được dùng) — trước đây chỉ dùng khung
@@ -4809,6 +5054,10 @@ class GeminiSubtitleTranslator:
             "nội dung của dòng khác, bị rút ngắn đánh rơi ý, hoặc sai nghĩa so với 'original', "
             "hãy SỬA LẠI theo 'original' — đừng kế thừa lỗi của khâu trước. Giữ đúng nghĩa gốc. "
             "Chỉ xử lý <current_batch>, trả JSON hợp lệ theo schema."
+            + (
+                " CHỈ đưa vào 'edits' những dòng cần đổi chữ; dòng giữ nguyên thì bỏ qua."
+                if edits_mode else ""
+            )
             if dual_payload
             else "Dựa trên các khối dữ liệu trên: chỉ xử lý <current_batch> và trả JSON "
             "hợp lệ theo schema."
@@ -4842,6 +5091,12 @@ class GeminiSubtitleTranslator:
         echo_retries = 0
 
         def _validator(data: dict[str, Any]) -> None:
+            if edits_mode:
+                if "edits" not in data and "subtitles" in data:     # mảng ở gốc → đã bị chuẩn hoá thành subtitles
+                    data["edits"] = data.pop("subtitles")
+                edited: int | None = expand_edits_payload(data, batch, start_idx)
+            else:
+                edited = None
             try:
                 self._validate_batch(data, len(batch), start_idx)
             except _BatchValidationError as exc:
@@ -4900,6 +5155,12 @@ class GeminiSubtitleTranslator:
                         f"Model trả NGUYÊN VĂN câu gốc (chưa dịch) ở {len(echoed)}/"
                         f"{len(batch)} dòng ({echoed[0]}-{echoed[-1]}) — cần dịch lại."
                     )
+            if edited is not None:        # chỉ đếm lô đã qua mọi phép kiểm (không đếm lượt thử lại)
+                stats = self.edits_stats
+                stats["batches"] += 1
+                stats["lines"] += len(batch)
+                stats["edited"] += edited
+                logger.info("Lô %d dòng (chỉ trả dòng cần sửa): AI sửa %d dòng.", len(batch), edited)
 
         # [v3.23.19] Ước lượng token gồm cả VIDEO để quota manager điều tiết ĐÚNG.
         # Trước đây chỉ tính text → quota "mù" với video → acquire cho qua → server
@@ -5150,8 +5411,17 @@ class GeminiSubtitleTranslator:
         video_refs: list[Any] | None = None,
         with_visual_cues: bool = False,
         prior_context: str = "",
+        fields: str = ANALYSIS_FIELDS_ALL,
+        pinned_characters: str = "",
     ) -> SubtitleContextAnalysis:
         """Phân tích TOÀN BỘ phụ đề, trả về ngôn ngữ + nhân vật đầy đủ + tóm tắt.
+
+        [v3.23.667] ``fields`` chọn phần cần trả (phân tích tách bước, chỉ dùng CHỮ):
+        :data:`ANALYSIS_FIELDS_ROSTER` = chỉ ngôn ngữ + bảng nhân vật;
+        :data:`ANALYSIS_FIELDS_CONTEXT` = ngôn ngữ + tóm tắt + thuật ngữ, với bảng nhân vật đã chốt
+        ``pinned_characters`` ghim vào chỉ dẫn (kết quả ``characters`` = đúng bảng đó). Hai chế độ này
+        bỏ qua video và Visual Cues — đo trên tập 1-3 phim mẫu: tách khỏi video + cues nâng bảng nhân
+        vật 73% → 84%, quy tắc xưng hô 38% → 62%.
 
         Khác với cách lấy mẫu cũ, hàm này gửi **toàn bộ** nội dung phụ đề
         (sau khi khử trùng lặp liên tiếp) để AI có đủ ngữ cảnh nhận diện:
@@ -5167,6 +5437,12 @@ class GeminiSubtitleTranslator:
         self._ensure_available()
         if not source_lines:
             return SubtitleContextAnalysis()
+        # [v3.23.667] Phân tích tách bước: chỉ CHỮ, không video / cues — đặt TRƯỚC khi dựng nội
+        # dung (giữ dòng lặp, mốc MM:SS chỉ dành cho lời gọi có cues).
+        staged = fields in (ANALYSIS_FIELDS_ROSTER, ANALYSIS_FIELDS_CONTEXT)
+        if staged:
+            with_visual_cues = False
+            video_refs = None
 
         # ── Khử trùng lặp liên tiếp và áp dụng soft-cap ────────────────────
         # Các phần mềm OCR thường tạo ra nhiều frame trùng nhau cho cùng 1 cụm
@@ -5286,9 +5562,14 @@ class GeminiSubtitleTranslator:
             # [v3.23.494] Chuẩn đoán thật cho thấy roster bị lẫn HỆ THỐNG/THƯƠNG HIỆU/ỨNG DỤNG
             # (宠妻系统, Alipay, 支付宝) và cùng một người bị tách thành nhiều mục (胖子 vs 三胖子)
             # → bảng quy đổi tên gửi cho khâu dịch bị nhiễu, gọi tên không nhất quán.
-            "CHỈ LIỆT KÊ CON NGƯỜI. TUYỆT ĐỐI KHÔNG đưa vào đây: hệ thống/thần khí/pháp bảo, "
-            "ứng dụng, thương hiệu, công ty, tổ chức, địa điểm, vật phẩm — những thứ đó thuộc "
-            "về glossary.\n"
+            # [v3.23.670] Đo tập 1-6 không video: "hệ thống" CÓ THOẠI hàng chục dòng ("恭喜宿主…")
+            # bị bỏ 4/6 tập vì quy tắc cũ cấm mọi "hệ thống" → khâu dịch không biết nó xưng
+            # "bản hệ thống" gọi "ký chủ". Thực thể biết NÓI/được nói chuyện cùng là nhân vật.
+            "CHỈ LIỆT KÊ NHỮNG AI CÓ THOẠI HOẶC LÀ NGƯỜI: con người, và thực thể biết NÓI / được "
+            "nói chuyện cùng (hệ thống/统子 trò chuyện với nhân vật, khí linh, AI, linh thú biết "
+            "nói). TUYỆT ĐỐI KHÔNG đưa vào đây thứ chỉ được NHẮC mà không nói: tên hệ thống như "
+            "một vật sở hữu, thần khí/pháp bảo, ứng dụng, thương hiệu, công ty, tổ chức, địa "
+            "điểm, vật phẩm — những thứ đó thuộc về glossary.\n"
             "GỘP BÍ DANH: một người có nhiều cách gọi (tên thật, biệt danh, cách gọi thân mật, "
             "chức danh) thì chỉ tạo MỘT phần tử; ghi các cách gọi vào \"name\", ngăn bằng ' / ' "
             "theo thứ tự phổ biến giảm dần (vd \"胖子 / 三胖子\"). KHÔNG tạo hai phần tử cho cùng "
@@ -5300,17 +5581,46 @@ class GeminiSubtitleTranslator:
             "bí danh trong \"name\", cùng thứ tự, ngăn bằng ' / ' (vd name \"楚瑶 / 瑶瑶\" → aka "
             "\"Sở Dao / Dao Dao\"). Nhân vật KHÔNG tên thì aka là danh xưng NGẮN như lời thoại gọi "
             "('师父' → 'Sư phụ', '门下弟子' → 'Đệ tử'), TUYỆT ĐỐI không viết cụm mô tả kiểu 'Sư "
-            "phụ của X', 'Đệ tử cùng môn' — quan hệ ghi vào \"role\".\n"
+            "phụ của X', 'Đệ tử cùng môn' — quan hệ ghi vào \"role\". (Ngoại lệ: người không tên "
+            "đặt tên MÔ TẢ không xuất hiện trong lời thoại như '灵霄宗女弟子' thì aka là nhãn mô tả "
+            "tương ứng 'Nữ đệ tử Linh Tiêu Tông' — dùng làm nhãn người nói, không chép vào lời.)\n"
             "LIỆT KÊ ĐẦY ĐỦ — KHÔNG chỉ tuyến chính: bao gồm CẢ nhân vật phụ, nhân vật chỉ "
             "xuất hiện vài cảnh, và nhân vật chỉ được NHẮC TÊN trong lời thoại (nhân vật vắng "
             "mặt, người đã mất, người ở xa). Bất kỳ ai có TÊN RIÊNG trong phụ đề đều phải có "
             "mặt. Nhân vật không tên nhưng có vai rõ (bác sĩ, cảnh sát, quản gia…) thì ghi "
             "nhãn vai trò làm tên. Thà thừa còn hơn thiếu.\n"
+            # [v3.23.670] Không video thì model chỉ kể người có tên: tập mẫu mất nhóm đệ tử chế
+            # giễu (3/3 lượt), sư phụ/sư tỷ bế quan, "秦师兄", "前辈" (= nhân vật chính Nam Cung
+            # chưa biết mặt). Đưa quy trình rà TỪNG dòng thay cho lời dặn chung.
+            "QUY TRÌNH RÀ SOÁT (làm trước khi trả lời, đi lần lượt hết phụ đề):\n"
+            "  1) Mỗi dòng: AI đang nói, nói VỚI AI. Giọng hệ thống/thông báo ('恭喜宿主…', "
+            "'任务…', '叮') là nhân vật hệ thống. Người KHÔNG TÊN có thoại (đệ tử, dân làng, "
+            "binh lính…): mỗi NGƯỜI nói một mục riêng — một tràng mỉa mai rồi câu phụ hoạ "
+            "'就是', '对啊', '没错' xen vào là của NGƯỜI KHÁC; tách theo giới khi chữ cho thấy "
+            "(trợ từ '呀/啦/嘛', cách người khác gọi), không chắc giới thì ghi 'chưa rõ'. Đặt tên "
+            "mô tả kèm phe/tông môn, KHÔNG dùng một từ có trong lời thoại làm tên (vd name "
+            "'灵霄宗男弟子', aka 'Nam đệ tử Linh Tiêu Tông'; '灵霄宗女弟子' → 'Nữ đệ tử Linh Tiêu "
+            "Tông'); cả đám cùng hô thì thêm một mục nhóm ('灵霄宗众弟子' → 'Các đệ tử Linh "
+            "Tiêu Tông', giới 'nhiều người').\n"
+            "  2) Mọi người được GỌI hoặc NHẮC tới, kể cả vắng mặt/bế quan/đã mất/chỉ biết qua "
+            "chức danh: 师父, 师尊, 师叔, 师姐 (người thứ ba), 长老, 宗主, 前辈, 'họ + 师兄' "
+            "(vd '秦师兄'). Mỗi người cụ thể một mục.\n"
+            "  3) Chức danh/cách gọi chỉ một người ĐÃ có trong bảng thì GHÉP vào \"name\" của "
+            "người đó (vd '叶然 / 叶师兄 / 前辈'), ghi trong role ai gọi thế và vì sao (vd 'Nam "
+            "Cung gọi là 前辈 vì chưa biết người cứu mình là anh').\n"
+            "  4) Tập không nhắc tên thật (chỉ '宿主', '逆徒', '前辈'…) mà NGỮ CẢNH CÁC TẬP TRƯỚC "
+            "cho biết là ai thì dùng ĐÚNG tên đã có và thêm cách gọi đó vào \"name\".\n"
             "BẮT BUỘC ghi GIỚI TÍNH cho TỪNG nhân vật: hãy NGHE GIỌNG NÓI trong "
             "audio của video (cao độ, âm sắc) kết hợp hình ảnh để xác định chính xác — "
             "giới tính quyết định cách xưng hô (anh/em/cô/chú/ông/bà) khi dịch, sai giới "
             "tính là sai cả bản dịch. Nêu thêm QUAN HỆ vai vế nếu rõ (vd 'anh trai của X', "
             "'cấp trên của Y').\n"
+            # [v3.23.670] Lượt chỉ chữ không có audio: model đoán bừa (sư phụ nữ ghi 'nam', đệ
+            # tử ghi thành 'cháu gái'). Chỉ ra bằng chứng trong CHỮ.
+            "KHÔNG có audio/video thì suy giới tính và quan hệ từ CHỮ: cách người khác gọi "
+            "(师姐/师妹/姑娘/仙子/小姐/她 → nữ; 师兄/师弟/公子/他 → nam), lời tự xưng, cách "
+            "xưng hô (徒儿/弟子 gọi 师父 → thầy trò, KHÔNG phải họ hàng). Quan hệ chỉ ghi khi "
+            "phụ đề cho thấy; không đoán quan hệ họ hàng.\n"
             f"Tên đã là Latin (Anh, Pháp…) thì giữ nguyên ở \"name\", \"aka\" để trống; nêu "
             f"chức danh trong \"role\" (vd 'Tiến sĩ', 'Giám đốc NASA').\n"
             f"BẮT BUỘC: luôn ghi \"aka\" ({target_lang}) cho mọi tên CJK (Hán, Nhật, Hàn)."
@@ -5367,6 +5677,21 @@ class GeminiSubtitleTranslator:
         if getattr(self, "_native_address", False):
             system_instr += NATIVE_ADDRESS_ANALYSIS_RULE
 
+        if fields == ANALYSIS_FIELDS_ROSTER:
+            system_instr += (
+                "\n\nLƯỢT NÀY CHỈ LẬP source_lang VÀ BẢNG NHÂN VẬT (characters) — dồn toàn bộ chú ý "
+                "vào việc liệt kê đủ người, giới tính, quan hệ và CÁCH XƯNG HÔ từng cặp. Tóm tắt và "
+                "thuật ngữ làm ở lượt sau."
+            )
+        elif fields == ANALYSIS_FIELDS_CONTEXT and pinned_characters.strip():
+            system_instr += (
+                "\n\n=== BẢNG NHÂN VẬT ĐÃ CHỐT (lượt trước) ===\n"
+                f"{pinned_characters.strip()}\n"
+                "=== HẾT BẢNG NHÂN VẬT ===\n"
+                "LƯỢT NÀY CHỈ LẬP source_lang, overview và glossary. Khi nhắc nhân vật dùng ĐÚNG "
+                "phiên âm trong bảng trên; KHÔNG đưa tên người vào glossary (đã có trong bảng)."
+            )
+
         # [v3.23.37] Khi bật phân tích hình ảnh: LẤY LUÔN Visual Cues trong cùng request
         # phân tích (đã gửi video) → tiết kiệm quota, không cần gọi riêng. Thêm chỉ thị
         # 'cues' và dùng schema kết hợp.
@@ -5407,6 +5732,8 @@ class GeminiSubtitleTranslator:
         analysis_schema = (
             _CONTEXT_WITH_CUES_SCHEMA if with_visual_cues else _CONTEXT_ANALYSIS_SCHEMA
         )
+        if staged:
+            analysis_schema = _staged_analysis_schema(fields)
 
         # ── Prompt ────────────────────────────────────────────────────────
         prompt = _wrap_xml_block(
@@ -5484,15 +5811,52 @@ class GeminiSubtitleTranslator:
             reject_truncated=True,
         )
         cues_json = self._extract_cues_json(data) if with_visual_cues else ""
+        characters = (
+            pinned_characters.strip() if fields == ANALYSIS_FIELDS_CONTEXT
+            else _normalize_roster(data.get("characters"))
+        )
         return SubtitleContextAnalysis(
             source_lang=self._reconcile_source_lang(
                 str(data.get("source_lang") or "").strip(), source_lines
             ),
-            characters=_normalize_roster(data.get("characters")),
+            characters=characters,
             overview=str(data.get("overview") or "").strip(),
-            glossary=_normalize_glossary(data.get("glossary")),
+            glossary=_normalize_glossary(data.get("glossary"), self._readings_for(target_lang)),
             visual_cues=cues_json,
         )
+
+    def _dialogue_audio_part(self, source: str) -> tuple[Any, float] | None:
+        """[v3.23.671] Âm thanh lời thoại của ``source`` thành Part INLINE (không qua Files API:
+        tệp tải lên bằng key A bị 403 khi xoay sang key B). ``None`` khi không có tiếng, quá dài
+        hoặc lỗi — bảng nhân vật giữ nguyên bản lập bằng chữ."""
+        import tempfile
+        from pathlib import Path
+
+        from subtitles_extractor.infrastructure.translation import (
+            gemini_diarization as diar,
+        )
+
+        path = Path(str(source or ""))
+        if not path.is_file():
+            return None
+        try:
+            from google.genai import types
+
+            with tempfile.TemporaryDirectory(prefix="se_voice_roster_") as tmp:
+                audio = Path(tmp) / "dialogue.m4a"
+                if not diar.extract_dialogue_audio(path, audio):
+                    return None
+                data = audio.read_bytes()
+            seconds = len(data) * 8 / VOICE_AUDIO_EST_BITRATE
+            if len(data) > VOICE_AUDIO_MAX_BYTES:
+                logger.info(
+                    "Âm thanh lời thoại %.1f MB vượt trần gửi kèm (%.0f MB) — lập bảng nhân vật "
+                    "bằng chữ.", len(data) / 1e6, VOICE_AUDIO_MAX_BYTES / 1e6)
+                return None
+            return types.Part.from_bytes(data=data, mime_type="audio/mp4"), seconds
+        except Exception as exc:  # noqa: BLE001 — tính năng tuỳ chọn: lỗi bất kỳ → chỉ dùng chữ
+            logger.warning("Không gửi kèm được âm thanh khi lập bảng nhân vật: %s", exc)
+            return None
 
     @staticmethod
     def _reconcile_source_lang(
@@ -5722,7 +6086,7 @@ class GeminiSubtitleTranslator:
                     source_lang=str(data.get("source_lang") or "").strip(),
                     characters=_normalize_roster(data.get("characters")),
                     overview=str(data.get("overview") or "").strip(),
-                    glossary=_normalize_glossary(data.get("glossary")),
+                    glossary=_normalize_glossary(data.get("glossary"), self._readings_for(target_lang)),
                 )
                 # Tích luỹ: ưu tiên kết quả mới (đã gồm ngữ cảnh cũ); giữ trường cũ nếu
                 # đoạn này trả rỗng (model thi thoảng bỏ trống 1 trường).
@@ -5909,7 +6273,7 @@ class GeminiSubtitleTranslator:
             source_lang=str(data.get("source_lang") or "").strip(),
             characters=_normalize_roster(data.get("characters")),
             overview=str(data.get("overview") or "").strip(),
-            glossary=_normalize_glossary(data.get("glossary")),
+            glossary=_normalize_glossary(data.get("glossary"), self._readings_for(target_lang)),
         )
 
     def _analysis_progress_key(
@@ -6152,13 +6516,8 @@ class GeminiSubtitleTranslator:
         # 403 → tải lại bằng key hiện tại, tránh mất ngữ cảnh HÌNH ở các đoạn CUỐI phim.
         video_handles = self._resolve_handles_with_heal(video_refs, [])
 
-        def _noop_validator(_data: dict[str, Any]) -> None:
-            pass
-
         from subtitles_extractor.application.services.visual_cue_batching import (
             batch_lines_by_video_chunk,
-            known_context_items,
-            scan_line_items,
         )
 
         all_cues: list[VisualCue] = []
@@ -6173,6 +6532,38 @@ class GeminiSubtitleTranslator:
             for r in (video_refs or [])
         ]
         batches = batch_lines_by_video_chunk(source_lines, chunk_bounds, batch_size)
+        try:
+            self._scan_cue_batches(
+                batches, all_cues, video_refs, video_handles, known_cues, context_lines, config,
+                model_name, max_line_no, sleep_between_s, cancel_cb, progress_cb,
+            )
+        except Exception as exc:
+            # [v3.23.667] Lỗi giữa chừng (hết hạn mức, quá tải…): đính kèm các lô đã xong để bên gọi
+            # giữ lại thay vì quét lại từ đầu.
+            if all_cues and not isinstance(exc, TranslationCancelledError):
+                try:
+                    exc.partial_cues = list(all_cues)  # type: ignore[attr-defined]
+                except AttributeError:
+                    pass
+            raise
+        return all_cues
+
+    def _scan_cue_batches(
+        self, batches: list[Any], all_cues: list[VisualCue], video_refs: list[Any] | None,
+        video_handles: list[Any], known_cues: list[VisualCue] | None,
+        context_lines: list[TranslationLine] | None, config: Any, model_name: str,
+        max_line_no: int, sleep_between_s: float, cancel_cb: CancellationCallback | None,
+        progress_cb: StageProgressCallback | None,
+    ) -> None:
+        """Vòng quét từng lô của :meth:`analyze_visual_cues` (thêm cues vào ``all_cues``)."""
+        from subtitles_extractor.application.services.visual_cue_batching import (
+            known_context_items,
+            scan_line_items,
+        )
+
+        def _noop_validator(_data: dict[str, Any]) -> None:
+            pass
+
         total_batches = len(batches)
         for batch_idx, batch in enumerate(batches):
             if cancel_cb is not None and cancel_cb():
@@ -6251,7 +6642,6 @@ class GeminiSubtitleTranslator:
                 and self._interruptible_sleep(sleep_between_s, cancel_cb)
             ):
                 raise TranslationCancelledError("Đã huỷ trong lúc nghỉ giữa các lô.")
-        return all_cues
 
     def analyze_text_cues(
         self,
@@ -6356,6 +6746,82 @@ class GeminiSubtitleTranslator:
             ):
                 raise TranslationCancelledError("Đã huỷ trong lúc nghỉ giữa các lô.")
         return all_cues
+
+    def listen_roster_voices(
+        self,
+        source_lines: list[TranslationLine],
+        target_lang: str,
+        model_name: str,
+        characters: str,
+        voice_source: str,
+        source_lang: str = "",
+        cancel_cb: CancellationCallback | None = None,
+    ) -> dict[str, Any]:
+        """[v3.23.671] NGHE âm thanh lời thoại để bổ sung bảng nhân vật đã chốt bằng chữ.
+
+        Một lời gọi kèm âm thanh INLINE (không tải video) + nhãn cụm giọng từng dòng (tách giọng
+        miễn phí, dùng chung bộ nhớ đệm với bước gán người nói). Model chỉ trả người KHÔNG có
+        trong bảng (người không tên theo từng giọng) — việc gộp có kiểm soát nằm ở
+        ``voice_roster.merge_voice_roster``.
+
+        Returns:
+            Bản bổ sung ``{voices, new_characters}``; ``{}`` khi không có âm thanh,
+            nhà cung cấp tuỳ chỉnh (không gửi được âm thanh) hoặc model không trả gì.
+        """
+        self._ensure_available()
+        if self.uses_custom_provider or not source_lines or not voice_source:
+            return {}
+        from subtitles_extractor.infrastructure.translation import gemini_diarization as diar
+        from subtitles_extractor.infrastructure.translation.gemini_video_context import (
+            GeminiVideoContextProvider,
+        )
+
+        try:
+            duration = GeminiVideoContextProvider._read_duration_sec(Path(str(voice_source)))
+        except Exception as exc:  # noqa: BLE001 — không đọc được thời lượng: bỏ bước tuỳ chọn
+            logger.info("Không đọc được thời lượng để nghe giọng — bỏ qua: %s", exc)
+            return {}
+        if duration > diar.MAX_DIARIZED_AUDIO_SEC:
+            # Phim dài: không tách cả âm thanh rồi mới vứt; tách giọng cũng không làm được.
+            logger.info("Phim %.0f phút vượt trần nghe giọng (%d phút) — bỏ qua.",
+                        duration / 60, diar.MAX_DIARIZED_AUDIO_SEC // 60)
+            return {}
+        if cancel_cb is not None and cancel_cb():
+            raise TranslationCancelledError("Người dùng đã huỷ bước nghe giọng.")
+        labels = self.label_voices(voice_source, source_lines, source_lang, cancel_cb)
+        if cancel_cb is not None and cancel_cb():
+            raise TranslationCancelledError("Người dùng đã huỷ bước nghe giọng.")
+        audio = self._dialogue_audio_part(voice_source)
+        if audio is None:
+            return {}
+        part, seconds = audio
+        lines = analysis_source_lines(source_lines, keep_repeats=True)
+
+        def _row(ln: TranslationLine) -> str:
+            voice = f" [giọng {labels[ln.index]}]" if ln.index in labels else ""
+            return (f"{ln.index}. [{ln.start_ms / 1000:.1f}s-{ln.end_ms / 1000:.1f}s]{voice} "
+                    f"{ln.text}")
+
+        prompt = "\n\n".join([
+            _wrap_xml_block("bang_nhan_vat", characters or "(rỗng)"),
+            _wrap_xml_block("phu_de_goc", "\n".join(_row(ln) for ln in lines)),
+            "Nghe âm thanh kèm theo (cùng mốc giây với phụ đề) rồi trả voices và new_characters. "
+            f"Nhãn (aka, role) viết bằng {target_lang}.",
+        ])
+        config = self._build_config(
+            0.2, _VOICE_ROSTER_SCHEMA, VOICE_ROSTER_SYSTEM,
+            enable_thinking=True, thinking_budget=-1, model_name=model_name,
+            thinking_level=getattr(self, "_analysis_thinking_level", "medium"),
+        )
+        logger.info("Nghe giọng bổ sung bảng nhân vật (%.0f giây âm thanh, %d dòng có nhãn giọng).",
+                    seconds, len(labels))
+        data = self._call_gemini(
+            model_name, prompt, config, lambda _d: None, cancel_cb=cancel_cb,
+            video_files=[part],
+            est_tokens=max(1, len(prompt) // 4) + int(seconds * VOICE_AUDIO_TOKENS_PER_SEC),
+            reject_truncated=True, require_media=True,
+        )
+        return data if isinstance(data, dict) else {}
 
     def audit_analysis(
         self,
@@ -6528,7 +6994,9 @@ class GeminiSubtitleTranslator:
         import tempfile
         from pathlib import Path
 
-        from subtitles_extractor.infrastructure.translation import gemini_diarization as diar
+        from subtitles_extractor.infrastructure.translation import (
+            gemini_diarization as diar,
+        )
         from subtitles_extractor.infrastructure.translation.gemini_video_context import (
             GeminiVideoContextProvider,
         )
@@ -6568,7 +7036,9 @@ class GeminiSubtitleTranslator:
         self, audio: Any, source_lang: str, cancel_cb: CancellationCallback | None
     ) -> list[Any]:
         """Gọi tách giọng lần lượt theo từng API key (xoay key khi hết hạn mức)."""
-        from subtitles_extractor.infrastructure.translation import gemini_diarization as diar
+        from subtitles_extractor.infrastructure.translation import (
+            gemini_diarization as diar,
+        )
 
         if self.uses_custom_provider:
             # [v3.23.666] Tách giọng cần tải âm thanh lên Gemini (Files API) — nhà cung cấp kiểu
@@ -6872,14 +7342,18 @@ class GeminiSubtitleTranslator:
             return
         cached_key = getattr(self, "_address_rules_source", None)
         if cached_key != characters:
-            from subtitles_extractor.application.services.roster_format import address_rule_map
+            from subtitles_extractor.application.services.roster_format import (
+                address_rule_map,
+            )
 
             try:
                 self._address_rules = address_rule_map(characters)
             except (ValueError, TypeError, AttributeError):
                 self._address_rules = {}
             self._address_rules_source = characters
-        from subtitles_extractor.application.services.roster_format import lookup_address_rule
+        from subtitles_extractor.application.services.roster_format import (
+            lookup_address_rule,
+        )
 
         rule = lookup_address_rule(
             getattr(self, "_address_rules", {}), line.speaker, line.addressee
@@ -7369,11 +7843,15 @@ class GeminiSubtitleTranslator:
 
         # [v3.23.584] Lô đã dịch ở lần chạy DỞ của chính giai đoạn này → dùng lại.
         resume = BatchResume.build(resume_lines, reindex_map)
-        response_schema = self._response_schema_for(stage, context)
+        edits_only = self.uses_edits_only(stage, has_prior_translation)
+        response_schema = _EDITS_SCHEMA if edits_only else self._response_schema_for(stage, context)
         system_instruction = self._system_instruction(
             stage, context, has_prior_translation,
             with_video=bool(attach_video and video_refs),
         )
+        if edits_only:
+            system_instruction += EDITS_ONLY_RULE
+            logger.info("Giai đoạn '%s': chế độ chỉ trả dòng cần sửa.", stage.kind.value)
         batch_size = max(1, stage.batch_size)
         # [v3.23.131] TỰ GIỚI HẠN lô cho model "lite": các model nhẹ (vd
         # gemini-3.1-flash-lite) trả kém ổn định khi lô quá lớn — hay rớt/đánh số lệch

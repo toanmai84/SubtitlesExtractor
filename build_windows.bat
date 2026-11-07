@@ -330,6 +330,9 @@ if /i "%SUBEXT_ONEDIR%"=="1" (
 if not exist "!EXE_PATH!" goto :build_failed
 
 echo.
+rem [v3.23.675] Windows giu icon cu cua exe theo duong dan (build lai cung cho van hien icon cu tren thanh tac vu).
+rem Lam moi bo nho dem icon cua nguoi dung hien tai - vo hai, bo qua neu khong co lenh.
+ie4uinit.exe -show >nul 2>&1
 echo ========================================================
 echo   BUILD THANH CONG
 echo   File: !EXE_PATH!

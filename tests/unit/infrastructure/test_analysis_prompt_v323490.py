@@ -154,12 +154,15 @@ class TestSpeakerLabelCleaning:
 
 
 class TestRosterPurityRules:
-    """[v3.23.494] Roster chỉ chứa CON NGƯỜI; bí danh của cùng một người phải gộp một mục."""
+    """[v3.23.494] Roster chỉ chứa CON NGƯỜI; bí danh của cùng một người phải gộp một mục.
+
+    [v3.23.670] Nới: thực thể biết NÓI (hệ thống có thoại) được vào bảng; vật chỉ được nhắc vẫn
+    thuộc glossary."""
 
     @pytest.mark.parametrize(
         "needle",
         [
-            "CHỈ LIỆT KÊ CON NGƯỜI",
+            "CHỈ LIỆT KÊ NHỮNG AI CÓ THOẠI HOẶC LÀ NGƯỜI",
             "những thứ đó thuộc",
             "GỘP BÍ DANH",
             "KHÔNG tạo hai phần tử cho cùng",

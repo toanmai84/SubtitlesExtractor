@@ -94,6 +94,8 @@ def _preset_roi(preset_key: str, video_w: int, video_h: int) -> Roi | None:
     return None
 
 
+from subtitles_extractor.presentation.utils.task_notifier import notify_task_finished
+
 logger = logging.getLogger(__name__)
 
 
@@ -161,7 +163,10 @@ class ExtractPage(QWidget):
         scroll.setWidget(control_panel)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(340)
+        # [v3.23.674] Cột điều khiển không được hẹp hơn nội dung (trước đây mép phải nút/ô chọn bị cắt ~10 px vì
+        # thanh cuộn dọc đè lên nội dung rộng hơn khung).
+        scroll.setMinimumWidth(max(340, control_panel.minimumSizeHint().width()
+                                   + scroll.verticalScrollBar().sizeHint().width() + 4))
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         splitter.addWidget(scroll)
 
@@ -308,7 +313,6 @@ class ExtractPage(QWidget):
         )
 
         self._main_lang_label = QLabel(self._translator.translate("extract.ex_sub_lang"))
-        self._main_lang_label.setStyleSheet(caption_style())
         self._cb_main_ocr_language = ComboBox()
         self._cb_main_ocr_language.addItem(self._translator.translate("extract.ex_by_settings"), "")
         for _label, _code in UI_LANGUAGE_CHOICES:
@@ -357,12 +361,31 @@ class ExtractPage(QWidget):
         self._start_button.setToolTip(
             self._translator.translate("extract.ex_tt_extract")
         )
-        inner.addWidget(self._main_lang_label)
-        inner.addWidget(self._cb_main_ocr_language)
-        inner.addWidget(self._rebuild_button)
-        inner.addWidget(self._cb_probe_position)
-        inner.addWidget(self._probe_button)
-        inner.addWidget(self._bench_button)
+        # [v3.23.674] Bố cục gọn: ngôn ngữ cùng hàng với nhãn; các công cụ THỬ (không bắt buộc) gom vào một nhóm,
+        # "Đoạn thử" có nhãn rõ và nằm cạnh nút thử; nút "Bắt đầu trích xuất" cao, nổi bật ở cuối — trước đây ô chọn
+        # "Giữa phim" đứng trơ không nhãn và nút chính bị đẩy khuất dưới vùng cuộn trên màn hình 1366×768.
+        lang_row = QHBoxLayout()
+        lang_row.setSpacing(_m.SPACING_XS)
+        lang_row.addWidget(self._main_lang_label)
+        lang_row.addWidget(self._cb_main_ocr_language, 1)
+        inner.addLayout(lang_row)
+
+        tools_card = SectionCard(self._translator.translate("extract.ex_group_tools"))
+        probe_row = QHBoxLayout()
+        probe_row.setSpacing(_m.SPACING_XS)
+        probe_label = QLabel(self._translator.translate("extract.ex_probe_pos_label"))
+        probe_row.addWidget(probe_label)
+        probe_row.addWidget(self._cb_probe_position, 1)
+        probe_row.addWidget(self._probe_button, 1)
+        tools_card.add_layout(probe_row)
+        tools_row = QHBoxLayout()
+        tools_row.setSpacing(_m.SPACING_XS)
+        tools_row.addWidget(self._bench_button, 1)
+        tools_row.addWidget(self._rebuild_button, 1)
+        tools_card.add_layout(tools_row)
+        inner.addWidget(tools_card)
+
+        self._start_button.setMinimumHeight(38)
         inner.addWidget(self._start_button)
         inner.addStretch(1)
         return tab
@@ -1230,6 +1253,7 @@ class ExtractPage(QWidget):
         self._batch_queue = runnable
         self._batch_index = 0
         self._batch_failures = []
+        self._series_learned_roi = None  # [v3.23.686]
         self._emit_extraction_running()  # [v3.23.656] khoá Re-OCR suốt lượt hàng loạt, cả giữa hai tập
         self._run_next_batch_item()
 
@@ -1268,6 +1292,7 @@ class ExtractPage(QWidget):
         self._batch_queue = runnable
         self._batch_index = 0
         self._batch_failures = []
+        self._series_learned_roi = None  # [v3.23.686]
         self._batch_cancelled = False
         self._emit_extraction_running()
         QTimer.singleShot(0, self._run_next_batch_item)
@@ -1318,8 +1343,24 @@ class ExtractPage(QWidget):
         self._pending_batch_item = None
         if item.roi is not None:
             self._view_model.set_roi(item.roi)
+        else:
+            self._remember_series_roi()
         self._reset_eta()
         self._view_model.start_extraction()
+
+    def _remember_series_roi(self) -> None:
+        """[v3.23.686] Ghi ROI tự dò (hoặc đã kiểm) của tập vừa nạp để tập kế của lượt hàng loạt dùng lại."""
+        roi, video = self._view_model.roi, self._view_model.video
+        if roi is not None and video is not None:
+            self._series_learned_roi = (roi, (video.width, video.height))
+
+    def _series_learned_roi_for(self, metadata: VideoMetadata) -> Roi | None:
+        """ROI đã học trong lượt hàng loạt này, chỉ khi tập mới cùng cỡ khung (khác cỡ → dò đầy đủ)."""
+        learned = getattr(self, "_series_learned_roi", None)
+        if learned is None:
+            return None
+        roi, size = learned
+        return roi if size == (metadata.width, metadata.height) else None
 
     def _advance_batch(self, *, failed_name: str | None = None) -> bool:
         """Chuyển sang tập kế tiếp. Trả ``True`` nếu đang chạy hàng loạt."""
@@ -1343,6 +1384,8 @@ class ExtractPage(QWidget):
 
         total = len(self._batch_queue)
         failures = list(self._batch_failures)
+        notify_task_finished(self, self._translator.translate("common.task_done_extract"), f"{total - len(failures)}/{total}",
+                             failed=bool(failures))  # [v3.23.682]
         cancelled = getattr(self, "_batch_cancelled", False)
         # [v3.23.434] Bỏ biểu thức chết '(0 if cancelled else 0)' (LUÔN = 0, gây khó hiểu, bị
         # ruff RUF034 gắn cờ). processed = số mục đã xong; khi huỷ giữa chừng, mục đang dở +
@@ -1790,7 +1833,11 @@ class ExtractPage(QWidget):
                     # [v3.23.659] Hàng loạt không có ROI mẫu: dò NGAY và tự chọn ROI chính (không hộp kiểm duyệt). Lối
                     # cũ hẹn 300 ms nên lượt trích xuất (hẹn 0 ms) chạy trước với ROI rỗng = OCR CẢ KHUNG HÌNH, còn
                     # lượt dò sau đó bị bỏ vì trang đang bận.
-                    self._view_model.detect_primary_subtitle_roi()
+                    # [v3.23.686] Tập kế của cùng lượt hàng loạt: kiểm nhanh ROI tập trước (~24 khung) thay vì dò lại
+                    # đầy đủ; không khớp thì chính tác vụ đó dò đầy đủ.
+                    learned = self._series_learned_roi_for(metadata)
+                    if learned is None or not self._view_model.detect_series_roi(learned):
+                        self._view_model.detect_primary_subtitle_roi()
                 else:
                     QTimer.singleShot(300, self._view_model.detect_auto_roi)  # AI (1 luồng)
 
@@ -1968,6 +2015,10 @@ class ExtractPage(QWidget):
             self._status_label.setText(
                 f"✓ Hoàn tất! {len(response.events)} câu trong {response.elapsed_seconds:.1f}s → Đã lưu vào Database"
             )
+        notify_task_finished(  # [v3.23.682]
+            self, self._translator.translate("common.task_done_extract"),
+            self._translator.translate("common.task_lines", count=len(response.events)),
+        )
 
         if hasattr(self, '_btn_export_raw'): self._btn_export_raw.setVisible(True)
 
@@ -2054,6 +2105,7 @@ class ExtractPage(QWidget):
         if hasattr(self, '_status_label'):
             self._status_label.setStyleSheet(f"color: {_c.danger()};")
             self._status_label.setText(self._translator.translate("extract.status_error", message=message))
+        notify_task_finished(self, self._translator.translate("common.task_failed_extract"), message, failed=True)  # [v3.23.682]
 
         InfoBar.error(
             title="Lỗi Trích xuất",

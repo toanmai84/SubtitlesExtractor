@@ -137,6 +137,9 @@ class TTSRequest:
     # ``events`` (cùng chỉ số với ``TTSSegmentResult.event_index``). Phần tử rỗng, hoặc
     # dòng nằm ngoài độ dài tuple, đọc bằng ``speaker`` như trước. Rỗng = một giọng.
     line_voices: tuple[str, ...] = ()
+    # [v3.23.688] Chỉ dẫn cách đọc RIÊNG từng dòng (vd "tức giận", "thì thầm"), theo vị trí trong ``events``. Chỉ engine
+    # hỗ trợ trường chỉ dẫn tách khỏi lời đọc mới dùng (Gemini TTS 3.8: ``speech_metadata.style``). Rỗng = không có.
+    line_styles: tuple[str, ...] = ()
     # [v3.23.596] TTS lại tập con dòng: mốc thật của hai dòng kề từng dòng (theo vị trí
     # trong ``events``). Rỗng = engine tự suy từ ``events`` như một lượt đầy đủ.
     neighbors: tuple[LineNeighbors, ...] = ()
@@ -167,6 +170,18 @@ class TTSRequest:
         if 0 <= position < len(self.line_voices):
             return self.line_voices[position].strip() or default_voice
         return default_voice
+
+    def style_at(self, position: int) -> str:
+        """[v3.23.688] Chỉ dẫn cách đọc của dòng ở vị trí ``position`` (rỗng = đọc bình thường)."""
+        if 0 <= position < len(self.line_styles):
+            return self.line_styles[position].strip()
+        return ""
+
+    def line_styles_for(self, positions: list[int]) -> tuple[str, ...]:
+        """[v3.23.688] Chỉ dẫn cách đọc của một TẬP CON dòng (TTS lại vài dòng vẫn giữ cảm xúc)."""
+        if not self.line_styles:
+            return ()
+        return tuple(self.style_at(position) for position in positions)
 
     def line_voices_for(self, positions: list[int]) -> tuple[str, ...]:
         """Giọng riêng của một TẬP CON dòng (để TTS lại vài dòng vẫn giữ đúng vai).

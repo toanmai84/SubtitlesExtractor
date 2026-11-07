@@ -225,3 +225,61 @@ def _reset_publish_mode_settings() -> Iterator[None]:
     settings = QSettings()
     settings.remove("publish/subtitle_mode")
     settings.remove("publish/audio_mode")
+
+
+@pytest.fixture(autouse=True)
+def _reset_ai_access_store() -> Iterator[None]:
+    """[v3.23.677] Khoá API dùng chung nằm trong QSettings: một test đặt key không được làm test sau "đã có key"."""
+    yield
+    try:
+        from PySide6.QtCore import QSettings
+
+        from subtitles_extractor.presentation.ai_access_store import SETTINGS_APP, SETTINGS_ORG, STORE_KEYS
+    except ImportError:
+        return
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    for key in STORE_KEYS:
+        settings.remove(key)
+    settings.sync()
+
+
+#: [v3.23.679] Giữ MỘT QApplication sống suốt phiên test. Nhiều tệp test tạo ``QApplication([])`` trong fixture phạm vi
+#: module: nếu tệp đó tạo ứng dụng đầu tiên, hết module thì đối tượng bị thu gom → QApplication bị huỷ, test Qt sau
+#: (qtbot tạo ứng dụng MỚI) chạm đối tượng của ứng dụng cũ → segfault (đo thật: bộ test toàn phần chết mã 139 ở 87 %,
+#: chia đôi ra test_dubbing_bugfixes_v323594 + test_pronunciation_check_v323679).
+_SESSION_QAPP: object | None = None
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _keep_single_qapplication() -> Iterator[None]:
+    global _SESSION_QAPP
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        yield
+        return
+    _SESSION_QAPP = QApplication.instance() or QApplication([])
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _flush_qt_leftovers(request: pytest.FixtureRequest) -> Iterator[None]:
+    """[v3.23.679] Dọn đối tượng Qt sót của MỖI test ngay khi test đó xong (thu gom vòng tham chiếu + xử lý xoá hoãn).
+
+    Trước đây đối tượng sót (vd bảng phân vai + view-model của test lồng tiếng) chỉ bị thu gom khi một test SAU tình cờ
+    tạo đủ rác để kích hoạt gc — crash (``~QObject`` trong DeferredDelete) bị đổ cho test sau, tuỳ thứ tự chạy.
+    """
+    yield
+    # Chỉ test có dựng đối tượng Qt (qtbot / qapp / fixture "app"): gc.collect sau CẢ 8 000 test làm bộ test chậm gấp 5.
+    if not {"qtbot", "qapp", "app"} & set(request.fixturenames):
+        return
+    try:
+        import gc
+
+        from PySide6.QtCore import QCoreApplication, QEvent
+    except ImportError:
+        return
+    if QCoreApplication.instance() is None:
+        return
+    gc.collect()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

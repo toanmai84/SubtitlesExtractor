@@ -30,6 +30,7 @@ _AUDIO_TAGS = {
     AudioMode.ORIGINAL: "",
     AudioMode.VOICE_OVER: "_thuyetminh",
     AudioMode.REPLACE_TRACK: "_tiengviet",
+    AudioMode.CLEAN_DUB: "_longtieng",  # [v3.23.678]
 }
 
 
@@ -156,8 +157,9 @@ def test_every_combination_has_distinct_name() -> None:
         for subtitle_mode in SubtitleMode
         for audio_mode in AudioMode
     ]
-    assert len(names) == 9
-    assert len(set(names)) == 9
+    count = len(SubtitleMode) * len(AudioMode)   # [v3.23.678] 3 × 4 (thêm lồng tiếng sạch)
+    assert len(names) == count == 12
+    assert len(set(names)) == count
 
 
 def test_no_video_gives_empty_name() -> None:

@@ -131,7 +131,12 @@ class PostProcessSettings(BaseSettings):
 
     similarity_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
     min_duration_sec: float = Field(default=0.15, ge=0.0, le=60.0)
-    max_duration_sec: float = Field(default=5.0, ge=0.1, le=600.0)
+    # [v3.23.674] Trần thời lượng khi ứng dụng TỰ KÉO DÀI một dòng (đệm thời gian OCR, kéo dài khung chớp, giãn giờ
+    # đọc ở trang Dịch). Không cắt dòng vốn hiện lâu trên video. 7 s = mức trần phổ biến của phụ đề (và là trần cũ của
+    # bước giãn giờ đọc). Trước v3.23.674 ô này không được dùng ở đâu.
+    max_duration_sec: float = Field(default=7.0, ge=0.5, le=600.0)
+    # [v3.23.674] Đã nâng mặc định cũ (5 s, chưa từng có tác dụng) lên 7 s cho cấu hình lưu từ bản cũ (một lần).
+    defaults_v674: bool = Field(default=True)
     merge_gap_sec: float = Field(default=0.20, ge=0.0, le=10.0)
     # [v3.23.654] Gộp phụ đề "hiện dần" (我 → 我只是) thành một câu. Mặc định TẮT (có thể là nói lắp thật).
     merge_progressive: bool = Field(default=False)

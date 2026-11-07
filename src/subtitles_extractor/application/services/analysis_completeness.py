@@ -12,6 +12,8 @@ Module chỉ chứa HÀM THUẦN: không I/O.
 from __future__ import annotations
 
 from subtitles_extractor.domain.ports.subtitle_translator_port import (
+    ANALYSIS_STEP_CONTEXT,
+    ANALYSIS_STEP_SPEAKERS,
     ANALYSIS_STOP_DAILY_QUOTA,
     ANALYSIS_STOP_OVERLOAD,
     SubtitleContextAnalysis,
@@ -48,6 +50,9 @@ def describe_incomplete_analysis(analysis: SubtitleContextAnalysis) -> str:
     Returns:
         Câu thông báo; rỗng khi phân tích đã đủ.
     """
+    steps = tuple(getattr(analysis, "incomplete_steps", ()) or ())
+    if steps:
+        return _describe_incomplete_steps(steps, analysis.stop_reason)
     missing = tuple(analysis.missing_segments)
     if not missing:
         return ""
@@ -57,6 +62,26 @@ def describe_incomplete_analysis(analysis: SubtitleContextAnalysis) -> str:
         f"Mới phân tích {total - len(missing)}/{total} đoạn video — còn thiếu đoạn "
         f"{_segment_list(missing)}. {reason} — các đoạn đã xong được giữ, chỉ gửi đoạn "
         "còn thiếu. Bảng nhân vật và Visual Cues hiện tại chỉ phủ phần phim đã phân tích."
+    )
+
+
+_STEP_NAMES = {
+    ANALYSIS_STEP_CONTEXT: "tóm tắt bối cảnh & thuật ngữ",
+    ANALYSIS_STEP_SPEAKERS: "nhận diện người nói",
+}
+
+
+def _describe_incomplete_steps(steps: tuple[str, ...], stop_reason: str) -> str:
+    """[v3.23.667] Phân tích tách bước dừng giữa chừng: nói rõ bước nào thiếu và đã giữ gì."""
+    names = ", ".join(_STEP_NAMES.get(step, step) for step in steps)
+    reason = _REASONS.get(stop_reason, _DEFAULT_REASON)
+    hint = (
+        " Bấm «Bổ sung người nói» để chỉ hỏi các dòng còn thiếu người nói."
+        if ANALYSIS_STEP_SPEAKERS in steps and ANALYSIS_STEP_CONTEXT not in steps else ""
+    )
+    return (
+        f"Phân tích chưa xong bước: {names}. {reason} — bảng nhân vật và các bước đã xong "
+        f"được giữ.{hint}"
     )
 
 

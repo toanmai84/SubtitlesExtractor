@@ -45,7 +45,9 @@ soxr             # resampling cho voice cloning
 tokenizers>=0.20 # phoneme tokenizer
 
 # ── Xử lý video / ảnh ──
-opencv-python
+# [v3.23.675] opencv-CONTRIB-python: paddlex ghim opencv-contrib-python==4.10.0.84. Cài thêm opencv-python (5.x)
+# thì HAI gói cùng ghi thư mục cv2/ — gói cài sau đè gói trước (build log 03/11: cả 4.10 contrib lẫn 5.0 cùng có).
+opencv-contrib-python
 numpy>=2.3.5
 soundfile
 Pillow>=10.0     # giải mã phụ đề ảnh PGS/VobSub

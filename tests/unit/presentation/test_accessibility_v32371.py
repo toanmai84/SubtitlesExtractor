@@ -27,8 +27,9 @@ _PAGES_DIR = (
 _CONTROLS_NEEDING_NAME: dict[str, set[str]] = {
     "debug_page.py": {"_btn_play", "_btn_prev", "_btn_next", "_slider"},
     "extract_page.py": {"_btn_play_pause", "_position_slider"},
-    "translate_page.py": {"_btn_eye"},
-    "tts_page.py": {"_btn_eye"},
+    # [v3.23.677] Nút mắt (hiện/ẩn key) chuyển sang widgets/ai_access_panel.py — kiểm ở test_ai_access_v323677.
+    "translate_page.py": set(),
+    "tts_page.py": set(),
     "editor_page.py": {
         "btn_play",
         "_btn_prev_frame",

@@ -91,10 +91,12 @@ _EDITOR_SHORTCUTS: dict[str, list[tuple[str, str]]] = {
     "sc_grp_navigate": [
         ("Ctrl+↑ / ↓", "sc_select_updown"),
         ("Ctrl+Shift+← / →", "sc_jump_edge"),
+        ("F8 / Shift+F8", "sc_next_suspect"),
     ],
     "sc_grp_timing": [
         ("Alt+← / →", "sc_shift_start"),
         ("Alt+Shift+← / →", "sc_shift_end"),
+        ("Ctrl+[ / Ctrl+]", "sc_set_at_playhead"),
     ],
     "sc_grp_edit": [
         ("Ctrl+B / Ctrl+I", "sc_bold_italic"),
@@ -111,8 +113,19 @@ _EDITOR_SHORTCUTS: dict[str, list[tuple[str, str]]] = {
         ("Ctrl+O", "sc_open_sub"),
         ("Ctrl+Shift+O", "sc_open_video"),
         ("F11 / ESC", "sc_fullscreen"),
+        ("F1", "sc_help"),
     ],
 }
+
+
+def next_suspect_row(suspect_rows: list[int] | set[int], current: int, forward: bool = True) -> int | None:
+    """[v3.23.682] Hàng nghi ngờ kế tiếp (vòng lại từ đầu/cuối); ``None`` nếu không còn dòng nghi."""
+    rows = sorted(suspect_rows)
+    if not rows:
+        return None
+    if forward:
+        return next((r for r in rows if r > current), rows[0])
+    return next((r for r in reversed(rows) if r < current), rows[-1])
 
 
 def editor_shortcuts_html(translator) -> str:
@@ -730,6 +743,8 @@ class _DetachedVideoWindow(QWidget):
 class EditorPage(QWidget):
     #: [v3.23.656] Lượt Re-OCR đang chạy (trang Trích xuất khoá bắt đầu trích xuất theo tín hiệu này).
     reocr_running_changed = Signal(bool)
+    #: [v3.23.682] Số dòng nghi ngờ OCR (thanh điều hướng hiện "● n" cạnh tên trang).
+    review_count_changed = Signal(int)
 
     _VIDEO_EXTENSIONS: frozenset[str] = frozenset({".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".ts", ".m4v"})
     _SUBTITLE_EXTENSIONS: frozenset[str] = frozenset({".srt", ".ass", ".ssa", ".vtt"})
@@ -934,8 +949,10 @@ class EditorPage(QWidget):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
-        root.addLayout(self._build_file_toolbar())
-        root.addLayout(self._build_edit_toolbar())
+        # [v3.23.674] Hai thanh công cụ tự xuống dòng (trước đây bị tràn/cắt chữ ở màn hình 1366×768); nút OCR lại
+        # chuyển lên nhóm sửa câu để hàng tìm/thay đủ chỗ.
+        root.addWidget(self._build_file_toolbar())
+        root.addWidget(self._build_edit_toolbar())
         root.addLayout(self._build_search_toolbar())
 
         from PySide6.QtWidgets import QSplitter
@@ -967,8 +984,10 @@ class EditorPage(QWidget):
         root.addWidget(self._v_splitter, stretch=1)
         root.addLayout(self._build_statusbar())
 
-    def _build_file_toolbar(self) -> QHBoxLayout:
-        layout = QHBoxLayout()
+    def _build_file_toolbar(self) -> QWidget:
+        from subtitles_extractor.presentation.widgets.flow_layout import flow_row
+
+        holder, layout = flow_row(self)
         self._open_video_button = PushButton(self._translator.translate("editor.ed_btn_open_video"))
         self._open_button = PushButton("📂 " + self._translator.translate("editor.btn_open"))
         self._export_button = PrimaryPushButton("💾 " + self._translator.translate("editor.btn_export"))
@@ -984,15 +1003,16 @@ class EditorPage(QWidget):
         layout.addWidget(self._open_video_button)
         layout.addWidget(self._open_button)
         layout.addWidget(self._export_button)
-        layout.addStretch(1)
         layout.addWidget(self._undo_button)
         layout.addWidget(self._redo_button)
         layout.addWidget(self._history_button)
         layout.addWidget(self._btn_shortcuts)
-        return layout
+        return holder
 
-    def _build_edit_toolbar(self) -> QHBoxLayout:
-        layout = QHBoxLayout()
+    def _build_edit_toolbar(self) -> QWidget:
+        from subtitles_extractor.presentation.widgets.flow_layout import flow_row
+
+        holder, layout = flow_row(self)
         self._insert_button = PushButton(self._translator.translate("editor.ed_btn_insert"))
         self._insert_button.setToolTip(self._translator.translate("editor.ed_tt_insert"))
         
@@ -1017,19 +1037,32 @@ class EditorPage(QWidget):
 
         layout.addWidget(self._insert_button); layout.addWidget(self._delete_button)
         layout.addWidget(self._split_button); layout.addWidget(self._merge_button)
-        layout.addSpacing(15)
         layout.addWidget(self._btn_autofix); layout.addWidget(self._btn_merge_similar)
-        layout.addStretch(1)
 
-        layout.addWidget(StrongBodyLabel(self._translator.translate("editor.shift_label")))
+        self._btn_fast_reocr = PushButton(self._translator.translate("editor.ed_btn_reocr_fast"))
+        self._btn_fast_reocr.setStyleSheet(f"color: {_c.success()}; font-weight: bold;")
+        self._btn_fast_reocr.setToolTip(
+            self._translator.translate("editor.ed_tt_reocr_fast")
+        )
+        layout.addWidget(self._btn_fast_reocr)
+        self._btn_reocr = PushButton(self._translator.translate("editor.ed_btn_reocr_adv"))
+        self._btn_reocr.setToolTip(self._translator.translate("editor.ed_tt_reocr_adv"))
+        layout.addWidget(self._btn_reocr)
+
+        # Dời giờ cả bộ: nhãn + ô số + nút đi liền nhau (không bị tách khi xuống dòng).
+        shift_box = QWidget(holder)
+        shift_lay = QHBoxLayout(shift_box)
+        shift_lay.setContentsMargins(0, 0, 0, 0)
+        shift_lay.addWidget(StrongBodyLabel(self._translator.translate("editor.shift_label")))
         self._shift_spin = DoubleSpinBox()
         self._shift_spin.setRange(-3600.0, 3600.0); self._shift_spin.setSingleStep(0.1)
         self._shift_spin.setDecimals(3); self._shift_spin.setSuffix(" s")
-        layout.addWidget(self._shift_spin)
+        shift_lay.addWidget(self._shift_spin)
         self._shift_button = PushButton(self._translator.translate("editor.btn_shift_apply"))
         self._shift_button.setEnabled(False)
-        layout.addWidget(self._shift_button)
-        return layout
+        shift_lay.addWidget(self._shift_button)
+        layout.addWidget(shift_box)
+        return holder
 
     def _build_search_toolbar(self) -> QHBoxLayout:
         layout = QHBoxLayout()
@@ -1059,17 +1092,6 @@ class EditorPage(QWidget):
         self._replace_one_button.setEnabled(False); self._replace_all_button.setEnabled(False)
         layout.addWidget(self._replace_one_button); layout.addWidget(self._replace_all_button)
 
-        layout.addSpacing(20)
-        self._btn_fast_reocr = PushButton(self._translator.translate("editor.ed_btn_reocr_fast"))
-        self._btn_fast_reocr.setStyleSheet(f"color: {_c.success()}; font-weight: bold;")
-        self._btn_fast_reocr.setToolTip(
-            self._translator.translate("editor.ed_tt_reocr_fast")
-        )
-        layout.addWidget(self._btn_fast_reocr)
-
-        self._btn_reocr = PrimaryPushButton(self._translator.translate("editor.ed_btn_reocr_adv"))
-        self._btn_reocr.setToolTip(self._translator.translate("editor.ed_tt_reocr_adv"))
-        layout.addWidget(self._btn_reocr)
         return layout
 
     def _build_top_left_panel(self) -> QWidget:
@@ -1087,6 +1109,14 @@ class EditorPage(QWidget):
         )
         self._proxy_model.setSourceModel(self._table_model)
         self._table.setModel(self._proxy_model)
+        # [v3.23.682] Đếm lại dòng nghi sau mỗi lần sửa/nạp (gom các thay đổi liền nhau thành một lần tính).
+        self._review_timer = QTimer(self)
+        self._review_timer.setSingleShot(True)
+        self._review_timer.setInterval(500)
+        self._review_timer.timeout.connect(self._emit_review_count)
+        for signal in (self._table_model.modelReset, self._table_model.rowsInserted, self._table_model.rowsRemoved):
+            signal.connect(self._review_timer.start)
+        self._table_model.dataChanged.connect(self._on_model_data_changed_for_review)
 
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -1126,8 +1156,8 @@ class EditorPage(QWidget):
 
         time_lay = QVBoxLayout()
         time_lay.setSpacing(4)
-        row_s = QHBoxLayout(); row_s.addWidget(StrongBodyLabel("Show:")); self._edit_start = TimeSpinBox(); row_s.addWidget(self._edit_start)
-        row_e = QHBoxLayout(); row_e.addWidget(StrongBodyLabel("Hide:  ")); self._edit_end = TimeSpinBox(); row_e.addWidget(self._edit_end)
+        row_s = QHBoxLayout(); row_s.addWidget(StrongBodyLabel(self._translator.translate("editor.ed_lbl_show"))); self._edit_start = TimeSpinBox(); row_s.addWidget(self._edit_start)
+        row_e = QHBoxLayout(); row_e.addWidget(StrongBodyLabel(self._translator.translate("editor.ed_lbl_hide"))); self._edit_end = TimeSpinBox(); row_e.addWidget(self._edit_end)
         time_lay.addLayout(row_s); time_lay.addLayout(row_e)
 
         self._edit_apply_timing = PushButton(self._translator.translate("editor.ed_btn_apply_time"))
@@ -1937,8 +1967,8 @@ class EditorPage(QWidget):
         if k == Qt.Key.Key_L and not ctrl and not alt: self._seek_delta(2.0); return True
         if k == Qt.Key.Key_Left and not (ctrl or alt or shift): self._seek_delta(-5.0); return True
         if k == Qt.Key.Key_Right and not (ctrl or alt or shift): self._seek_delta(5.0); return True
-        if k == Qt.Key.Key_BracketLeft: self._change_speed(-0.25); return True
-        if k == Qt.Key.Key_BracketRight: self._change_speed(0.25); return True
+        if k == Qt.Key.Key_BracketLeft and not ctrl: self._change_speed(-0.25); return True
+        if k == Qt.Key.Key_BracketRight and not ctrl: self._change_speed(0.25); return True
         if k == Qt.Key.Key_Left and alt and not shift: self._nudge_time(is_start=True, delta=-0.1); return True
         if k == Qt.Key.Key_Right and alt and not shift: self._nudge_time(is_start=True, delta=0.1); return True
         if k == Qt.Key.Key_Left and alt and shift: self._nudge_time(is_start=False, delta=-0.1); return True
@@ -1988,6 +2018,11 @@ class EditorPage(QWidget):
         if k == Qt.Key.Key_Insert and alt: self._insert_event_at(self._current_row()); return True
         if k == Qt.Key.Key_F and ctrl: self._find_edit.setFocus(); self._find_edit.selectAll(); return True
         if k == Qt.Key.Key_F3: self._find(forward=not shift); return True
+        # [v3.23.682] Duyệt nhanh dòng nghi ngờ OCR, đặt mốc theo vị trí phát, bảng phím tắt.
+        if k == Qt.Key.Key_F8 and not (ctrl or alt): self._jump_to_suspect(forward=not shift); return True
+        if k == Qt.Key.Key_BracketLeft and ctrl and not alt: self._set_time_at_playhead(is_start=True); return True
+        if k == Qt.Key.Key_BracketRight and ctrl and not alt: self._set_time_at_playhead(is_start=False); return True
+        if k == Qt.Key.Key_F1 and not (ctrl or alt or shift): self._on_show_shortcuts(); return True
         if k == Qt.Key.Key_O and ctrl and shift: self._on_open_video_clicked(); return True
         if k == Qt.Key.Key_O and ctrl: self._on_open_clicked(); return True
 
@@ -2010,6 +2045,60 @@ class EditorPage(QWidget):
         if not self._video_widget.is_playing:
             self._video_widget.play()
         InfoBar.info(self._translator.translate("editor.ib_play_current_t"), self._translator.translate("editor.ib_play_current_c").replace("{n}", str(row + 1)).replace("{dur}", f"{ev.duration_sec:.2f}"), parent=self, duration=1500)
+
+    def review_count(self) -> int:
+        """[v3.23.682] Số dòng nghi ngờ OCR hiện có."""
+        return len(self._proxy_model.suspects())
+
+    def _emit_review_count(self) -> None:
+        self.review_count_changed.emit(self.review_count())
+
+    def _on_model_data_changed_for_review(self, _tl=None, _br=None, roles=()) -> None:
+        # Tô hàng đang phát đổi mỗi nhịp phát: không đụng chữ thì không đếm lại.
+        if roles and Qt.ItemDataRole.DisplayRole not in roles and Qt.ItemDataRole.EditRole not in roles:
+            return
+        self._review_timer.start()
+
+    def _jump_to_suspect(self, forward: bool = True) -> None:
+        """[v3.23.682] F8 / Shift+F8: chọn dòng nghi ngờ OCR kế tiếp / trước đó và tua video tới đó.
+
+        Dùng cùng tiêu chí với bộ lọc "Nghi ngờ OCR"; dòng đang bị bộ lọc khác ẩn thì bỏ lọc để thấy được.
+        """
+        suspects = self._proxy_model.suspects()
+        target = next_suspect_row(suspects.keys(), self._current_row(), forward)
+        if target is None:
+            InfoBar.info(
+                self._translator.translate("editor.ib_suspect"), self._translator.translate("editor.ib_no_suspect"),
+                parent=self, duration=1500,
+            )
+            return
+        proxy_index = self._proxy_model.mapFromSource(self._table_model.index(target, 0))
+        if not proxy_index.isValid():
+            self._filter_combo.setCurrentIndex(0)
+            proxy_index = self._proxy_model.mapFromSource(self._table_model.index(target, 0))
+        if proxy_index.isValid():
+            self._table.selectRow(proxy_index.row())
+            self._table.scrollTo(proxy_index)
+        self._jump_to_event_at(target)
+        reasons = self._proxy_model.suspect_reasons_text(target)
+        if reasons:
+            InfoBar.info(self._translator.translate("editor.ib_suspect"), reasons, parent=self, duration=2500)
+
+    def _set_time_at_playhead(self, is_start: bool) -> None:
+        """[v3.23.682] Ctrl+[ / Ctrl+]: đặt mốc bắt đầu / kết thúc dòng đang chọn bằng vị trí đang phát (hoàn tác được)."""
+        idx = self._current_row()
+        if idx < 0 or idx >= len(self._table_model.events):
+            return
+        pos = max(0.0, float(getattr(self._video_widget, "position_sec", 0.0) or 0.0))
+        ev = self._table_model.events[idx]
+        start, end = (pos, ev.end_sec) if is_start else (ev.start_sec, pos)
+        if end - start < 0.1:          # mốc ngược / quá ngắn → bỏ, không làm hỏng dòng
+            InfoBar.warning(
+                self._translator.translate("editor.ib_timing"), self._translator.translate("editor.ib_bad_playhead"),
+                parent=self, duration=2000,
+            )
+            return
+        self._view_model.update_timing(idx, start, end)
 
     def _nudge_time(self, is_start: bool, delta: float) -> None:
         idx = self._current_row()

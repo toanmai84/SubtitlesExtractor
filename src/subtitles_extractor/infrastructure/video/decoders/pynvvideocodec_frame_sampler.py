@@ -28,11 +28,23 @@ from subtitles_extractor.domain.ports.frame_sampler_port import (
     SampledFrame,
     is_sample_due,
 )
+from subtitles_extractor.domain.value_objects.boundary_track import BoundaryTrack
 from subtitles_extractor.domain.value_objects.roi import Roi
-from subtitles_extractor.infrastructure.video.frame_dedupe import FrameDeduper, FrameVerdict
 
 # [V3.28] Import Pipeline GPU mới tạo
-from subtitles_extractor.infrastructure.ocr.preprocessing.gpu_image_filters import apply_gpu_preprocessing_pipeline
+from subtitles_extractor.infrastructure.ocr.preprocessing.gpu_image_filters import (
+    apply_gpu_preprocessing_pipeline,
+)
+from subtitles_extractor.infrastructure.video.decoders.boundary_probe import (
+    BoundaryProber,
+    expand_studio_luma,
+    probe_av_frame,
+    probing_enabled,
+)
+from subtitles_extractor.infrastructure.video.frame_dedupe import (
+    FrameDeduper,
+    FrameVerdict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -369,7 +381,11 @@ class PyNvVideoCodecFrameSampler:
             _setup_dll()
             _get_cudart()
 
+    #: [v3.23.680] Dải ranh giới của lượt vừa xong (xem ``PyAvFrameSampler.last_boundary_track``).
+    last_boundary_track: BoundaryTrack | None = None
+
     def iter_frames(self, metadata: VideoMetadata, roi: Roi | None, config: FrameSamplingConfig) -> Iterator[SampledFrame]:
+        self.last_boundary_track = None
         if not metadata.path.exists():
             raise VideoNotFoundError(f"Không tìm thấy video: {metadata.path}")
 
@@ -419,7 +435,10 @@ class PyNvVideoCodecFrameSampler:
                 " kèm tonemap HDR→SDR" if is_hdr else "",
             )
             av_container.close()
-            yield from self._iter_frames_hdr_via_pyav(metadata, roi, config, is_hdr=is_hdr)
+            hdr_prober = BoundaryProber(roi) if probing_enabled(roi, config.sample_step_sec) else None
+            yield from self._iter_frames_hdr_via_pyav(metadata, roi, config, is_hdr=is_hdr, prober=hdr_prober)
+            if hdr_prober is not None:
+                self.last_boundary_track = hdr_prober.finish()
             return
         extra_data_bytes = bytes(av_stream.codec_context.extradata) if av_stream.codec_context.extradata else b''
 
@@ -441,6 +460,9 @@ class PyNvVideoCodecFrameSampler:
             av_container.close()
             raise VideoDecodeError(f"Khởi tạo CreateDecoder thất bại: {exc}") from exc
 
+        # [v3.23.680] Mặt phẳng Y vùng phụ đề được cắt sẵn trên GPU → bộ dò không cắt lại (roi=None). Không CuPy (đường
+        # CPU dự phòng chỉ đổi khung mẫu) → không ghi.
+        prober = BoundaryProber(None) if HAS_CUPY and probing_enabled(roi, config.sample_step_sec) else None
         try:
             yield from self._decode_loop(
                 av_container=av_container, av_stream=av_stream, nv_decoder=nv_decoder,
@@ -448,8 +470,10 @@ class PyNvVideoCodecFrameSampler:
                 is_16bit=is_16bit, is_hdr=is_hdr, needs_annexb_conversion=needs_annexb_conversion,
                 nal_length_size=nal_length_size, annexb_header=annexb_header,
                 enum_eos=EOS, class_packet_data=PacketData, metadata=metadata,
-                roi=roi, config=config,
+                roi=roi, config=config, prober=prober,
             )
+            if prober is not None:
+                self.last_boundary_track = prober.finish()
         finally:
             # [v3.7 bugfix REOCR-LEAK]: Giải phóng TƯỜNG MINH NVDEC session + bộ
             # nhớ GPU sau mỗi lần quét. Trước đây finally chỉ đóng av_container,
@@ -476,6 +500,7 @@ class PyNvVideoCodecFrameSampler:
     def _iter_frames_hdr_via_pyav(
         self, metadata: VideoMetadata, roi: Roi | None, config: FrameSamplingConfig,
         is_hdr: bool = True,
+        prober: BoundaryProber | None = None,
     ) -> Iterator[SampledFrame]:
         """Giải mã video 10-bit/HDR bằng PyAV (libswscale xử lý pitch/màu đúng).
 
@@ -518,8 +543,12 @@ class PyNvVideoCodecFrameSampler:
                 if ts > end_sec:
                     break
                 if not is_sample_due(ts, next_target_sec):
+                    if prober is not None:
+                        probe_av_frame(prober.skipped, frame, ts)
                     continue
                 next_target_sec += step_sec
+                if prober is not None:
+                    probe_av_frame(prober.sampled, frame, ts)
 
                 rgb = self._tonemap_frame_to_rgb(frame, graph, graph_sink)
                 if rgb is None:
@@ -606,7 +635,8 @@ class PyNvVideoCodecFrameSampler:
         is_16bit: bool, is_hdr: bool = False, needs_annexb_conversion: bool,
         nal_length_size: int,
         annexb_header: bytes, enum_eos: Any, class_packet_data: Any,
-        metadata: VideoMetadata, roi: Roi | None, config: FrameSamplingConfig
+        metadata: VideoMetadata, roi: Roi | None, config: FrameSamplingConfig,
+        prober: BoundaryProber | None = None,
     ) -> Iterator[SampledFrame]:
 
         step_sec = max(0.001, config.sample_step_sec)
@@ -675,8 +705,16 @@ class PyNvVideoCodecFrameSampler:
                 if frame_timestamp_sec > end_sec: return
 
                 if HAS_CUPY:
-                    cropped_gpu = self._convert_and_crop_cupy(device_frame, video_height, video_width, is_16bit, is_hdr, roi, rgb_gpu_buffer)
+                    luma: list[np.ndarray] | None = [] if prober is not None else None
+                    cropped_gpu = self._convert_and_crop_cupy(
+                        device_frame, video_height, video_width, is_16bit, is_hdr, roi, rgb_gpu_buffer, luma,
+                    )
                     if cropped_gpu is None: continue
+                    if luma:
+                        will_sample = is_sample_due(frame_timestamp_sec, next_target_sec) and (
+                            not config.apply_median_blend or history_count + 1 >= num_blend_frames
+                        )
+                        (prober.sampled if will_sample else prober.skipped)(luma[0], frame_timestamp_sec)  # type: ignore[union-attr]
 
                     if config.apply_median_blend:
                         if history_ring_buffer is None:
@@ -757,8 +795,13 @@ class PyNvVideoCodecFrameSampler:
                     continue
 
                 if HAS_CUPY:
-                    cropped_gpu = self._convert_and_crop_cupy(device_frame, video_height, video_width, is_16bit, is_hdr, roi, rgb_gpu_buffer)
+                    eos_luma: list[np.ndarray] | None = [] if prober is not None else None
+                    cropped_gpu = self._convert_and_crop_cupy(
+                        device_frame, video_height, video_width, is_16bit, is_hdr, roi, rgb_gpu_buffer, eos_luma,
+                    )
                     if cropped_gpu is None: continue
+                    if eos_luma:
+                        prober.sampled(eos_luma[0], frame_timestamp_sec)  # type: ignore[union-attr]
                     cropped_gpu = self._apply_vram_preprocessing(cropped_gpu, config, vram_buffers)
                     final_rgb_numpy = cp.asnumpy(cropped_gpu)
                 else:
@@ -781,8 +824,10 @@ class PyNvVideoCodecFrameSampler:
         except RuntimeError: pass
 
     def _convert_and_crop_cupy(
-        self, device_frame: Any, video_height: int, video_width: int, is_16bit: bool, is_hdr: bool, roi: Roi | None, rgb_gpu_buffer: Any
+        self, device_frame: Any, video_height: int, video_width: int, is_16bit: bool, is_hdr: bool, roi: Roi | None,
+        rgb_gpu_buffer: Any, luma_sink: list[np.ndarray] | None = None,
     ) -> Any | None:
+        """NV12 (GPU) → RGB vùng ROI. ``luma_sink`` (v3.23.680): nhận thêm độ sáng dải đầy của ROI (numpy) cho bộ dò ranh giới."""
         try:
             interleaved_arr = None
             if hasattr(device_frame, '__dlpack__'):
@@ -821,6 +866,16 @@ class PyNvVideoCodecFrameSampler:
                 # còn SDR 10-bit — dịch bit là đúng.
                 y_plane = (y_plane.view(cp.uint16) >> 8).astype(cp.uint8)
                 uv_plane = (uv_plane.view(cp.uint16) >> 8).astype(cp.uint8)
+
+            if luma_sink is not None:
+                # Lỗi ở đây chỉ bỏ đầu dò của khung này — KHÔNG được làm mất khung OCR.
+                try:
+                    box = roi.clip_to(video_width, video_height) if roi is not None else None
+                    y_roi = y_plane[box.y:box.y2, box.x:box.x2] if box is not None else y_plane[:video_height, :video_width]
+                    if y_roi.ndim == 2:
+                        luma_sink.append(cp.asnumpy(expand_studio_luma(y_roi)))
+                except (RuntimeError, ValueError, AttributeError, IndexError, TypeError) as exc:
+                    logger.debug("Bỏ đầu dò ranh giới (NVDEC): %s", exc)
 
             pitch = y_plane.shape[1]
             block, grid = (32, 32), (math.ceil(video_width / 32), math.ceil(video_height / 32))

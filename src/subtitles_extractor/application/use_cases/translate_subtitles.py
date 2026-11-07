@@ -32,6 +32,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from subtitles_extractor.application.services.cjk_transliteration import (
+    is_short_leftover,
+    is_vietnamese_target,
+    transliterate_leftover_cjk,
+)
 from subtitles_extractor.application.services.stage_cache import (
     StageCacheScope,
     adopt_previous_checkpoints,
@@ -104,6 +109,18 @@ SHIFT_REVERT_PADDING_LINES = 2
 #: [v3.23.432] Nhận diện chữ CJK (Hán/Nhật kana/Hàn) để chống giai đoạn tinh chỉnh chèn
 #: CJK ngược vào câu đã dịch sạch. Dùng cho safety-net _revert_cjk_regressions.
 _CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af]")
+
+
+def _is_cjk_target(target_lang: str) -> bool:
+    """[v3.23.673] Ngôn ngữ đích viết bằng chữ CJK (Trung/Nhật/Hàn)."""
+    lowered = " ".join((target_lang or "").lower().split())
+    if "vietnam" in lowered or "việt" in lowered:
+        return False
+    code = lowered.replace("_", "-").split("-")[0]
+    return code in {"zh", "ja", "ko", "zho", "jpn", "kor"} or any(name in lowered for name in (
+        "chinese", "japanese", "korean", "mandarin", "cantonese",
+        "tiếng trung", "tiếng nhật", "tiếng hàn", "中文", "日本", "한국",
+    ))
 
 # Callback tiến độ tổng: (phần_trăm_0_đến_1, mô_tả_giai_đoạn).
 OverallProgressCallback = Callable[[float, str], None]
@@ -341,6 +358,7 @@ class TranslateSubtitlesUseCase:
         cache_max_files: int = DEFAULT_CACHE_MAX_FILES,
         cache_max_age_days: int = DEFAULT_CACHE_MAX_AGE_DAYS,
         native_address: bool = False,
+        name_readings: Any = None,
     ) -> None:
         """Khởi tạo use case.
 
@@ -352,7 +370,10 @@ class TranslateSubtitlesUseCase:
             native_address: [v3.23.612] Đổi tiếng gọi kiểu Hán-Việt ("Kiếm ca") của bản
                 cuối sang thuần Việt ("anh Kiếm") — xem
                 :mod:`subtitles_extractor.application.services.native_address`.
+            name_readings: [v3.23.673] Bảng âm Hán-Việt — bước cứu cuối đổi chữ Hán còn sót
+                (sau khi đã thay theo bảng tên và dịch lại) sang âm Hán-Việt.
         """
+        self._name_readings = name_readings
         self._translator = translator
         self._checkpoint_dir = checkpoint_dir
         self._cache_max_files = max(1, cache_max_files)
@@ -762,6 +783,11 @@ class TranslateSubtitlesUseCase:
         Returns:
             Danh sách dòng đã dọn (giữ nguyên nếu không dọn được).
         """
+        target_lang = str(getattr(getattr(request, "context", None), "target_lang", "") or "")
+        if _is_cjk_target(target_lang):
+            # [v3.23.673] Đích tiếng Trung/Nhật/Hàn: chữ CJK là chữ ĐÚNG của bản dịch — trước đây
+            # MỌI dòng bị coi là "còn sót" và gửi dịch lại (tốn lời gọi API, không được gì).
+            return current_lines
         residual = {
             ln.index for ln in current_lines if _CJK_CHAR_RE.search(ln.text or "")
         }
@@ -841,14 +867,35 @@ class TranslateSubtitlesUseCase:
 
         result: list[TranslationLine] = []
         still_residual: list[int] = []
+        transliterated: list[int] = []
         for line in current_lines:
             if line.index in residual:
                 candidate = retry_by_index.get(line.index)
                 if candidate and not _CJK_CHAR_RE.search(candidate):
                     result.append(replace(line, text=candidate))
                     continue
+                # [v3.23.673] Bước cứu cuối: chữ Hán còn sót → âm Hán-Việt (tập 3 phim mẫu:
+                # "Cửu Chuyển Liệt Dương C蛊" sau khi dịch lại vẫn còn 蛊 → "… Cổ"). Bản dịch lại
+                # vẫn lẫn chữ Hán thì sửa trên bản đó; không có thì sửa bản cũ.
+                # Chỉ khi đích là tiếng Việt và chữ Hán chỉ là phần SÓT nhỏ: đích tiếng Trung/Nhật
+                # thì chữ Hán là chữ đúng; câu chưa dịch cả câu phải để cờ QC báo người soát.
+                base_text = candidate or line.text or ""
+                if (self._name_readings is not None
+                        and is_vietnamese_target(target_lang)
+                        and is_short_leftover(base_text)):
+                    fixed = transliterate_leftover_cjk(base_text, self._name_readings)
+                    if fixed and not _CJK_CHAR_RE.search(fixed):
+                        result.append(replace(line, text=fixed))
+                        transliterated.append(line.index)
+                        continue
                 still_residual.append(line.index)
             result.append(line)
+        if transliterated:
+            logger.warning(
+                "Dọn CJK sót: %d dòng đổi chữ Hán còn sót sang âm Hán-Việt: %s — nên soát lại.",
+                len(transliterated), transliterated,
+            )
+            _record_guard_event("residual_cjk_transliterated", lines=transliterated)
         if still_residual:
             logger.warning(
                 "Dọn CJK sót: %d dòng VẪN còn chữ Hán sau khi thử lại: %s — cần soi/sửa tay "
@@ -858,7 +905,7 @@ class TranslateSubtitlesUseCase:
         _record_guard_event(
             "residual_cjk_cleaned",
             how="retranslation",
-            lines=sorted(residual - set(still_residual)),
+            lines=sorted(residual - set(still_residual) - set(transliterated)),
             still_residual=still_residual,
         )
         return result

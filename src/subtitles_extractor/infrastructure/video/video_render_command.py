@@ -111,6 +111,9 @@ class AudioMode(StrEnum):
     REPLACE_TRACK = "replace_track"
     """Thêm tiếng Việt thành track riêng (đặt mặc định), giữ tiếng gốc làm track 2."""
 
+    CLEAN_DUB = "clean_dub"
+    """[v3.23.678] Lồng tiếng sạch: BỎ lời thoại gốc (tách bằng AI), giữ nhạc + tiếng động, trộn giọng Việt lên."""
+
 
 class RenderMode(StrEnum):
     """Kiểu xuất video."""
@@ -163,6 +166,9 @@ class RenderRequest:
             tương thích với mã cũ).
         audio_mode: [v3.23.326] Cách xử lý âm thanh. ``None`` = suy từ ``mode``.
         clip_start_sec: [v3.23.630] Xuất thử: mốc bắt đầu đoạn (giây) trong video gốc.
+        background_path: [v3.23.678] CLEAN_DUB: phần NỀN đã bỏ lời gốc (``None`` = ``render_video`` tự tách).
+        separation_dir: [v3.23.678] CLEAN_DUB: thư mục model tách giọng + bộ nhớ đệm phần nền.
+        background_offset_sec: [v3.23.678] Mốc (giây trong video) mà tệp nền bắt đầu — xuất thử chỉ tách đúng đoạn.
         clip_duration_sec: [v3.23.630] Xuất thử: độ dài đoạn (giây); ``0`` = xuất cả phim.
             Log thật: mỗi lần xuất cả phim 86 tập mất ~3 phút dù chỉ cần nghe thử vài câu.
             Đoạn thử luôn MÃ HOÁ LẠI hình (nhanh, preset ``veryfast``): cắt sao chép luồng
@@ -186,6 +192,9 @@ class RenderRequest:
     audio_mode: AudioMode | None = None
     clip_start_sec: float = 0.0
     clip_duration_sec: float = 0.0
+    background_path: Path | None = None
+    separation_dir: Path | None = None
+    background_offset_sec: float = 0.0
 
     @property
     def is_clip(self) -> bool:
@@ -349,7 +358,7 @@ def resolve_modes(request: RenderRequest) -> tuple[SubtitleMode, AudioMode]:
 
 
 def build_voice_over_filter(
-    request: RenderRequest, audio_input_index: int = 1
+    request: RenderRequest, audio_input_index: int = 1, background_input_index: int | None = None
 ) -> str:
     """Dựng biểu thức filter_complex trộn thuyết minh lên tiếng gốc, có ducking.
 
@@ -367,6 +376,9 @@ def build_voice_over_filter(
     Returns:
         Chuỗi ``filter_complex``, đầu ra gắn nhãn ``[aout]``.
 
+        ``background_input_index`` [v3.23.678]: CLEAN_DUB lấy nền từ tệp đã tách (stereo, không cần trộn xuống) thay
+        cho tiếng gốc ``0:a``. Vẫn hạ nhẹ nền khi có giọng Việt (nhạc to át lời) theo mức người dùng chọn.
+
     Notes:
         GIỚI HẠN QUAN TRỌNG: bộ nén hạ **toàn bộ** tiếng gốc (cả nhạc lẫn thoại gốc),
         chứ không tách riêng thoại. Muốn xoá HẲN thoại gốc mà giữ nguyên nhạc/tiếng động
@@ -381,8 +393,8 @@ def build_voice_over_filter(
         f"{narration},asplit=2[narr][key];"
         # [v3.23.349] Trộn xuống stereo có nhấn kênh giữa TRƯỚC khi chuẩn hoá — nếu để
         # aformat tự trộn, kênh thoại (FC) bị hạ ~3dB và lời nói mờ đi dưới nhạc nền.
-        f"[0:a]{DOWNMIX_FILTER},"
-        f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+        + (f"[{background_input_index}:a]" if background_input_index is not None else f"[0:a]{DOWNMIX_FILTER},")
+        + "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
         f"{background}[bg];"
         # Nén tiếng gốc theo tín hiệu điều khiển -> đây chính là ducking.
         f"[bg][key]sidechaincompress="
@@ -436,6 +448,8 @@ def _validate_modes(
             raise VideoRenderError("Kiểu này cần tệp âm thanh tiếng Việt.")
         if not request.audio_path.is_file():
             raise VideoRenderError(f"Không tìm thấy âm thanh: {request.audio_path}")
+    if audio_mode is AudioMode.CLEAN_DUB and (request.background_path is None or not request.background_path.is_file()):
+        raise VideoRenderError("Lồng tiếng sạch cần phần nền đã tách lời thoại (chưa tách được).")
 
 
 def build_render_command(ffmpeg_binary: str, request: RenderRequest) -> list[str]:
@@ -483,6 +497,14 @@ def build_render_command(ffmpeg_binary: str, request: RenderRequest) -> list[str
         audio_input_index = next_index
         next_index += 1
 
+    # [v3.23.678] Lồng tiếng sạch: phần nền đã bỏ lời gốc là một input nữa (cùng mốc xuất thử).
+    background_input_index: int | None = None
+    if audio_mode is AudioMode.CLEAN_DUB:
+        offset = max(0.0, request.clip_start_sec - request.background_offset_sec) if clip else 0.0
+        command += [*(["-ss", f"{offset:.3f}"] if offset > 0 else []), "-i", str(request.background_path)]
+        background_input_index = next_index
+        next_index += 1
+
     # Phụ đề chỉ cần làm INPUT khi ghép mềm; kiểu cháy dùng bộ lọc đọc thẳng tệp.
     if subtitle_mode is SubtitleMode.SOFT:
         command += ["-i", str(request.subtitle_path)]
@@ -490,13 +512,13 @@ def build_render_command(ffmpeg_binary: str, request: RenderRequest) -> list[str
         next_index += 1
 
     needs_video_filter = subtitle_mode is SubtitleMode.BURNED
-    needs_audio_filter = audio_mode is AudioMode.VOICE_OVER
+    needs_audio_filter = audio_mode in (AudioMode.VOICE_OVER, AudioMode.CLEAN_DUB)
 
     # KHÔNG thể dùng đồng thời -vf và -filter_complex. Khi cần cả hai, gộp vào một
     # filter_complex duy nhất.
     if needs_video_filter and needs_audio_filter:
         escaped = escape_filter_path(request.subtitle_path)
-        audio_filter = build_voice_over_filter(request, audio_input_index or 1)
+        audio_filter = build_voice_over_filter(request, audio_input_index or 1, background_input_index)
         command += [
             "-filter_complex",
             f"[0:v]subtitles='{escaped}'[vout];{audio_filter}",
@@ -507,7 +529,7 @@ def build_render_command(ffmpeg_binary: str, request: RenderRequest) -> list[str
         ]
     elif needs_audio_filter:
         command += [
-            "-filter_complex", build_voice_over_filter(request, audio_input_index or 1),
+            "-filter_complex", build_voice_over_filter(request, audio_input_index or 1, background_input_index),
             "-map", "0:v", "-map", "[aout]",
             *video_copy,             # hình không đụng tới -> rất nhanh (đoạn thử: mã hoá lại)
             "-c:a", "aac", "-b:a", "192k",
@@ -582,18 +604,13 @@ def _plain_audio_args(
     return ["-map", "0:a?", "-c:a", "copy"]
 
 
-# ── Ghi chú: muốn XOÁ HẲN thoại gốc mà giữ nhạc/tiếng động? ─────────────────
-# Ducking ở trên hạ TOÀN BỘ tiếng gốc (nhạc + thoại) khi thuyết minh nói. Đây là kỹ
-# thuật chuẩn của thuyết minh và nghe rất tự nhiên, nhưng thoại gốc VẪN CÒN nghe được
-# nhỏ bên dưới.
-#
-# Muốn tách riêng: cần **tách nguồn âm bằng AI** — chia tiếng gốc thành "giọng hát/thoại"
-# và "nhạc đệm", bỏ phần thoại, rồi trộn thuyết minh với phần nhạc đệm. Thư viện phù hợp:
-#   * Demucs (MIT, facebookresearch/demucs) — chất lượng tốt nhất hiện nay, cần torch.
-# Chưa tích hợp vì cần torch (~2GB, giống WhisperX). Nếu bật WhisperX thì đã có torch,
-# lúc đó thêm Demucs là rẻ.
+# ── [v3.23.678] Muốn XOÁ HẲN thoại gốc mà giữ nhạc/tiếng động? ─────────────────
+# Chọn AudioMode.CLEAN_DUB: ``render_video`` tách lời thoại khỏi nền bằng model MDX-Net ONNX
+# (``infrastructure/audio/voice_separator``, chạy bằng onnxruntime đã đóng gói — không cần torch),
+# rồi trộn giọng Việt lên phần nền như thuyết minh.
 
 __all__ = [
+    "AudioMode",
     "DuckLevel",
     "RenderMode",
     "RenderRequest",

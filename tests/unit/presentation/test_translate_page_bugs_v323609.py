@@ -192,7 +192,7 @@ class TestVideoOptionsAfterNewFile:
         self, app: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         page, _container = _page(tmp_path)
-        page._api_key_edit.setText("KEY")
+        page._ai_store.set_gemini_keys(["KEY"])
         page._attach_video_check.setChecked(True)
         page._video_path = str(tmp_path / "x.mp4")
         assert page._visual_cues_check.isChecked()
@@ -228,7 +228,7 @@ class TestSessionWithoutAttachedVideo:
         video = str(tmp_path / "tap3.mp4")
         page.suggest_source_path(video)
         page._view_model.set_source_events(_events("新"))
-        page._api_key_edit.setText("KEY")
+        page._ai_store.set_gemini_keys(["KEY"])
         assert not page._attach_video_check.isChecked()
 
         class _Worker:
@@ -352,7 +352,7 @@ def _item(folder: Path, name: str, lines: int = 6):
 class TestBatchTranslate:
     def _batch_page(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         page, container = _page(tmp_path)
-        page._api_key_edit.setText("KEY")
+        page._ai_store.set_gemini_keys(["KEY"])
         summaries: list[str] = []
         monkeypatch.setattr(
             QMessageBox, "information", lambda _p, _t, text, *_a: summaries.append(text)
@@ -392,7 +392,7 @@ class TestBatchTranslate:
         self, app: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         page, _container, summaries, _persisted = self._batch_page(tmp_path, monkeypatch)
-        page._api_key_edit.setText("")
+        page._ai_store.set_gemini_keys([])
         page._show_warning = lambda *_a: None
         page._batch_items = [_item(tmp_path, "t1"), _item(tmp_path, "t2")]
         page._batch_index = 0
@@ -527,7 +527,7 @@ class TestAnalysisWithoutAttachedVideo:
         page.suggest_source_path(video)
         events = _events("新")
         page._view_model.set_source_events(events)
-        page._api_key_edit.setText("KEY")
+        page._ai_store.set_gemini_keys(["KEY"])
 
         class _Worker:
             def __init__(self, *_args: object, **_kwargs: object) -> None:

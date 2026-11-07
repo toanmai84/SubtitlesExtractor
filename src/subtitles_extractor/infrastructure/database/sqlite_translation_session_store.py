@@ -186,6 +186,9 @@ class TranslationSession:
     analysis_source_lang: str = ""
     analysis_target_lang: str = ""
     analysis_input_hash: str = ""
+    #: [v3.23.668] Dòng phụ đề lúc phân tích (JSON ``[[start_ms, end_ms, text], …]``) — để giữ
+    #: phân tích khi ReOCR thêm/bớt/sửa vài dòng (xem ``analysis_realign``).
+    analysis_lines: str = ""
     stages: tuple[StageResult, ...] = field(default_factory=tuple)
     cloud_files: tuple[CloudVideoFile, ...] = field(default_factory=tuple)
     updated_at: str = ""
@@ -246,6 +249,10 @@ class SqliteTranslationSessionStore:
             self._migrate_add_column_if_missing(
                 "translation_session", "analysis_visual_cues", "TEXT DEFAULT ''"
             )
+            # [v3.23.668] Dòng phụ đề lúc phân tích.
+            self._migrate_add_column_if_missing(
+                "translation_session", "analysis_lines", "TEXT DEFAULT ''"
+            )
 
     def _migrate_add_column_if_missing(
         self, table: str, column: str, decl: str
@@ -297,6 +304,7 @@ class SqliteTranslationSessionStore:
             analysis_source_lang=row["analysis_source_lang"] or "",
             analysis_target_lang=row["analysis_target_lang"] or "",
             analysis_input_hash=row["analysis_input_hash"] or "",
+            analysis_lines=self._row_get(row, "analysis_lines"),
             stages=stages,
             cloud_files=cloud_files,
             updated_at=row["updated_at"] or "",
@@ -341,8 +349,12 @@ class SqliteTranslationSessionStore:
         source_hash: str = "",
         glossary: str = "",
         visual_cues: str = "",
+        source_lines: str | None = None,
     ) -> None:
-        """Lưu kết quả PHÂN TÍCH ngữ cảnh (kèm hash đầu vào để nhận biết hợp lệ)."""
+        """Lưu kết quả PHÂN TÍCH ngữ cảnh (kèm hash đầu vào để nhận biết hợp lệ).
+
+        ``source_lines``: [v3.23.668] dòng phụ đề lúc phân tích (``None`` = giữ giá trị đang lưu).
+        """
         key = self._normalize_key(video_key)
         if not key:
             raise ValueError("video_key không được rỗng.")
@@ -358,12 +370,24 @@ class SqliteTranslationSessionStore:
                     analysis_source_lang = ?,
                     analysis_target_lang = ?,
                     analysis_input_hash = ?,
+                    analysis_lines = COALESCE(?, analysis_lines),
                     source_hash = CASE WHEN ? != '' THEN ? ELSE source_hash END,
                     updated_at = ?
                 WHERE video_key = ?
                 """,
                 (characters, overview, glossary, visual_cues, source_lang, target_lang,
-                 input_hash, source_hash, source_hash, _utc_now_iso(), key),
+                 input_hash, source_lines, source_hash, source_hash, _utc_now_iso(), key),
+            )
+
+    def save_analysis_lines(self, video_key: str | Path, source_lines: str) -> None:
+        """[v3.23.668] Ghi riêng danh sách dòng của phân tích (phân tích lưu từ bản cũ chưa có)."""
+        key = self._normalize_key(video_key)
+        if not key:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE translation_session SET analysis_lines = ? WHERE video_key = ?",
+                (source_lines, key),
             )
 
     def save_analysis_texts(

@@ -177,6 +177,24 @@ def _drop_own_legacy_entries(entries: list, source_lines: list[str], min_overlap
         return entries
     return [entry for entry in entries if entry.source_text.strip() not in current]
 
+
+def _speaker_job_matches_source(view_model: object) -> bool:
+    """[v3.23.668] Kết quả hỏi lại người nói còn khớp phụ đề đang nạp không.
+
+    Phụ đề đổi giữa lúc chạy (ReOCR → nạp lại) thì phân tích đã căn sang số dòng mới; lưu cues
+    đánh số theo phụ đề cũ sẽ làm người nói lệch vĩnh viễn (mã băm đã là của phụ đề mới).
+    """
+    started = getattr(view_model, "_speaker_completion_source_version", None)
+    if started is None or started == getattr(view_model, "_source_version", None):
+        return True
+    logger.warning("Phụ đề đã đổi trong lúc hỏi lại người nói — bỏ kết quả (đánh số theo phụ đề cũ).")
+    signal = getattr(view_model, "status_message", None)
+    if signal is not None:
+        signal.emit(
+            "Phụ đề đã đổi trong lúc hỏi lại người nói — không lưu kết quả cũ; bấm lại nếu cần."
+        )
+    return False
+
 class TranslatePageViewModel(QObject):
     """ViewModel điều phối dịch phụ đề.
 
@@ -441,18 +459,23 @@ class TranslatePageViewModel(QObject):
                 derive_series_key,
                 merge_characters,
                 merge_glossary,
+                upsert_episode_overview,
             )
             series_key = derive_series_key(video_path)
             if not series_key:
                 return
             store = self._container.translation_memory_store
             prior = store.get_series_context(series_key)
+            # [v3.23.669] Tóm tắt phim bộ = mỗi tập một khối "[tập] …" theo thứ tự (trước đây tập sau
+            # ghi đè tập trước, nên tập kế tiếp không biết diễn biến đã qua).
+            overview = upsert_episode_overview(
+                prior.overview if prior is not None else "", Path(video_path).stem, overview,
+            )
             if prior is not None:
                 glossary = merge_glossary(prior.glossary, glossary)
                 # [v3.23.91] GỘP roster (không ghi đè) -> danh sách tên chuẩn tích luỹ
                 # xuyên tập, giúp tên riêng nhất quán hơn giữa các tập.
                 characters = merge_characters(prior.characters, characters)
-                overview = overview.strip() or prior.overview
             store.save_series_context(series_key, glossary, characters, overview)
             logger.info("Đã cập nhật ngữ cảnh chung cho phim bộ '%s'.", series_key)
         except (OSError, ValueError, ImportError, sqlite3.Error) as exc:
@@ -467,13 +490,24 @@ class TranslatePageViewModel(QObject):
         prior = self.restore_series_context(video_path)
         if prior is None:
             return ""
+        from subtitles_extractor.application.services.translation_memory import (
+            recent_series_overview,
+        )
+
         parts: list[str] = []
         chars = (getattr(prior, "characters", "") or "").strip()
         gloss = (getattr(prior, "glossary", "") or "").strip()
+        # [v3.23.669] Diễn biến các tập TRƯỚC (bỏ khối của chính tập này) — trước đây phân tích tập
+        # sau chỉ nhận tên/thuật ngữ, không biết ai là ai trong câu chuyện đã qua.
+        story = recent_series_overview(
+            getattr(prior, "overview", "") or "", exclude_episode=Path(video_path).stem,
+        )
         if chars:
             parts.append("# Nhân vật đã thiết lập:\n" + chars)
         if gloss:
             parts.append("# Thuật ngữ đã thiết lập:\n" + gloss)
+        if story:
+            parts.append("# Diễn biến các tập trước (tóm tắt):\n" + story)
         return "\n\n".join(parts)
 
     def restore_series_context(self, video_path: str):
@@ -1132,7 +1166,7 @@ class TranslatePageViewModel(QObject):
         return len(outcome.applied)
 
     def retranslate_lines(
-        self, api_key: str, retry_count: int, line_indices: list[int],
+        self, api_key: str, retry_count: int | None, line_indices: list[int],
         stages: list[TranslationStageConfig], context: TranslationContext,
     ) -> bool:
         """[v3.23.46] Dịch lại CHỈ các dòng được chọn (theo index 0-based), giữ nguyên
@@ -1294,10 +1328,15 @@ class TranslatePageViewModel(QObject):
         self._text_cues = bool(enabled)
         self._voice_source_path = str(voice_source_path or "") if enabled else ""
 
+    def set_voice_roster(self, enabled: bool, video_path: str = "") -> None:
+        """[v3.23.671] Bật/tắt bước NGHE giọng khi lập bảng nhân vật (thêm người không tên có
+        giọng riêng); chỉ gửi ÂM THANH lời thoại, không tải video."""
+        self._voice_roster_path = str(video_path or "") if enabled else ""
+
     def start_translation(
         self,
         api_key: str,
-        retry_count: int,
+        retry_count: int | None,
         stages: list[TranslationStageConfig],
         context: TranslationContext,
         video_path: str | None = None,
@@ -1310,7 +1349,7 @@ class TranslatePageViewModel(QObject):
 
         Args:
             api_key: Khoá API Gemini.
-            retry_count: Số lần thử lại khi lỗi.
+            retry_count: Số lần thử lại khi lỗi; ``None`` = theo Cài đặt (v3.23.677).
             stages: Các giai đoạn dịch đã bật.
             context: Ngữ cảnh dịch.
             video_path: Video ĐÍNH KÈM gửi Gemini (tuỳ chọn).
@@ -1655,6 +1694,11 @@ class TranslatePageViewModel(QObject):
         if not self._source_events:
             self.error_occurred.emit("Chưa có phụ đề nguồn để phân tích.")
             return False
+        if video_path and not enable_visual_cues:
+            # [v3.23.667] Phân tích tách bước chỉ dùng video cho bước NGƯỜI NÓI (Visual Cues):
+            # không bật thì đừng nén/tải video lên mất vài phút mà không dùng tới.
+            session_path = session_path or video_path
+            video_path = None
         if self.custom_provider_active() and video_path:
             # [v3.23.666] Phân tích bằng phụ đề; vẫn lưu theo video của phim.
             session_path = session_path or video_path
@@ -1693,6 +1737,7 @@ class TranslatePageViewModel(QObject):
                 getattr(self, "_text_cues", False) and not (enable_visual_cues and video_path)
             ),
             voice_source_path=getattr(self, "_voice_source_path", "") or "",
+            voice_roster_path=getattr(self, "_voice_roster_path", "") or "",
         )
         self._analyze_worker.finished_ok.connect(self._on_analyze_finished)
         self._analyze_worker.video_refs_ready.connect(self._on_video_refs_ready)
@@ -1704,6 +1749,8 @@ class TranslatePageViewModel(QObject):
         self._pending_analysis_video_path = session_key
         self._pending_analysis_target_lang = target_lang
         self._pending_analysis_source_lines = [ln.text for ln in source_lines]
+        # [v3.23.668] Lưu kèm mốc thời gian để còn căn dòng khi ReOCR đổi phụ đề.
+        self._pending_analysis_spans = [(ln.start_ms, ln.end_ms, ln.text) for ln in source_lines]
         self._set_busy(True)
         self._analyze_worker.start()
         n = len(source_lines)
@@ -1784,7 +1831,10 @@ class TranslatePageViewModel(QObject):
         default = (analysis_model or DEFAULT_AUDIT_MODEL) if custom else DEFAULT_AUDIT_MODEL
         primary = getattr(self, "_audit_choice", "") or default
         backup = getattr(self, "_fallback_choice", "")
-        candidates = [backup] if backup and backup != "-" else []
+        if backup == "-":
+            # [v3.23.667] Người dùng TẮT model dự phòng: không đổi sang model nào khác.
+            return primary, ()
+        candidates = [backup] if backup else []
         if not custom:
             candidates.append(DEFAULT_AUDIT_MODEL)
         return primary, tuple(dict.fromkeys(m for m in candidates if m and m != primary))
@@ -1850,6 +1900,8 @@ class TranslatePageViewModel(QObject):
         self._pending_analysis_video_path = session_path
         self._pending_analysis_target_lang = target_lang
         self._pending_analysis_source_lines = [ln.text for ln in source_lines]
+        # [v3.23.668] Lưu kèm mốc thời gian để còn căn dòng khi ReOCR đổi phụ đề.
+        self._pending_analysis_spans = [(ln.start_ms, ln.end_ms, ln.text) for ln in source_lines]
         self._set_busy(True)
         self._analyze_worker.start()
         # [v3.23.640] Nói đúng model THẬT sự dùng (trước đây hiện model phân tích đang chọn, trong khi
@@ -1997,6 +2049,8 @@ class TranslatePageViewModel(QObject):
             characters=characters,
         )
         self._speaker_completion_video_path = session_path or video_path
+        # [v3.23.668] Phụ đề đổi giữa chừng (ReOCR) thì cues trả về đánh số theo phụ đề CŨ.
+        self._speaker_completion_source_version = self._source_version
         self._analyze_worker.finished_ok.connect(self._on_speaker_completion_finished)
         self._analyze_worker.video_refs_ready.connect(self._on_video_refs_ready)
         self._analyze_worker.cancelled.connect(
@@ -2051,6 +2105,8 @@ class TranslatePageViewModel(QObject):
             characters=characters,
         )
         self._speaker_completion_video_path = session_path or video_path
+        # [v3.23.668] Phụ đề đổi giữa chừng (ReOCR) thì cues trả về đánh số theo phụ đề CŨ.
+        self._speaker_completion_source_version = self._source_version
         self._analyze_worker.finished_ok.connect(self._on_cue_recheck_finished)
         self._analyze_worker.video_refs_ready.connect(self._on_video_refs_ready)
         self._analyze_worker.cancelled.connect(lambda: self.status_message.emit("Đã huỷ kiểm lại dòng nghi."))
@@ -2063,12 +2119,16 @@ class TranslatePageViewModel(QObject):
         self.status_message.emit(f"Đang kiểm lại các dòng nghi bằng {model_name}…")
         return True
 
+    def _speaker_job_matches_source(self) -> bool:
+        """[v3.23.668] Xem :func:`_speaker_job_matches_source`."""
+        return _speaker_job_matches_source(self)
+
     def _on_cue_recheck_finished(self, result: object) -> None:
         from subtitles_extractor.application.use_cases.complete_speakers import CueRecheckResult
 
         if not isinstance(result, CueRecheckResult):
             return
-        if result.changed:
+        if result.changed and _speaker_job_matches_source(self):
             self._persist_topped_up_cues(
                 result.visual_cues, getattr(self, "_speaker_completion_video_path", "") or "",
             )
@@ -2084,7 +2144,7 @@ class TranslatePageViewModel(QObject):
         """[v3.23.601] Lưu cues đã bổ sung vào phiên rồi báo kết quả cho trang."""
         if not isinstance(result, SpeakerCompletionResult):
             return
-        if result.changed:
+        if result.changed and _speaker_job_matches_source(self):
             self._persist_topped_up_cues(
                 result.visual_cues,
                 getattr(self, "_speaker_completion_video_path", "") or "",
@@ -2114,11 +2174,15 @@ class TranslatePageViewModel(QObject):
         tokens = self._close_token_report()
         self.analyze_context_ready.emit(result)
         missing = len(getattr(result, "missing_segments", ()) or ())
+        steps = tuple(getattr(result, "incomplete_steps", ()) or ())
         audit_note = getattr(getattr(self, "_analyze_worker", None), "audit_note", "")
         self.status_message.emit(
             (
                 f"Phân tích ngữ cảnh CHƯA đủ — còn thiếu {missing} đoạn video."
                 if missing
+                # [v3.23.667] Phân tích tách bước dừng ở bước sau (quá tải / hết hạn mức).
+                else "Phân tích ngữ cảnh CHƯA đủ — " + describe_incomplete_analysis(result)
+                if steps
                 else "Phân tích ngữ cảnh hoàn tất."
             )
             + (f" {audit_note}" if audit_note else "")
@@ -2140,6 +2204,16 @@ class TranslatePageViewModel(QObject):
             target_lang = getattr(self, "_pending_analysis_target_lang", "") or ""
             source_lines = getattr(self, "_pending_analysis_source_lines", []) or []
             input_hash = hash_analysis_input(source_lines, target_lang)
+            from subtitles_extractor.application.services.analysis_realign import (
+                SourceLine,
+                encode_lines,
+            )
+
+            spans = getattr(self, "_pending_analysis_spans", None) or []
+            lines_json = (
+                encode_lines([SourceLine(int(a), int(b), str(t)) for a, b, t in spans])
+                if len(spans) == len(source_lines) else None
+            )
             store = self._container.translation_session_store
             store.save_analysis(
                 video_path,
@@ -2150,10 +2224,93 @@ class TranslatePageViewModel(QObject):
                 input_hash=input_hash,
                 glossary=getattr(result, "glossary", "") or "",
                 visual_cues=getattr(result, "visual_cues", "") or "",
+                source_lines=lines_json,
             )
             logger.info("Đã lưu phân tích ngữ cảnh vào phiên dịch cho %s.", video_path)
         except Exception as exc:  # noqa: BLE001 — lưu phiên không được phá luồng UI
             logger.warning("Không lưu được phân tích vào phiên dịch: %s", exc)
+
+    #: [v3.23.668] Ghi chú của lần khôi phục gần nhất (vd đã căn dòng sau ReOCR); rỗng = không có.
+    last_restore_note: str = ""
+
+    def _realign_saved_analysis(
+        self, session, store, video_path: str, current_hash: str, target_lang: str
+    ) -> str | None:
+        """[v3.23.668] Dùng lại phân tích đã lưu cho phụ đề vừa đổi một ít.
+
+        Bảng nhân vật / tóm tắt / thuật ngữ không phụ thuộc từng dòng nên giữ nguyên; người nói
+        (Visual Cues) được chuyển sang số dòng mới theo chữ + thời gian, dòng mới/khác hẳn để trống
+        để «Bổ sung người nói» / khâu dịch chỉ hỏi lại đúng các dòng đó. Phân tích được lưu lại với
+        phụ đề mới.
+
+        Returns:
+            Visual Cues đã căn (có thể rỗng), hoặc ``None`` khi không dùng lại được (phân tích của bản
+            cũ chưa lưu dòng, khác ngôn ngữ đích, hoặc phụ đề khác quá nhiều).
+        """
+        from subtitles_extractor.application.services.analysis_realign import (
+            SourceLine,
+            decode_lines,
+            encode_lines,
+            realign,
+            remap_cues,
+        )
+
+        if not (session.analysis_overview or session.analysis_characters):
+            return None
+        if (session.analysis_target_lang or "") != target_lang:
+            return None
+        old = decode_lines(getattr(session, "analysis_lines", ""))
+        if not old:
+            return None
+        new = [
+            SourceLine(ev.interval.start_ms(), ev.interval.end_ms(), ev.text)
+            for ev in self._source_events
+        ]
+        alignment = realign(old, new)
+        if not alignment.reusable:
+            logger.info(
+                "Phụ đề khác phân tích đã lưu quá nhiều (khớp %.0f%% dòng) → cần phân tích lại.",
+                100 * alignment.matched_ratio,
+            )
+            return None
+        old_cues = getattr(session, "analysis_visual_cues", "") or ""
+        cues = remap_cues(old_cues, alignment) if old_cues.strip() else ""
+        store.save_analysis(
+            video_path, characters=session.analysis_characters,
+            overview=session.analysis_overview, source_lang=session.analysis_source_lang,
+            target_lang=target_lang, input_hash=current_hash,
+            glossary=session.analysis_glossary, visual_cues=cues,
+            source_lines=encode_lines(new),
+        )
+        changed = len(alignment.changed) + len(alignment.unmatched) + alignment.removed
+        missing = len(alignment.unmatched) if old_cues.strip() else 0
+        self.last_restore_note = (
+            f"Phụ đề đã đổi {changed} dòng (từ {len(old)} → {len(new)} dòng) — giữ bảng nhân vật, "
+            "tóm tắt, thuật ngữ"
+            + (f"; {missing} dòng mới cần hỏi lại người nói (bấm «Bổ sung người nói»)"
+               if missing else "")
+            + "."
+        )
+        logger.info("Căn dòng phân tích đã lưu sau khi phụ đề đổi: %s", self.last_restore_note)
+        return cues
+
+    def _backfill_analysis_lines(self, store, video_path: str) -> None:
+        """[v3.23.668] Ghi danh sách dòng hiện tại vào phân tích đã lưu (phụ đề khớp mã băm)."""
+        from subtitles_extractor.application.services.analysis_realign import (
+            SourceLine,
+            encode_lines,
+        )
+
+        saver = getattr(store, "save_analysis_lines", None)
+        if saver is None:
+            return
+        try:
+            saver(video_path, encode_lines([
+                SourceLine(ev.interval.start_ms(), ev.interval.end_ms(), ev.text)
+                for ev in self._source_events
+            ]))
+        except Exception as exc:  # noqa: BLE001 — bổ sung phụ: lỗi không được chặn khôi phục
+            logger.debug("Không ghi bổ sung dòng phân tích: %s", exc)
 
     def try_restore_saved_analysis(self, video_path: str, target_lang: str) -> bool:
         """[v3.23.45] Nạp lại phân tích ngữ cảnh đã lưu cho video (nếu còn hợp lệ).
@@ -2223,15 +2380,28 @@ class TranslatePageViewModel(QObject):
                 return None
             source_lines = [ev.text for ev in self._source_events]
             current_hash = hash_analysis_input(source_lines, target_lang or "")
+            visual_cues = getattr(session, "analysis_visual_cues", "") or ""
+            self.last_restore_note = ""
+            if session.has_valid_analysis(current_hash) and not getattr(
+                session, "analysis_lines", ""
+            ):
+                # [v3.23.668] Phân tích lưu từ bản cũ: phụ đề đang khớp đúng → ghi bổ sung dòng
+                # để lần ReOCR sau còn căn dòng được.
+                self._backfill_analysis_lines(store, video_path)
             if not session.has_valid_analysis(current_hash):
-                return None
+                # [v3.23.668] Phụ đề đổi (ReOCR thêm/bớt/sửa dòng): căn dòng thay vì bỏ cả phân tích.
+                visual_cues = self._realign_saved_analysis(
+                    session, store, video_path, current_hash, target_lang or ""
+                )
+                if visual_cues is None:
+                    return None
             logger.info("Khôi phục phân tích ngữ cảnh đã lưu cho %s.", video_path)
             restored = SubtitleContextAnalysis(
                 source_lang=session.analysis_source_lang,
                 characters=session.analysis_characters,
                 overview=session.analysis_overview,
                 glossary=session.analysis_glossary,
-                visual_cues=getattr(session, "analysis_visual_cues", "") or "",
+                visual_cues=visual_cues,
             )
             corrected, corrections = self._correct_context_names(restored, video_path)
             self._restored_name_corrections = corrections
@@ -2371,6 +2541,7 @@ class TranslatePageViewModel(QObject):
             return
         target_cps = float(getattr(tr, "reading_cps_budget", 0.0)) or 20.0
         from subtitles_extractor.application.services.reading_time_extender import (
+            DEFAULT_MAX_DURATION_SEC,
             GLITCH_WINDOW_SEC,
             extend_events_for_reading,
         )
@@ -2380,9 +2551,16 @@ class TranslatePageViewModel(QObject):
                 1 for ev in events if ev.end_sec - ev.start_sec < GLITCH_WINDOW_SEC
             )
 
+        # [v3.23.674] Trần thời lượng = "Thời lượng tối đa" trong Cài đặt (trước đây cố định 7 s).
+        try:
+            max_duration = float(
+                self._container.settings_service.current.post_process.max_duration_sec
+            )
+        except (AttributeError, TypeError, ValueError):
+            max_duration = DEFAULT_MAX_DURATION_SEC
         try:
             extended_events, extended_count = extend_events_for_reading(
-                self._translated_events, target_cps
+                self._translated_events, target_cps, max_duration_sec=max_duration
             )
         except (ValueError, TypeError) as exc:
             logger.warning("Giãn giờ đọc thất bại (%s) — giữ nguyên timing.", exc)
@@ -2736,21 +2914,21 @@ class TranslatePageViewModel(QObject):
     def push_to_editor(self) -> bool:
         """Gửi bản dịch sang trang Biên tập qua callback đã được tiêm."""
         if not self._translated_events:
-            self.error_occurred.emit("Chưa có bản dịch để gửi sang trang Biên tập.")
+            self.error_occurred.emit("Chưa có bản dịch để gửi sang trang Chỉnh sửa.")
             return False
         if self._push_to_editor_callback is None:
-            self.error_occurred.emit("Chưa kết nối được với trang Biên tập.")
+            self.error_occurred.emit("Chưa kết nối được với trang Chỉnh sửa.")
             return False
         try:
             # [v3.23.609] Gửi BẢN SAO: trang Biên tập đánh số lại / giữ trong ngăn hoàn
             # tác các dòng này; sửa tiếp ở trang Dịch không được đổi ngầm chúng.
             self._push_to_editor_callback(self.translated_events)
             self.status_message.emit(
-                f"Đã gửi {len(self._translated_events)} dòng dịch sang trang Biên tập."
+                f"Đã gửi {len(self._translated_events)} dòng dịch sang trang Chỉnh sửa."
             )
             return True
         except Exception as exc:  # noqa: BLE001
-            self.error_occurred.emit(f"Lỗi gửi sang Biên tập: {exc}")
+            self.error_occurred.emit(f"Lỗi gửi sang Chỉnh sửa: {exc}")
             return False
 
     def set_push_to_editor_callback(

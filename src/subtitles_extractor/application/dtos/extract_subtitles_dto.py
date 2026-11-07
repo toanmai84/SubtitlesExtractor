@@ -16,7 +16,7 @@ from subtitles_extractor.domain.value_objects.roi import Roi
 class SubtitleBuilderConfig:
     similarity_threshold: float = 0.75
     min_duration_sec: float = 0.15
-    max_duration_sec: float = 30.0
+    max_duration_sec: float = 7.0
     merge_gap_sec: float = 0.60
     min_confidence: float = 0.30
     use_viterbi: bool = False

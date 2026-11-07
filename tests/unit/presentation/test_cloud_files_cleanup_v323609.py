@@ -216,8 +216,7 @@ def test_clear_cloud_button_uses_every_key(
     from tests.unit.presentation.test_translate_review2_v323609 import _page
 
     page = _page(tmp_path)
-    page._api_key_edit.setText("KEY_A")
-    page._extra_keys = ["KEY_B", "KEY_C"]
+    page._ai_store.set_gemini_keys(["KEY_A", "KEY_B", "KEY_C"])
     page._session_video_path = lambda: "/phim/tap5.mkv"  # type: ignore[method-assign]
     monkeypatch.setattr(
         QMessageBox, "question", lambda *_a, **_k: QMessageBox.StandardButton.Yes

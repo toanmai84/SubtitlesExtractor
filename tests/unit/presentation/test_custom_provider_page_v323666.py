@@ -60,14 +60,10 @@ def test_chon_tuy_chinh_hien_o_nhap_va_ap_xuong_bo_dich(
 ) -> None:
     container = _container()
     page = _page(container)
-    form = page._ai_form
-    assert page._provider_combo.currentData() == "gemini"
-    assert form.isRowVisible(page._gemini_key_row)
-    assert not form.isRowVisible(page._custom_url_edit)
+    store = page._ai_store  # [v3.23.677] khoá/nhà cung cấp nay sửa ở Cài đặt, trang đọc kho chung
+    assert store.provider() == "gemini"
 
-    page._provider_combo.setCurrentIndex(page._provider_combo.findData("custom"))
-    assert form.isRowVisible(page._custom_url_edit) and form.isRowVisible(page._custom_key_row)
-    assert not form.isRowVisible(page._gemini_key_row)
+    store.set_provider("custom")
     assert not page._attach_video_check.isEnabled()
     # Chưa nhập địa chỉ/key: không lặng lẽ dùng key Gemini, cảnh báo rõ.
     assert container.custom_text_provider is None
@@ -75,9 +71,7 @@ def test_chon_tuy_chinh_hien_o_nhap_va_ap_xuong_bo_dich(
     assert page._warn_custom_incomplete() is True
     assert page._test_warnings
 
-    page._custom_url_edit.setText("https://oxionai.com/v1/chat/completions")
-    page._custom_key_edit.setText("sk-abc")
-    page._custom_key_edit.editingFinished.emit()
+    store.set_custom("https://oxionai.com/v1/chat/completions", "sk-abc")
     provider = container.custom_text_provider
     assert provider is not None and provider.normalized_base_url == "https://oxionai.com/v1"
     assert page._combined_keys_text() == "sk-abc"
@@ -88,11 +82,10 @@ def test_chon_tuy_chinh_hien_o_nhap_va_ap_xuong_bo_dich(
     # Mở lại ứng dụng: khôi phục lựa chọn.
     container2 = _container()
     page2 = _page(container2)
-    assert page2._provider_combo.currentData() == "custom"
-    assert page2._custom_url_edit.text() == "https://oxionai.com/v1/chat/completions"
+    assert page2._custom_mode()
     assert container2.custom_text_provider is not None
 
-    page2._provider_combo.setCurrentIndex(page2._provider_combo.findData("gemini"))
+    page2._ai_store.set_provider("gemini")
     assert container2.custom_text_provider is None
     assert page2._attach_video_check.isEnabled()
     page.close()
@@ -125,9 +118,8 @@ def test_tuy_chinh_bo_tick_dinh_video_va_khong_dung_ten_gemini_co_dinh(
     page = _page(container)
     page._attach_video_check.setChecked(True)
     assert page._visual_cues_check.isChecked()
-    page._custom_url_edit.setText("https://oxionai.com/v1")
-    page._custom_key_edit.setText("sk-abc")
-    page._provider_combo.setCurrentIndex(page._provider_combo.findData("custom"))
+    page._ai_store.set_custom("https://oxionai.com/v1", "sk-abc")
+    page._ai_store.set_provider("custom")
     # Không còn ô "tick mà xám": bỏ tick kéo theo các ô phụ thuộc video.
     assert not page._attach_video_check.isChecked() and not page._attach_video_check.isEnabled()
     assert not page._visual_cues_check.isChecked()
@@ -141,7 +133,7 @@ def test_tuy_chinh_bo_tick_dinh_video_va_khong_dung_ten_gemini_co_dinh(
     assert vm.analysis_fallback_model() == ""
     assert vm.audit_chain("gemini-3.1-pro") == ("gemini-3.1-pro", ())
 
-    page._provider_combo.setCurrentIndex(page._provider_combo.findData("gemini"))
+    page._ai_store.set_provider("gemini")
     assert page.shorten_model() == "gemini-3.1-flash-lite"
     assert vm.analysis_fallback_model() == "gemini-3.1-flash-lite"
     page.close()

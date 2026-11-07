@@ -60,6 +60,7 @@ class RawOcrMeta:
         app_version:       Phiên bản ứng dụng (để debug tương thích).
         preprocess:        [NEW] Cấu hình tiền xử lý ảnh lúc OCR.
         advanced_ocr:      [NEW] Các thông số OCR nâng cao (Det Thresh, Unclip...).
+        boundary:          [v3.23.682] Dải ranh giới (``BoundaryTrack.to_dict``) — dựng lại phụ đề vẫn đặt mốc đúng khung.
     """
 
     video_name: str
@@ -71,9 +72,10 @@ class RawOcrMeta:
     score_threshold: float
     saved_at: str
     roi_xywh: list[int] | None = None
-    app_version: str = "3.23.666"
+    app_version: str = "3.23.689"
     preprocess: dict[str, Any] | None = None
     advanced_ocr: dict[str, Any] | None = None
+    boundary: dict[str, Any] | None = None
 
 
 def save_raw_ocr(
@@ -154,7 +156,11 @@ def load_raw_ocr(input_path: Path) -> tuple[list[OcrFrameResult], RawOcrMeta]:
     try:
         payload = json.loads(raw_bytes.decode("utf-8"))
     except ValueError as exc:   # [v3.23.638] gồm UnicodeDecodeError (tệp nhị phân / sai bảng mã)
-        raise ValueError(f"File JSON không hợp lệ: {exc}") from exc
+        # [v3.23.673] Câu dễ hiểu: quét giao diện chọn nhầm một tệp .srt → "Extra data: line 2".
+        raise ValueError(
+            f"Tệp '{input_path.name}' không phải dữ liệu OCR thô của ứng dụng "
+            f"(.seraw.json / .seraw.json.gz) — JSON lỗi: {exc}"
+        ) from exc
     if not isinstance(payload, dict):
         raise ValueError("File JSON không hợp lệ: gốc phải là một đối tượng.")
 
@@ -240,6 +246,7 @@ def _deserialize_meta(data: dict[str, Any]) -> RawOcrMeta:
         app_version=str(data.get("app_version", "")),
         preprocess=data.get("preprocess"),
         advanced_ocr=data.get("advanced_ocr"),
+        boundary=data.get("boundary") if isinstance(data.get("boundary"), dict) else None,
     )
 
 

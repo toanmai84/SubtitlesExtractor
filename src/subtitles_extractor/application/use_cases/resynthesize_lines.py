@@ -193,6 +193,7 @@ class ResynthesizeLinesUseCase:
             # từ 0 nên phải cắt ``line_voices`` theo đúng vị trí gốc, không thì dòng TTS
             # lại mượn giọng của dòng 0, 1, … của cả phim.
             line_voices=full_request.line_voices_for(selected_positions),
+            line_styles=full_request.line_styles_for(selected_positions),  # [v3.23.688]
             # [v3.23.596] Mốc dòng kề thật — không thì dòng TTS lại đè lên câu không chọn.
             neighbors=resynthesis_neighbors(
                 list(events), selected_positions, prior_results,

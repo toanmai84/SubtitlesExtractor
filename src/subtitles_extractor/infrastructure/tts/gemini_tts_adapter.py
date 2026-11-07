@@ -216,6 +216,26 @@ def _quota_sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _verbatim_contents(text: str, style: str) -> Any:
+    """[v3.23.688] Nội dung gửi model TTS ≥ 3.8: lời nguyên văn, kèm chỉ dẫn cách đọc ở ``speech_metadata.style``.
+
+    Tài liệu Gemini 3.8 TTS: ``text`` là lời đọc NGUYÊN VĂN; cảm xúc/nhịp cả câu đặt ở ``speech_metadata.style`` để không
+    bị đọc thành tiếng. Đo thật (12 câu tập 2, gemini-3.8-flash-lite-tts): không câu nào đọc nhãn thành tiếng; câu
+    "phẫn nộ" to hơn 1,7 dB và cao hơn ~70 Hz, câu "tự nói một mình" nhỏ hơn 3,8 dB. Không có chỉ dẫn (hoặc SDK cũ
+    chưa có ``SpeechMetadata``) → gửi chuỗi như trước.
+    """
+    direction = (style or "").strip()
+    if direction:
+        try:
+            from google.genai import types
+
+            part = types.Part(text=text, speech_metadata=types.SpeechMetadata(style=direction))
+            return [types.Content(role="user", parts=[part])]
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return text
+
+
 def _live_style_for(text: str, available_s: float) -> str:
     """[v3.23.662] Chỉ dẫn đọc cho model Live theo khung của dòng: đủ chỗ → nhịp tự nhiên, chật → đọc rất nhanh."""
     syllables = dem_am_tiet(text)
@@ -533,6 +553,7 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         config = types.GenerateContentConfig(**config_kwargs)
         audio = self._standard_with_retry(
             client, model, text, config, request, cancel_cb,
+            style=request.style_at(idx) if hasattr(request, "style_at") else "",
             # [v3.23.234] Khung THẬT của câu -> vòng retry phân biệt được "audio bất
             # thường so với nhịp đọc engine" với "audio không vừa khung phụ đề".
             available_s=effective_available_seconds(start_sec, end_sec, next_start_sec),
@@ -729,7 +750,8 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         self._active_client = self._make_client()
 
     def _standard_with_retry(
-        self, client, model, text, config, request, cancel_cb, available_s: float = 0.0
+        self, client, model, text, config, request, cancel_cb, available_s: float = 0.0,
+        style: str = "",
     ):
         # [v3.23.221] Lưới "audio dài bất thường" (đồng bộ VieNeu): model neural thi
         # thoảng ngân dài một âm tiết -> nén kịch trần + đè câu sau. Giữ ứng viên ngắn
@@ -755,7 +777,7 @@ class GeminiTTSAdapter(SubtitleTTSPort):
                 response = self._generate_within_quota(
                     client, model=model,
                     contents=(
-                        text.strip() if uses_verbatim_tts_schema(model)
+                        _verbatim_contents(text.strip(), style) if uses_verbatim_tts_schema(model)
                         else wrap_transcript_for_tts(text)
                     ),
                     config=config, cancel_cb=cancel_cb,

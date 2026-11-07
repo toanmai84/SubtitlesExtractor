@@ -240,3 +240,54 @@ def detect_subtitle_band_from_boxes(
         width=max(1, int(x_max - x_min)),
         height=max(1, int(y_max - y_min)),
     )
+
+
+#: [v3.23.686] Kiểm nhanh ROI của tập trước cho tập kế (phim bộ) — xem :func:`refit_series_roi`.
+SERIES_CHECK_SAMPLES = 24
+_SERIES_MIN_CONF = 0.85
+_SERIES_MIN_FRAMES = 3
+_SERIES_MIN_SHARE = 0.4
+_SERIES_MIN_OVERLAP = 0.5
+
+
+def refit_series_roi(
+    roi: Roi, boxes: "list", frame_width: int, frame_height: int,
+) -> Roi | None:
+    """[v3.23.686] Dùng lại ROI của tập trước nếu một lượt OCR thưa (~24 khung) của tập này xác nhận phụ đề vẫn ở đó.
+
+    Phim bộ 86 tập: tự dò vùng mỗi tập ~5 phút trên CPU (lâu hơn cả trích xuất tập ngắn), trong khi mọi tập dùng chung
+    một dải phụ đề. Chỉ bề NGANG đổi theo câu dài nhất của từng tập (đo trên phim nối: 406–603 px) — vì vậy ROI được
+    NỚI ngang theo các hộp chữ thấy trong lượt kiểm, không bao giờ thu hẹp.
+
+    Trả ``None`` (→ dò vùng đầy đủ như cũ) khi:
+    * hộp chữ chắc chắn (độ tin cậy ≥ 0,85) nằm trong dải của ROI có ở ít hơn 3 khung, hoặc ít hơn 40 % số khung có chữ;
+    * dải phụ đề đậm đặc nhất của lượt kiểm (:func:`detect_subtitle_band_from_boxes`) nằm NGOÀI dải ROI (phụ đề đổi chỗ).
+    """
+    if frame_width <= 0 or frame_height <= 0 or roi.orientation == TextOrientation.VERTICAL:
+        return None
+    confident = [b for b in boxes if b.confidence >= _SERIES_MIN_CONF and b.box_height > 0]
+    if not confident:
+        return None
+    top, bottom = roi.y, roi.y + roi.height
+
+    def in_band(box) -> bool:
+        overlap = min(bottom, box.coord_y_max) - max(top, box.coord_y_min)
+        return (
+            overlap >= _SERIES_MIN_OVERLAP * box.box_height
+            and 0.3 * roi.height <= box.box_height <= 1.3 * roi.height
+        )
+
+    band = [b for b in confident if in_band(b)]
+    band_frames = {b.frame_idx for b in band}
+    text_frames = {b.frame_idx for b in confident}
+    if len(band_frames) < _SERIES_MIN_FRAMES or len(band_frames) < _SERIES_MIN_SHARE * len(text_frames):
+        return None
+    densest = detect_subtitle_band_from_boxes(confident, frame_width, frame_height)
+    if densest is not None and not (top <= densest.y + densest.height / 2 <= bottom):
+        return None
+    x0 = max(0, min(roi.x, int(min(b.coord_x_min for b in band))))
+    x1 = min(frame_width, max(roi.x + roi.width, int(round(max(b.coord_x_max for b in band)))))
+    return Roi(
+        x=x0, y=roi.y, width=max(1, x1 - x0), height=roi.height,
+        alignment=roi.alignment, orientation=roi.orientation,
+    )

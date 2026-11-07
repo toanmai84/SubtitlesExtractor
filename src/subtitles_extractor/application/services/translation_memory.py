@@ -34,12 +34,16 @@ __all__ = [
     "SeriesContext",
     "TranslationMemoryEntry",
     "derive_series_key",
+    "episode_label",
     "format_reference_block",
     "merge_characters",
     "merge_glossary",
+    "recent_series_overview",
     "retrieve_for_lines",
     "retrieve_relevant",
     "roster_overlap_ratio",
+    "split_episode_overviews",
+    "upsert_episode_overview",
 ]
 
 
@@ -116,7 +120,9 @@ def _roster_identity_keys(line: str) -> set[str]:
                 if token:
                     keys.add(token)
     else:
-        name = line.split(":", 1)[0].strip().lower()
+        # [v3.23.669] Cắt cả ở " — " / " - " (dòng "Tên — vai trò", vd người nói bổ sung): trước đây
+        # cả dòng thành khoá, nên thêm mệnh đề vào cuối dòng là đổi danh tính và sinh dòng trùng.
+        name = re.split(r":|\s[—–-]\s", line, maxsplit=1)[0].strip().lower()
         if name:
             keys.add(name)
     return keys
@@ -167,17 +173,187 @@ def merge_characters(existing: str, incoming: str) -> str:
     """
     merged: list[str] = []
     seen: set[str] = set()
+    resolve = _partner_identity_resolver(existing, incoming)   # dựng MỘT lần (O(R) thay vì O(R²))
     for block in (existing, incoming):
         for raw in (block or "").splitlines():
             line = raw.strip()
             if not line:
                 continue
             keys = _roster_identity_keys(line)
-            if keys & seen:  # trùng danh tính -> giữ mục đã thêm trước
+            if keys & seen:
+                # [v3.23.669] Trùng danh tính → giữ dòng đã có (tên, phiên âm, mô tả đã chốt) nhưng
+                # BỔ SUNG mệnh đề xưng hô với người MỚI. Đo 8 cặp tập 1+2 phim mẫu: giữ nguyên dòng
+                # cũ làm mất quy tắc của tập 2 ở 7/8 lần ("với Nam Cung Mộng tự xưng 'đệ tử' gọi
+                # 'sư thúc'" — Nam Cung Mộng chỉ xuất hiện từ tập 2); gộp mệnh đề: 134 → 139/166.
+                index = next(
+                    (i for i, kept in enumerate(merged) if _roster_identity_keys(kept) & keys),
+                    None,
+                )
+                if index is not None:
+                    merged[index] = _with_new_address_clauses(merged[index], line, resolve)
                 continue
             seen |= keys
             merged.append(line)
     return "\n".join(merged)
+
+
+#: [v3.23.669] Một mệnh đề xưng hô của bảng nhân vật: "với X tự xưng 'a' gọi 'b' (danh xưng: …)".
+_ADDRESS_CLAUSE_RE = re.compile(
+    r"(?:^|(?<=[;:—–,]))\s*(?:xưng hô:\s*)?"
+    r"(?P<clause>với\s+(?P<who>[^;,.:]+?)\s+tự xưng\s+['‘“\"][^'’”\"]*['’”\"]\s+gọi\s+"
+    r"['‘“\"][^'’”\"]*['’”\"](?:\s*\([^)]*\))?)",
+    re.MULTILINE,
+)
+#: Kính ngữ / đại từ hay đứng trước tên người đối diện ("nàng Sở Dao").
+_PARTNER_PREFIXES = ("nàng ", "chàng ", "cô ", "anh ", "chị ", "ông ", "bà ", "lão ", "tiểu ")
+
+
+def _partner_identity_resolver(*rosters: str):
+    """Hàm ``tên người đối diện → khoá danh tính`` theo các bảng nhân vật (bí danh cùng một người)."""
+    groups: list[set[str]] = []
+    for roster in rosters:
+        for raw in (roster or "").splitlines():
+            keys = _roster_identity_keys(raw.strip()) if raw.strip() else set()
+            if not keys:
+                continue
+            for group in groups:
+                if group & keys:
+                    group |= keys
+                    break
+            else:
+                groups.append(set(keys))
+
+    def resolve(name: str) -> str:
+        key = re.sub(r"\s*[(（][^)）]*[)）]", "", name).strip().lower()
+        candidates = [key]
+        for prefix in _PARTNER_PREFIXES:
+            if key.startswith(prefix):
+                candidates.append(key[len(prefix):].strip())
+        for candidate in candidates:
+            for index, group in enumerate(groups):
+                if candidate in group:
+                    return f"#{index}"
+        return key
+
+    return resolve
+
+
+def _with_new_address_clauses(kept: str, incoming: str, resolve=lambda name: name.strip().lower()) -> str:
+    """Thêm vào ``kept`` các mệnh đề xưng hô của ``incoming`` với người ``kept`` chưa nhắc tới.
+
+    ``resolve`` quy tên người đối diện về danh tính ("Sở Dao" và "Dao Dao" là một người) để không thêm
+    mệnh đề thứ hai mâu thuẫn cho cùng một cặp.
+    """
+    have = {resolve(m.group("who")) for m in _ADDRESS_CLAUSE_RE.finditer(kept)}
+    extra: list[str] = []
+    for match in _ADDRESS_CLAUSE_RE.finditer(incoming):
+        who = resolve(match.group("who"))
+        if who not in have:
+            have.add(who)
+            extra.append(match.group("clause"))
+    if not extra:
+        return kept
+    base = kept.rstrip(" ;.")
+    # Dòng chỉ có tên (không ":" / "(" / "—"): nối bằng ": " để khoá danh tính của dòng không đổi.
+    joiner = "; " if re.search(r"[:(（—–]|\s-\s", base) else ": "
+    return base + joiner + "; ".join(extra)
+
+
+#: [v3.23.669] Trần độ dài tóm tắt phim bộ tích luỹ (~3k token) — gửi kèm khi phân tích tập sau.
+MAX_SERIES_OVERVIEW_CHARS = 12_000
+#: Đầu khối của một tập: "⟦nhãn⟧ " ở đầu dòng. Dấu ⟦⟧ (không dùng "[…]") để tóm tắt của model có dòng
+#: "[Cảnh 1] …" / "[Hồi tưởng] …" không bị hiểu nhầm là ranh giới tập.
+_EPISODE_BLOCK_RE = re.compile(r"^⟦([^⟧\n]{1,80})⟧\s?", re.MULTILINE)
+_LABEL_MAX = 80
+
+
+def episode_label(stem: str) -> str:
+    """[v3.23.669] Nhãn tập dùng chung cho ghi và tra (tên tệp video, bỏ ký tự đặc biệt).
+
+    Tên dài hơn trần thì giữ PHẦN CUỐI — số tập thường nằm cuối ("… Episode 01").
+    """
+    label = re.sub(r"[⟦⟧\r\n]+", " ", stem or "").strip()
+    return label if len(label) <= _LABEL_MAX else label[-_LABEL_MAX:]
+
+
+def split_episode_overviews(series_overview: str) -> list[tuple[str, str]]:
+    """Tách tóm tắt phim bộ thành ``[(nhãn tập, tóm tắt), …]`` theo thứ tự (hàm thuần).
+
+    Văn bản cũ không có nhãn (bản trước chỉ giữ tóm tắt của tập dịch gần nhất) thành một khối nhãn ``""``.
+    """
+    text = (series_overview or "").strip()
+    if not text:
+        return []
+    marks = list(_EPISODE_BLOCK_RE.finditer(text))
+    if not marks:
+        return [("", text)]
+    blocks: list[tuple[str, str]] = []
+    head = text[: marks[0].start()].strip()
+    if head:
+        blocks.append(("", head))
+    for k, mark in enumerate(marks):
+        end = marks[k + 1].start() if k + 1 < len(marks) else len(text)
+        blocks.append((mark.group(1).strip(), text[mark.end():end].strip()))
+    return blocks
+
+
+def upsert_episode_overview(
+    series_overview: str, episode: str, overview: str,
+    max_chars: int = MAX_SERIES_OVERVIEW_CHARS,
+) -> str:
+    """[v3.23.669] Ghi tóm tắt của MỘT tập vào tóm tắt phim bộ (thay khối cũ của chính tập đó).
+
+    Trước đây mỗi tập ghi đè tóm tắt của tập trước, nên phân tích tập N không biết diễn biến các tập
+    trước, và "Dịch cả bộ" dùng tóm tắt của tập khác cho tập chưa phân tích. Nay giữ mỗi tập một khối
+    "[tên tập] …" theo thứ tự; vượt trần thì bỏ các khối cũ ở GIỮA (giữ tập đầu = thiết lập bối cảnh
+    và các tập gần nhất).
+
+    Args:
+        series_overview: Tóm tắt phim bộ đang lưu.
+        episode: Nhãn tập (vd tên tệp video ``"01"``).
+        overview: Tóm tắt của tập (rỗng = không đổi).
+        max_chars: Trần độ dài.
+
+    Returns:
+        Tóm tắt phim bộ mới.
+    """
+    episode = episode_label(episode)
+    body = (overview or "").strip()
+    existing = split_episode_overviews(series_overview)
+    # Tóm tắt đã mang nhãn tập, hoặc trùng nguyên văn một khối đã có / cả tóm tắt phim bộ (ô tóm tắt
+    # được điền từ chính tóm tắt phim bộ khi tập chưa phân tích) → không phải của riêng tập này.
+    if (
+        not body or _EPISODE_BLOCK_RE.search(body)
+        or any(text == body for label, text in existing if label != episode)
+        or body == (series_overview or "").strip()
+    ):
+        return (series_overview or "").strip()
+    blocks = [(label, text) for label, text in existing if label != episode]
+    blocks.append((episode, body))
+    while len(blocks) > 2 and len(_render_blocks(blocks)) > max_chars:
+        del blocks[1]                                   # giữ tập đầu + các tập mới nhất
+    if len(_render_blocks(blocks)) > max_chars:
+        # Còn ≤ 2 khối mà vẫn quá dài: rút gọn PHẦN THÂN (giữ nguyên nhãn) thay vì cắt chuỗi.
+        budget = max(200, max_chars // len(blocks) - _LABEL_MAX - 4)
+        blocks = [(label, text if len(text) <= budget else text[:budget].rstrip() + " …")
+                  for label, text in blocks]
+    return _render_blocks(blocks)
+
+
+def _render_blocks(items: list[tuple[str, str]]) -> str:
+    return "\n\n".join(f"⟦{label}⟧ {text}" if label else text for label, text in items)
+
+
+def recent_series_overview(series_overview: str, exclude_episode: str = "",
+                           max_chars: int = 6000) -> str:
+    """[v3.23.669] Diễn biến các tập TRƯỚC (bỏ khối của chính tập đang phân tích), gọn ``max_chars``."""
+    exclude = episode_label(exclude_episode) if exclude_episode else ""
+    blocks = [(label, text) for label, text in split_episode_overviews(series_overview)
+              if not exclude or label != exclude]
+    while len(blocks) > 1 and len(_render_blocks(blocks)) > max_chars:
+        del blocks[0]                                   # gửi kèm các tập GẦN NHẤT
+    out = _render_blocks(blocks)
+    return out if len(out) <= max_chars else "…" + out[-max_chars:]
 
 
 def retrieve_relevant(

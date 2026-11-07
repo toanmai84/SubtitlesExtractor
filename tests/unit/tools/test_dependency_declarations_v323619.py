@@ -17,7 +17,7 @@ SRC = ROOT / "src" / "subtitles_extractor"
 #: Tên module import → tên gói pip.
 IMPORT_TO_DIST = {
     "PIL": "pillow",
-    "cv2": "opencv-python",
+    "cv2": "opencv-contrib-python",  # [v3.23.675] paddlex ghim bản contrib (cùng thư mục cv2)
     "mpv": "python-mpv",
     "google": "google-genai",
     "yaml": "pyyaml",

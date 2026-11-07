@@ -714,6 +714,14 @@ class TTSPageViewModel(QObject):
         )
         return voices_for_lines(speakers, casting)
 
+    def dubbing_line_styles(self) -> tuple[str, ...]:
+        """[v3.23.688] Chỉ dẫn cách đọc từng dòng nguồn HIỆN TẠI theo nhãn cue của phân tích (rỗng = không có)."""
+        if self._dubbing_source is None:
+            return ()
+        from subtitles_extractor.application.services.line_delivery_style import line_delivery_styles
+
+        return line_delivery_styles(self._source_events, self._dubbing_source)
+
     def set_source_events(self, events: list["SubtitleEvent"]) -> None:
         self._restored_structure = None
         self._source_events = list(events)
@@ -857,6 +865,9 @@ class TTSPageViewModel(QObject):
         )
         if line_voices is not None:
             full_request = replace(full_request, line_voices=tuple(line_voices))
+        if self._last_request.line_styles:
+            # [v3.23.688] Dòng đã thêm/xoá/tách → vị trí đổi: tính lại chỉ dẫn cách đọc theo phụ đề hiện tại.
+            full_request = replace(full_request, line_styles=self.dubbing_line_styles())
 
         use_case = self._container.make_resynthesize_use_case(self._last_adapter)
         from subtitles_extractor.presentation.workers.resynthesize_worker import (
@@ -1605,6 +1616,7 @@ class TTSPageViewModel(QObject):
         media_duration_s: float | None = None,
         line_voices: tuple[str, ...] = (),
         incremental: bool = True,
+        line_styles: tuple[str, ...] = (),
     ) -> bool:
         """Chạy TTS cả bộ phụ đề (hoặc chỉ các dòng đã đổi khi ``incremental``).
 
@@ -1661,6 +1673,7 @@ class TTSPageViewModel(QObject):
             gemini_temperature=gemini_temperature,
             media_duration_s=media_duration_s,
             line_voices=tuple(line_voices),
+            line_styles=tuple(line_styles),  # [v3.23.688]
             # [v3.23.450] Luôn giữ audio từng dòng ở trang TTS → cho phép nghe lại + TTS lại
             # dòng chọn. Chi phí: mỗi dòng một WAV nhỏ trong thư mục _segments cạnh output.
             keep_line_audio=True,

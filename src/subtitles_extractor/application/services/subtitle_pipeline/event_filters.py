@@ -15,6 +15,8 @@ Pipeline post-processing 6 stage:
 from __future__ import annotations
 
 import bisect
+from collections import Counter
+from collections.abc import Sequence
 from itertools import pairwise
 
 import rapidfuzz.fuzz as fuzz
@@ -46,6 +48,7 @@ from subtitles_extractor.application.services.subtitle_pipeline.voting import (
     calculate_effective_similarity,
     evaluate_multi_line_similarity,
 )
+from subtitles_extractor.domain.entities.ocr_frame_result import OcrFrameResult
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
 from subtitles_extractor.domain.value_objects.confidence import Confidence
 from subtitles_extractor.domain.value_objects.time_interval import TimeInterval
@@ -56,7 +59,10 @@ from subtitles_extractor.domain.value_objects.time_interval import TimeInterval
 
 
 #: [Stable Variant Split] Một "khối ổn định" cần tối thiểu bấy nhiêu frame...
-_VARIANT_MIN_FRAMES: int = 6
+#: [v3.23.672] 6 → 3: điều kiện thời lượng (>= 0,30s) mới là chính — 6 khung ở bước lấy mẫu
+#: mặc định 0,12s là 0,72s, bỏ lọt câu ngắn thật ("师叔" 0,68s); ở bước 0,04s thì 0,30s vẫn
+#: đòi >= 8 khung như trước. (Bản sao thứ hai của khối hằng số này đã bị xoá.)
+_VARIANT_MIN_FRAMES: int = 3
 #: ...và kéo dài tối thiểu bấy nhiêu giây.
 _VARIANT_MIN_SPAN_SEC: float = 0.30
 #: Run nhiễu (<= số frame này) được hấp thụ vào khối lớn đứng trước.
@@ -81,7 +87,18 @@ def _is_cjk_char(ch: str) -> bool:
     )
 
 
-def _should_split_boundary(text_before: str, text_after: str) -> bool:
+#: [v3.23.682] Hai khối cùng đứng yên ≥ ngưỡng này (giây) mà chữ khác nhau là hai câu thật (xem ``_should_split_boundary``).
+_STABLE_DISTINCT_SPAN_SEC: float = 0.45
+#: [v3.23.682] Mất/thêm đúng 1 chữ ở ĐẦU cần đứng yên lâu hơn mới coi là 2 câu: "就可以实现" (0,5 s, OCR làm rơi "不")
+#: rồi "不就可以实现" là MỘT câu; "你不要抛弃我" → "不要抛弃我" (mỗi câu 0,84 s) là hai câu.
+_STABLE_LEADING_DROP_SPAN_SEC: float = 0.7
+#: [v3.23.682] Nét mảnh OCR hay đánh rơi ở đầu câu — chỉ những chữ này mới coi "mất 1 chữ đầu" là lỗi đọc.
+_THIN_LEADING_CHARS = frozenset("一丨丶丿乙亅二")
+
+
+def _should_split_boundary(
+    text_before: str, text_after: str, span_before: float = 0.0, span_after: float = 0.0,
+) -> bool:
     """Quyết định ranh giới 2 khối ổn định có phải 2 CÂU THẬT khác nhau.
 
     Quy tắc (rút từ dữ liệu thực):
@@ -91,29 +108,52 @@ def _should_split_boundary(text_before: str, text_after: str) -> bool:
         >= 2 ký tự; delta 1 ký tự đầu (vd ``一``) là OCR mất nét mảnh.
       * Delta chứa Latin → biến thể watermark dính (``BOR``/``CIACA``), KHÔNG tách.
       * Không prefix/suffix: similarity < 0.5 → 2 câu khác hẳn.
+      * [v3.23.682] Cả hai khối đứng yên ≥ 0,45 s (``span_*``) và phần khác nhau toàn chữ Hán → 2 câu, kể cả khi chỉ
+        khác 1 chữ. Phim nối 86 tập: "我去哪"→"你去哪" (mỗi câu 0,5 s), "我不闭关了"→"好不闭关了",
+        "那师兄大可以试试"(1,3 s)→"那师兄今天就试试" từng bị gộp thành một câu (mất lời thoại). Lỗi đọc OCR chỉ là khối
+        1–2 khung hoặc nhảy qua lại A-B-A (đã chặn ở nơi gọi).
+      * Mất 1 chữ ở đầu: hai khối cùng đứng yên ≥ 0,7 s và chữ đó không phải nét mảnh (一, 丨…) → 2 câu
+        ("你不要抛弃我"→"不要抛弃我"); ngắn hơn là OCR làm rơi chữ ("就可以实现" 0,5 s → "不就可以实现").
     """
     a = _normalize_for_variant(text_before)
     b = _normalize_for_variant(text_after)
     if not a or not b or a == b:
         return False
 
+    both_stable = min(span_before, span_after) >= _STABLE_DISTINCT_SPAN_SEC
     shorter, longer = (a, b) if len(a) < len(b) else (b, a)
     if longer.startswith(shorter):
         delta = longer[len(shorter):]
         return bool(delta) and all(_is_cjk_char(c) for c in delta)
     if longer.endswith(shorter):
         delta = longer[: len(longer) - len(shorter)]
-        return len(delta) >= 2 and all(_is_cjk_char(c) for c in delta)
+        if not all(_is_cjk_char(c) for c in delta):
+            return False
+        leading_stable = min(span_before, span_after) >= _STABLE_LEADING_DROP_SPAN_SEC
+        return len(delta) >= 2 or (leading_stable and delta not in _THIN_LEADING_CHARS)
 
-    return fuzz.ratio(a, b) / 100.0 < 0.5
+    if fuzz.ratio(a, b) / 100.0 < 0.5:
+        return True
+    if both_stable:
+        from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
+            normalize_traditional_to_simplified,
+        )
+
+        # Cùng chữ, khác cách viết phồn/giản ("想自毀灵台" 0,52 s rồi "想自毁灵台") là MỘT câu.
+        if normalize_traditional_to_simplified(a) == normalize_traditional_to_simplified(b):
+            return False
+        # Phần khác nhau (bỏ đầu/đuôi chung) phải toàn chữ Hán — chữ Latin chen vào là watermark dính.
+        head = 0
+        while head < min(len(a), len(b)) and a[head] == b[head]:
+            head += 1
+        tail = 0
+        while tail < min(len(a), len(b)) - head and a[-1 - tail] == b[-1 - tail]:
+            tail += 1
+        diff = a[head:len(a) - tail] + b[head:len(b) - tail]
+        return bool(diff) and all(_is_cjk_char(c) for c in diff)
+    return False
 
 
-#: [Stable Variant Split] Một "khối ổn định" cần tối thiểu bấy nhiêu frame...
-_VARIANT_MIN_FRAMES: int = 6
-#: ...và kéo dài tối thiểu bấy nhiêu giây.
-_VARIANT_MIN_SPAN_SEC: float = 0.30
-#: Run nhiễu (<= số frame này) được hấp thụ vào khối lớn đứng trước.
-_VARIANT_NOISE_RUN_FRAMES: int = 2
 
 
 def split_stable_variant_groups(
@@ -182,7 +222,13 @@ def split_stable_variant_groups(
         # Gom các khối thành segment; chỉ cắt tại ranh giới "2 câu thật".
         segments: list[list[dict]] = [[stable_runs[0]]]
         for prev_run, next_run in zip(stable_runs, stable_runs[1:]):
-            if _should_split_boundary(prev_run["text"], next_run["text"]):
+            if _should_split_boundary(
+                prev_run["text"], next_run["text"],
+                prev_run["end"] - prev_run["start"], next_run["end"] - next_run["start"],
+            ) and not _is_fade_residue(
+                prev_run["text"], next_run["text"],
+                prev_run["end"] - prev_run["start"], next_run["end"] - next_run["start"],
+            ):
                 segments.append([next_run])
             else:
                 segments[-1].append(next_run)
@@ -195,10 +241,12 @@ def split_stable_variant_groups(
             group.accumulated_confidence / group.total_frames_count
             if group.total_frames_count > 0 else 0.0
         )
-        for segment in segments:
+        for seg_index, segment in enumerate(segments):
             best_run = max(segment, key=lambda r: r["count"])
-            seg_start = segment[0]["start"]
-            seg_end = segment[-1]["end"]
+            # [v3.23.676] Mép NGOÀI giữ mốc của group (đã nới theo khung bị lọc mềm ở bước trước), như
+            # split_repeat_gap_groups — trước đây lấy mốc khung đầu/cuối, làm mất phần nới.
+            seg_start = group.start_timestamp_sec if seg_index == 0 else segment[0]["start"]
+            seg_end = group.end_timestamp_sec if seg_index == len(segments) - 1 else segment[-1]["end"]
             seg_frames = sum(r["count"] for r in segment)
             result_groups.append(
                 FrameGroup(
@@ -222,9 +270,246 @@ def split_stable_variant_groups(
     return result_groups
 
 
+#: [v3.23.672] Câu LẶP (cùng chữ) được giữ riêng khi giữa hai lần hiện có tối thiểu bấy nhiêu
+#: khung lấy mẫu TRỐNG liên tiếp và khoảng trống >= ``_REPEAT_MIN_BLANK_SEC``. Đo 12 tập phim
+#: mẫu (bước 0,04s): hai lần "师叔"/"卑鄙" thật cách nhau 3-8 khung trống; OCR lỡ nhận một câu
+#: đang hiện chỉ làm trống ĐÚNG 1 khung ("啊" 108 khung, trống 1, rồi 3 khung). Ở bước thưa
+#: (0,12s) một khung trống không phân biệt được với một khung OCR lỡ → không tách (2 khung
+#: trống ở 0,12s đã là >= 0,36s, tức ngưỡng cũ).
+_REPEAT_MIN_BLANK_SAMPLES: int = 2
+_REPEAT_MIN_BLANK_SEC: float = 0.10
+#: [v3.23.676] Ở bước lấy mẫu DÀY (≤ 0,05s) cần ≥ 3 khung trống: OCR lỡ 2 khung liền (chữ mờ/nhoè chuyển động) chỉ là
+#: 80 ms và từng cắt một câu dài thành hai câu trùng (dịch, lồng tiếng hai lần). Câu lặp thật cách nhau 3-8 khung.
+_REPEAT_MIN_BLANK_SAMPLES_DENSE: int = 3
+_REPEAT_DENSE_STEP_SEC: float = 0.06
+#: Ngưỡng cũ (khoảng trống đủ dài thì luôn là câu lặp, bất kể bước lấy mẫu).
+_REPEAT_LONG_GAP_SEC: float = 0.35
+#: Phần dư khi chữ hiện/tắt dần: chênh 1 ký tự ở mép, khối ngắn hiện dưới bấy nhiêu giây.
+_FADE_RESIDUE_MAX_SEC: float = 0.50
+
+
+def is_repeat_utterance(
+    gap_sec: float, sample_step_sec: float, span_before_sec: float, span_after_sec: float,
+    *, pixel_blank: bool = False,
+) -> bool:
+    """[v3.23.672] Hai lần hiện CÙNG chữ là hai câu thật (nhân vật nói lặp), không phải OCR chớp.
+
+    Args:
+        gap_sec: Mốc bắt đầu lần sau − mốc kết thúc lần trước (theo khung có chữ).
+        sample_step_sec: Bước lấy mẫu khung (0 = không rõ → chỉ dùng ngưỡng 0,35s cũ).
+        span_before_sec / span_after_sec: Thời lượng mỗi lần hiện.
+        pixel_blank: [v3.23.683] Dải ranh giới xác nhận màn hình trống chữ trong khoảng trống
+            (:func:`confirmed_blank_between`) → MỘT khung OCR trống là đủ, vì OCR lỡ không làm mất điểm chữ sáng.
+            Thời lượng mỗi lần hiện tính cả khung cuối (+1 bước): "散了吧" 3 khung = 0,36 s trên màn hình.
+
+    Người gọi phải bảo đảm khoảng trống là trống THẬT (khung OCR không có chữ nào — xem
+    :func:`blank_between`), không phải khung bị bộ lọc độ tin cậy/vị trí loại.
+    """
+    if pixel_blank and sample_step_sec > 0:
+        shown = min(span_before_sec, span_after_sec) + sample_step_sec
+        return (
+            shown >= _VARIANT_MIN_SPAN_SEC and gap_sec >= _REPEAT_MIN_BLANK_SEC
+            and round(gap_sec / sample_step_sec) - 1 >= 1
+        ) or is_repeat_utterance(gap_sec, sample_step_sec, span_before_sec, span_after_sec)
+    if span_before_sec < _VARIANT_MIN_SPAN_SEC or span_after_sec < _VARIANT_MIN_SPAN_SEC:
+        return False
+    if gap_sec >= _REPEAT_LONG_GAP_SEC:
+        return True
+    if sample_step_sec <= 0:
+        return False
+    blank_samples = round(gap_sec / sample_step_sec) - 1
+    min_blank = (
+        _REPEAT_MIN_BLANK_SAMPLES_DENSE if sample_step_sec < _REPEAT_DENSE_STEP_SEC
+        else _REPEAT_MIN_BLANK_SAMPLES
+    )
+    return blank_samples >= min_blank and gap_sec >= _REPEAT_MIN_BLANK_SEC
+
+
+def textful_timestamps(frames: Sequence[OcrFrameResult]) -> list[float]:
+    """[v3.23.672] Mốc các khung OCR đọc ra CÓ chữ (trước mọi bộ lọc), đã sắp xếp."""
+    return sorted(f.timestamp_sec for f in frames if f.text_boxes)
+
+
+def blank_between(textful: Sequence[float] | None, after_sec: float, before_sec: float) -> bool:
+    """[v3.23.672] Không khung nào CÓ chữ nằm giữa hai mốc (khoảng trống thật).
+
+    Khung bị loại vì độ tin cậy thấp / lệch vị trí / lệch dòng vẫn là khung có chữ — một câu dài
+    có hai khung mờ không bị cắt làm đôi. ``textful`` rỗng/``None`` = không có bằng chứng.
+    """
+    if not textful:
+        return False
+    lo = bisect.bisect_right(textful, after_sec + 1e-6)
+    hi = bisect.bisect_left(textful, before_sec - 1e-6)
+    return lo >= hi
+
+
+def confirmed_blank_between(
+    confirmed: Sequence[float] | None, after_sec: float, before_sec: float,
+) -> bool:
+    """[v3.23.683] Có khung mẫu nằm giữa hai mốc mà điểm ảnh xác nhận trống chữ (xem
+    :func:`~.boundary_refinement.pixel_confirmed_blanks`). ``confirmed`` rỗng/``None`` = không có bằng chứng."""
+    if not confirmed:
+        return False
+    lo = bisect.bisect_right(confirmed, after_sec + 1e-6)
+    hi = bisect.bisect_left(confirmed, before_sec - 1e-6)
+    return lo < hi
+
+
+def last_textful_at_or_before(
+    textful: Sequence[float] | None, start_sec: float, limit_sec: float,
+) -> float | None:
+    """[v3.23.672] Mốc khung có chữ cuối cùng trong ``[start_sec, limit_sec)`` (bỏ phần đệm cuối)."""
+    if not textful:
+        return None
+    idx = bisect.bisect_left(textful, limit_sec - 1e-6) - 1
+    if idx >= 0 and textful[idx] >= start_sec - 1e-6:
+        return textful[idx]
+    return None
+
+
+def _is_fade_residue(text_a: str, text_b: str, span_a: float, span_b: float) -> bool:
+    """[v3.23.672] Mảnh chữ hiện/tắt dần: chênh đúng 1 ký tự ở mép, khối ngắn < 0,5s.
+
+    "他就是掌门" rồi "他就是掌" 0,4s khi chữ mờ dần là MỘT câu; "舒服吗" rồi "舒服" (mỗi câu 1s)
+    là hai câu thật.
+    """
+    a, b = _normalize_for_variant(text_a), _normalize_for_variant(text_b)
+    if abs(len(a) - len(b)) != 1:
+        return False
+    short, long_, short_span = (a, b, span_a) if len(a) < len(b) else (b, a, span_b)
+    return (
+        (long_.startswith(short) or long_.endswith(short))
+        and short_span < _FADE_RESIDUE_MAX_SEC
+    )
+
+
+def is_stable_distinct_pair(
+    text_before: str, text_after: str,
+    span_before_sec: float, span_after_sec: float,
+    frames_before: int, frames_after: int,
+) -> bool:
+    """[v3.23.672] Hai câu LIỀN NHAU, mỗi câu ổn định trên màn hình, là hai câu thật — không gộp.
+
+    Dùng chung tiêu chí với :func:`split_stable_variant_groups` (ranh giới
+    :func:`_should_split_boundary`) cho các pass gộp liền kề. Ca thật (tập 5 phim mẫu): "师叔"
+    (0,76s) rồi ngay "哎呦师叔" (0,88s), không có khung trống ở giữa — câu ngắn nằm trong câu dài
+    nên điểm giống nhau cao, và trước đây chỉ cặp chênh ĐÚNG MỘT ký tự mới được giữ riêng.
+    """
+    return (
+        span_before_sec >= _VARIANT_MIN_SPAN_SEC and span_after_sec >= _VARIANT_MIN_SPAN_SEC
+        and frames_before >= _VARIANT_MIN_FRAMES and frames_after >= _VARIANT_MIN_FRAMES
+        # Như pass tách: khối 1 chữ ("我" → "我只是") giữ hành vi cũ (tuỳ chọn gộp hiện dần).
+        and len(_normalize_for_variant(text_before)) >= 2
+        and len(_normalize_for_variant(text_after)) >= 2
+        and not _is_fade_residue(text_before, text_after, span_before_sec, span_after_sec)
+        and _should_split_boundary(text_before, text_after, span_before_sec, span_after_sec)
+    )
+
+
+def _majority_text(part: Sequence[tuple[float, str]]) -> str:
+    counts = Counter(_normalize_for_variant(text) for _ts, text in part)
+    key = counts.most_common(1)[0][0]
+    return next(text for _ts, text in part if _normalize_for_variant(text) == key)
+
+
+def _is_voted_variant(voted: str, majority: str) -> bool:
+    """[v3.23.676] Chữ đã bầu của group là bản (đã sửa) của chính câu đa số: cùng độ dài ±1, giống ≥ 60%."""
+    if not voted or not majority:
+        return False
+    a, b = _normalize_for_variant(voted), _normalize_for_variant(majority)
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b) and len(a) <= 2:
+        # Câu ngắn ("师叔", "卑鄙" — ca câu lặp chính): cùng độ dài, khác đúng 1 chữ.
+        return sum(x != y for x, y in zip(a, b, strict=True)) <= 1
+    from difflib import SequenceMatcher
+
+    return SequenceMatcher(None, a, b).ratio() >= 0.6
+
+
+def split_repeat_gap_groups(
+    source_groups: list[FrameGroup], sample_step_sec: float,
+    textful: Sequence[float] | None = None,
+    confirmed_blanks: Sequence[float] | None = None,
+) -> list[FrameGroup]:
+    """[v3.23.672] Tách group gồm HAI lần hiện cùng một câu cách nhau một khoảng trống thật.
+
+    Bộ gom Viterbi chỉ thấy các khung CÓ chữ nên nối liền hai lần "师叔" (tập 2 phim mẫu: 0,72s,
+    trống 3 khung, 0,72s — phụ đề gốc là hai dòng). Chỉ cắt khi: khoảng trống là trống thật
+    (:func:`blank_between` theo ``textful``), :func:`is_repeat_utterance` đúng, và CHỮ đa số hai
+    phía giống nhau. Mỗi phần mang chữ đa số của chính nó; mép ngoài giữ mốc của group (đã nới
+    theo khung bị lọc mềm).
+    """
+    result: list[FrameGroup] = []
+    for group in source_groups:
+        members = sorted(getattr(group, "member_texts", None) or [], key=lambda m: m[0])
+        if len(members) < 2 * _VARIANT_MIN_FRAMES or not textful:
+            result.append(group)
+            continue
+        # Ranh giới các đoạn liên tục (khoảng cách hai khung > 1,5 bước).
+        breaks = [
+            i for i in range(1, len(members))
+            if members[i][0] - members[i - 1][0] > max(sample_step_sec, 1e-6) * 1.5
+        ]
+        if not breaks:
+            result.append(group)
+            continue
+        cuts: list[int] = []
+        seg_start = 0
+        edges = [*breaks, len(members)]
+        for k, i in enumerate(breaks):
+            before, after = members[seg_start:i], members[i:edges[k + 1]]
+            gap = members[i][0] - members[i - 1][0]
+            if (
+                len(before) >= _VARIANT_MIN_FRAMES and len(after) >= _VARIANT_MIN_FRAMES
+                and blank_between(textful, members[i - 1][0], members[i][0])
+                and is_repeat_utterance(
+                    gap, sample_step_sec,
+                    before[-1][0] - before[0][0], after[-1][0] - after[0][0],
+                    pixel_blank=confirmed_blank_between(confirmed_blanks, members[i - 1][0], members[i][0]),
+                )
+                and _normalize_for_variant(_majority_text(before))
+                == _normalize_for_variant(_majority_text(after))
+            ):
+                cuts.append(i)
+                seg_start = i
+        if not cuts:
+            result.append(group)
+            continue
+        per_frame_confidence = (
+            group.accumulated_confidence / group.total_frames_count
+            if group.total_frames_count > 0 else 0.0
+        )
+        bounds = [0, *cuts, len(members)]
+        # [v3.23.676] Hai phía đã cùng chữ đa số (đã chuẩn hoá) → dùng chữ đã BẦU của cả group (ROVER/phục hồi)
+        # thay cho chuỗi thô xuất hiện nhiều nhất (có thể là biến thể nhiễu, vd "掌鬥" thay "掌门").
+        voted = group.reconstructed_text or ""
+        for n, (lo, hi) in enumerate(zip(bounds, bounds[1:], strict=False)):
+            part = members[lo:hi]
+            majority = _majority_text(part)
+            text = voted if _is_voted_variant(voted, majority) else majority
+            result.append(FrameGroup(
+                reconstructed_text=text,
+                start_timestamp_sec=group.start_timestamp_sec if n == 0 else part[0][0],
+                end_timestamp_sec=(
+                    group.end_timestamp_sec if hi == len(members) else part[-1][0]
+                ),
+                accumulated_confidence=per_frame_confidence * len(part),
+                total_frames_count=len(part),
+                primary_center_position=group.primary_center_position,
+                aggregated_bounding_box=group.aggregated_bounding_box,
+                member_texts=list(part),
+            ))
+    return result
+
+
 def merge_adjacent_duplicates(
     source_frame_groups: list[FrameGroup],
     config: SubtitleBuilderConfig,
+    textful: Sequence[float] | None = None,
+    confirmed_blanks: Sequence[float] | None = None,
 ) -> list[FrameGroup]:
     """Gộp 2 group liền kề có text tương đồng (sau greedy/Viterbi grouping).
 
@@ -267,13 +552,26 @@ def merge_adjacent_duplicates(
 
         # [Repeat Utterance Guard] Hai group GIỐNG HỆT text, mỗi bên ổn định
         # >= 0.30s, cách nhau >= 0.35s frame trống → câu lặp, KHÔNG gộp.
-        if (
-            normalized_previous_text == normalized_current_text
-            and time_gap_duration_seconds >= 0.35
-            and (previous_frame_group.end_timestamp_sec
-                 - previous_frame_group.start_timestamp_sec) >= 0.30
-            and (current_frame_group.end_timestamp_sec
-                 - current_frame_group.start_timestamp_sec) >= 0.30
+        # [v3.23.672] Khoảng trống ngắn hơn 0,35s vẫn là câu lặp khi đủ khung trống liên tiếp.
+        span_prev = previous_frame_group.end_timestamp_sec - previous_frame_group.start_timestamp_sec
+        span_curr = current_frame_group.end_timestamp_sec - current_frame_group.start_timestamp_sec
+        if normalized_previous_text == normalized_current_text and (
+            # Ngưỡng cũ: trống >= 0,35s, cả hai ổn định >= 0,30s.
+            (time_gap_duration_seconds >= _REPEAT_LONG_GAP_SEC
+             and span_prev >= _VARIANT_MIN_SPAN_SEC and span_curr >= _VARIANT_MIN_SPAN_SEC)
+            # [v3.23.672] Khoảng trống ngắn hơn nhưng đủ khung TRỐNG THẬT liên tiếp.
+            or (
+                blank_between(
+                    textful, previous_frame_group.end_timestamp_sec,
+                    current_frame_group.start_timestamp_sec)
+                and is_repeat_utterance(
+                    time_gap_duration_seconds,
+                    float(getattr(config, "sample_step_sec", 0.0) or 0.0),
+                    span_prev, span_curr,
+                    pixel_blank=confirmed_blank_between(
+                        confirmed_blanks, previous_frame_group.end_timestamp_sec,
+                        current_frame_group.start_timestamp_sec))
+            )
         ):
             successfully_merged_results.append(current_frame_group)
             continue
@@ -486,6 +784,12 @@ def convert_groups_to_events(
             if padded_end_time >= next_group_original_start:
                 padded_end_time = next_group_original_start - minimum_gap_buffer_seconds
 
+        # [v3.23.674] Phần ĐỆM không kéo dòng quá "Thời lượng tối đa" (không cắt thời lượng gốc).
+        padded_end_time = min(
+            padded_end_time,
+            max(original_end_time, padded_start_time + config.max_duration_sec),
+        )
+
         if padded_end_time <= padded_start_time:
             padded_end_time = padded_start_time + minimum_gap_buffer_seconds
 
@@ -529,6 +833,7 @@ def filter_short_duration_events(
         min_duration_sec=config.min_duration_sec,
         similarity_threshold=config.similarity_threshold,
         merge_gap_sec=config.merge_gap_sec,
+        max_duration_sec=config.max_duration_sec,
     )
 
 
@@ -613,6 +918,14 @@ def _two_cjk_min_confidence(event: SubtitleEvent) -> float:
     ):
         return _STABLE_TWO_CJK_MIN_CONFIDENCE
     return _TWO_CJK_MIN_CONFIDENCE
+
+
+#: [v3.23.682] Câu một chữ Hán ≤ 2 khung vẫn giữ nếu hiện ≥ 0,2 s với tin cậy ≥ 0,95.
+_SINGLE_CJK_MIN_EVIDENCE_SEC = 0.2
+_SINGLE_CJK_SHORT_MIN_CONF = 0.95
+#: [v3.23.682] Câu một chữ đứng yên ≥ 0,6 s chỉ cần tin cậy ≥ 0,55.
+_SINGLE_CJK_STABLE_SEC = 0.6
+_SINGLE_CJK_STABLE_MIN_CONF = 0.55
 
 
 def filter_short_text_events(
@@ -708,8 +1021,13 @@ def filter_short_text_events(
                         is_animated_intro_of_next_event = True
 
                 if not is_animated_intro_of_next_event:
-                    if recorded_frame_count <= 2:
-                        # Flicker rác chỉ 1-2 frame: drop bất kể conf.
+                    # [v3.23.682] Theo THỜI GIAN chứ không theo số khung: 2 khung ở bước 0,04 s (0,08 s) là chớp nhiễu,
+                    # nhưng ở bước mặc định 0,12 s là 0,24 s — đúng độ dài câu một chữ thật (我/当/切…, tin cậy 1,0).
+                    evidence_sec = recorded_frame_count * float(getattr(config, "sample_step_sec", 0.0) or 0.0)
+                    if recorded_frame_count <= 2 and not (
+                        evidence_sec >= _SINGLE_CJK_MIN_EVIDENCE_SEC
+                        and recorded_confidence >= _SINGLE_CJK_SHORT_MIN_CONF
+                    ):
                         continue
                     # Adaptive threshold theo độ ổn định (frame_count):
                     #   fc >= 5: cluster ổn định >= 0.4s → 0.72 đủ (bắt
@@ -722,6 +1040,10 @@ def filter_short_text_events(
                     minimum_required_conf_for_single_cjk = (
                         0.72 if recorded_frame_count >= 5 else 0.75
                     )
+                    # [v3.23.682] Chữ đứng yên ≥ 0,6 s: bộ nhận dạng dao động giữa hai cách viết (别/別) nên tin cậy trung
+                    # bình thấp (0,67) dù chữ rõ. Rác hình dạng lạ đã bị lọc theo hình học hộp chữ (box_geometry).
+                    if evidence_sec >= _SINGLE_CJK_STABLE_SEC:
+                        minimum_required_conf_for_single_cjk = _SINGLE_CJK_STABLE_MIN_CONF
                     if recorded_confidence < minimum_required_conf_for_single_cjk:
                         continue
             elif cjk_only_char_count == 2 and non_cjk_residue_count == 0:
@@ -950,9 +1272,34 @@ def _execute_merge_onto_last(
     )
 
 
+def _is_repeat_event_pair(
+    prev: SubtitleEvent, curr: SubtitleEvent, config: SubtitleBuilderConfig,
+    textful: Sequence[float] | None,
+    confirmed_blanks: Sequence[float] | None = None,
+) -> bool:
+    """[v3.23.672] Hai event CÙNG chữ cách nhau khoảng trống thật ngắn (câu lặp).
+
+    Mốc kết thúc của event có thể đã được đệm (``temporal_padding_sec``) tới sát câu sau → lấy
+    mốc khung CÓ chữ cuối cùng của event trước làm điểm kết thúc thật.
+    """
+    if prev.frame_count < _VARIANT_MIN_FRAMES or curr.frame_count < _VARIANT_MIN_FRAMES:
+        return False
+    true_end = last_textful_at_or_before(textful, prev.start_sec, curr.start_sec)
+    if true_end is None:
+        return False
+    return blank_between(textful, true_end, curr.start_sec) and is_repeat_utterance(
+        curr.start_sec - true_end,
+        float(getattr(config, "sample_step_sec", 0.0) or 0.0),
+        true_end - prev.start_sec, curr.duration_sec,
+        pixel_blank=confirmed_blank_between(confirmed_blanks, true_end, curr.start_sec),
+    )
+
+
 def post_merge_duplicates(
     finalized_events: list[SubtitleEvent],
     config: SubtitleBuilderConfig,
+    textful: Sequence[float] | None = None,
+    confirmed_blanks: Sequence[float] | None = None,
 ) -> list[SubtitleEvent]:
     """Pass merge cuối: gộp events còn duplicate sau khi đã filter rác.
 
@@ -1017,11 +1364,14 @@ def post_merge_duplicates(
             # [Repeat Utterance Guard] Text GIỐNG HỆT + cả 2 cluster ổn định
             # (không phải mảnh blink) + phụ đề đã biến mất >= 0.35s giữa chừng
             # → nhân vật nói LẶP câu, giữ 2 event riêng (khớp phụ đề gốc).
-            if (
-                normalized_prev1_text == normalized_curr_text
-                and time_gap_to_previous >= 0.35
-                and immediate_previous_event.frame_count > _BLINK_FC_THRESHOLD
-                and current_candidate_event.frame_count > _BLINK_FC_THRESHOLD
+            if normalized_prev1_text == normalized_curr_text and (
+                (
+                    time_gap_to_previous >= 0.35
+                    and immediate_previous_event.frame_count > _BLINK_FC_THRESHOLD
+                    and current_candidate_event.frame_count > _BLINK_FC_THRESHOLD
+                )
+                or _is_repeat_event_pair(
+                    immediate_previous_event, current_candidate_event, config, textful, confirmed_blanks)
             ):
                 post_merged_result.append(current_candidate_event)
                 continue
@@ -1046,6 +1396,10 @@ def post_merge_duplicates(
             )
             should_treat_as_distinct_pair = (
                 are_both_clusters_substantial and is_short_superset_pattern
+            ) or is_stable_distinct_pair(
+                normalized_prev1_text, normalized_curr_text,
+                immediate_previous_event.duration_sec, current_candidate_event.duration_sec,
+                immediate_previous_event.frame_count, current_candidate_event.frame_count,
             )
 
             if (

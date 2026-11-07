@@ -669,6 +669,51 @@ def _preferred_tone(age_group: str) -> str:
     return ""
 
 
+def _alias_keys(name: str) -> set[str]:
+    """Khoá so khớp của tên vai và từng bí danh (``"楚瑶 / 瑶瑶"`` → {楚瑶 / 瑶瑶, 楚瑶, 瑶瑶})."""
+    from subtitles_extractor.application.services.cue_label_canonicalizer import (
+        _ALIAS_SPLIT_RE,
+        _label_key,
+    )
+
+    parts = [name, *_ALIAS_SPLIT_RE.split(name or "")]
+    return {key for key in (_label_key(part) for part in parts) if key}
+
+
+def match_saved_casting(role_names: list[str], saved: dict[str, str]) -> dict[str, str]:
+    """[v3.23.687] Giọng đã lưu cho từng vai — khớp theo tên HOẶC bí danh chung, không cần trùng nguyên chuỗi.
+
+    Phim bộ: bảng nhân vật mỗi tập ghi tên khác nhau cho cùng người ("楚瑶" tập 1, "楚瑶 / 瑶瑶" tập 5 — đo trên phân
+    tích tập 1–12 phim mẫu), nên khớp nguyên chuỗi bắt người dùng gán lại giọng cho vai cũ. Nhiều mục đã lưu cùng khớp
+    → lấy mục lưu GẦN NHẤT (thứ tự dict = thứ tự lưu). Một mục đã lưu không được gán cho hai vai khác nhau của cùng
+    phim (hai người đối đáp không được chung giọng vì trùng một bí danh mơ hồ) — vai nào trùng nguyên tên được ưu tiên.
+
+    Args:
+        role_names: Tên vai của phim đang mở.
+        saved: ``{tên vai đã lưu: giọng}`` theo thứ tự lưu.
+
+    Returns:
+        ``{tên vai: giọng}`` cho các vai tìm được giọng đã lưu.
+    """
+    out: dict[str, str] = {}
+    used: set[str] = set()
+    for name in role_names:                                   # lượt 1: trùng nguyên tên
+        if name in saved:
+            out[name] = saved[name]
+            used.add(name)
+    saved_keys = [(key, _alias_keys(key)) for key in saved]
+    for name in role_names:                                   # lượt 2: trùng bí danh
+        if name in out:
+            continue
+        keys = _alias_keys(name)
+        matches = [key for key, aliases in saved_keys if key not in used and keys & aliases]
+        if matches:
+            chosen = matches[-1]
+            out[name] = saved[chosen]
+            used.add(chosen)
+    return out
+
+
 __all__ = [
     "AGE_ADULT",
     "AGE_CHILD",
@@ -686,6 +731,7 @@ __all__ = [
     "conversation_weights",
     "default_gender_voices",
     "line_speakers",
+    "match_saved_casting",
     "role_choices",
     "two_voice_casting",
     "two_voice_sides",

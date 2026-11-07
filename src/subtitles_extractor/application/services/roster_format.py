@@ -261,7 +261,11 @@ def _is_single_entry_line(line: str, entry: RosterEntry | None) -> bool:
 
 
 #: Cách ghi giới tính trong ngoặc vuông của bảng nhân vật.
-_GENDER_TRAIT_PREFIXES = ("nam", "nữ", "nu", "male", "female", "không rõ", "chưa rõ")
+#: [v3.23.671] Gồm cả "nhiều người"/"nhóm" (mục giọng đám đông): "[nhiều người]" đứng một mình
+#: trước đây bị đọc thành TUỔI, mất giới của mục nhóm.
+_GENDER_TRAIT_PREFIXES = (
+    "nam", "nữ", "nu", "male", "female", "không rõ", "chưa rõ", "nhiều người", "nhóm",
+)
 
 
 def _is_gender_trait(trait: str) -> bool:

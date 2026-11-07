@@ -7,6 +7,7 @@ bối cảnh/cốt truyện đầy đủ. Người dùng chọn model AI dùng c
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -28,6 +29,7 @@ from subtitles_extractor.application.services.analysis_audit import (
 )
 from subtitles_extractor.application.services.cue_completion import speaker_coverage
 from subtitles_extractor.application.services.cue_label_canonicalizer import (
+    add_cue_speakers_to_roster,
     canonicalize_cue_labels,
 )
 from subtitles_extractor.application.services.name_reading_check import (
@@ -39,7 +41,9 @@ from subtitles_extractor.application.services.native_address import (
     describe_changes,
     nativize_context,
 )
-from subtitles_extractor.application.services.roster_register import normalize_roster_register
+from subtitles_extractor.application.services.roster_register import (
+    normalize_roster_register,
+)
 from subtitles_extractor.application.services.title_reconciliation import (
     describe_title_fix,
     reconcile_context_titles,
@@ -48,11 +52,19 @@ from subtitles_extractor.application.services.visual_cue_serializer import (
     deserialize_visual_cues,
     serialize_visual_cues,
 )
+from subtitles_extractor.application.services.voice_roster import merge_voice_roster
 from subtitles_extractor.application.use_cases.complete_speakers import (
     CompleteSpeakersUseCase,
     GeminiQuotaAwareUseCase,
 )
 from subtitles_extractor.domain.ports.subtitle_translator_port import (
+    ANALYSIS_FIELDS_CONTEXT,
+    ANALYSIS_FIELDS_ROSTER,
+    ANALYSIS_STEP_CONTEXT,
+    ANALYSIS_STEP_SPEAKERS,
+    ANALYSIS_STOP_DAILY_QUOTA,
+    ANALYSIS_STOP_OVERLOAD,
+    ModelOverloadedError,
     SubtitleContextAnalysis,
     SubtitleTranslationError,
     SubtitleTranslatorPort,
@@ -65,6 +77,16 @@ logger = logging.getLogger(__name__)
 CancellationCallback = Callable[[], bool]
 
 
+def _stop_reason_of(error: BaseException) -> str:
+    """[v3.23.667] ``ANALYSIS_STOP_*`` cho lỗi khiến một bước phân tích dừng (rỗng = lỗi khác)."""
+    if isinstance(error, ModelOverloadedError):
+        return ANALYSIS_STOP_OVERLOAD
+    # QuotaExhaustedError thuộc tầng hạ tầng (không import ngược vào tầng ứng dụng).
+    if type(error).__name__ == "QuotaExhaustedError" or "hạn mức ngày" in str(error).lower():
+        return ANALYSIS_STOP_DAILY_QUOTA
+    return ""
+
+
 class AnalyzeSubtitleContextUseCase(GeminiQuotaAwareUseCase):
     """Phân tích ngữ cảnh toàn cục từ toàn bộ phụ đề bằng AI."""
 
@@ -74,6 +96,7 @@ class AnalyzeSubtitleContextUseCase(GeminiQuotaAwareUseCase):
         name_readings: NameReadings | None = None,
         native_address: bool = False,
         audit_ledger: object | None = None,
+        staged: bool = True,
     ) -> None:
         """Khởi tạo use case.
 
@@ -86,7 +109,10 @@ class AnalyzeSubtitleContextUseCase(GeminiQuotaAwareUseCase):
             audit_ledger: [v3.23.631] Sổ "model đã bỏ qua" của bước tự kiểm tra (đối tượng có
                 ``load(film_id) -> dict`` và ``save(film_id, dict)``); ``None`` = không nhớ
                 giữa các lần chạy.
+            staged: [v3.23.667] Phân tích tách bước (nhân vật → tóm tắt/thuật ngữ → người nói).
+                ``False`` = lời gọi gộp cũ.
         """
+        self._staged = bool(staged)
         self._translator = translator
         self._name_readings = name_readings
         self._native_address = bool(native_address)
@@ -112,6 +138,7 @@ class AnalyzeSubtitleContextUseCase(GeminiQuotaAwareUseCase):
         self_audit: bool = True,
         audit_model: str = "",
         audit_fallbacks: Sequence[str] = (),
+        voice_roster_path: str = "",
     ) -> SubtitleContextAnalysis:
         """Gửi toàn bộ phụ đề đến AI, nhận ngôn ngữ gốc + nhân vật + tóm tắt.
 
@@ -137,6 +164,9 @@ class AnalyzeSubtitleContextUseCase(GeminiQuotaAwareUseCase):
                 KHÔNG dùng ``model_name`` vì model phân tích thường chỉ 20 request/ngày).
             audit_fallbacks: [v3.23.640] Model kiểm định dự phòng, thử theo thứ tự khi model kiểm
                 định hết hạn mức ngày / lỗi.
+            voice_roster_path: [v3.23.671] Video/âm thanh cạnh phụ đề → sau khi lập bảng nhân vật
+                bằng chữ, NGHE âm thanh lời thoại (gửi inline, không tải video) để thêm người không
+                tên có giọng riêng (vd nam/nữ đệ tử) — xem :meth:`_listen_voices`.
 
         Returns:
             :class:`SubtitleContextAnalysis` với source_lang, characters, overview,
@@ -172,6 +202,7 @@ class AnalyzeSubtitleContextUseCase(GeminiQuotaAwareUseCase):
                     source_lines, target_lang, model_name, cancel_cb, video_refs, want_cues_inline,
                     prior_context, visual_cues_batch_size, progress_cb, text_cues, text_cues_model,
                     voice_source_path, self_audit, audit_model, audit_fallbacks,
+                    voice_roster_path,
                 )
             except BaseException:
                 release(clear=False)
@@ -182,6 +213,7 @@ class AnalyzeSubtitleContextUseCase(GeminiQuotaAwareUseCase):
                 source_lines, target_lang, model_name, cancel_cb, video_refs, want_cues_inline,
                 prior_context, visual_cues_batch_size, progress_cb, text_cues, text_cues_model,
                 voice_source_path, self_audit, audit_model, audit_fallbacks,
+                voice_roster_path,
             )
         char_preview = result.characters[:80] + "…" if len(result.characters) > 80 else result.characters
         logger.info(
@@ -208,8 +240,20 @@ class AnalyzeSubtitleContextUseCase(GeminiQuotaAwareUseCase):
         self_audit: bool,
         audit_model: str,
         audit_fallbacks: Sequence[str],
+        voice_roster_path: str = "",
     ) -> SubtitleContextAnalysis:
         """[v3.23.643] Phân tích + hoàn thiện người nói + tự kiểm tra (tách ra để bọc giữ tiến độ)."""
+        if self._supports_staged_analysis():
+            result = self._analyze_staged(
+                source_lines, target_lang, model_name, cancel_cb, video_refs, want_cues_inline,
+                prior_context, visual_cues_batch_size, progress_cb, text_cues, text_cues_model,
+                voice_source_path, voice_roster_path,
+            )
+            if self_audit:
+                result = self.refine(
+                    result, source_lines, target_lang, audit_model or DEFAULT_AUDIT_MODEL,
+                    cancel_cb, fallback_models=audit_fallbacks)
+            return result
         result = self._translator.analyze_global_context(
             source_lines=source_lines,
             target_lang=target_lang,
@@ -237,6 +281,195 @@ class AnalyzeSubtitleContextUseCase(GeminiQuotaAwareUseCase):
                 result, source_lines, target_lang, audit_model or DEFAULT_AUDIT_MODEL,
                 cancel_cb, fallback_models=audit_fallbacks)
         return result
+
+    def _supports_staged_analysis(self) -> bool:
+        """[v3.23.667] Bộ dịch có hỗ trợ phân tích tách bước (tham số ``fields``) không."""
+        analyze = getattr(self._translator, "analyze_global_context", None)
+        if analyze is None or not self._staged:
+            return False
+        try:
+            return "fields" in inspect.signature(analyze).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _analyze_staged(
+        self,
+        source_lines: list[TranslationLine],
+        target_lang: str,
+        model_name: str,
+        cancel_cb: CancellationCallback | None,
+        video_refs: list | None,
+        want_video_cues: bool,
+        prior_context: str,
+        visual_cues_batch_size: int,
+        progress_cb: Callable[[float, str], None] | None,
+        text_cues: bool,
+        text_cues_model: str,
+        voice_source_path: str,
+        voice_roster_path: str = "",
+    ) -> SubtitleContextAnalysis:
+        """[v3.23.667] Phân tích TÁCH BƯỚC: nhân vật → tóm tắt + thuật ngữ → người nói.
+
+        Lời gọi gộp cũ đòi cùng lúc ngôn ngữ, nhân vật, tóm tắt, thuật ngữ VÀ người nói cho từng
+        dòng kèm video. Đo 54 lượt trên tập 1-3 phim mẫu (gemini-3.5-flash-lite, chấm theo đáp
+        án soát tay): bảng nhân vật + xưng hô 73% → 84% khi lập riêng bằng chữ, quy tắc xưng hô
+        38% → 62%; người nói 84% → 85%; video đưa vào khâu chữ còn làm kém đi (71%) và tốn gấp
+        đôi token. Hai bước đầu chỉ dùng CHỮ; chỉ bước người nói cần video.
+        """
+        def _report(fraction: float, label: str) -> None:
+            if progress_cb is not None:
+                progress_cb(fraction, label)
+
+        _report(0.0, "Lập bảng nhân vật")
+        roster = self._translator.analyze_global_context(
+            source_lines=source_lines, target_lang=target_lang, model_name=model_name,
+            cancel_cb=cancel_cb, prior_context=prior_context, fields=ANALYSIS_FIELDS_ROSTER,
+        )
+        roster = self._normalize_context(roster)
+        if voice_roster_path and not want_video_cues:
+            _report(0.2, "Nghe giọng nói bổ sung nhân vật")
+            roster = self._listen_voices(
+                roster, source_lines, target_lang, model_name, voice_roster_path, cancel_cb)
+        _report(0.3, "Tóm tắt bối cảnh & thuật ngữ")
+        try:
+            context = self._translator.analyze_global_context(
+                source_lines=source_lines, target_lang=target_lang, model_name=model_name,
+                cancel_cb=cancel_cb, prior_context=prior_context, fields=ANALYSIS_FIELDS_CONTEXT,
+                pinned_characters=roster.characters,
+            )
+        except TranslationCancelledError:
+            raise
+        except (SubtitleTranslationError, RuntimeError) as exc:
+            # Bảng nhân vật đã trả tiền xong — giữ lại, báo bước thiếu thay vì bỏ cả lượt.
+            logger.warning("Bước tóm tắt & thuật ngữ thất bại — giữ bảng nhân vật: %s", exc)
+            context = SubtitleContextAnalysis(
+                source_lang=roster.source_lang, stop_reason=_stop_reason_of(exc),
+                incomplete_steps=(ANALYSIS_STEP_CONTEXT,),
+            )
+        result = replace(
+            context,
+            characters=roster.characters,
+            source_lang=context.source_lang or roster.source_lang,
+        )
+        result = self._normalize_context(result)
+        if result.incomplete_steps:
+            # Dừng sớm (hạn mức/quá tải): không đốt thêm lượt cho bước người nói.
+            missing = (*result.incomplete_steps, ANALYSIS_STEP_SPEAKERS) if (
+                want_video_cues or text_cues) else result.incomplete_steps
+            return replace(result, incomplete_steps=missing)
+        if want_video_cues and video_refs:
+            result = self._scan_video_speakers(
+                result, source_lines, target_lang, model_name, list(video_refs),
+                visual_cues_batch_size, cancel_cb, progress_cb,
+            )
+            result = self._complete_speakers(
+                result, source_lines, target_lang, model_name, video_refs,
+                visual_cues_batch_size, cancel_cb, progress_cb,
+            )
+        elif text_cues and not result.visual_cues:
+            result = self._label_speakers_from_text(
+                result, source_lines, target_lang, text_cues_model or model_name,
+                model_name, cancel_cb, progress_cb, voice_source_path,
+            )
+        return self._adopt_new_speakers(result)
+
+    def _listen_voices(
+        self,
+        roster: SubtitleContextAnalysis,
+        source_lines: list[TranslationLine],
+        target_lang: str,
+        model_name: str,
+        voice_path: str,
+        cancel_cb: CancellationCallback | None,
+    ) -> SubtitleContextAnalysis:
+        """[v3.23.671] Bước NGHE GIỌNG: thêm người không tên có giọng riêng vào bảng nhân vật.
+
+        Đo tập 1-6 phim mẫu (gemini-3.5-flash-lite, 3 lượt): cảnh đệ tử chế giễu ở tập 1 có một
+        nam đệ tử, một nữ đệ tử và giọng phụ hoạ; bảng lập bằng chữ có nữ đệ tử 0/3 lượt, sau
+        bước này 3/3, không thêm sai ai ở tập 2-6. Chỉ THÊM (không đổi tên/giới người đã có);
+        lỗi bất kỳ (trừ huỷ) giữ nguyên bảng.
+        """
+        listen = getattr(self._translator, "listen_roster_voices", None)
+        if listen is None or not roster.characters.strip():
+            return roster
+        try:
+            patch = listen(
+                source_lines, target_lang, model_name, roster.characters, voice_path,
+                roster.source_lang or "", cancel_cb,
+            )
+        except TranslationCancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — [v3.23.676] bước TUỲ CHỌN: mọi lỗi (OSError/ValueError khi tách âm
+            # thanh, JSON hỏng…) chỉ làm mất phần bổ sung, không được làm hỏng cả bước phân tích ngữ cảnh.
+            logger.warning("Bước nghe giọng thất bại — giữ bảng nhân vật lập bằng chữ: %s", exc)
+            return roster
+        source_text = "\n".join(
+            str(getattr(ln, "original_text", None) or getattr(ln, "text", "") or "")
+            for ln in source_lines)
+        characters, added = merge_voice_roster(roster.characters, patch, source_text)
+        if not added:
+            return roster
+        logger.info("Nghe giọng: thêm %d người có giọng riêng: %s.", len(added), ", ".join(added))
+        return self._normalize_context(replace(roster, characters=characters))
+
+    def _scan_video_speakers(
+        self,
+        result: SubtitleContextAnalysis,
+        source_lines: list[TranslationLine],
+        target_lang: str,
+        model_name: str,
+        video_refs: list,
+        batch_size: int,
+        cancel_cb: CancellationCallback | None,
+        progress_cb: Callable[[float, str], None] | None,
+    ) -> SubtitleContextAnalysis:
+        """[v3.23.667] Bước 3 khi có video: nhận diện người nói/người nghe với bảng nhân vật đã chốt.
+
+        Lỗi (trừ huỷ) không làm mất hai bước đầu: kết quả trả về không có cues, như phân tích
+        không video.
+        """
+        scan = getattr(self._translator, "analyze_visual_cues", None)
+        if scan is None:
+            return result
+        try:
+            cues = scan(
+                source_lines, target_lang, model_name=model_name, video_refs=video_refs,
+                batch_size=batch_size, cancel_cb=cancel_cb, characters=result.characters,
+                progress_cb=(lambda p: progress_cb(0.6 + 0.4 * p, "Nhận diện người nói từ video"))
+                if progress_cb is not None else None,
+            )
+        except TranslationCancelledError:
+            raise
+        except (SubtitleTranslationError, RuntimeError) as exc:
+            # [v3.23.667] Gồm cả hết hạn mức ngày (QuotaExhaustedError là RuntimeError): giữ hai
+            # bước đầu + các lô người nói đã quét xong, báo bước thiếu cho giao diện.
+            logger.warning("Nhận diện người nói từ video thất bại — giữ nhân vật/tóm tắt: %s", exc)
+            partial = list(getattr(exc, "partial_cues", None) or [])
+            result = replace(result, stop_reason=_stop_reason_of(exc),
+                             incomplete_steps=(*result.incomplete_steps, ANALYSIS_STEP_SPEAKERS))
+            if not partial:
+                return result
+            cues = partial
+        if not cues:
+            return result
+        cues = canonicalize_cue_labels(cues, result.characters or "")
+        return replace(result, visual_cues=serialize_visual_cues(cues))
+
+    @staticmethod
+    def _adopt_new_speakers(result: SubtitleContextAnalysis) -> SubtitleContextAnalysis:
+        """[v3.23.667] Người nói mới do bước người nói tìm ra → thêm vào bảng nhân vật."""
+        if not result.visual_cues:
+            return result
+        characters, added = add_cue_speakers_to_roster(
+            result.characters or "", deserialize_visual_cues(result.visual_cues)
+        )
+        if not added:
+            return result
+        logger.info(
+            "Bước người nói tìm thêm %d người chưa có trong bảng nhân vật: %s.",
+            len(added), ", ".join(added),
+        )
+        return replace(result, characters=characters)
 
     def _normalize_context(self, result: SubtitleContextAnalysis) -> SubtitleContextAnalysis:
         """Sửa tất định kết quả phân tích: phiên âm tên, chức danh, xưng hô thuần Việt.

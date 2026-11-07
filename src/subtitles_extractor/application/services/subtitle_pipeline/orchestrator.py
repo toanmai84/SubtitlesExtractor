@@ -30,6 +30,7 @@ Thứ tự pipeline:
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 import re
 from collections.abc import Sequence
 from functools import lru_cache
@@ -37,8 +38,16 @@ from functools import lru_cache
 from subtitles_extractor.application.dtos.extract_subtitles_dto import (
     SubtitleBuilderConfig,
 )
+from subtitles_extractor.application.services.subtitle_pipeline.boundary_refinement import (
+    pixel_confirmed_blanks,
+    refine_event_boundaries,
+)
 from subtitles_extractor.application.services.subtitle_pipeline.box_filters import (
     pre_filter_garbage_boxes,
+)
+from subtitles_extractor.application.services.subtitle_pipeline.box_geometry import (
+    drop_drifting_events,
+    drop_implausible_boxes,
 )
 from subtitles_extractor.application.services.subtitle_pipeline.event_filters import (
     convert_groups_to_events,
@@ -46,15 +55,17 @@ from subtitles_extractor.application.services.subtitle_pipeline.event_filters im
     extend_group_timing_from_soft_drops,
     filter_echo_trail_events,
     filter_echo_trail_groups,
-    split_stable_variant_groups,
     filter_short_duration_events,
     filter_short_text_events,
     frame_display_hold,
     merge_adjacent_duplicates,
     post_merge_duplicates,
     reindex_events,
+    split_repeat_gap_groups,
+    split_stable_variant_groups,
     strip_latin_watermark_prefix_from_cjk_events,
     strip_persistent_watermark_lines,
+    textful_timestamps,
 )
 from subtitles_extractor.application.services.subtitle_pipeline.frame_group import (
     FrameGroup,
@@ -68,17 +79,22 @@ from subtitles_extractor.application.services.subtitle_pipeline.spatial_filters 
     filter_cross_frame_spatial_outliers,
     filter_noise_by_confidence,
 )
+from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
+    centering_reference,
+    collect_restored_texts,
+)
 from subtitles_extractor.application.services.subtitle_pipeline.voting import (
     clear_frame_build_cache,
     prewarm_frame_cache,
 )
 from subtitles_extractor.domain.entities.ocr_frame_result import OcrFrameResult
-from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
-    centering_reference,
-    collect_restored_texts,
-)
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
-from subtitles_extractor.domain.value_objects.roi import Roi, TextAlignment, TextOrientation
+from subtitles_extractor.domain.value_objects.boundary_track import BoundaryTrack
+from subtitles_extractor.domain.value_objects.roi import (
+    Roi,
+    TextAlignment,
+    TextOrientation,
+)
 
 # Số vòng lặp tối đa cho echo trail filter (hội tụ thường <= 2 vòng).
 _ECHO_TRAIL_MAX_ITERATIONS: int = 3
@@ -235,12 +251,14 @@ class SubtitleBuilder:
         self,
         frame_results: Sequence[OcrFrameResult],
         roi: Roi | None = None,
+        boundary_track: BoundaryTrack | None = None,
     ) -> list[SubtitleEvent]:
         """Dựng danh sách :class:`SubtitleEvent` từ chuỗi kết quả OCR.
 
         Args:
             frame_results: Chuỗi frame OCR (sẽ được sort theo timestamp).
             roi: ROI căn lề + kích thước (None = bỏ qua spatial filter).
+            boundary_track: [v3.23.680] Dải ranh giới của lượt giải mã → đặt mốc câu đúng khung (None = như cũ).
 
         Returns:
             Danh sách :class:`SubtitleEvent` đã hoàn chỉnh, index 1-based.
@@ -250,6 +268,11 @@ class SubtitleBuilder:
 
         # ── Stage 1: Box-level OCR garbage filter ──
         purified_frames = pre_filter_garbage_boxes(frame_results)
+        # [v3.23.682] Hộp sai hình dạng so với cỡ chữ phụ đề của chính phim (vật trong cảnh bị đọc thành chữ).
+        if roi is None or roi.orientation != TextOrientation.VERTICAL:
+            purified_frames, dropped_boxes = drop_implausible_boxes(purified_frames)
+            if dropped_boxes:
+                logger.info("Bỏ %d hộp chữ sai hình dạng so với cỡ chữ phụ đề (vật trong cảnh).", dropped_boxes)
         if not purified_frames:
             return []
 
@@ -320,7 +343,12 @@ class SubtitleBuilder:
                 grouped_frames = group_using_greedy(confident_frames, self._config)
 
             # ── Stage 6: Merge group liền kề ──
-            merged_groups = merge_adjacent_duplicates(grouped_frames, self._config)
+            # [v3.23.672] Mốc các khung OCR CÓ chữ (trước mọi bộ lọc): bằng chứng "trống thật"
+            # cho quy tắc câu lặp — khung bị lọc vì mờ/lệch không tính là trống.
+            textful = textful_timestamps(frame_results)
+            # [v3.23.683] Khung mẫu mà điểm ảnh xác nhận trống chữ → câu lặp cách nhau 1 khung OCR trống vẫn tách được.
+            confirmed_blanks = pixel_confirmed_blanks(boundary_track)
+            merged_groups = merge_adjacent_duplicates(grouped_frames, self._config, textful, confirmed_blanks)
 
             # ── Stage 6.5: Phục hồi timing biên từ soft-drop timestamps ──
             # Các stage 2+3 loại bỏ frame có nội dung nhưng kém chất lượng
@@ -345,13 +373,17 @@ class SubtitleBuilder:
             # ── Stage 7.5: Tách group chứa nhiều khối text ổn định ──
             # (progressive utterance bị merge nhầm, vd ``舒服吗`` → ``舒服``).
             merged_groups = split_stable_variant_groups(merged_groups)
+            # [v3.23.672] Câu lặp cách nhau khoảng trống ngắn (Viterbi nối qua khung trống).
+            merged_groups = split_repeat_gap_groups(
+                merged_groups, float(self._config.sample_step_sec or 0.0), textful, confirmed_blanks,
+            )
 
             # ── Stage 8-12: Group → Event và các filter cuối ──
             subtitle_events = convert_groups_to_events(merged_groups, self._config)
             subtitle_events = filter_short_duration_events(
                 subtitle_events, self._config
             )
-            subtitle_events = post_merge_duplicates(subtitle_events, self._config)
+            subtitle_events = post_merge_duplicates(subtitle_events, self._config, textful, confirmed_blanks)
             subtitle_events = filter_short_text_events(subtitle_events, self._config)
             subtitle_events = filter_echo_trail_events(subtitle_events, self._config)
 
@@ -367,7 +399,17 @@ class SubtitleBuilder:
             from subtitles_extractor.application.services.subtitle_pipeline.event_refinement import (
                 refine_final_events,
             )
-            subtitle_events = refine_final_events(subtitle_events)
+            subtitle_events = refine_final_events(
+                subtitle_events, float(self._config.sample_step_sec or 0.0),
+            )
+            # [v3.23.685] Chữ phụ đề đứng yên; hộp chữ trôi ngang đều qua khung là vật trong cảnh ("00" trên đai lưng).
+            if roi is None or roi.orientation != TextOrientation.VERTICAL:
+                subtitle_events, drifting = drop_drifting_events(
+                    subtitle_events, sorted(frame_results, key=lambda f: f.timestamp_sec),
+                    float(self._config.sample_step_sec or 0.0),
+                )
+                if drifting:
+                    logger.info("Bỏ %d câu có hộp chữ trôi theo cảnh (không phải phụ đề).", drifting)
 
             # ── Stage 13d': [v3.23.654] Gộp phụ đề "hiện dần" (tuỳ chọn) ──
             if getattr(self._config, "merge_progressive", False):
@@ -385,8 +427,19 @@ class SubtitleBuilder:
                 subtitle_events,
                 frame_display_hold([frame.timestamp_sec for frame in frame_results]),
             )
+            # ── Stage 13f: [v3.23.680] Mốc đúng khung từ dải ranh giới (khung không OCR) ──
+            if boundary_track is not None:
+                subtitle_events = refine_event_boundaries(subtitle_events, boundary_track)
 
             mark_restored_events(subtitle_events, restored_texts)
+
+            # ── Stage 13g: [v3.23.682] Phim giản thể: chữ phồn lẻ tẻ do OCR đọc lệch → giản thể ──
+            from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
+                unify_minority_traditional,
+            )
+
+            for position, text in unify_minority_traditional([e.text for e in subtitle_events]).items():
+                subtitle_events[position] = replace(subtitle_events[position], text=text)
 
             # ── Stage 14: Reindex ──
             return reindex_events(subtitle_events)

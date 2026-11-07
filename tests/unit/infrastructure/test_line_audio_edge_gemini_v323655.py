@@ -97,7 +97,7 @@ def test_gemini_standard_keeps_line_audio(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(adapter, "_standard_speech_config", lambda *a, **k: None)
     monkeypatch.setattr(
         adapter, "_standard_with_retry",
-        lambda client, model, text, config, request, cancel_cb, available_s=0.0: _tone(text),
+        lambda client, model, text, config, request, cancel_cb, available_s=0.0, **_kw: _tone(text),
     )
     out = tmp_path / "ep.tts.wav"
     results = adapter.generate(_request(tmp_path, speaker="Aoede"), out)

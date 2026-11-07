@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import math
 import os
 import random
+import re
 from subtitles_extractor.infrastructure.torch_import_blocker import without_torch_block
 from subtitles_extractor.infrastructure.process.hidden_process import no_window_kwargs
 import tempfile
@@ -496,6 +498,23 @@ def completed_task_results(outcomes: Iterable[object], stage: str) -> list[Any]:
             continue
         completed.append(outcome)
     return completed
+
+
+
+#: [v3.23.673] Lý do lỗi edge-tts của CHÍNH câu đang đọc (mỗi task asyncio một bản — nhiều câu
+#: chạy song song không lấy nhầm lý do của nhau).
+_LINE_FAILURE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "edge_line_failure", default=""
+)
+
+
+def _note_edge_failure(reason: str) -> None:
+    """Ghi lý do lỗi edge-tts cho câu hiện tại và cho lượt thử kết nối."""
+    reason = " ".join(str(reason or "").split())
+    # [v3.23.676] Che tên/mật khẩu proxy ("http://user:pass@host") — lý do này hiện trong hộp thoại lỗi và nhật ký.
+    reason = re.sub(r"(?i)\b([a-z][a-z0-9+.-]*://)\S+@", r"\1***@", reason)[:300]
+    _LINE_FAILURE.set(reason)
+    EdgeTTSAdapter._last_failure = reason
 
 
 class EdgeTTSAdapter(SubtitleTTSPort):
@@ -1029,8 +1048,10 @@ class EdgeTTSAdapter(SubtitleTTSPort):
 
         if progress_cb:
             progress_cb(0.01, "Kiểm tra kết nối và sample rate…")
+        _note_edge_failure("")
         probe = self._sync_generate_with_retry("a", voice, request.base_speed, request)
         if probe is None:
+            last = EdgeTTSAdapter._last_failure
             # [v3.23.342] Thông điệp cũ chỉ nói "Kiểm tra mạng" — SAI LỆCH. Log thực tế
             # cho thấy nguyên nhân là Python ngoài thiếu thư viện edge-tts (worker thoát
             # mã 3), mạng hoàn toàn bình thường. Nay nêu CẢ HAI khả năng và cách phân biệt.
@@ -1042,6 +1063,7 @@ class EdgeTTSAdapter(SubtitleTTSPort):
                 "• Không ra được Internet: dịch vụ cần truy cập "
                 "speech.platform.bing.com.\n\n"
                 "Có thể dùng VieNeu-TTS (chạy hoàn toàn offline) để không phụ thuộc mạng."
+                + (f"\n\nLỗi cuối cùng: {last}" if last else "")
             )
         sr = probe[1]
 
@@ -2398,16 +2420,19 @@ class EdgeTTSAdapter(SubtitleTTSPort):
                 if not text.strip():
                     return np.array([], dtype=np.float32), 24000
                 rate = _rate_from_speed(speed)
+                _LINE_FAILURE.set("")
                 audio, sr = await self._async_generate(text, voice, rate)
                 # [v3.23.210] Audio toàn im lặng = thất bại -> retry (đồng bộ VieNeu
                 # v205: lưới len>0 để lọt audio CÓ độ dài nhưng không tiếng -> mất
                 # thoại mà vẫn báo OK).
                 if len(audio) > 0 and not _is_silent_audio(audio):
                     return audio, sr
+                reason = _LINE_FAILURE.get() if len(audio) == 0 else ""
                 logger.warning(
-                    "Edge TTS async lần %d/%d: audio %s cho '%s…'",
+                    "Edge TTS async lần %d/%d: audio %s cho '%s…'%s",
                     attempt + 1, request.retry_count,
                     "rỗng" if len(audio) == 0 else "toàn im lặng", text[:25],
+                    f" — lý do: {reason}" if reason else "",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Edge TTS async lần %d/%d: %s", attempt + 1, request.retry_count, exc)
@@ -2444,6 +2469,8 @@ class EdgeTTSAdapter(SubtitleTTSPort):
     #: [v3.23.342] Đã biết Python ngoài thiếu edge-tts -> khỏi thử subprocess nữa.
     #: Thử lại vô ích tốn ~2 giây mỗi câu; với 55 câu là gần 2 phút.
     _prefer_in_process: bool = False
+    #: [v3.23.673] Lý do lỗi gần nhất của edge-tts (báo cho người dùng khi thử kết nối hỏng).
+    _last_failure: str = ""
 
     @staticmethod
     async def _run_edge_in_process(
@@ -2482,7 +2509,14 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         try:
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
                 mp3_path = handle.name
-            communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+            from subtitles_extractor.infrastructure.tts.edge_tts_subprocess import (
+                resolve_system_proxy,
+            )
+
+            # [v3.23.673] aiohttp không tự đi qua proxy hệ thống — truyền tường minh.
+            communicate = edge_tts.Communicate(
+                text, voice, rate=rate, pitch=pitch, proxy=resolve_system_proxy()
+            )
             # Giới hạn thời gian giống worker: mạng chậm không được treo vô hạn.
             await asyncio.wait_for(communicate.save(mp3_path), timeout=30.0)
             # Tái dùng CHÍNH hàm chuyển đổi của worker để hai đường chạy cho kết quả
@@ -2494,9 +2528,11 @@ class EdgeTTSAdapter(SubtitleTTSPort):
             return bool(_mp3_to_wav(mp3_path, output_path))
         except (TimeoutError, asyncio.TimeoutError):
             logger.warning("Edge TTS (trong tiến trình): quá hạn 30s — bỏ qua câu này.")
+            _note_edge_failure("quá hạn 30 giây khi kết nối dịch vụ đọc")
             return False
         except Exception as exc:  # noqa: BLE001 — lỗi mạng/dịch vụ không được phá TTS
             logger.warning("Edge TTS (trong tiến trình) lỗi: %s", exc)
+            _note_edge_failure(f"{type(exc).__name__}: {exc}")
             return False
         finally:
             if mp3_path:
@@ -2616,11 +2652,17 @@ class EdgeTTSAdapter(SubtitleTTSPort):
             except asyncio.TimeoutError:
                 proc.kill()
                 logger.warning("Edge TTS subprocess quá thời gian (35s) — bỏ dòng.")
+                _note_edge_failure("quá hạn 35 giây khi kết nối dịch vụ đọc")
                 return False
             if proc.returncode != 0:
                 detail = stderr.decode("utf-8", "replace").strip() if stderr else ""
                 logger.debug(
                     "Edge TTS subprocess lỗi (mã %s): %s", proc.returncode, detail
+                )
+                # [v3.23.673] Giữ lý do lỗi để lượt thử kết nối báo đúng nguyên nhân
+                # (trước đây chỉ log DEBUG → người dùng thấy "audio rỗng").
+                _note_edge_failure(
+                    detail.splitlines()[-1] if detail else f"mã thoát {proc.returncode}"
                 )
                 # [v3.23.342] SỬA LỖI THẬT: mã 3 = Python NGOÀI không có thư viện
                 # edge-tts. Nhưng bản đóng gói CÓ gom edge_tts vào bundle, nên chạy
@@ -2646,6 +2688,8 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         self, text: str, voice: str, speed: float, request: TTSRequest
     ) -> tuple[np.ndarray, int] | None:
         for attempt in range(max(1, request.retry_count)):
+            # [v3.23.673] Lý do lỗi tính theo TỪNG lượt — không mang lý do của lượt trước.
+            EdgeTTSAdapter._last_failure = ""
             try:
                 rate = _rate_from_speed(speed)
                 try:
@@ -2663,10 +2707,12 @@ class EdgeTTSAdapter(SubtitleTTSPort):
                         raise
                 if len(audio) > 0 and not _is_silent_audio(audio):
                     return audio, sr
+                reason = EdgeTTSAdapter._last_failure if len(audio) == 0 else ""
                 logger.warning(
-                    "Edge TTS probe lần %d/%d: audio %s cho '%s…'",
+                    "Edge TTS probe lần %d/%d: audio %s cho '%s…'%s",
                     attempt + 1, request.retry_count,
                     "rỗng" if len(audio) == 0 else "toàn im lặng", text[:25],
+                    f" — lý do: {reason}" if reason else "",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Edge TTS probe lần %d/%d: %s", attempt + 1, request.retry_count, exc)

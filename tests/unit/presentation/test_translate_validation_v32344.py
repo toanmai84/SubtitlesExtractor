@@ -26,7 +26,7 @@ def _make_page(app):
 
 def test_empty_api_key_blocks_translation(app) -> None:
     page, calls = _make_page(app)
-    page._api_key_edit.setText("")
+    page._ai_store.set_gemini_keys([])
     page._stage_literal.enable_check.setChecked(True)
     page._on_run_clicked()
     assert calls == []  # không gọi dịch khi thiếu key
@@ -34,7 +34,7 @@ def test_empty_api_key_blocks_translation(app) -> None:
 
 def test_no_stage_blocks_translation(app) -> None:
     page, calls = _make_page(app)
-    page._api_key_edit.setText("FAKE")
+    page._ai_store.set_gemini_keys(["FAKE"])
     for panel in (page._stage_preprocess, page._stage_literal,
                   page._stage_style, page._stage_localize):
         panel.enable_check.setChecked(False)
@@ -44,7 +44,7 @@ def test_no_stage_blocks_translation(app) -> None:
 
 def test_valid_inputs_proceed(app) -> None:
     page, calls = _make_page(app)
-    page._api_key_edit.setText("FAKE")
+    page._ai_store.set_gemini_keys(["FAKE"])
     page._stage_literal.enable_check.setChecked(True)
     page._on_run_clicked()
     assert len(calls) == 1
@@ -53,7 +53,7 @@ def test_valid_inputs_proceed(app) -> None:
 
 def test_video_enabled_without_file_blocks(app) -> None:
     page, calls = _make_page(app)
-    page._api_key_edit.setText("FAKE")
+    page._ai_store.set_gemini_keys(["FAKE"])
     page._stage_literal.enable_check.setChecked(True)
     page._attach_video_check.setChecked(True)
     page._video_stage_literal.setChecked(True)
@@ -64,7 +64,7 @@ def test_video_enabled_without_file_blocks(app) -> None:
 
 def test_video_enabled_with_file_proceeds(app) -> None:
     page, calls = _make_page(app)
-    page._api_key_edit.setText("FAKE")
+    page._ai_store.set_gemini_keys(["FAKE"])
     page._stage_literal.enable_check.setChecked(True)
     page._attach_video_check.setChecked(True)
     page._video_stage_literal.setChecked(True)

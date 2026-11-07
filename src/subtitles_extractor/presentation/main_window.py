@@ -15,7 +15,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QSize, Signal
 from PySide6.QtGui import QCloseEvent
-from subtitles_extractor.presentation.fluent_compat import FluentIcon, FluentWindow, NavigationItemPosition
+from subtitles_extractor.presentation.fluent_compat import FluentWindow, NavigationItemPosition
 
 from subtitles_extractor.application.services.dubbing_cast import DubbingSource
 from subtitles_extractor.composition.container import ApplicationContainer
@@ -64,7 +64,7 @@ def _build_close_warnings(
     if editor_page is not None and getattr(editor_page, "has_unsaved_changes", None):
         try:
             if editor_page.has_unsaved_changes():
-                warnings.append("• " + (translator.translate("mw.warn_unsaved") if translator else "Trang Biên tập có thay đổi CHƯA LƯU"))
+                warnings.append("• " + (translator.translate("mw.warn_unsaved") if translator else "Trang Chỉnh sửa có thay đổi CHƯA LƯU"))
         except (AttributeError, RuntimeError):
             pass
     _labels = (
@@ -93,6 +93,7 @@ class MainWindow(FluentWindow):
         self._current_video_hash = ""
 
         self._setup_window()
+        self._migrate_legacy_ai_settings()
 
         self._extract_page = ExtractPage(container, parent=self)
         self._editor_page = EditorPage(container, parent=self)
@@ -106,6 +107,12 @@ class MainWindow(FluentWindow):
         self._series_page = SeriesPage(self._series_controller, container.translator, parent=self)
         self._log_page = LogPage(container.log_bridge, container.translator, parent=self)
         self._settings_page = SettingsPage(container, parent=self)
+
+        # [v3.23.677] Khoá API ở Cài đặt → "Khoá API và AI"; trang Dịch/Lồng tiếng có nút mở thẳng mục đó.
+        self._translate_page.set_open_settings_callback(self._open_ai_settings)
+        self._tts_page.set_open_settings_callback(self._open_ai_settings)
+        self._settings_page.ai_access_panel.set_quota_status_provider(
+            self._translate_page._keys_quota_status_text)
 
         # Mở lại dự án từ Thư viện → nạp vào quy trình các trang.
         self._projects_page.set_open_callback(self._open_project)
@@ -282,6 +289,25 @@ class MainWindow(FluentWindow):
         if answer == QMessageBox.StandardButton.Yes:
             self.switchTo(self._settings_page)
 
+    def _migrate_legacy_ai_settings(self) -> None:
+        """[v3.23.677] Chuyển key Gemini TTS riêng + "Số lần thử lại" trang Dịch về chỗ mới (một lần)."""
+        from subtitles_extractor.presentation.ai_access_store import (
+            migrate_legacy_ai_settings,
+            shared_ai_access_store,
+        )
+
+        try:
+            service = self._container.settings_service
+        except (AttributeError, RuntimeError):
+            service = None
+        for note in migrate_legacy_ai_settings(shared_ai_access_store(), service):
+            logger.info("Nâng cấu hình cũ: %s.", note)
+
+    def _open_ai_settings(self) -> None:
+        """[v3.23.677] Mở Cài đặt → "Khoá API và AI"."""
+        self.switchTo(self._settings_page)
+        self._settings_page.show_ai_access()
+
     def _switch_to_page_key(self, object_name: str) -> None:
         """Chuyển tới trang theo ``objectName`` (dùng cho nút “Đi tới”).
 
@@ -331,6 +357,14 @@ class MainWindow(FluentWindow):
                 app_instance.setWindowIcon(app_icon)
         else:
             logger.warning("Không tìm thấy icon ứng dụng tại: %s", icon_path)
+        # [v3.23.674] Bảng kiểu chung: nút chính nổi bật, thanh điều hướng chia nhóm.
+        from PySide6.QtWidgets import QApplication as _QApp
+
+        from subtitles_extractor.presentation.theme.app_style import build_app_stylesheet
+
+        _app = _QApp.instance()
+        if _app is not None:
+            _app.setStyleSheet(build_app_stylesheet())
         self.resize(QSize(1280, 820))
         self.setMinimumSize(QSize(960, 640))
         self.showMaximized()
@@ -361,60 +395,37 @@ class MainWindow(FluentWindow):
         )
 
     def _register_pages(self) -> None:
+        # [v3.23.674] Thanh điều hướng chia nhóm: QUY TRÌNH (5 khâu theo thứ tự làm việc) và CÔNG CỤ; mỗi mục một
+        # biểu tượng riêng (trước đây "Trích xuất" và "Xuất bản" cùng một icon ▶, "Chỉnh sửa" và "Cài đặt" cùng icon).
+        t = self._translator.translate
+        workflow = t("nav.section_workflow")
+        tools = t("nav.section_tools")
+        entries = (
+            (self._extract_page, "🎞", "nav.extract", workflow),
+            (self._editor_page, "✏️", "nav.editor", workflow),
+            (self._translate_page, "🌐", "nav.translate", workflow),
+            (self._tts_page, "🎙", "nav.tts", workflow),
+            (self._publish_page, "🎬", "nav.publish", workflow),
+            (self._series_page, "📚", "nav.series", tools),
+            (self._projects_page, "🗂", "nav.library", tools),
+            (self._debug_page, "🔬", "nav.debug", tools),
+        )
+        for page, emoji, key, section in entries:
+            self.addSubInterface(page, None, f"{emoji}  {t(key)}", section=section)
         self.addSubInterface(
-            self._extract_page,
-            FluentIcon.VIDEO,
-            self._translator.translate("nav.extract"),
+            self._log_page, None, f"📜  {t('nav.log')}", position=NavigationItemPosition.BOTTOM,
         )
         self.addSubInterface(
-            self._editor_page,
-            FluentIcon.EDIT,
-            self._translator.translate("nav.editor"),
-        )
-        self.addSubInterface(
-            self._translate_page,
-            FluentIcon.LANGUAGE,
-            self._translator.translate("nav.translate"),
-        )
-        self.addSubInterface(
-            self._tts_page,
-            FluentIcon.MICROPHONE,
-            self._translator.translate("nav.tts"),
-        )
-        self.addSubInterface(
-            self._publish_page,
-            FluentIcon.VIDEO,
-            self._translator.translate("nav.publish"),
-        )
-        self.addSubInterface(
-            self._series_page,
-            FluentIcon.LINK,
-            self._translator.translate("nav.series"),
-        )
-        self.addSubInterface(
-            self._debug_page,
-            FluentIcon.CODE,
-            self._translator.translate("nav.debug"),
-        )
-        self.addSubInterface(
-            self._projects_page,
-            FluentIcon.FOLDER,
-            self._translator.translate("nav.library"),
-        )
-        self.addSubInterface(
-            self._log_page,
-            FluentIcon.HISTORY,
-            self._translator.translate("nav.log"),
-            position=NavigationItemPosition.BOTTOM,
-        )
-        self.addSubInterface(
-            self._settings_page,
-            FluentIcon.SETTING,
-            self._translator.translate("nav.settings"),
+            self._settings_page, None, f"⚙️  {t('nav.settings')}",
             position=NavigationItemPosition.BOTTOM,
         )
 
         self.stackedWidget.currentChanged.connect(self._on_page_changed)
+        # [v3.23.682] "Việc cần duyệt": số dòng nghi ngờ OCR / câu cần nghe lại hiện cạnh tên trang.
+        for page, tip_key in ((self._editor_page, "nav.review_editor_tip"), (self._tts_page, "nav.review_tts_tip")):
+            signal = getattr(page, "review_count_changed", None)
+            if signal is not None:
+                signal.connect(lambda n, p=page, k=tip_key: self.set_nav_badge(p, n, t(k, count=n)))
 
     def _on_page_changed(self, index: int) -> None:
         current_widget = self.stackedWidget.widget(index)

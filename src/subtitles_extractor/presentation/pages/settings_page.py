@@ -25,7 +25,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
     QMessageBox,
@@ -89,18 +88,35 @@ class SettingsPage(QWidget):
         title.setStyleSheet(f"font-size: {_m.FONT_SIZE_HEADING}px; font-weight: 600;")
         root.addWidget(title)
 
-        self._tabs = QTabWidget()
-        self._tabs.addTab(self._build_tab_ocr_hardware(), self._translator.translate("settings.tab_ocr_hw"))
-        self._tabs.addTab(self._build_tab_nlp(), self._translator.translate("settings.tab_nlp"))
-        self._tabs.addTab(self._build_tab_mpv(), self._translator.translate("settings.tab_mpv"))
-        self._tabs.addTab(self._build_tab_roi(), self._translator.translate("settings.tab_roi"))
-        self._tabs.addTab(self._build_tab_threshold(), self._translator.translate("settings.tab_threshold"))
-        self._tabs.addTab(self._build_tab_frame(), self._translator.translate("settings.tab_frame"))
-        self._tabs.addTab(self._build_tab_post(), self._translator.translate("settings.tab_post"))
-        self._tabs.addTab(self._build_tab_preprocess(), self._translator.translate("settings.tab_preprocess"))
-        self._tabs.addTab(self._build_tab_video_translation(), self._translator.translate("settings.tab_video_translation"))
-        self._tabs.addTab(self._build_tab_ui(), self._translator.translate("settings.tab_ui"))
-        self._tabs.addTab(self._build_tab_advanced(), self._translator.translate("settings.tab_advanced"))
+        # [v3.23.674] Danh mục bên trái chia nhóm thay cho 11 tab ngang. Dựng các trang theo THỨ TỰ CŨ (giữ nguyên
+        # phụ thuộc giữa các hàm dựng), chỉ đổi thứ tự hiển thị.
+        from subtitles_extractor.presentation.widgets.category_pages import CategoryPages
+
+        t = self._translator.translate
+        built = {
+            "ocr_hw": self._build_tab_ocr_hardware(),
+            "nlp": self._build_tab_nlp(),
+            "mpv": self._build_tab_mpv(),
+            "roi": self._build_tab_roi(),
+            "threshold": self._build_tab_threshold(),
+            "frame": self._build_tab_frame(),
+            "post": self._build_tab_post(),
+            "preprocess": self._build_tab_preprocess(),
+            "video_translation": self._build_tab_video_translation(),
+            "ui": self._build_tab_ui(),
+            "advanced": self._build_tab_advanced(),
+            # [v3.23.677] Khoá API + nhà cung cấp AI dùng chung (trước nằm ở trang Dịch và trang Lồng tiếng).
+            "ai_access": self._build_tab_ai_access(),
+        }
+        self._tabs = CategoryPages(self)
+        for section, keys in (
+            ("settings.cat_general", ("ai_access", "ui", "video_translation", "nlp")),
+            ("settings.cat_extract", ("ocr_hw", "frame", "roi", "threshold", "post", "preprocess")),
+            ("settings.cat_advanced", ("mpv", "advanced")),
+        ):
+            self._tabs.addSection(t(section))
+            for key in keys:
+                self._tabs.addTab(built[key], t(f"settings.tab_{key}"))
         root.addWidget(self._tabs, stretch=1)
 
         actions = QHBoxLayout()
@@ -122,6 +138,27 @@ class SettingsPage(QWidget):
 
         self._status_label = QLabel("")
         root.addWidget(self._status_label)
+
+    def _build_tab_ai_access(self) -> QWidget:
+        """[v3.23.677] Trang "Khoá API và AI": lưu ngay khi sửa (không qua nút Lưu)."""
+        from subtitles_extractor.presentation.widgets.ai_access_panel import AiAccessPanel
+
+        scroll_widget, scroll_layout, scroll_area = self._create_scroll_container()
+        self._ai_access_panel = AiAccessPanel(self._translator)
+        scroll_layout.addWidget(self._ai_access_panel)
+        scroll_area.setWidget(scroll_widget)
+        return scroll_area
+
+    @property
+    def ai_access_panel(self) -> QWidget:
+        return self._ai_access_panel
+
+    def show_ai_access(self) -> None:
+        """Chọn mục "Khoá API và AI" (MainWindow gọi sau khi chuyển sang trang Cài đặt)."""
+        for index in range(self._tabs.count()):
+            if self._tabs.widget(index) is not None and self._tabs.widget(index).isAncestorOf(self._ai_access_panel):
+                self._tabs.setCurrentIndex(index)
+                return
 
     def _create_scroll_container(self, parent: QWidget | None = None) -> tuple[QWidget, QVBoxLayout, QScrollArea]:
         scroll_area = QScrollArea(parent)
@@ -675,7 +712,10 @@ class SettingsPage(QWidget):
         self._sp_min_dur = _make_double_spin(0.0, 60.0, 0.05, 2, suffix=" s")
         form_algo.addRow(self._translator.translate("settings.rl_min_dur"), self._sp_min_dur)
 
-        self._sp_max_dur = _make_double_spin(0.1, 600.0, 1.0, 2, suffix=" s")
+        self._sp_min_dur.setToolTip(self._translator.translate("settings.tip_min_dur"))
+        # [v3.23.674] Nay có tác dụng thật: trần khi ứng dụng tự kéo dài dòng.
+        self._sp_max_dur = _make_double_spin(0.5, 600.0, 0.5, 1, suffix=" s")
+        self._sp_max_dur.setToolTip(self._translator.translate("settings.tip_max_dur"))
         form_algo.addRow(self._translator.translate("settings.rl_max_dur"), self._sp_max_dur)
 
         self._sp_merge_gap = _make_double_spin(0.0, 10.0, 0.05, 2, suffix=" s")

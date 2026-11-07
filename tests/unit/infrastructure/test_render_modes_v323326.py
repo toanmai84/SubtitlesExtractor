@@ -54,6 +54,7 @@ def _request(
         audio_path=audio,
         subtitle_mode=subtitle_mode,
         audio_mode=audio_mode,
+        background_path=audio,  # [v3.23.678] lồng tiếng sạch cần phần nền (chỉ cần tồn tại)
     )
 
 
@@ -199,6 +200,14 @@ def test_all_combinations_run(
         check=True, capture_output=True,
     )
 
+    # [v3.23.678] Lồng tiếng sạch: phần nền đã tách (ở đây tiếng nhạc giả) là một input nữa.
+    background = tmp_path / "nen.flac"
+    subprocess.run(
+        [_FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "sine=frequency=300:duration=3", "-ac", "2", str(background)],
+        check=True, capture_output=True,
+    )
+
     output = tmp_path / "ra.mkv"
     command = build_render_command(
         _FFMPEG,
@@ -207,6 +216,7 @@ def test_all_combinations_run(
             subtitle_path=subtitle, audio_path=audio,
             subtitle_mode=subtitle_mode, audio_mode=audio_mode,
             video_encoder="libx264",
+            background_path=background if audio_mode is AudioMode.CLEAN_DUB else None,
         ),
     )
     result = subprocess.run(command, capture_output=True, text=True)

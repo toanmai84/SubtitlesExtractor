@@ -230,6 +230,8 @@ def stage_config_signature(stage: TranslationStageConfig, attach_video: bool) ->
             stage.thinking_budget if thinking else 0,
             (stage.thinking_level or "") if thinking else "",
             stage.allow_retime, attach_video,
+            # [v3.23.681] Chỉ thêm khi bật — chữ ký cũ (và bộ nhớ đệm đã lưu) giữ nguyên.
+            *(["edits_only"] if getattr(stage, "edits_only", False) else []),
         ]
     )
 

@@ -19,7 +19,14 @@ from subtitles_extractor.infrastructure.translation.gemini_translation_adapter i
 from subtitles_extractor.infrastructure.translation.model_health import ModelHealth
 
 MODEL = "gemini-3.1-flash-lite"
-PERIOD = GeminiQuotaManager._period_key()
+#: [v3.23.672] Chỗ giữ khoá ngày, thay bằng ngày HIỆN TẠI lúc chạy từng test. Trước đây tính một
+#: lần lúc nạp module: bộ test chạy qua 00:00 giờ Thái Bình Dương (08:00 UTC) thì khoá cũ thành
+#: "hôm qua", mục đếm bị coi là hết hạn và test_bad_count_only_drops_that_entry hỏng ngẫu nhiên.
+PERIOD = "@@PERIOD@@"
+
+
+def _today(text: str) -> str:
+    return text.replace(PERIOD, GeminiQuotaManager._period_key())
 
 
 def _cfg() -> SimpleNamespace:
@@ -45,17 +52,17 @@ class TestCorruptQuotaState:
     ])
     def test_constructor_survives(self, tmp_path: Path, payload: str) -> None:
         path = tmp_path / "q.json"
-        path.write_text(payload, encoding="utf-8")
+        path.write_text(_today(payload), encoding="utf-8")
         manager = GeminiQuotaManager(state_path=path)
         manager.snapshot()
         assert manager.get_remaining(MODEL, key_id="k")["rpd_remaining"] >= 0
 
     def test_bad_count_only_drops_that_entry(self, tmp_path: Path) -> None:
         path = tmp_path / "q.json"
-        path.write_text(json.dumps({
+        path.write_text(_today(json.dumps({
             "bad|m": {"period_key": PERIOD, "count": "abc"},
             "good|m": {"period_key": PERIOD, "count": 7},
-        }), encoding="utf-8")
+        })), encoding="utf-8")
         manager = GeminiQuotaManager(state_path=path)
         assert manager._daily["good|m"]["count"] == 7
         assert "bad|m" not in manager._daily

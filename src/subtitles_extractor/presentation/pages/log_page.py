@@ -35,10 +35,25 @@ logger = logging.getLogger(__name__)
 _LEVEL_ORDER = {
     "DEBUG": 10, "INFO": 20, "SUCCESS": 25, "WARNING": 30, "ERROR": 40, "CRITICAL": 50,
 }
+#: Màu theo cấp độ cho nền TỐI (giữ như cũ).
 _LEVEL_COLOR = {
     "DEBUG": "#888888", "INFO": "#e0e0e0", "SUCCESS": "#4caf50",
     "WARNING": "#ffb300", "ERROR": "#ff5252", "CRITICAL": "#ff1744",
 }
+#: [v3.23.675] Màu cho nền SÁNG. Trước đây luôn dùng bảng nền tối → dòng INFO chữ #e0e0e0 trên nền sáng gần như
+#: vô hình (ảnh chụp bản exe của người dùng). Mọi màu chữ ≥ 4,5:1 trên nền #f5f5f5.
+_LEVEL_COLOR_LIGHT = {
+    "DEBUG": "#5f5f5f", "INFO": "#1f1f1f", "SUCCESS": "#1b6e20",
+    "WARNING": "#8a4b00", "ERROR": "#b3261e", "CRITICAL": "#8c0000",
+}
+#: (màu giờ, màu tên module) theo nền tối / sáng.
+_META_COLOR = {True: ("#8a8a8a", "#569cd6"), False: ("#616161", "#1a5fb4")}
+
+
+def level_palette(dark: bool) -> tuple[dict[str, str], str, str]:
+    """[v3.23.675] Bảng màu dòng nhật ký: ``(màu theo cấp, màu giờ, màu tên module)``."""
+    time_color, name_color = _META_COLOR[bool(dark)]
+    return (_LEVEL_COLOR if dark else _LEVEL_COLOR_LIGHT), time_color, name_color
 
 
 class LogPage(QWidget):
@@ -162,15 +177,18 @@ class LogPage(QWidget):
     def _append_entry(self, entry: LogEntry, refresh: bool) -> None:
         if _LEVEL_ORDER.get(entry.level, 20) < self._min_level:
             return
-        color = _LEVEL_COLOR.get(entry.level, "#e0e0e0")
+        from subtitles_extractor.presentation.fluent_compat import isDarkTheme
+
+        levels, time_color, name_color = level_palette(isDarkTheme())
+        color = levels.get(entry.level, levels["INFO"])
         short_name = entry.name.split(".")[-1] if entry.name else ""
         # [v3.23.614] Thoát ký tự HTML và giữ xuống dòng/khoảng trắng: trước đây mọi thứ
         # sau "<" bị coi là thẻ và biến mất ("khung OCR chớp nhoáng < 0.3 s" mất nửa sau,
         # traceback mất từ "in <module>") và traceback dồn thành một dòng trong app_log.
         line = (
-            f'<span style="color:#666">{escape(entry.time_str)}</span> '
+            f'<span style="color:{time_color}">{escape(entry.time_str)}</span> '
             f'<span style="color:{color};font-weight:600">{escape(entry.level)}</span> '
-            f'<span style="color:#569cd6">{escape(short_name)}</span>: '
+            f'<span style="color:{name_color}">{escape(short_name)}</span>: '
             f'<span style="color:{color};white-space:pre-wrap">'
             f"{escape(entry.message)}</span>"
         )

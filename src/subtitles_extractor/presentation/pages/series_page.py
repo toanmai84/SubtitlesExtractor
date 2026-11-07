@@ -32,6 +32,8 @@ from subtitles_extractor.application.services.series_pipeline import (
 )
 from subtitles_extractor.presentation.view_models.series_pipeline_controller import SeriesPipelineController
 
+from subtitles_extractor.presentation.utils.task_notifier import notify_task_finished
+
 logger = logging.getLogger(__name__)
 
 _SETTINGS_KEY_FOLDER = "series/last_folder"
@@ -72,8 +74,17 @@ class SeriesPage(QWidget):
     # ── giao diện ──────────────────────────────────────────────────────────
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        # [v3.23.674] Tiêu đề trang như các trang khác; phần giải thích thành chú thích nhỏ.
+        from subtitles_extractor.presentation.theme import metrics as _m
+        from subtitles_extractor.presentation.theme.styles import caption_style
+
+        title = QLabel(self._tr("series.title"))
+        title.setStyleSheet(f"font-size: {_m.FONT_SIZE_HEADING}px; font-weight: 600;")
+        layout.addWidget(title)
         intro = QLabel(self._tr("series.intro"))
         intro.setWordWrap(True)
+        intro.setStyleSheet(caption_style())
         layout.addWidget(intro)
 
         top = QHBoxLayout()
@@ -98,6 +109,7 @@ class SeriesPage(QWidget):
         run_row.addWidget(self._cb_stop)
         run_row.addStretch()
         self._btn_run = QPushButton(self._tr("series.btn_run"))
+        self._btn_run.setProperty("primary", True)  # [v3.23.674] nút chính của trang
         self._btn_run.setToolTip(self._tr("series.tip_run"))
         self._btn_run.clicked.connect(self._on_run)
         self._btn_stop = QPushButton(self._tr("series.btn_stop"))
@@ -162,6 +174,7 @@ class SeriesPage(QWidget):
 
     def _on_run_finished(self, message: str) -> None:
         self._lbl_status.setText(message.splitlines()[0] if message else "")
+        notify_task_finished(self, self._tr("series.title"), message.splitlines()[0] if message else "")  # [v3.23.682]
         QMessageBox.information(self, self._tr("series.title"), message)
 
     def _on_running_changed(self, running: bool) -> None:

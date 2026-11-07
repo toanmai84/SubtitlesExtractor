@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "subtitles-extractor"
-version = "3.23.666"
+version = "3.23.689"
 description = "Subtitle Studio — trích xuất, dịch, lồng tiếng và xuất bản phụ đề video (Clean Architecture)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,7 +33,7 @@ dependencies = [
     "paddleocr>=3.7.0",
     # Video / ảnh / âm thanh
     "python-mpv>=1.0",
-    "opencv-python>=4.9",
+    "opencv-contrib-python>=4.9",
     "numpy>=1.24",
     "soundfile>=0.12",
     "Pillow>=10.0",  # giải mã phụ đề ảnh PGS/VobSub

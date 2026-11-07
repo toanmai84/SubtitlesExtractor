@@ -34,6 +34,7 @@ from subtitles_extractor.application.services.dubbing_cast import (
     DubbingSource,
     canonical_voice_id,
     default_gender_voices,
+    match_saved_casting,
     role_choices,
     two_voice_sides,
 )
@@ -433,14 +434,16 @@ class TTSDubbingCoordinator(QObject):
         self._saved_overrides = 0
         if prefer_saved:
             known = {profile.voice_id for profile in catalog}
-            saved = {
+            usable = {
                 name: voice
                 for name, voice in (
                     (name, canonical_voice_id(voice, catalog))
                     for name, voice in self._saved_casting(engine_key).items()
                 )
-                if name in casting and (voice in known or voice == "")
+                if voice in known or voice == ""
             }
+            # [v3.23.687] Khớp cả theo bí danh: tập 5 ghi "楚瑶 / 瑶瑶" vẫn nhận giọng đã chọn cho "楚瑶" ở tập 1.
+            saved = match_saved_casting(list(casting), usable)
             # [v3.23.596] Lựa chọn đã lưu THẮNG phân vai tự động một cách lặng lẽ — lượt
             # thật 10/10/2026: 19 vai nhưng chỉ 2 giọng (nam/nữ) do lựa chọn lưu từ trước,
             # trong khi phân vai tự động cho 19 giọng. Đếm để dòng trạng thái nói ra.

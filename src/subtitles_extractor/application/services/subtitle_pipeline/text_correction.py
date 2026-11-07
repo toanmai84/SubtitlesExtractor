@@ -66,7 +66,92 @@ def correct_hallucination_typos(source_text: str) -> str:
     for wrong_pattern, correct_pattern in OCR_HALLUCINATION_TYPO_MAP.items():
         if wrong_pattern in source_text:
             source_text = source_text.replace(wrong_pattern, correct_pattern)
-    return source_text
+    return restore_bound_words(source_text)
+
+
+#: [v3.23.683] Từ hai chữ "dính liền" (连绵词): chữ được đánh dấu hầu như CHỈ xuất hiện trong từ đó, nên khi OCR đọc đúng
+#: chữ ấy thì chữ kề bên buộc phải là chữ còn lại. Phim nối 86 tập: "觊觎我的女人" đọc thành "凯觎…" ở MỌI khung (tin cậy
+#: 0,96, 2 câu) — bầu chọn giữa các khung không sửa được. Mỗi mục: (từ, chữ trái dính, chữ phải dính). Chỉ đưa vào chữ
+#: thật sự dính (vd 吩 dính nhưng 咐 còn trong 嘱咐 → chỉ chữ trái).
+BOUND_WORDS: tuple[tuple[str, bool, bool], ...] = (
+    ("觊觎", True, True), ("踌躇", True, True), ("忐忑", True, True), ("尴尬", True, True),
+    ("蜻蜓", True, True), ("蝙蝠", True, True), ("蟋蟀", True, True), ("蚯蚓", True, True),
+    ("蜈蚣", True, True), ("蝌蚪", True, True), ("鹦鹉", True, True),
+    ("琵琶", True, True), ("枇杷", True, True), ("琥珀", True, False), ("玳瑁", True, True),
+    ("囫囵", True, True), ("踉跄", True, True), ("蹒跚", True, True), ("徘徊", True, True),
+    ("窈窕", True, True), ("旖旎", True, True), ("婀娜", True, False), ("憧憬", True, True),
+    ("缥缈", True, False), ("氤氲", True, True), ("匍匐", True, True), ("蹉跎", True, True),
+    ("傀儡", True, True), ("魍魉", True, True), ("魑魅", True, False), ("饕餮", True, True),
+    ("麒麟", True, False), ("蟾蜍", False, True), ("吩咐", True, False), ("彷徨", False, True),
+    ("鸳鸯", True, True), ("玫瑰", True, False), ("葡萄", False, True),
+    ("嘈杂", True, False), ("蹂躏", True, True), ("涟漪", False, True), ("龌龊", True, True),
+)
+
+
+def _bound_partners() -> tuple[dict[str, str], dict[str, str]]:
+    right_of: dict[str, str] = {}
+    left_of: dict[str, str] = {}
+    for word, left_bound, right_bound in BOUND_WORDS:
+        if left_bound:
+            right_of[word[0]] = word[1]
+        if right_bound:
+            left_of[word[1]] = word[0]
+    return right_of, left_of
+
+
+_RIGHT_OF, _LEFT_OF = _bound_partners()
+_BOUND_CHARS = frozenset(ch for word, _left, _right in BOUND_WORDS for ch in word)
+
+
+def restore_bound_words(text: str) -> str:
+    """[v3.23.683] Sửa chữ kề một chữ "dính liền" bị OCR đọc nhầm hình ("凯觎" → "觊觎").
+
+    Chỉ thay khi chữ kề là chữ Hán KHÁC (không phải dấu câu / Latin / khoảng trắng — câu có thể bị ngắt dòng), bản
+    thân nó không phải chữ dính của từ nào, và chữ còn lại của từ không đứng ở phía bên kia (đảo thứ tự "尬尴").
+    """
+    if not text or not any(ch in _BOUND_CHARS for ch in text):
+        return text
+    chars = list(text)
+    for i, ch in enumerate(text):
+        prev = text[i - 1] if i > 0 else ""
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        # Chữ kề được đọc từ câu GỐC (không từ bản đang sửa) để một lần sửa không kéo theo lần khác.
+        partner = _RIGHT_OF.get(ch)
+        if partner and nxt and prev != partner and nxt != partner and _replaceable(nxt):
+            chars[i + 1] = partner
+        partner = _LEFT_OF.get(ch)
+        if partner and prev and nxt != partner and prev != partner and _replaceable(prev):
+            chars[i - 1] = partner
+    return "".join(chars)
+
+
+def _replaceable(ch: str) -> bool:
+    """Chữ kề được phép thay: chữ Hán, không phải chữ dính của từ nào (tránh hai luật giành nhau / đảo thứ tự)."""
+    return is_single_cjk_char(ch) and ch not in _BOUND_CHARS
+
+
+#: [v3.23.682] Phim coi là giản thể khi dòng có chữ phồn (trong bảng) ≤ tỉ lệ này so với dòng có chữ giản tương ứng.
+MINORITY_TRADITIONAL_RATIO = 0.02
+#: Cần ít nhất chừng này dòng giản thể mới đủ căn cứ.
+MINORITY_TRADITIONAL_MIN_SIMPLIFIED_LINES = 20
+
+
+def unify_minority_traditional(texts: list[str]) -> dict[int, str]:
+    """[v3.23.682] Phim giản thể mà OCR đọc lẻ tẻ vài chữ ra dạng phồn → đổi về giản. Trả ``{vị trí: chữ mới}``.
+
+    Phim nối 86 tập (3661 câu): 3 câu chứa chữ phồn ("最強的五人", "楚瑶解決了", "更何況") so với 1951 câu chứa chữ
+    giản tương ứng; ảnh trong phim cả 3 đều là giản thể. Khác lần thử v3.7 (đổi vô điều kiện, hỏng phim dùng lẫn
+    phồn/giản): chỉ đổi khi phồn thể là THIỂU SỐ rõ rệt của CHÍNH phim đó; phim phồn thể / dùng lẫn thì giữ nguyên.
+    """
+    traditional = {k for k, v in HAN_TRADITIONAL_TO_SIMPLIFIED.items() if k != v}
+    simplified = {v for k, v in HAN_TRADITIONAL_TO_SIMPLIFIED.items() if k != v}
+    trad_lines = [i for i, text in enumerate(texts) if any(ch in traditional for ch in text)]
+    simp_lines = sum(1 for text in texts if any(ch in simplified for ch in text))
+    if not trad_lines or simp_lines < MINORITY_TRADITIONAL_MIN_SIMPLIFIED_LINES:
+        return {}
+    if len(trad_lines) > MINORITY_TRADITIONAL_RATIO * simp_lines:
+        return {}
+    return {i: normalize_traditional_to_simplified(texts[i]) for i in trad_lines}
 
 
 def clean_edge_noise(text_input: str) -> str:
@@ -468,8 +553,10 @@ __all__ = [
     "apply_yi_suffix_restore",
     "clean_edge_noise",
     "correct_hallucination_typos",
+    "restore_bound_words",
     "is_single_cjk_char",
     "normalize_traditional_to_simplified",
+    "unify_minority_traditional",
     "restore_dropped_space",
     "restore_dropped_yi_prefix",
 ]

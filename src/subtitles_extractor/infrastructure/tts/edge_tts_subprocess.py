@@ -41,6 +41,41 @@ def _eprint(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+#: Máy chủ dịch vụ đọc của Edge (để xét danh sách bỏ qua proxy ``no_proxy``).
+EDGE_TTS_HOST = "speech.platform.bing.com"
+
+
+def resolve_system_proxy() -> str | None:
+    """[v3.23.673] Proxy hệ thống cho kết nối WebSocket của edge-tts.
+
+    edge-tts dùng aiohttp, mà aiohttp KHÔNG tự đọc ``HTTPS_PROXY`` / proxy của Windows: chạy
+    thật sau proxy, mọi câu đều "audio rỗng" (thực chất ``ClientConnectorDNSError`` tới
+    speech.platform.bing.com) rồi báo "kiểm tra mạng" dù trình duyệt vẫn ra mạng bình thường.
+    Lấy proxy như ``urllib`` (biến môi trường; trên Windows cả cài đặt hệ thống), chỉ nhận
+    proxy HTTP (aiohttp không hỗ trợ SOCKS) và tôn trọng ``no_proxy``.
+
+    Returns:
+        URL proxy, hoặc ``None`` khi không có / không dùng được.
+    """
+    import urllib.request
+
+    try:
+        proxies = urllib.request.getproxies()
+        if urllib.request.proxy_bypass(EDGE_TTS_HOST):
+            return None
+    except Exception:  # đọc cài đặt hệ thống lỗi thì đi thẳng như cũ
+        return None
+    for key in ("https", "http", "all"):
+        value = str(proxies.get(key) or "").strip()
+        if not value:
+            continue
+        if "://" not in value:
+            value = f"http://{value}"
+        if value.lower().startswith("http://") or value.lower().startswith("https://"):
+            return value
+    return None
+
+
 async def _synthesize(
     text: str, voice: str, rate: str, output_path: str, pitch: str = "+0Hz"
 ) -> int:
@@ -61,7 +96,9 @@ async def _synthesize(
 
     os.close(mp3_fd)
     try:
-        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+        communicate = edge_tts.Communicate(
+            text, voice, rate=rate, pitch=pitch, proxy=resolve_system_proxy()
+        )
         try:
             # Timeout cứng: WebSocket tới Microsoft có thể treo vô hạn khi mạng lỗi.
             await asyncio.wait_for(communicate.save(mp3_path), timeout=30.0)

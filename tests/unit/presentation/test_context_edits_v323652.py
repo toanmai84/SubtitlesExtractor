@@ -50,7 +50,7 @@ def _make_page(app):
 
 def test_invalid_cues_block_translation(app) -> None:
     page, calls, warnings = _make_page(app)
-    page._api_key_edit.setText("FAKE")
+    page._ai_store.set_gemini_keys(["FAKE"])
     page._stage_literal.enable_check.setChecked(True)
     page._visual_cues_edit.setPlainText('[{"start_ms": 0 "end_ms": 10}]')
     page._on_run_clicked()

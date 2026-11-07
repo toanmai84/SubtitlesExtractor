@@ -55,6 +55,10 @@ from subtitles_extractor.infrastructure.video.bbox_analyzer import (
 
 _COMPOSITE_FRAME_COUNT: int = 8
 _MAX_ITERATIONS_FOR_AUTO_ROI: int = 3000
+#: [v3.23.676] Số khung mẫu MỤC TIÊU trải đều cả phim. Trước đây phim dài lấy mẫu dày 0,5s rồi DỪNG ở 3000 khung — phim
+#: 2,3 giờ chỉ được xét ~25 phút đầu mà vẫn tốn ~1 giờ OCR toàn khung trên CPU (đo: 1,2 s/khung). Độ chính xác vùng
+#: phụ thuộc SỐ CÂU được lấy mẫu (câu dài nhất quyết định bề ngang), không phụ thuộc mật độ: tập 2,5 phút dùng 274 khung.
+_TARGET_AUTO_ROI_SAMPLES: int = 400
 # Cap skip intro/outro tránh skip quá nhiều với video dài.
 _MAX_SKIP_INTRO_OUTRO_SEC: float = 60.0
 # Throttle progress callback: gọi mỗi N frame thay vì every frame.
@@ -237,6 +241,63 @@ class OcrBasedAutoRoiDetector:
             )
         return roi
 
+    def refit_series_roi(
+        self,
+        metadata: VideoMetadata,
+        roi: Roi,
+        batch_size: int = 8,
+        progress_callback: ProgressCallback | None = None,
+        vram_flags: FrameSamplingConfig | None = None,
+        sample_count: int | None = None,
+    ) -> Roi | None:
+        """[v3.23.686] Phim bộ: kiểm ROI của tập trước trên ~24 khung trải đều tập này (thay cho dò vùng đầy đủ).
+
+        Trả ROI (đã nới ngang theo câu dài hơn nếu có) hoặc ``None`` khi không đủ bằng chứng → người gọi dò đầy đủ.
+        """
+        from subtitles_extractor.infrastructure.video.roi_selection import (
+            SERIES_CHECK_SAMPLES,
+            refit_series_roi,
+        )
+
+        count = max(4, sample_count or SERIES_CHECK_SAMPLES)
+        skip = min(metadata.duration_sec * 0.05, _MAX_SKIP_INTRO_OUTRO_SEC)
+        span_sec = max(1.0, metadata.duration_sec - 2 * skip)
+        step_ms = max(200, int(span_sec * 1000 / count))
+        _top_images, raw_boxes = self._sample_and_ocr(
+            metadata, step_ms, batch_size, progress_callback, vram_flags=vram_flags,
+        )
+        refit = refit_series_roi(roi, raw_boxes, metadata.width, metadata.height)
+        logger.info(
+            "Kiểm ROI phim bộ trên {} hộp chữ: {}.", len(raw_boxes),
+            "dùng lại" + (f" (nới thành x={refit.x}, rộng {refit.width})" if refit and refit != roi else "")
+            if refit else "không khớp — dò lại đầy đủ",
+        )
+        return refit
+
+    def detect_series_roi(
+        self,
+        metadata: VideoMetadata,
+        previous_roi: Roi | None,
+        step_ms: int = 1000,
+        batch_size: int = 8,
+        progress_callback: ProgressCallback | None = None,
+        vram_flags: FrameSamplingConfig | None = None,
+    ) -> Roi | None:
+        """[v3.23.686] ROI cho một tập phim bộ: kiểm nhanh ROI tập trước; không khớp → dò đầy đủ (một lượt, một luồng).
+
+        Gộp hai bước vào MỘT tác vụ để trang Trích xuất không có khoảng "rảnh" giữa kiểm và dò lại — hàng đợi hàng loạt
+        bắt đầu trích xuất ngay khi trang hết bận (từng chạy OCR cả khung hình khi ROI còn rỗng).
+        """
+        if previous_roi is not None:
+            refit = self.refit_series_roi(
+                metadata, previous_roi, batch_size, progress_callback, vram_flags=vram_flags,
+            )
+            if refit is not None:
+                return refit
+        return self.detect_primary_subtitle_roi(
+            metadata, step_ms, batch_size, progress_callback, vram_flags=vram_flags,
+        )
+
     def _sample_and_ocr(
         self,
         metadata: VideoMetadata,
@@ -269,6 +330,15 @@ class OcrBasedAutoRoiDetector:
             self._ocr_engine.initialize()
 
         step_sec = step_ms / 1000.0
+        # [v3.23.676] Giãn bước để số khung mẫu ≤ _TARGET_AUTO_ROI_SAMPLES, trải ĐỀU toàn phim.
+        span_sec = max(0.0, metadata.duration_sec - 2 * min(metadata.duration_sec * 0.05, _MAX_SKIP_INTRO_OUTRO_SEC))
+        if span_sec / max(step_sec, 1e-6) > _TARGET_AUTO_ROI_SAMPLES:
+            widened = span_sec / _TARGET_AUTO_ROI_SAMPLES
+            logger.info(
+                "Phim dài {:.0f} phút: lấy mẫu tự dò vùng mỗi {:.1f}s (thay {:.1f}s) — {} khung trải đều cả phim.",
+                metadata.duration_sec / 60, widened, step_sec, _TARGET_AUTO_ROI_SAMPLES,
+            )
+            step_sec = widened
         # Cap skip intro/outro để không skip quá nhiều cho video dài.
         # Ví dụ: video 2h → 5% = 6 phút (quá nhiều) → cap về 60s.
         raw_skip_sec = metadata.duration_sec * 0.05

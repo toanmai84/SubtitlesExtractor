@@ -34,6 +34,14 @@ class TranslationStageKind(Enum):
     """Bản địa hoá: đơn vị đo, xưng hô, thành ngữ, quy ước văn hoá đích."""
 
 
+
+#: [v3.23.667] Phần cần trả của ``analyze_global_context`` (phân tích tách bước).
+ANALYSIS_FIELDS_ALL = "all"
+#: Chỉ ngôn ngữ + bảng nhân vật.
+ANALYSIS_FIELDS_ROSTER = "roster"
+#: Ngôn ngữ + tóm tắt + thuật ngữ, với bảng nhân vật đã chốt ghim vào chỉ dẫn.
+ANALYSIS_FIELDS_CONTEXT = "context"
+
 @dataclass(frozen=True)
 class TranslationStageConfig:
     """Cấu hình bất biến cho một giai đoạn dịch.
@@ -69,6 +77,9 @@ class TranslationStageConfig:
     'medium', hoặc 'high'. Với Gemini 3.x, dùng trường này thay cho thinking_budget
     (không được dùng cả hai). Dịch thuật nên để 'low' — suy nghĩ nhiều dễ phản tác
     dụng."""
+    edits_only: bool = False
+    """[v3.23.681] Chỉ ``STYLE``/``LOCALIZE`` có bản dịch trước: AI chỉ trả các dòng CẦN sửa (dòng không trả = giữ
+    nguyên) thay vì chép lại cả lô — ít token đầu ra, ít "viết lại cho có"."""
 
 
 @dataclass(frozen=True)
@@ -145,6 +156,9 @@ BatchDoneCallback = Callable[[list[TranslationLine]], None]
 #: [v3.23.585] Lý do phân tích dừng khi CHƯA đủ mọi đoạn video.
 ANALYSIS_STOP_OVERLOAD = "overload"
 ANALYSIS_STOP_DAILY_QUOTA = "daily_quota"
+#: [v3.23.667] Bước của phân tích tách bước (xem ``SubtitleContextAnalysis.incomplete_steps``).
+ANALYSIS_STEP_CONTEXT = "context"
+ANALYSIS_STEP_SPEAKERS = "speakers"
 
 
 @dataclass(frozen=True)
@@ -172,6 +186,9 @@ class SubtitleContextAnalysis:
     missing_segments: tuple[int, ...] = ()
     total_segments: int = 0
     stop_reason: str = ""
+    #: [v3.23.667] Bước của phân tích tách bước CHƯA xong (``ANALYSIS_STEP_*``) — các bước trước
+    #: vẫn được giữ; giao diện báo để người dùng chạy tiếp phần thiếu.
+    incomplete_steps: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -339,8 +356,13 @@ class SubtitleTranslatorPort(Protocol):
         video_refs: list[Any] | None = None,
         with_visual_cues: bool = False,
         prior_context: str = "",
+        fields: str = ANALYSIS_FIELDS_ALL,
+        pinned_characters: str = "",
     ) -> SubtitleContextAnalysis:
         """Phân tích **toàn bộ** phụ đề nguồn để trích xuất ngữ cảnh toàn cục.
+
+        [v3.23.667] ``fields`` / ``pinned_characters``: phân tích tách bước (xem hằng số
+        ``ANALYSIS_FIELDS_*``).
 
         Gửi TOÀN BỘ nội dung phụ đề (không lấy mẫu) tới model AI đã chỉ định.
         Một lần gọi duy nhất bao phủ cả 3 mục tiêu:
@@ -422,6 +444,11 @@ class LineCharBudgetProvider(Protocol):
 
 
 __all__ = [
+    "ANALYSIS_STEP_CONTEXT",
+    "ANALYSIS_STEP_SPEAKERS",
+    "ANALYSIS_FIELDS_ALL",
+    "ANALYSIS_FIELDS_CONTEXT",
+    "ANALYSIS_FIELDS_ROSTER",
     "ANALYSIS_STOP_DAILY_QUOTA",
     "ANALYSIS_STOP_OVERLOAD",
     "BatchDoneCallback",

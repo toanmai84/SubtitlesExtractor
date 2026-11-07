@@ -19,11 +19,11 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
     QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QMessageBox, QProgressBar, QScrollArea, QSpinBox,
-    QStackedWidget, QTableWidget, QTextEdit,
+    QTableWidget, QTextEdit,
     QVBoxLayout, QWidget,
 )
 from subtitles_extractor.presentation.fluent_compat import (
-    PrimaryPushButton, PushButton, ToolButton,
+    PrimaryPushButton, PushButton,
 )
 
 from subtitles_extractor.application.services.dubbing_cast import (
@@ -51,6 +51,8 @@ from subtitles_extractor.presentation.theme import metrics as _m
 from subtitles_extractor.presentation.widgets.section_card import SectionCard
 from subtitles_extractor.presentation.widgets.dubbing_cast_panel import DubbingCastPanel
 from subtitles_extractor.presentation.pages.tts_dubbing import TTSDubbingCoordinator
+from subtitles_extractor.presentation.widgets.flow_layout import flow_row
+from subtitles_extractor.presentation.widgets.current_page_stack import CurrentPageStack
 from subtitles_extractor.presentation.pages.tts_line_edits import (
     COLUMN_COUNT as _COLUMN_COUNT,
     TTSLineEditsController,
@@ -60,10 +62,11 @@ from subtitles_extractor.presentation.pages.tts_line_edits import (
     row_head_item,
     selected_positions,
 )
-from subtitles_extractor.presentation.utils.accessibility import set_accessible_name
 from subtitles_extractor.infrastructure.process.hidden_process import (
     no_window_kwargs,
 )
+
+from subtitles_extractor.presentation.utils.task_notifier import notify_task_finished
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +170,8 @@ class TTSPage(QWidget):
 
     # Phát khi tạo TTS xong, mang đường dẫn file WAV — để liên thông lưu dự án.
     tts_completed = Signal(str)
+    #: [v3.23.682] Số dòng cần nghe lại / duyệt (thanh điều hướng hiện "● n" cạnh tên trang).
+    review_count_changed = Signal(int)
     # [v3.23.652] Kết quả dò GPU (chạy ``pip list`` ở luồng nền) gửi về luồng giao diện.
     _gpu_plan_ready = Signal(object)
     # [v3.23.653] Người nói chọn tay quy về câu gốc ``{id cue: vai}`` — cửa sổ chính ghi vào Visual Cues trang Dịch.
@@ -269,7 +274,8 @@ class TTSPage(QWidget):
         col.setContentsMargins(4, 8, 8, 8)
         col.setSpacing(8)
         for w in widgets:
-            col.addWidget(w)
+            # [v3.23.674] Bám đỉnh ô: phần cao thừa (nếu có) nằm dưới cùng, không chen giữa các nhóm.
+            col.addWidget(w, 0, Qt.AlignmentFlag.AlignTop)
         col.addStretch(1)
         scroll.setWidget(holder)
         return scroll
@@ -298,13 +304,13 @@ class TTSPage(QWidget):
                 self._build_engine_selector(),
                 self._build_engine_stack(),
             ),
-            "🎙 Engine & Nguồn",
+            "🎙 Nguồn và Engine",
         )
         self._config_tabs.addTab(
             self._make_config_tab(
                 self._build_common_config(), self._build_output_group()
             ),
-            "🎚 Âm thanh & Xuất",
+            "🎚 Âm thanh và Xuất",
         )
         self._config_tabs.addTab(
             self._make_config_tab(self._build_dubbing_group()),
@@ -412,23 +418,21 @@ class TTSPage(QWidget):
             status_row.addWidget(lbl)
         status_row.addStretch()
         lay.addLayout(status_row)
-        # Install hint
-        hint = QLabel(
-            "  💡 Edge TTS: <code>pip install edge-tts soundfile</code>"
-            " &nbsp;|&nbsp; Gemini TTS: <code>pip install google-genai soundfile</code>"
-            " &nbsp;|&nbsp; VieNeu-TTS: <code>pip install vieneu soundfile</code>"
-        )
-        hint.setTextFormat(Qt.TextFormat.RichText)
-        hint.setStyleSheet(caption_style())
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
+        # [v3.23.674] Gợi ý cài đặt CHỈ cho engine chưa cài (trước đây luôn hiện cả 3 lệnh pip dù đã cài đủ).
+        self._install_hint = QLabel("")
+        self._install_hint.setTextFormat(Qt.TextFormat.RichText)
+        self._install_hint.setStyleSheet(caption_style())
+        self._install_hint.setWordWrap(True)
+        self._install_hint.setVisible(False)
+        lay.addWidget(self._install_hint)
         g.add_layout(lay)
         return g
 
     # ── Engine-specific config panels ─────────────────────────────────────────
 
     def _build_engine_stack(self) -> QWidget:
-        self._engine_stack = QStackedWidget()
+        # [v3.23.674] Khung chỉ cao theo engine ĐANG CHỌN (xem CurrentPageStack).
+        self._engine_stack = CurrentPageStack()
         self._engine_stack.addWidget(self._build_edge_panel())    # idx 0
         self._engine_stack.addWidget(self._build_gemini_panel())  # idx 1
         self._engine_stack.addWidget(self._build_vieneu_panel())  # idx 2
@@ -458,15 +462,10 @@ class TTSPage(QWidget):
         )
         form.addRow(self._translator.translate("tts.tts_concurrency"), self._edge_concurrency)
 
-        info = QLabel(
-            "ℹ️  Tốc độ đọc qua API (server-side) GIỮ PITCH + ngữ điệu tự nhiên,\n"
-            "   chất lượng tốt hơn time-stretch → ưu tiên dùng tới 3.0×.\n"
-            "   Elastic timing: dời câu trong dung sai thay vì nén; tự re-sync ở gap.\n"
-            "   Chống cắt: audio tràn nhẹ thay vì cắt nội dung (bảo toàn 100%).\n"
-            "   Chất lượng wave: RMS đồng đều + fade chống click + soft-limit.\n"
-            "   Tốt nhất: <code>pip install pedalboard</code> (Rubber Band — giữ rõ giọng khi nén mạnh; lưu ý license GPL)."
-        )
-        info.setTextFormat(Qt.TextFormat.RichText)
+        # [v3.23.677] Chú thích bằng lời thường (bản cũ: "Elastic timing", "pip install pedalboard", "Rubber Band",
+        # GPL… dồn thành một đoạn vì xuống dòng "\n" bị bỏ ở chế độ RichText). Chi tiết kỹ thuật chuyển vào tooltip.
+        info = QLabel(self._translator.translate("tts.edge_info"))
+        info.setToolTip(self._translator.translate("tts.edge_info_tip"))
         info.setWordWrap(True)
         info.setStyleSheet(caption_style())
         form.addRow(info)
@@ -474,27 +473,25 @@ class TTSPage(QWidget):
         w.add_layout(form)
         return w
 
+    def _gemini_api_keys(self) -> str:
+        """[v3.23.677] Mọi key Gemini (Cài đặt → Khoá API và AI), nối xuống dòng — adapter tự xoay key."""
+        return "\n".join(self._ai_store.gemini_keys())
+
+    def set_open_settings_callback(self, callback: "Callable[[], None] | None") -> None:
+        """[v3.23.677] MainWindow tiêm hàm mở Cài đặt → "Khoá API và AI"."""
+        self._gemini_key_summary.set_open_settings_callback(callback)
+
     def _build_gemini_panel(self) -> QWidget:
         w = SectionCard(self._translator.translate("tts.tts_sec_gemini"))
         form = QFormLayout()
         form.setSpacing(_m.SPACING_SM)
-        # API Key
-        key_row = QHBoxLayout()
-        self._gemini_key = QLineEdit()
-        self._gemini_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._gemini_key.setPlaceholderText(self._translator.translate("tts.gemini_key_ph"))
-        self._btn_eye = ToolButton()
-        self._btn_eye.setIcon(__import__('subtitles_extractor.presentation.fluent_compat', fromlist=['FluentIcon']).FluentIcon.VIEW.icon())
-        set_accessible_name(self._btn_eye, self._translator.translate("tts.tts_acc_eye"))
-        self._btn_eye.setCheckable(True)
-        self._btn_eye.toggled.connect(
-            lambda on: self._gemini_key.setEchoMode(
-                QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password
-            )
-        )
-        key_row.addWidget(self._gemini_key, 1)
-        key_row.addWidget(self._btn_eye)
-        form.addRow("API Key:", self._wrap(key_row))
+        # [v3.23.677] Key Gemini dùng chung (Cài đặt → Khoá API và AI) thay ô "API Key" riêng của trang này.
+        from subtitles_extractor.presentation.ai_access_store import shared_ai_access_store
+        from subtitles_extractor.presentation.widgets.ai_access_panel import AiAccessSummary
+
+        self._ai_store = shared_ai_access_store()
+        self._gemini_key_summary = AiAccessSummary(self._translator, self._ai_store, gemini_only=True)
+        form.addRow(self._translator.translate("ai.summary_label"), self._gemini_key_summary)
 
         self._gemini_model = QComboBox()
         self._gemini_model.addItems(GEMINI_TTS_MODELS)
@@ -529,6 +526,11 @@ class TTSPage(QWidget):
             "Callirrhoe — thoải mái  |  Achernar — mềm mại  |  Sulafat — ấm áp"
         )
         form.addRow(self._translator.translate("tts.tts_voice"), self._gemini_voice)
+        # [v3.23.688] Cảm xúc từng câu theo nhãn của phân tích ngữ cảnh (Gemini TTS 3.8, trường chỉ dẫn riêng).
+        self._gemini_line_emotion = QCheckBox(self._translator.translate("tts.opt_line_emotion"))
+        self._gemini_line_emotion.setChecked(False)
+        self._gemini_line_emotion.setToolTip(self._translator.translate("tts.opt_line_emotion_tip"))
+        form.addRow(self._gemini_line_emotion)
 
         # Native Audio: style prompt + affective dialog
         self._gemini_native_group = SectionCard(self._translator.translate("tts.tts_sec_native"))
@@ -1151,7 +1153,8 @@ class TTSPage(QWidget):
         self._incremental.setChecked(True)
         self._incremental.setToolTip(self._translator.translate("tts.tip_incremental"))
         lay.addWidget(self._incremental)
-        btn_row = QHBoxLayout()
+        # [v3.23.674] Hàng nút tự xuống dòng (nút chính bị cắt chữ "Tổng hợp tiếng nó…" ở màn hình 1366×768).
+        btn_holder, btn_row = flow_row()
         # [v3.23.331] Tổng hợp cả bộ — mô hình chỉ nạp MỘT LẦN cho toàn bộ hàng đợi,
         # tiết kiệm ~15 giây nạp lại cho mỗi tập.
         self._btn_batch = PushButton(self._translator.translate("tts.btn_batch"))
@@ -1167,10 +1170,10 @@ class TTSPage(QWidget):
         self._btn_gen.clicked.connect(self._on_generate)
         self._btn_can.clicked.connect(self._on_cancel_clicked)
         self._btn_reset.clicked.connect(self._on_reset_defaults)
-        btn_row.addWidget(self._btn_gen, 2); btn_row.addWidget(self._btn_batch, 1)
-        btn_row.addWidget(self._btn_can, 1)
-        btn_row.addWidget(self._btn_reset, 1)
-        lay.addLayout(btn_row)
+        btn_row.addWidget(self._btn_gen); btn_row.addWidget(self._btn_batch)
+        btn_row.addWidget(self._btn_can)
+        btn_row.addWidget(self._btn_reset)
+        lay.addWidget(btn_holder)
         g.add_layout(lay)
         return g
 
@@ -1221,7 +1224,6 @@ class TTSPage(QWidget):
         for c in (3, 4, 5, 6):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         lay.addWidget(self._table, 1)
-        btn_row = QHBoxLayout()
         self._btn_open = PushButton(self._translator.translate("tts.btn_open_folder"))
         self._btn_open.setEnabled(False)
         self._btn_open.clicked.connect(self._on_open_folder)
@@ -1236,9 +1238,6 @@ class TTSPage(QWidget):
             "tốc độ, thời lượng audio, trạng thái, lỗi — để điều tra/debug quá trình TTS."
         )
         self._btn_export.clicked.connect(self._on_export_details)
-        btn_row.addWidget(self._btn_open)
-        btn_row.addWidget(self._btn_open_file)
-        btn_row.addWidget(self._btn_export)
         # [v3.23.450] Nghe lại + TTS lại các dòng ĐANG CHỌN (dùng audio segment per-line).
         self._btn_play_sel = PushButton("▶ Nghe dòng chọn")
         self._btn_play_sel.setEnabled(False)
@@ -1264,17 +1263,6 @@ class TTSPage(QWidget):
         self._btn_clean_line_audio.setEnabled(False)
         self._btn_clean_line_audio.setToolTip(self._translator.translate("tts.tip_clean_line_audio"))
         self._btn_clean_line_audio.clicked.connect(self._on_clean_line_audio)
-        btn_row.addStretch()
-        lay.addLayout(btn_row)
-        # [v3.23.601] Nút theo DÒNG sang hàng riêng: sáu nút một hàng bị bóp còn ~120 px
-        # ở cửa sổ 1500 px ("⚠ Chọn dòng bất thường", "📊 Xuất chi tiết (debug)" bị cắt).
-        line_row = QHBoxLayout()
-        line_row.addWidget(self._btn_play_sel)
-        line_row.addWidget(self._btn_resynth)
-        line_row.addWidget(self._btn_select_abnormal)
-        line_row.addStretch()
-        line_row.addWidget(self._btn_clean_line_audio)
-        lay.addLayout(line_row)
         # [v3.23.598] Sửa tay từng dòng: người nói (giọng) + lời thoại, trước/sau khi TTS.
         self._line_edits = TTSLineEditsController(
             self._table, self._view_model, self._dubbing, self._dubbing_panel,
@@ -1288,7 +1276,16 @@ class TTSPage(QWidget):
             parent=self,
             edits_store=self._make_edits_store(),
         )
-        lay.addLayout(self._line_edits.button_row())
+        self._build_result_actions(lay)
+        self._install_review_shortcuts()
+        # [v3.23.682] Đếm việc cần duyệt sau mỗi thay đổi (gom 0,5 s; bảng vẽ lại người nói chạy trước đó).
+        self._review_timer = QTimer(self)
+        self._review_timer.setSingleShot(True)
+        self._review_timer.setInterval(500)
+        self._review_timer.timeout.connect(lambda: self.review_count_changed.emit(self.review_count()))
+        self._view_model.result_ready.connect(self._schedule_review_count)
+        self._view_model.line_edits_changed.connect(self._schedule_review_count)
+        self._dubbing.line_speakers_changed.connect(self._schedule_review_count)
         # [v3.23.653] Người nói chọn tay → đồng bộ về Visual Cues của trang Dịch (gom 1,5 s sau lần sửa cuối).
         self._speaker_sync_timer = QTimer(self)
         self._speaker_sync_timer.setSingleShot(True)
@@ -1299,6 +1296,49 @@ class TTSPage(QWidget):
         self._dubbing.line_speakers_changed.connect(self._speaker_sync_timer.start)
         g.add_layout(lay)
         return g
+
+    def _build_result_actions(self, lay: QVBoxLayout) -> None:
+        """[v3.23.677] Dưới bảng dòng: 2 hàng nút hay dùng + 3 menu (trước: 22 nút xếp 6 hàng).
+
+        Ảnh chụp 1366×768 bản 3.23.676: 22 nút xám khi chưa có dữ liệu chiếm nửa cột phải. Nút ít dùng (thêm/xoá/
+        gộp/tách dòng, khôi phục, lịch sử, dọn audio, xuất debug…) nay nằm trong menu; mọi nút vẫn là đối tượng cũ.
+        """
+        from subtitles_extractor.presentation.widgets.menu_button import MenuButton
+
+        tr = self._translator.translate
+        le = self._line_edits.action_buttons()
+        line_holder, line_row = flow_row()
+        for button in (self._btn_play_sel, self._btn_resynth, le["speaker"], le["quick_review"],
+                       le["shorten"], le["undo"]):
+            line_row.addWidget(button)
+        self._menu_edit_lines = MenuButton(tr("tts.menu_edit_lines"), [
+            le["add_line"], le["delete_lines"], le["timing"], le["merge"], le["split"], le["redo"],
+        ])
+        # [v3.23.679] AI nghe lại từng câu, TTS lại câu đọc sai (tối đa 2 lượt), chọn sẵn câu còn sai.
+        from subtitles_extractor.presentation.pages.tts_pronunciation import PronunciationController
+
+        self._pronunciation = PronunciationController(self, tr)
+        self._btn_check_pron = PushButton(tr("tts.btn_check_pron"))
+        self._btn_check_pron.setToolTip(tr("tts.btn_check_pron_tip"))
+        self._btn_check_pron.setEnabled(False)
+        self._btn_check_pron.clicked.connect(lambda _checked=False: self._pronunciation.start())
+        self._view_model.result_ready.connect(self._pronunciation.on_result_ready)
+        self._view_model.error_occurred.connect(self._pronunciation.on_run_failed)
+        self._view_model.tts_cancelled.connect(self._pronunciation.on_run_failed)
+        self._menu_select = MenuButton(tr("tts.menu_select"), [
+            self._btn_check_pron, self._btn_select_abnormal, le["review"], le["select_edited"], le["revert"],
+        ])
+        line_row.addWidget(self._menu_edit_lines)
+        line_row.addWidget(self._menu_select)
+        lay.addWidget(line_holder)
+        file_holder, file_row = flow_row()
+        self._menu_more = MenuButton(tr("tts.menu_more"), [
+            le["restore_deleted"], le["restore_original"], le["history"],
+            self._btn_clean_line_audio, self._btn_export,
+        ])
+        for widget in (self._btn_open, self._btn_open_file, self._menu_more):
+            file_row.addWidget(widget)
+        lay.addWidget(file_holder)
 
     def hideEvent(self, event) -> None:  # noqa: N802 — rời trang / đóng app: ghi sửa tay đang chờ
         line_edits = getattr(self, "_line_edits", None)
@@ -1946,7 +1986,7 @@ class TTSPage(QWidget):
 
         # [fix B4] Validate theo engine trước khi start worker
         if engine_id == _ENGINE_GEMINI:
-            if not self._gemini_key.text().strip():
+            if not self._gemini_api_keys():
                 self._show_warning(
                     self._translator.translate("tts.toast_noapikey_t"),
                     self._translator.translate("tts.toast_need_gemini_key"),
@@ -2022,10 +2062,12 @@ class TTSPage(QWidget):
             gemini_temp = temp_val if temp_val >= 0.0 else None
             kwargs.update(language=self._gemini_model.currentText(),
                           speaker=self._gemini_voice.currentText(),
-                          api_key=self._gemini_key.text().strip(),
+                          api_key=self._gemini_api_keys(),
                           style_prompt=self._gemini_style.toPlainText().strip(),
                           affective_dialog=self._gemini_affective.isChecked(),
                           gemini_temperature=gemini_temp)
+            if self._gemini_line_emotion.isChecked():
+                kwargs["line_styles"] = self._view_model.dubbing_line_styles()
         else:  # VieNeu
             # [v3.23.195] Danh sách giọng nạp LAZY: nếu chưa nạp (combo chỉ có mặc định)
             # thì dùng giọng đã LƯU từ phiên trước — tránh mất lựa chọn giọng; tên giọng
@@ -2458,6 +2500,10 @@ class TTSPage(QWidget):
         return True
 
     def _finish_batch_tts(self) -> None:
+        notify_task_finished(self, self._translator.translate("common.task_done_tts"), "")  # [v3.23.682]
+        self._finish_batch_tts_report()
+
+    def _finish_batch_tts_report(self) -> None:
         """Báo tổng kết và dọn trạng thái hàng đợi."""
         from PySide6.QtWidgets import QMessageBox
 
@@ -2603,6 +2649,9 @@ class TTSPage(QWidget):
         ))
         if hasattr(self, "_btn_clean_line_audio"):
             self._btn_clean_line_audio.setEnabled(self._line_audio_bytes > 0 and not busy)
+        if hasattr(self, "_btn_check_pron"):
+            self._btn_check_pron.setEnabled(
+                bool(self._last_results) and not busy and not self._pronunciation.is_running)
         # [v3.23.459] Nút chọn dòng bất thường: bật khi có ≥1 dòng bất thường + không bận.
         if hasattr(self, "_btn_select_abnormal"):
             n_abnormal = len(self._abnormal_event_indices())
@@ -2872,6 +2921,77 @@ class TTSPage(QWidget):
                 else "Cần đã chạy TTS một lần và còn file audio gốc.",
             )
 
+    def _install_review_shortcuts(self) -> None:
+        """[v3.23.682] Phím tắt khi bảng dòng giữ focus: Space nghe dòng, Ctrl+R TTS lại dòng chọn, F8 / Shift+F8 dòng
+        cần nghe lại kế tiếp / trước đó (đọc sai theo kiểm tra phát âm hoặc audio dài bất thường).
+
+        Dùng ``click()`` của nút sẵn có: nút đang tắt (đang chạy, chưa có audio…) thì phím cũng không làm gì.
+        """
+        from PySide6.QtGui import QKeySequence, QShortcut
+
+        bindings = (
+            (QKeySequence(Qt.Key.Key_Space), self._btn_play_sel.click),
+            (QKeySequence("Ctrl+R"), self._btn_resynth.click),
+            (QKeySequence(Qt.Key.Key_F8), lambda: self._jump_to_review_line(forward=True)),
+            (QKeySequence("Shift+F8"), lambda: self._jump_to_review_line(forward=False)),
+        )
+        self._review_shortcuts = []
+        for sequence, handler in bindings:
+            shortcut = QShortcut(sequence, self._table)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(handler)
+            self._review_shortcuts.append(shortcut)
+
+    def _speaker_review_rows(self) -> set[int]:
+        """[v3.23.682] Hàng có người nói chưa chắc (cùng tiêu chí với nút "Duyệt người nói nhanh")."""
+        line_edits = getattr(self, "_line_edits", None)
+        if line_edits is None or not self._dubbing_panel.is_dubbing_enabled():
+            return set()
+        try:
+            cells = self._dubbing.line_speaker_cells()
+        except (AttributeError, RuntimeError, ValueError):
+            return set()
+        wanted = {position for position, cell in enumerate(cells) if cell.needs_review}
+        if not wanted:
+            return set()
+        return {
+            row for row in range(self._table.rowCount())
+            if line_edits._row_position(row) in wanted
+        }
+
+    def _schedule_review_count(self, *_args) -> None:
+        if hasattr(self, "_review_timer"):
+            self._review_timer.start()
+
+    def review_count(self) -> int:
+        """[v3.23.682] Câu đọc sai + audio dài bất thường + dòng người nói cần duyệt."""
+        speakers = int(getattr(self._line_edits, "_review_count", 0) or 0) if hasattr(self, "_line_edits") else 0
+        return len(self._review_event_indices()) + speakers
+
+    def _review_event_indices(self) -> set[int]:
+        """[v3.23.682] Dòng nên nghe lại: AI chấm đọc sai + audio dài bất thường."""
+        wrong = set(self._pronunciation.wrong_indices()) if hasattr(self, "_pronunciation") else set()
+        return wrong | set(self._abnormal_event_indices())
+
+    def _jump_to_review_line(self, forward: bool = True) -> None:
+        """[v3.23.682] Chọn dòng cần nghe lại kế tiếp / trước đó (vòng lại), cuộn tới đó."""
+        from subtitles_extractor.presentation.pages.editor_page import next_suspect_row
+
+        wanted = self._review_event_indices()
+        rows = []
+        for row in range(self._table.rowCount()):
+            item0 = self._table.item(row, 0)
+            value = item0.data(Qt.ItemDataRole.UserRole) if item0 is not None else None
+            if value is not None and int(value) in wanted:
+                rows.append(row)
+        rows = sorted(set(rows) | self._speaker_review_rows())
+        target = next_suspect_row(rows, self._table.currentRow(), forward)
+        if target is None:
+            self._stage_lbl.setText(self._translator.translate("tts.review_none"))
+            return
+        self._table.selectRow(target)
+        self._table.scrollToItem(self._table.item(target, 0))
+
     def _abnormal_event_indices(self) -> list[int]:
         """[v3.23.459] event_index của các dòng audio dài bất thường."""
         return [
@@ -2944,6 +3064,11 @@ class TTSPage(QWidget):
         logger.info("UI: bắt đầu hiển thị kết quả TTS (%d câu).", len(rs))
         self._last_results = rs  # lưu để xuất chi tiết debug
         self._populate_table(rs)
+        if not getattr(self, "_batch_items", None):  # [v3.23.682] cả bộ: báo một lần khi xong hàng đợi
+            notify_task_finished(
+                self, self._translator.translate("common.task_done_tts"),
+                self._translator.translate("common.task_lines", count=len(rs)),
+            )
         logger.debug("UI: đã đổ bảng kết quả TTS.")
         n_ok    = sum(1 for r in rs if not r.was_skipped)
         n_trunc = sum(1 for r in rs if r.was_truncated)
@@ -3036,6 +3161,24 @@ class TTSPage(QWidget):
             .replace("{changed}", str(changed))
         )
 
+    #: [v3.23.674] Lệnh cài từng engine (chỉ hiện cho engine CHƯA cài).
+    _INSTALL_COMMANDS = (
+        (_ENGINE_EDGE, "Edge TTS", "pip install edge-tts soundfile"),
+        (_ENGINE_GEMINI, "Gemini TTS", "pip install google-genai soundfile"),
+        (_ENGINE_VIENEU, "VieNeu-TTS", "pip install vieneu soundfile"),
+    )
+
+    def _refresh_install_hint(self) -> None:
+        hint = getattr(self, "_install_hint", None)
+        if hint is None:
+            return
+        avail = getattr(self, "_engine_avail", {})
+        missing = [(name, cmd) for engine_id, name, cmd in self._INSTALL_COMMANDS
+                   if avail.get(engine_id) is False]
+        hint.setText(" &nbsp;|&nbsp; ".join(
+            f"💡 {name}: <code>{cmd}</code>" for name, cmd in missing))
+        hint.setVisible(bool(missing))
+
     def _on_engine_available(self, name: str, available: bool) -> None:
         icon = "✅" if available else "❌"
         color = "#27ae60" if available else "#c0392b"
@@ -3057,6 +3200,7 @@ class TTSPage(QWidget):
             self._engine_avail[_ENGINE_VIENEU] = available
             self._lbl_vieneu_st.setText(f"{icon} VieNeu-TTS{note}")
             self._lbl_vieneu_st.setStyleSheet(style)
+        self._refresh_install_hint()
 
         # [v3.23.291] Khi da kiem du 3 engine: neu engine dang chon CHUA san sang nhung co
         # engine khac san sang -> tu chuyen sang engine do (tranh nguoi dung bi ket o engine
@@ -3084,11 +3228,11 @@ class TTSPage(QWidget):
         s.setValue("engine_id", self._engine_combo.currentData() or _ENGINE_EDGE)
         s.setValue("edge_lang", self._edge_lang.currentData())
         s.setValue("edge_voice", self._edge_voice.currentText())
-        s.setValue("gemini_key", self._gemini_key.text())
         s.setValue("gemini_model", self._gemini_model.currentText())
         s.setValue("gemini_voice", self._gemini_voice.currentText())
         s.setValue("gemini_style", self._gemini_style.toPlainText())
         s.setValue("gemini_affective", self._gemini_affective.isChecked())
+        s.setValue("gemini_line_emotion", self._gemini_line_emotion.isChecked())
         s.setValue("gemini_temperature", self._gemini_temperature.value())
         s.setValue("vieneu_mode", self._vieneu_mode.currentData() or "standard")
         s.setValue("vieneu_emotion", self._vieneu_emotion.currentData() or "natural")
@@ -3155,8 +3299,6 @@ class TTSPage(QWidget):
         if v := s.value("edge_voice", type=str):
             self._edge_voice.setCurrentText(v)
         # Gemini
-        if k := s.value("gemini_key", type=str):
-            self._gemini_key.setText(k)
         if m := s.value("gemini_model", type=str):
             idx = self._gemini_model.findText(m)
             if idx >= 0: self._gemini_model.setCurrentIndex(idx)
@@ -3167,6 +3309,8 @@ class TTSPage(QWidget):
             self._gemini_style.setPlainText(st)
         if s.contains("gemini_affective"):
             self._gemini_affective.setChecked(s.value("gemini_affective", type=bool))
+        if s.contains("gemini_line_emotion"):
+            self._gemini_line_emotion.setChecked(s.value("gemini_line_emotion", type=bool))
         if s.contains("gemini_temperature"):
             self._gemini_temperature.setValue(
                 s.value("gemini_temperature", type=float)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from subtitles_extractor.presentation.workers.detection_workers import (
     DetectAutoRoiWorker,
+    DetectSeriesRoiWorker,
     DetectHardsubWorker,
 )
 from subtitles_extractor.presentation.workers.extract_subtitles_worker import (
@@ -15,6 +16,7 @@ from subtitles_extractor.presentation.workers.qt_progress_reporter import (
 
 __all__ = [
     "DetectAutoRoiWorker",
+    "DetectSeriesRoiWorker",
     "DetectHardsubWorker",
     "ExtractSubtitlesWorker",
     "QtProgressReporter",

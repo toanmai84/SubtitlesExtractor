@@ -25,6 +25,10 @@ from subtitles_extractor.application.services.cue_label_canonicalizer import (
     is_roster_label,
     roster_label_map,
 )
+from subtitles_extractor.application.services.roster_coverage import (
+    TITLE_READINGS,
+    find_unlisted_mentions,
+)
 from subtitles_extractor.application.services.roster_format import (
     RosterEntry,
     address_clauses,
@@ -57,6 +61,12 @@ MAX_AUDIT_ROUNDS = 2
 #: [v3.23.637] Bảng nhân vật không có MỘT mệnh đề xưng hô nào đọc được (ca thật: phim 86 tập,
 #: 19 nhân vật, 0 mệnh đề; tái hiện 1/6 lượt phân tích phim ghép 12 tập với gemini-3.8-flash).
 NO_ADDRESS_RULES_KIND = "no_address_rules"
+#: [v3.23.670] Cách gọi chỉ một người (师父, 前辈, "秦师兄", 系统 có thoại, tên đứng riêng thành lời
+#: gọi) lặp lại trong phụ đề mà phần tên của bảng nhân vật không có — bắt được thiếu người KHÔNG
+#: cần nhãn người nói (phân tích không video trước đây không bao giờ tự kiểm tra ra thiếu người).
+UNLISTED_MENTION_KIND = "unlisted_mention"
+#: Số dòng mẫu gửi kèm mỗi cách gọi (đủ thấy ngữ cảnh, giữ lời gọi kiểm định nhỏ).
+UNLISTED_MENTION_SAMPLE_LINES = 3
 #: Loại khiếm khuyết chỉ mang tính gợi ý, không tự nó đáng một lời gọi AI.
 STALE_GLOSSARY_KIND = "stale_glossary"
 
@@ -91,7 +101,7 @@ class AnalysisDefect:
 
     Attributes:
         kind: ``empty_roster`` | ``empty_overview`` | ``unlisted_label`` | ``missing_speaker`` |
-            ``self_address`` | ``stale_glossary``.
+            ``self_address`` | ``stale_glossary`` | ``unlisted_mention``.
         detail: Mô tả cụ thể cho model/nhật ký.
         line_ids: Các dòng liên quan (rỗng nếu lỗi ở bảng).
     """
@@ -126,6 +136,24 @@ def find_analysis_defects(
             "dòng của họ (giữ tên gốc, giới, tuổi, vai trò) và thêm ĐÚNG dạng: xưng hô: với <Tên "
             "người nghe, đúng như bảng> tự xưng '<một đại từ>' gọi '<một đại từ>' (mỗi người nghe "
             "một mệnh đề, cách nhau dấu phẩy). Tên trong bảng: " + names + "."))
+
+    lang = (analysis.source_lang or "").strip().lower()
+    # Chỉ phụ đề tiếng Trung (hoặc chưa rõ ngôn ngữ): chức danh Hán trong phụ đề Nhật (先生, 殿下)
+    # là từ thường — dò ở đó chỉ tốn lời gọi kiểm định.
+    if roster and (not lang or lang.startswith("zh")):
+        for mention in find_unlisted_mentions(
+                analysis.characters, spoken, glossary=analysis.glossary):
+            defects.append(AnalysisDefect(
+                UNLISTED_MENTION_KIND,
+                f"'{mention.term}' được gọi/nhắc ở {mention.count} dòng nhưng phần tên của bảng "
+                "nhân vật không có. Đọc các dòng đó: nếu là người/thực thể biết nói CHƯA có trong "
+                "bảng (kể cả người vắng mặt, bế quan, nhóm, hệ thống có thoại) thì THÊM một dòng "
+                "nhân vật; nếu là cách gọi của người ĐÃ có thì trả lại dòng của người đó với cách "
+                f"gọi này GHÉP vào phần tên (vd 'Tên gốc / {mention.term} (Phiên âm / cách đọc)'); "
+                "không chỉ một người cụ thể thì bỏ qua. Cách gọi chỉ NGƯỜI ĐƯỢC GỌI / ĐƯỢC NHẮC "
+                "tới, KHÔNG phải người đang nói dòng đó (\"昨晚救我的前辈\" là người đã cứu người "
+                "nói); không chắc là ai thì thêm thành nhân vật riêng.",
+                mention.line_ids[:UNLISTED_MENTION_SAMPLE_LINES]))
 
     full_text = "\n".join(_line_text(ln) for ln in spoken)
     for entry in parse_glossary(analysis.glossary):
@@ -179,6 +207,81 @@ def find_analysis_defects(
 
 def _entry_key(entry: RosterEntry) -> str:
     return entry.name.split("/")[0].strip().lower()
+
+
+def _alias_keys(entry: RosterEntry) -> list[str]:
+    """[v3.23.670] Mọi bí danh (viết thường) trong phần tên của một mục."""
+    return [part.strip().lower() for part in re.split(r"[/|]", entry.name) if part.strip()]
+
+
+#: Cách đọc của các chức danh chung (viết thường) — không dùng để nhận ra MỘT người cụ thể.
+_GENERIC_TITLES = frozenset(
+    {t.lower() for t in TITLE_READINGS}
+    | {r.lower() for readings in TITLE_READINGS.values() for r in readings}
+)
+
+
+def _same_gender(a: RosterEntry, b: RosterEntry) -> bool:
+    ga, gb = a.gender.strip().lower(), b.gender.strip().lower()
+    return not ga or not gb or ga == gb
+
+
+def _match_entry(
+    new: RosterEntry, by_key: dict[str, int], entries: list[RosterEntry]
+) -> int | None:
+    """[v3.23.670] Mục cũ ứng với dòng bản vá: trùng tên chính, hoặc bản vá đặt cách gọi mới LÊN
+    TRƯỚC tên chính đã có ("前辈 / 叶然") — trước đây ca này thành mục trùng lặp.
+
+    Khớp qua bí danh phụ chỉ khi bí danh đó là TÊN RIÊNG (không phải chức danh chung như 师父/前辈
+    — mục giữ chỗ "师父" không được nuốt "青云子 / 师父" của một người khác) và giới tính không vênh.
+    """
+    idx = by_key.get(_entry_key(new))
+    if idx is not None:
+        return idx
+    for alias in _alias_keys(new)[1:]:
+        if alias in by_key and alias not in _GENERIC_TITLES and _same_gender(
+                entries[by_key[alias]], new):
+            return by_key[alias]
+    return None
+
+
+def _split_aliases(value: str) -> list[str]:
+    return [part.strip() for part in re.split(r"\s*[/|]\s*", value or "") if part.strip()]
+
+
+def _merge_names(
+    old: RosterEntry, new: RosterEntry, claimed: set[str]
+) -> tuple[str, str]:
+    """[v3.23.670] Tên + phiên âm sau khi gộp bản vá vào mục cũ.
+
+    Chỉ THÊM bí danh mới (giữ nguyên chữ của dòng cũ khi không có gì mới — người dùng có thể đã
+    sửa); bỏ bí danh mà MỤC KHÁC đang dùng: hai người cùng mang "前辈" thì bộ đọc bảng gộp họ làm
+    một (mất giới tính, vai trò của người thứ hai). Phiên âm chỉ thêm cách đọc của đúng các bí
+    danh mới, theo vị trí trong bản vá — không chép biến thể chính tả ("Ye Ran") vào bảng.
+    """
+    if not old.name:
+        return new.name, new.aka
+    have = {a.lower() for a in _split_aliases(old.name)}
+    new_names = _split_aliases(new.name)
+    new_readings = _split_aliases(new.aka)
+    added: list[tuple[str, str]] = []
+    for pos, alias in enumerate(new_names):
+        key = alias.lower()
+        if key in have or key in claimed:
+            continue
+        have.add(key)
+        reading = new_readings[pos] if len(new_readings) == len(new_names) else ""
+        added.append((alias, reading))
+    if not added:
+        return old.name, old.aka or new.aka
+    name = " / ".join([old.name.strip(), *(alias for alias, _ in added)])
+    aka = old.aka or ""
+    readings = [r for _, r in added if r and r.lower() not in {x.lower() for x in _split_aliases(aka)}]
+    if aka and readings:
+        aka = " / ".join([aka.strip(), *readings])
+    elif not aka:
+        aka = new.aka
+    return name, aka
 
 
 def _has_address_clause(entry: RosterEntry) -> bool:
@@ -253,15 +356,24 @@ def apply_audit_patch(
             key = _entry_key(new)
             if not key:
                 continue
-            idx = by_key.get(key)
+            idx = _match_entry(new, by_key, entries)
             if idx is None:
+                others = {a for e in entries for a in _alias_keys(e)}
+                if key in others:
+                    continue  # tên chính là bí danh của người đã có: thêm sẽ bị gộp nhầm
+                aliases = [a for a in _split_aliases(new.name) if a.lower() not in others]
+                new = replace(new, name=" / ".join(aliases)) if aliases else new
                 entries.append(new)
                 by_key[key] = len(entries) - 1
                 changes += 1
                 continue
             old = entries[idx]
+            # [v3.23.670] THÊM bí danh: bản vá "thêm cách gọi vào phần tên" (前辈, 瑶瑶…) trước
+            # đây bị bỏ vì chỉ giữ tên cũ — khiếm khuyết thiếu người không bao giờ hết.
+            claimed = {a for j, e in enumerate(entries) if j != idx for a in _alias_keys(e)}
+            name, aka = _merge_names(old, new, claimed)
             merged = RosterEntry(
-                name=old.name or new.name, aka=old.aka or new.aka,
+                name=name, aka=aka,
                 gender=old.gender or new.gender, age=old.age or new.age,
                 role=_role_with_address(old, new),
             )
@@ -306,7 +418,11 @@ def apply_audit_patch(
 
     visual_cues = analysis.visual_cues
     fixes = patch.get("cue_fixes") if isinstance(patch.get("cue_fixes"), (list, tuple)) else []
-    if fixes and valid_line_ids:
+    # [v3.23.670] Phân tích CHƯA có nhãn người nói nào (không video, tắt gán người nói) thì bỏ
+    # cue_fixes: tự kiểm tra nay chạy cả khi không có nhãn (thiếu nhân vật) và model kiểm định
+    # tự "gán" người nói cho 56-63 dòng chỉ từ vài cửa sổ ±8 dòng — người dùng không yêu cầu,
+    # chất lượng thấp hơn bước gán người nói thật, lại khoá các dòng đó với khâu dịch.
+    if fixes and valid_line_ids and (visual_cues or "").strip():
         cues = {c.line_no: c for c in deserialize_visual_cues(visual_cues)}
         fixed: list[VisualCue] = []
         for item in fixes:
@@ -375,6 +491,7 @@ def describe_audit_report(report: AuditReport | None) -> str:
 
 
 _LABEL_IN_DETAIL = re.compile(r"^'(.+?)' xuất hiện")
+_MENTION_IN_DETAIL = re.compile(r"^'(.+?)' được gọi")
 
 
 def defect_units(defect: AnalysisDefect) -> list[str]:
@@ -384,9 +501,9 @@ def defect_units(defect: AnalysisDefect) -> list[str]:
     được một phần danh sách vẫn nhận ra phần còn lại; ``unlisted_label`` theo nhãn; loại ở cấp
     bảng theo loại + mô tả.
     """
-    if defect.kind == "unlisted_label":
-        match = _LABEL_IN_DETAIL.match(defect.detail)
-        return [f"unlisted_label:{match.group(1) if match else defect.detail}"]
+    if defect.kind in ("unlisted_label", UNLISTED_MENTION_KIND):
+        match = _LABEL_IN_DETAIL.match(defect.detail) or _MENTION_IN_DETAIL.match(defect.detail)
+        return [f"{defect.kind}:{match.group(1) if match else defect.detail}"]
     if defect.line_ids:
         return [f"{defect.kind}:{line_id}" for line_id in defect.line_ids]
     return [f"{defect.kind}:{defect.detail}"]
@@ -414,7 +531,7 @@ def filter_declined(
     for defect in defects:
         if defect.kind == STALE_GLOSSARY_KIND:
             kept.append(defect)
-        elif defect.line_ids and defect.kind != "unlisted_label":
+        elif defect.line_ids and defect.kind not in ("unlisted_label", UNLISTED_MENTION_KIND):
             ids = tuple(
                 i for i in defect.line_ids if declined.get(f"{defect.kind}:{i}", 0) < limit
             )
@@ -522,7 +639,7 @@ def defects_to_prompt(defects: list[AnalysisDefect]) -> str:
 __all__ = [
     "AUDIT_MAX_CALLS", "AUDIT_MAX_PROMPT_LINES", "AUDIT_THINKING_LEVEL", "AUDIT_WINDOW_LINES",
     "DECLINE_LIMIT", "DEFAULT_AUDIT_MODEL", "MAX_AUDIT_ROUNDS", "NO_ADDRESS_RULES_KIND",
-    "STALE_GLOSSARY_KIND",
+    "STALE_GLOSSARY_KIND", "UNLISTED_MENTION_KIND",
     "AnalysisDefect", "AuditReport", "apply_audit_patch", "describe_audit_report", "audit_film_id", "defect_units", "defects_to_prompt",
     "filter_declined", "find_analysis_defects", "note_declined", "plan_audit_batches",
 ]

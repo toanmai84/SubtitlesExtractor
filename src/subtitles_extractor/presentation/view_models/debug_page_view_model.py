@@ -32,6 +32,7 @@ from subtitles_extractor.application.services.subtitle_builder import SubtitleBu
 from subtitles_extractor.composition.container import ApplicationContainer
 from subtitles_extractor.domain.entities.ocr_frame_result import OcrFrameResult, OcrTextBox
 from subtitles_extractor.domain.ports.ocr_engine_port import OcrEngineConfig, PreprocessConfig
+from subtitles_extractor.domain.value_objects.boundary_track import BoundaryTrack
 from subtitles_extractor.domain.value_objects.confidence import Confidence
 from subtitles_extractor.domain.value_objects.device_kind import DeviceKind, PrecisionMode
 from subtitles_extractor.domain.value_objects.roi import Roi, TextAlignment, TextOrientation
@@ -433,6 +434,14 @@ class DebugPageViewModel(QObject):
             self.file_loaded.emit(True, f"Đã nạp thành công {len(frames)} frames từ {file_path.name}")
             self.jump_to_frame(0)
 
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            # [v3.23.673] Tệp sai loại / hỏng là lỗi của TỆP, không phải lỗi chương trình: cảnh báo
+            # kèm lý do dễ hiểu, không in vết ngăn xếp ở mức ERROR.
+            logger.warning("Không nạp được dữ liệu OCR thô: %s", exc)
+            self.file_loaded.emit(False, str(exc))
+            self._frames = []
+            self._meta = None
+            self._current_idx = -1
         except Exception as exc:
             logger.exception("Lỗi nạp file OCR Debug: %s", exc)
             self.file_loaded.emit(False, str(exc))
@@ -633,7 +642,8 @@ class DebugPageViewModel(QObject):
                 roi = self._clip_roi_to_video(roi)  # [v3.23.656] B7: cache cũ có thể lưu ROI vượt mép khung
 
             builder = SubtitleBuilder(builder_cfg)
-            events = builder.build(self._frames, roi=roi)
+            boundary = BoundaryTrack.from_dict(self._meta.boundary) if self._meta is not None else None   # [v3.23.680]
+            events = builder.build(self._frames, roi=roi, boundary_track=boundary)
 
             self.subtitles_built.emit(events)
 

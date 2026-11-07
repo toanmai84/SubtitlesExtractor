@@ -169,7 +169,42 @@ def drop_digit_garbage_events(events: list[SubtitleEvent]) -> list[SubtitleEvent
     ]
 
 
-def drop_flash_fragments(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
+#: [v3.23.672] Rác "chữ + số" Latin (hoạ tiết lọt vùng phụ đề): ngưỡng tin cậy và thời lượng.
+_ALNUM_GARBAGE_MAX_CONFIDENCE = 0.75
+_ALNUM_GARBAGE_MAX_DURATION_SEC = 0.50
+_CJK_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+
+
+def _is_alnum_garbage(text: str, confidence: float, duration_sec: float) -> bool:
+    """Chuỗi Latin LẪN chữ số, không có chữ CJK, conf thấp, hiện rất ngắn (hàm thuần).
+
+    Ca thật (tập 5 phim mẫu, bước 0,04s): "200 2a1s wses" — 0,19s, conf ~0,57, do hoạ tiết
+    quần áo lướt qua vùng phụ đề. Bộ lọc watermark chỉ bắt Latin VIẾT HOA, bộ lọc chữ số chỉ
+    bắt chuỗi KHÔNG có chữ cái. Chữ Latin thật trong thoại CJK ("OK", "iPhone 15") được OCR đọc
+    rõ (conf >= 0,90) hoặc hiện lâu, nên không bị đụng.
+    """
+    compact = "".join(text.split())
+    return (
+        bool(compact)
+        and not _CJK_CHAR_RE.search(compact)
+        and any(ch.isdigit() for ch in compact)
+        and any(ch.isascii() and ch.isalpha() for ch in compact)
+        and confidence < _ALNUM_GARBAGE_MAX_CONFIDENCE
+        and duration_sec < _ALNUM_GARBAGE_MAX_DURATION_SEC
+    )
+
+
+def drop_alnum_garbage_events(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
+    """[v3.23.672] Drop event rác "chữ Latin + số" ngắn, conf thấp trong phim CJK chủ đạo."""
+    if not _events_are_cjk_dominant(events):
+        return events
+    return [
+        event for event in events
+        if not _is_alnum_garbage(event.text, float(event.confidence), event.duration_sec)
+    ]
+
+
+def drop_flash_fragments(events: list[SubtitleEvent], sample_step_sec: float = 0.0) -> list[SubtitleEvent]:
     """Drop mảnh flash cực ngắn (< 0.18s) CÓ THÊM bằng chứng rác.
 
     Phụ đề thật ngắn nhất quan sát được ~0.21s, nhưng OCR có thể bắt thiếu frame
@@ -179,8 +214,14 @@ def drop_flash_fragments(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
       * là ECHO: na ná (>= 0.66) một event lân cận trong ±4s (mảnh vỡ sớm/muộn
         của câu thật đã có event riêng).
 
+    [v3.23.682] Thời lượng tính theo BẰNG CHỨNG: ≥ số khung × bước lấy mẫu. Mốc cuối của câu là khung mẫu cuối (chưa cộng
+    phần giữ khung), nên câu 2 khung ở bước 0,12 s chỉ "dài" 0,15 s dù hiện ≥ 0,24 s — trước đây bị coi là mảnh chớp:
+    phim nối 86 tập mất 6 câu một chữ có thật (我, 当, 你, 切, 你, 来; tin cậy 1,0). Ở bước 0,04 s, 2 khung = 0,08 s → như cũ.
+    Chỉ áp cho câu có chữ Hán: mảnh Latin lẻ ("V" — tin cậy 0,99, 2 khung) vẫn là rác như trước.
+
     Args:
         events: Events đã dựng (sort theo thời gian).
+        sample_step_sec: Bước lấy mẫu OCR (0 = không rõ → chỉ dùng mốc thời gian như cũ).
 
     Returns:
         Events đã loại mảnh flash rác.
@@ -188,6 +229,8 @@ def drop_flash_fragments(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
     kept: list[SubtitleEvent] = []
     for idx, event in enumerate(events):
         duration = event.end_sec - event.start_sec
+        if any(_is_cjk_char(c) for c in event.text):   # chữ Latin/số lẻ loi (vd "V") vẫn tính như cũ
+            duration = max(duration, event.frame_count * max(0.0, sample_step_sec))
         if duration >= _FLASH_MAX_DURATION_SEC:
             kept.append(event)
             continue
@@ -259,9 +302,10 @@ def merge_progressive_events(
     return merged, absorbed
 
 
-def refine_final_events(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
+def refine_final_events(events: list[SubtitleEvent], sample_step_sec: float = 0.0) -> list[SubtitleEvent]:
     """Tinh lọc cuối: đuôi watermark → watermark Latin → rác chữ số → mảnh flash."""
     refined = strip_latin_suffix_from_cjk_events(events)
     refined = drop_pure_latin_watermark_events(refined)
     refined = drop_digit_garbage_events(refined)
-    return drop_flash_fragments(refined)
+    refined = drop_alnum_garbage_events(refined)
+    return drop_flash_fragments(refined, sample_step_sec)
