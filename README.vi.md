@@ -1,0 +1,190 @@
+# Subtitles Extractor — v3.23.689
+
+[English](README.md) | **Tiếng Việt**
+
+Ứng dụng desktop **trích xuất phụ đề hardsub/embedded → dịch bằng AI → lồng tiếng (TTS)**
+cho video, viết hoàn toàn bằng Python (PySide6) theo kiến trúc **Clean Architecture / Hexagonal**.
+
+Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên tập → Dịch → Lồng tiếng**.
+
+---
+
+## ✨ Tính năng chính
+
+### 🎯 Trích xuất phụ đề
+- Hỗ trợ MP4/MKV/AVI/MOV/FLV/WEBM → SRT/ASS.
+- **OCR hardsub** bằng PaddleOCR (GPU + TensorRT FP16 khi có CUDA, tự fallback CPU).
+- **STT** (nhận dạng tiếng nói) bằng WhisperX cho video không có phụ đề cứng.
+- Trích xuất phụ đề embedded có sẵn trong video.
+- Lấy mẫu khung hình thông minh: bước thời gian + loại trùng pHash + so sánh pixel.
+- Hai thuật toán gộp câu: **Greedy** (mặc định, nhanh) và **Viterbi** (tối ưu khi OCR nhiễu).
+- **Tự phát hiện ROI** vùng phụ đề bằng clustering Connected Components, lấy mẫu phân tầng theo thời gian.
+- Nhận biết và xử lý riêng văn bản **CJK** (Trung/Nhật/Hàn) và Latin xuyên suốt pipeline.
+- Có thể kiểm tra lại dòng OCR đáng ngờ bằng AI; điều phối Re-OCR và cài đặt an toàn hơn khi đang
+  trích xuất.
+- Lọc vật thể chuyển động trong cảnh để tránh nhận nhầm thành phụ đề; ở chế độ hàng loạt có thể
+  kiểm tra và dùng lại vùng phụ đề của tập trước nếu phù hợp.
+
+### ✏️ Biên tập phụ đề
+- Mở/sửa `.srt`/`.ass`; bảng sửa trực tiếp; chèn/xoá/tách/gộp dòng.
+- Re-OCR từng dòng/khung hình để sửa nhận dạng sai.
+- Undo/Redo (Memento). Waveform âm thanh với phím tắt chuẩn DAW.
+- Xem trước video đồng bộ (MPV/PyAV/OpenCV).
+
+### 🌐 Dịch bằng AI (Gemini hoặc API tương thích OpenAI, đa giai đoạn)
+- Pipeline dịch nhiều giai đoạn: **Tiền xử lý → Dịch thô → Tinh chỉnh văn phong → Bản địa hoá**.
+- **Phân tích ngữ cảnh toàn cục**: tự nhận diện ngôn ngữ, nhân vật, tóm tắt cốt truyện, bảng thuật ngữ.
+- **Phân tích hình ảnh (visual cues)**: đính video để AI hiểu bối cảnh, xưng hô, người nói.
+- Chọn **Google Gemini** hoặc nhà cung cấp tuỳ chỉnh dùng API kiểu OpenAI; nhập API URL, API key
+  và tải danh sách model ngay trong trang Dịch. Các thao tác xử lý văn bản dùng được với nhà cung
+  cấp tuỳ chỉnh; tính năng cần phân tích video/âm thanh vẫn cần Gemini.
+- `thinking_level` tối ưu cho Gemini 3.x (nhanh/rẻ cho dịch), `thinking_budget` cho Gemini 2.5.
+- Length-hint (`max_chars`) cho bản dịch súc tích, vừa thời lượng đọc TTS.
+- **Tinh chỉnh chuyên dụng**: dịch lại dòng đã chọn, sửa bản dịch tại chỗ, so sánh các giai đoạn,
+  kiểm tra nhất quán thuật ngữ. Mọi chỉnh sửa được lưu bền vững và khôi phục khi mở lại.
+- **Quản lý giai đoạn** (bộ nhớ đệm từng giai đoạn, giữ lại sau khi dịch): xem giai đoạn nào đã
+  lưu, model nào, lần dịch tới sẽ dùng lại hay dịch lại (và vì sao); **sửa tay nội dung từng
+  giai đoạn** (dòng sửa tay luôn được giữ, kể cả khi giai đoạn bị dịch lại); xoá một giai đoạn
+  để dịch lại riêng nó. Đổi cấu hình hay sửa một giai đoạn thì lần dịch tới chỉ dịch phần thật
+  sự đổi — sửa 5 dòng dịch thô của phim 1246 dòng: 10 lượt gọi thay vì 42.
+
+### 📚 Translation Memory cho phim bộ
+- Tự **nhớ câu đã dịch** theo từng phim bộ (gom theo thư mục) và truy hồi làm tham chiếu
+  (RAG grounding) khi dịch tập mới → nhất quán tên riêng/thuật ngữ/xưng hô xuyên suốt.
+- **Chia sẻ bảng thuật ngữ + roster nhân vật** tự động giữa các tập (gộp thông minh, giữ
+  cách dịch đã thống nhất).
+- Giao diện quản lý: xem/xoá bộ nhớ dịch theo từng phim bộ.
+- **Dây chuyền phim bộ**: xử lý liên tiếp các tập qua trích xuất, dịch và xuất bản; có thể dừng
+  sau khâu Dịch để rà soát trước khi tiếp tục.
+- Tự gán lại giọng đã chọn cho nhân vật giữa các tập kể cả khi tên có bí danh; Gemini TTS có tuỳ
+  chọn đọc theo sắc thái từng câu (mặc định tắt).
+
+### 🎙️ Lồng tiếng (TTS)
+- Tổng hợp giọng nói bằng EdgeTTS, Gemini TTS và VieNeu, đồng bộ thời gian với phụ đề.
+- Bỏ qua nội dung không đọc được; tag người nói được giữ trong file phụ đề nhưng không đọc thành tiếng.
+- Cân chỉnh tốc độ/time-stretch để khớp thời lượng.
+- Phát hiện và xử lý phần đọc lặp ở câu ngắn; cân chỉnh độ to theo LUFS với hệ số đúng theo tần số lấy mẫu.
+- Sửa người nghe/xưng hô theo từng dòng, tạo lại audio riêng từng câu và quản lý lịch sử audio
+  có thể khôi phục.
+
+### 🛠️ Cấu hình & Đa ngôn ngữ
+- Validate runtime bằng `pydantic-settings`; override qua biến môi trường (`SE_HW_*`,
+  `SE_OCR_*`, `SE_VIDCTX_*`, `SE_TRANS_*`...).
+- Lưu tự động qua QSettings. Giao diện tiếng Việt, theme Sáng/Tối/Tự động.
+- Khi dùng nhà cung cấp API tuỳ chỉnh, video/Visual Cues và các tính năng cần âm thanh hoặc video
+  sẽ yêu cầu chuyển về Google Gemini.
+
+### 🛡️ Ổn định, chẩn đoán & phục hồi
+- mpv được cấu hình an toàn hơn; lệnh seek được gộp khi kéo thanh thời gian để giảm tải và hạn chế
+  crash trên Windows. Có thể tự chuyển sang trình xem dự phòng nếu phát hiện lỗi mpv.
+- Ghi nhật ký crash native và cảnh báo khi lần chạy trước kết thúc bất thường.
+- Sao lưu xoay vòng và phục hồi cơ sở dữ liệu SQLite khi phát hiện hỏng; giữ lại bản dữ liệu lỗi
+  để có thể kiểm tra.
+
+---
+
+## 🏛️ Kiến trúc
+
+```
+src/subtitles_extractor/
+├── domain/          # Entities, value objects, ports — Python thuần
+├── application/     # Use cases + services — điều phối nghiệp vụ
+│   ├── use_cases/       Extract, Translate, Export, Import, DetectAutoRoi...
+│   └── services/        SubtitleBuilder, TranslationMemory, GlossaryConsistency...
+├── infrastructure/  # Adapters cho thế giới ngoài
+│   ├── ocr/             PaddleOcrAdapter
+│   ├── stt/             WhisperxAdapter
+│   ├── translation/     GeminiSubtitleTranslator, GeminiVideoContext
+│   ├── tts/             EdgeTtsAdapter
+│   ├── video/           Metadata, FrameSampler, AutoRoiDetector
+│   ├── subtitle/        SRT/ASS exporter & importer
+│   └── database/        SQLite: project, session, translation memory
+├── presentation/    # Qt UI (MVVM)
+│   ├── pages/           Extract, Editor, Translate, TTS, Debug, Projects, Log, Settings
+│   ├── view_models/     theo từng trang
+│   ├── theme/           token màu thích ứng theme (sáng/tối)
+│   └── widgets/         waveform, video canvas, ROI review...
+└── composition/     # DI container + bootstrap
+```
+
+**Quy tắc phụ thuộc**: `presentation → application → domain ← infrastructure`. Domain thuần
+Python, không phụ thuộc Qt/Paddle/OpenCV; các tầng giao tiếp qua `Protocol` (Port).
+
+---
+
+## 🚀 Cài đặt & Chạy
+
+### Yêu cầu
+- Python ≥ **3.11** (khuyến nghị 3.12).
+- (Tuỳ chọn) GPU NVIDIA + CUDA cho OCR/STT nhanh.
+- API Key Google Gemini (miễn phí tại https://aistudio.google.com/apikey) hoặc API key từ nhà cung
+  cấp tương thích OpenAI. Một số tính năng xử lý video/âm thanh cần Gemini.
+
+### Cài đặt
+```bash
+git clone https://github.com/toanmai84/SubtitlesExtractor.git
+cd SubtitlesExtractor
+python -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Tuỳ chọn — cho phát triển:
+```bash
+pip install -r requirements-dev.txt
+```
+
+### Chạy ứng dụng
+```bash
+python main.py
+```
+`main.py` tự inject `src/` vào path — không cần export `PYTHONPATH`.
+
+### Chạy tests
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONPATH=src python -m pytest tests/unit -q
+```
+
+---
+
+## 📖 Hướng dẫn nhanh: dịch một phim bộ nhiều tập
+
+1. Đặt tất cả các tập của phim trong **cùng một thư mục**.
+2. **Trích xuất** phụ đề tập 1 (OCR/STT) → tinh chỉnh ở **Biên tập** nếu cần.
+3. Sang trang **Dịch**: dán API Key, nhấn *Phân tích toàn bộ phụ đề* để tự sinh ngữ cảnh +
+   bảng thuật ngữ + nhân vật, rồi bật các giai đoạn dịch và chạy.
+4. Tinh chỉnh: *Dịch lại* dòng chưa ưng, *Sửa bản dịch* tại chỗ, *So sánh giai đoạn*,
+   *Kiểm tra thuật ngữ*, *Quản lý giai đoạn* (sửa một giai đoạn rồi bấm Dịch: các giai đoạn
+   sau chỉ dịch lại các lô có dòng đổi).
+5. Các tập sau (cùng thư mục): ứng dụng **tự kế thừa** câu dịch + thuật ngữ + nhân vật để
+   nhất quán — chỉ cần bổ sung khi có nội dung mới.
+6. (Tuỳ chọn) Sang trang **TTS** để lồng tiếng bản dịch.
+
+---
+
+## 🔧 Tuỳ chỉnh qua biến môi trường (ví dụ)
+
+```bash
+export SE_HW_DEVICE=cpu                 # ép CPU
+export SE_HW_USE_TENSORRT=true
+export SE_OCR_SCORE_THRESHOLD=0.5
+export SE_POST_USE_VITERBI=true         # bật Viterbi grouper
+export SE_TRANS_DEFAULT_BATCH_SIZE=50   # cỡ lô dịch mặc định
+export SE_VIDCTX_FPS=1.0                # fps lấy mẫu cho phân tích video
+python main.py
+```
+
+---
+
+## 📋 Quy tắc code
+
+- **PEP 8** + **Black** (line length 90) + **Ruff**.
+- **Type hints** đầy đủ; tránh `except Exception` trống (bắt ngoại lệ cụ thể).
+- Dùng `logging` thay cho `print`. Identifier tiếng Anh, docstring/log/UI tiếng Việt.
+- Mỗi thay đổi đi kèm test; pytest phải xanh trước khi đóng gói.
+
+---
+
+## 📝 Giấy phép
+
+MIT.
