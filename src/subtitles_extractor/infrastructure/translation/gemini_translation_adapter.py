@@ -3702,7 +3702,9 @@ class GeminiSubtitleTranslator:
             hết quá tải). ``failover_tried`` chỉ lớn dần nên không thể quay vòng vô hạn.
             """
             if model_name == primary_model:
-                return False
+                # [v3.23.690] Model CHÍNH hết hạn mức ngày ở mọi key: chuyển sang model dự phòng (nếu bật) như ô
+                # "Model dự phòng" vẫn hứa — trước đây chỉ quá tải mới chuyển, hết hạn mức ngày thì dừng hẳn.
+                return _fail_over("hết hạn mức ngày ở mọi key", raw)
             if _fail_over("hết hạn mức ngày", raw):
                 return True
             if self._has_any_key_capacity(primary_model):
@@ -3778,7 +3780,12 @@ class GeminiSubtitleTranslator:
                             with self._state_lock:
                                 reserve_index = self._key_index
                             continue
-                        raise  # mọi key đều hết → báo lên trên
+                        # [v3.23.690] Mọi key đều hết theo bộ đếm → model dự phòng (nếu bật) rồi đặt chỗ lại.
+                        if _leave_exhausted_fallback(raw_attempt):
+                            with self._state_lock:
+                                reserve_index = self._key_index
+                            continue
+                        raise  # mọi key đều hết, không còn dự phòng → báo lên trên
             # [v3.23.585] Key vừa bị xoay NGAY trong bước đặt chỗ ở trên: bước tải lại ở
             # đầu vòng lặp đã qua, nên lời gọi này sẽ mang handle video của key cũ → 403:
             # mất một request của key mới (403 vẫn bị tính) và một lượt thử kèm thời gian

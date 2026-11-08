@@ -1,4 +1,4 @@
-# Subtitles Extractor — v3.23.689
+# Subtitles Extractor — v3.23.690
 
 [English](README.md) | **Tiếng Việt**
 
@@ -38,6 +38,8 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
 - Chọn **Google Gemini** hoặc nhà cung cấp tuỳ chỉnh dùng API kiểu OpenAI; nhập API URL, API key
   và tải danh sách model ngay trong trang Dịch. Các thao tác xử lý văn bản dùng được với nhà cung
   cấp tuỳ chỉnh; tính năng cần phân tích video/âm thanh vẫn cần Gemini.
+- Khi model Gemini hết hạn mức theo ngày, ứng dụng có thể tự chuyển sang model dự phòng đã cấu hình
+  cho dịch và phân tích; có thể tắt tính năng dự phòng trong cài đặt.
 - `thinking_level` tối ưu cho Gemini 3.x (nhanh/rẻ cho dịch), `thinking_budget` cho Gemini 2.5.
 - Length-hint (`max_chars`) cho bản dịch súc tích, vừa thời lượng đọc TTS.
 - **Tinh chỉnh chuyên dụng**: dịch lại dòng đã chọn, sửa bản dịch tại chỗ, so sánh các giai đoạn,

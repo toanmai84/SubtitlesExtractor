@@ -1,4 +1,4 @@
-# Subtitles Extractor — v3.23.689
+# Subtitles Extractor — v3.23.690
 
 **English** | [Tiếng Việt](README.vi.md)
 
@@ -31,6 +31,7 @@ The complete workflow in one app: **Extract → Edit → Translate → Dub**.
 - Choose **Google Gemini** or a custom provider with an OpenAI-compatible API. Configure its API URL and key, then load the provider's available text models in the Translate page.
 - Global context analysis can identify languages and characters and create plot summaries and glossaries.
 - Video-based visual cues help the AI understand scene context, forms of address, and speakers when using Gemini.
+- If a Gemini model reaches its daily quota, the app can automatically switch to the configured fallback model for translation and analysis, when fallback is enabled and available.
 - Translation stages are cached and can be reviewed or edited individually; unchanged stages can be reused on the next run.
 - Translate selected lines again, edit translations in place, compare stages, and check terminology consistency.
 - Translation Memory shares translated phrases, glossaries, and character information across episodes in a series.

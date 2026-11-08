@@ -81,9 +81,18 @@ def test_exhausted_fallback_moves_on_to_the_next_candidate(
     assert server.models[-1] == FLASH_37
 
 
-def test_primary_exhausted_still_raises(monkeypatch, clock, tmp_path: Path) -> None:
+def test_primary_exhausted_moves_to_fallback(monkeypatch, clock, tmp_path: Path) -> None:
+    """[v3.23.690] Trước đây model CHÍNH hết hạn mức ngày thì ném lỗi dừng dù còn dự phòng — trái với lời hứa của ô
+    "Model dự phòng" (quá tải HOẶC hết hạn mức ngày). Nay chuyển sang dự phòng; không còn dự phòng thì vẫn dừng."""
     server = _Server({}, {LITE_31})
     translator, _ = _setup(monkeypatch, clock, tmp_path, server, [LITE_31, LITE_35])
+    assert call_gemini(translator, LITE_31) == {"subtitles": []}
+    assert server.models == [LITE_31, LITE_35]
+
+
+def test_primary_exhausted_without_fallback_still_raises(monkeypatch, clock, tmp_path: Path) -> None:
+    server = _Server({}, {LITE_31})
+    translator, _ = _setup(monkeypatch, clock, tmp_path, server, [LITE_31])
     with pytest.raises(QuotaExhaustedError):
         call_gemini(translator, LITE_31)
 

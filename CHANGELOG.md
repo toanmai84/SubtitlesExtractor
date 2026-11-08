@@ -1,5 +1,50 @@
 # Changelog
 
+## [3.23.690] — 🔁 Model chính hết hạn mức NGÀY → tự chuyển model dự phòng (lỗi tìm được khi đo D5)
+
+### Lỗi
+* Ô "Model dự phòng" hứa: "khi model đang dùng quá tải (503) **hoặc hết hạn mức ngày**, ứng dụng chuyển sang model dự
+  phòng (dịch, phân tích, tự kiểm tra)".
+* Thực tế chỉ quá tải mới chuyển. Khi model CHÍNH hết hạn mức ngày ở mọi key, lời gọi Gemini ném lỗi và dừng — ở cả
+  hai nơi:
+  * bộ đếm của ứng dụng đã báo hết;
+  * server trả 429 "PerDay" ở key cuối.
+* Riêng phân tích có một lớp tự đổi model ở tầng worker. Dịch và tự kiểm tra thì không có.
+* **Ảnh hưởng thật (đo khi làm D5):** phân tích ngữ cảnh mặc định dùng `gemini-3.8-flash`, bản miễn phí chỉ
+  20 request/ngày/key. Đo tập 3 (58 dòng): phân tích 2 request, dịch 4 request. Phim bộ 86 tập ≈ 170–200 request
+  phân tích, trong khi 3 key chỉ có 60/ngày. Model dịch (`flash-lite`, 500/ngày) dừng tương tự nếu chọn model Flash
+  cho các giai đoạn tinh chỉnh.
+
+### Sửa
+* Model chính hết hạn mức ngày ở mọi key → chuyển sang model dự phòng (cùng bộ chọn như khi quá tải: còn hạn mức, chưa
+  thử trong lời gọi này, theo model người dùng chọn), cho cả hai nơi trên.
+* Theo bộ đếm thì không tốn request nào cho model đã cạn.
+* Tắt dự phòng ("Không chuyển model") → vẫn dừng như cũ.
+* Dự phòng cũng cạn → dừng, không lặp vòng.
+
+### D5 (chi phí phim dài) — số đo, không đổi mã
+* Gemini đã tự dùng lại phần đầu prompt (implicit caching) khi các lô gửi lần lượt: nhật ký ghi 35–55 % prompt lấy từ
+  cache. Lượt dịch tập 3: 5 693 / 22 699 token.
+* Gửi song song hoặc xoay key thì cache gần như 0, vì cache tính theo dự án / key.
+* Với key miễn phí, giới hạn chạm trước là số request/ngày, không phải token. Nên việc quan trọng của D5 là bản sửa ở
+  trên (không đứng lại khi model chính cạn), không phải nén prompt.
+
+### Kiểm thử
+* `tests/unit/infrastructure/test_daily_quota_fallback_v323690.py` (4 ca, chạy thật vòng thử lại của `_call_gemini`
+  với server giả):
+  * 429 ngày ở key cuối → model dự phòng;
+  * bộ đếm báo hết → đi thẳng model dự phòng;
+  * tắt dự phòng → dừng;
+  * dự phòng cũng cạn → dừng, không lặp.
+* Ca 1, 2 và 4 thất bại trên mã 3.23.689. Ca 3 (tắt dự phòng) qua ở cả hai bản, vì hành vi đó không đổi.
+* 1355 test quota / dự phòng / Gemini / phân tích đều qua.
+* `test_failover_exhausted_v323643.py`: ca cũ "model chính hết hạn mức ngày → vẫn dừng" (khoá đúng hành vi lỗi, khi đã
+  có model dự phòng) đổi thành hai ca:
+  * có dự phòng thì chuyển sang dự phòng;
+  * không có dự phòng thì vẫn dừng.
+* Toàn bộ test: 8377 qua, 61 bỏ qua (lượt đầy đủ: 1 lỗi đúng là ca cũ trên; đã đổi và chạy lại cùng tệp test mới đều
+  qua).
+
 ## [3.23.689] — 🧱 Tách phần "Dịch cả bộ" khỏi trang Dịch (U6, không đổi hành vi)
 
 ### Vì sao
