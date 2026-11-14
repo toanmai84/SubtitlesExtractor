@@ -577,8 +577,30 @@ def _handle_batch(
     print(json.dumps({"ok": True, "batch": written}), flush=True)
 
 
+def _hide_child_consoles() -> None:
+    """[v3.23.709] Worker chạy không có console: tiến trình con của nó (ffmpeg, lệnh dò của thư viện…) sẽ bật cửa sổ
+    cmd nếu không ẩn. Bản rút gọn của ``hidden_process.install_hidden_console_default`` (worker không import gói
+    ứng dụng)."""
+    import subprocess
+    import sys
+
+    if sys.platform != "win32" or getattr(subprocess.Popen, "_se_hidden_console_default", False):
+        return
+    flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    original_init = subprocess.Popen.__init__
+
+    def hidden_init(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if flag and not kwargs.get("creationflags") and kwargs.get("startupinfo") is None:
+            kwargs["creationflags"] = flag
+        original_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = hidden_init  # type: ignore[method-assign]
+    subprocess.Popen._se_hidden_console_default = True  # type: ignore[attr-defined]
+
+
 def main() -> int:
     """Điểm vào dòng lệnh."""
+    _hide_child_consoles()
     parser = argparse.ArgumentParser(description="VieNeu-TTS GPU worker")
     parser.add_argument("--job", help="Tệp JSON mô tả công việc (chế độ một lượt)")
     parser.add_argument(

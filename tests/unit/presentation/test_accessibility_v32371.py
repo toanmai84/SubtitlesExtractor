@@ -30,14 +30,14 @@ _CONTROLS_NEEDING_NAME: dict[str, set[str]] = {
     # [v3.23.677] Nút mắt (hiện/ẩn key) chuyển sang widgets/ai_access_panel.py — kiểm ở test_ai_access_v323677.
     "translate_page.py": set(),
     "tts_page.py": set(),
+    # [v3.23.693] Hộp thoại Re-OCR nâng cao (btn_play, timeline_slider) tách sang editor_dialogs.py.
+    "editor_dialogs.py": {"btn_play", "timeline_slider"},
     "editor_page.py": {
-        "btn_play",
         "_btn_prev_frame",
         "_btn_step_back",
         "_btn_play",
         "_btn_step_forward",
         "_btn_next_frame",
-        "timeline_slider",
         "_vol",
         "_position_slider",
         "_waveform_y_zoom",

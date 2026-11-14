@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from subtitles_extractor.application.services.speaker_review_flow import MAX_CANDIDATES
 from subtitles_extractor.application.services.speaker_review_session import (
     SpeakerReviewSession,
 )

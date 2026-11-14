@@ -11,7 +11,9 @@ Tích lũy → QFileDialog mở (cùng parent) tương tác GPU context → TREO
 """
 from pathlib import Path
 
-_PAGE = Path(__file__).resolve().parents[3] / "src/subtitles_extractor/presentation/pages/editor_page.py"
+from tests.unit.editor_page_source import EDITOR_PAGE_SOURCE
+
+_PAGE = EDITOR_PAGE_SOURCE  # [v3.23.693] editor_page.py + các phần đã tách (U6)
 
 
 def _snip(source: str, method: str) -> str:

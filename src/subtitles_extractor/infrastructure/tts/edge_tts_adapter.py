@@ -1282,7 +1282,6 @@ class EdgeTTSAdapter(SubtitleTTSPort):
         master: np.ndarray, sr: int, target: Path, fmt: str, bitrate_kbps: int
     ) -> bool:
         """Pipe float32 PCM vào ffmpeg để encode lossy chất lượng cao. True nếu OK."""
-        import shutil
         import subprocess
 
         from subtitles_extractor.infrastructure.media import find_ffmpeg

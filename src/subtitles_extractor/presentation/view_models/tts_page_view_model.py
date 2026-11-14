@@ -65,6 +65,7 @@ from subtitles_extractor.infrastructure.tts.segment_store import renumber_result
 from subtitles_extractor.infrastructure.tts.tts_fit import (
     LineFit,
     measured_misfits,
+    plan_fragment_merges,
     predict_misfits,
 )
 
@@ -164,6 +165,8 @@ class TTSPageViewModel(QObject):
         self._worker = None
         self._is_busy = False
         self._last_adapter = None  # [v3.23.450] adapter lần TTS gần nhất (để TTS lại dòng chọn)
+        #: [v3.23.698] Hàm trả key Gemini HIỆN TẠI (Cài đặt) — adapter dùng lại phải theo key mới nhất.
+        self._gemini_key_provider = None
         #: [v3.23.630] Lượt TTS đang chạy dùng cache từng dòng (ghi lại cache khi xong).
         self._run: incremental_run.PreparedRun | None = None
         #: [v3.23.630] ``(dùng lại, tổng, tổng hợp lại)`` của lượt tăng dần vừa xong; ``None``
@@ -765,6 +768,17 @@ class TTSPageViewModel(QObject):
         current = str(getattr(self._source_events[position], "text", "") or "")
         if new_text.strip() == current.strip():
             return
+        self._set_text(position, new_text)
+        # Lời mới có thể vừa thêm/bỏ tag [Tên:] đầu dòng — tag quyết định người nói.
+        self._refresh_auto_speakers()
+        self._mark_edited([position])
+        self.line_edits_changed.emit()
+
+    def _set_text(self, position: int, new_text: str) -> None:
+        """[v3.23.724] Ghi lời mới + sổ "sửa tay" (nhớ chữ gốc), KHÔNG tính lại người nói / phát tín hiệu."""
+        current = str(getattr(self._source_events[position], "text", "") or "")
+        if new_text.strip() == current.strip():
+            return
         edit = self._text_edits.get(position)
         original = edit.original if edit is not None else current
         self._replace_event_text(position, new_text)
@@ -772,10 +786,6 @@ class TTSPageViewModel(QObject):
             self._text_edits.pop(position, None)
         else:
             self._text_edits[position] = TextEdit(original=original, edited=new_text)
-        # Lời mới có thể vừa thêm/bỏ tag [Tên:] đầu dòng — tag quyết định người nói.
-        self._refresh_auto_speakers()
-        self._mark_edited([position])
-        self.line_edits_changed.emit()
 
     def _replace_event_text(self, position: int, text: str) -> None:
         event = self._source_events[position]
@@ -799,6 +809,21 @@ class TTSPageViewModel(QObject):
         return sorted({
             int(position) for position in positions if 0 <= int(position) < count
         })
+
+    def set_gemini_key_provider(self, provider) -> None:
+        """[v3.23.698] Trang Lồng tiếng tiêm hàm đọc key Gemini hiện tại (Cài đặt → Khoá API và AI)."""
+        self._gemini_key_provider = provider
+
+    def _refresh_adapter_keys(self) -> None:
+        """[v3.23.698] Cập nhật key cho adapter dùng lại (chỉ adapter có ``set_api_keys`` — Gemini TTS)."""
+        setter = getattr(self._last_adapter, "set_api_keys", None)
+        provider = self._gemini_key_provider
+        if setter is None or provider is None:
+            return
+        try:
+            setter(provider())
+        except Exception as exc:  # noqa: BLE001 — không được làm hỏng thao tác TTS lại
+            logger.warning("Không cập nhật được key Gemini cho TTS lại: %s", exc)
 
     def resynthesize_lines(
         self,
@@ -869,6 +894,7 @@ class TTSPageViewModel(QObject):
             # [v3.23.688] Dòng đã thêm/xoá/tách → vị trí đổi: tính lại chỉ dẫn cách đọc theo phụ đề hiện tại.
             full_request = replace(full_request, line_styles=self.dubbing_line_styles())
 
+        self._refresh_adapter_keys()
         use_case = self._container.make_resynthesize_use_case(self._last_adapter)
         from subtitles_extractor.presentation.workers.resynthesize_worker import (
             ResynthesizeWorker,
@@ -1414,25 +1440,69 @@ class TTSPageViewModel(QObject):
             return None
         if chosen[-1] - chosen[0] != len(chosen) - 1:
             return None
+        merged = self._merge_spans([(chosen[0], chosen[-1])])
+        return merged[0] if merged else None
+
+    def _merge_spans(self, spans: list[tuple[int, int]]) -> list[int]:
+        """[v3.23.724] Gộp NHIỀU cụm dòng liền nhau ``(đầu, cuối)`` trong MỘT lượt; trả vị trí MỚI của các dòng gộp.
+
+        Trước bản này "Đọc liền cụm câu" gọi :meth:`merge_lines` từng cụm: mỗi cụm một lần tính lại người nói cả phim,
+        đổi tên cache audio trên đĩa và phát ``structure_changed`` → trang vẽ lại CẢ bảng. Đo 3664 dòng / 916 cụm:
+        đơ 222,7 s. Nay chỉnh lời/mốc mọi dòng đầu cụm trước, rồi xoá mọi dòng đuôi bằng MỘT lần :meth:`delete_lines`
+        (một ánh xạ, một lần phát tín hiệu).
+        """
         events = self._source_events
-        first = chosen[0]
-        merged_text = " ".join(
-            str(getattr(events[p], "text", "") or "").strip() for p in chosen
-        ).strip()
-        start = float(events[first].start_sec)
-        end = max(float(events[p].end_sec) for p in chosen)
-        if not merged_text or end <= start:
-            return None
-        self.update_event_text(first, merged_text)
-        self._set_interval(first, start, end)
-        for index, result in enumerate(self._last_results):
-            if int(result.event_index) == first:
-                self._last_results[index] = replace(
-                    result, text=merged_text, subtitle_text=merged_text
-                )
-        self.delete_lines(chosen[1:])
-        self._mark_edited([first])
-        return first
+        count = len(events)
+        heads: list[int] = []
+        tails: list[int] = []
+        last_end = -1
+        for first, last in sorted(spans):
+            if first <= last_end or not (0 <= first < last < count):
+                continue  # cụm chồng / ngoài phạm vi: bỏ, không đoán
+            merged_text = " ".join(
+                str(getattr(events[p], "text", "") or "").strip() for p in range(first, last + 1)
+            ).strip()
+            start = float(events[first].start_sec)
+            end = max(float(events[p].end_sec) for p in range(first, last + 1))
+            if not merged_text or end <= start:
+                continue
+            self._set_text(first, merged_text)
+            self._set_interval(first, start, end)
+            for index, result in enumerate(self._last_results):
+                if int(result.event_index) == first:
+                    self._last_results[index] = replace(
+                        result, text=merged_text, subtitle_text=merged_text
+                    )
+            self._mark_edited([first])
+            heads.append(first)
+            tails.extend(range(first + 1, last + 1))
+            last_end = last
+        if not heads:
+            return []
+        mapping = delete_mapping(count, tails)
+        if not self.delete_lines(tails):
+            # Không xoá được (không thể xảy ra khi còn dòng đầu cụm): vẫn báo trang lời/mốc đã đổi.
+            self._refresh_auto_speakers()
+            self.line_edits_changed.emit()
+            return heads
+        return [mapping[head] for head in heads]
+
+    def fragment_merge_plan(self) -> list[tuple[int, int]]:
+        """[v3.23.705] Các cụm mảnh câu ``(đầu, cuối)`` nên đọc liền (cùng người nói, có dòng đọc không kịp)."""
+        return plan_fragment_merges(self._source_events, self.effective_line_speakers())
+
+    @_undoable
+    def merge_fast_fragments(self) -> list[int]:
+        """[v3.23.705] Gộp mọi cụm mảnh câu đọc không kịp thành từng dòng — MỘT bước hoàn tác.
+
+        [v3.23.724] Gộp mọi cụm trong MỘT lượt (:meth:`_merge_spans`) — trước đây từng cụm một làm đơ trang.
+
+        Returns:
+            Vị trí (sau khi gộp) của các dòng gộp; rỗng nếu đang bận hoặc không có cụm nào.
+        """
+        if self._is_busy:
+            return []
+        return self._merge_spans(self.fragment_merge_plan())
 
     @_undoable
     def split_line(

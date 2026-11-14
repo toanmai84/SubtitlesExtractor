@@ -43,11 +43,14 @@ MPV_REPO_URL: Final[str] = "https://github.com/shinchiro/mpv-winbuild-cmake"
 MPV_RELEASES_API: Final[str] = (
     "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases?per_page=5"
 )
+MPV_SOURCEFORGE_RSS: Final[str] = "https://sourceforge.net/projects/mpv-player-windows/rss?path=/libmpv"
+MPV_SOURCEFORGE_FILES: Final[str] = "https://sourceforge.net/projects/mpv-player-windows/files/libmpv"
 FFMPEG_RELEASE_BASE: Final[str] = (
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
 )
 REQUEST_TIMEOUT_SEC: Final[float] = 120.0
 USER_AGENT: Final[str] = "SubtitlesExtractor-vendor-fetcher"
+SOURCEFORGE_USER_AGENT: Final[str] = "curl/8.5.0"
 
 #: Tệp BẮT BUỘC phải có sau khi giải nén — dùng để xác nhận tải đúng gói.
 MPV_REQUIRED: Final[tuple[str, ...]] = ("libmpv-2.dll",)
@@ -70,7 +73,9 @@ def _http_get(url: str) -> bytes:
     Raises:
         FetchError: Khi mạng lỗi hoặc máy chủ trả mã lỗi.
     """
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    # [v3.23.717] SourceForge trả 403 cho tên trình tải lạ; dùng tên trình tải dòng lệnh thông dụng cho riêng kho đó.
+    agent = SOURCEFORGE_USER_AGENT if "sourceforge.net" in url else USER_AGENT
+    request = urllib.request.Request(url, headers={"User-Agent": agent})
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SEC) as response:
             return response.read()
@@ -97,7 +102,13 @@ def resolve_latest_mpv_asset() -> tuple[str, str]:
         # máy dùng chung IP rất dễ chạm trần và nhận 403. Khi đó chuyển sang đọc trang phát hành —
         # không qua API nên không bị giới hạn.
         logger.info("API GitHub không dùng được (%s) → chuyển sang đọc trang phát hành.", exc)
-        return _resolve_mpv_asset_via_html()
+        try:
+            return _resolve_mpv_asset_via_html()
+        except FetchError as html_exc:
+            # [v3.23.717] Mạng chặn cả trang phát hành GitHub (proxy công ty / môi trường kiểm thử chỉ cho tải tệp):
+            # dùng kho gương chính thức của cùng tác giả trên SourceForge.
+            logger.info("Trang phát hành GitHub không đọc được (%s) → dùng kho gương SourceForge.", html_exc)
+            return _resolve_mpv_asset_via_sourceforge()
     if not isinstance(payload, list):
         raise FetchError(f"GitHub trả dữ liệu lạ: {str(payload)[:200]}")
     for release in payload:
@@ -135,6 +146,33 @@ def _resolve_mpv_asset_via_html() -> tuple[str, str]:
                 continue
             return name, f"https://github.com{href}"
     raise FetchError("Không thấy tài sản mpv-dev-x86_64 ở các bản phát hành gần nhất.")
+
+
+def _resolve_mpv_asset_via_sourceforge() -> tuple[str, str]:
+    """[v3.23.717] Tìm tài sản libmpv mới nhất trên kho gương SourceForge của shinchiro.
+
+    Ưu tiên bản x86_64 thường; kho gương hiện chỉ còn biến thể ``-v3`` (cần CPU có AVX2 — mọi CPU đi kèm GPU RTX đều
+    có) nên chấp nhận ``-v3`` khi không có bản thường, kèm ghi chú trong log.
+
+    Returns:
+        Cặp ``(tên tệp, địa chỉ tải)``.
+
+    Raises:
+        FetchError: Khi nguồn cấp không liệt kê tài sản phù hợp nào.
+    """
+    feed = _http_get(MPV_SOURCEFORGE_RSS).decode("utf-8", "replace")
+    names = sorted(
+        set(re.findall(r"/libmpv/(mpv-dev-x86_64-(?:v3-)?[0-9]{8}-git-[0-9a-f]+\.7z)", feed)),
+        key=lambda name: re.search(r"([0-9]{8})-git", name).group(1),  # type: ignore[union-attr]
+        reverse=True,
+    )
+    if not names:
+        raise FetchError("Kho gương SourceForge không liệt kê tài sản mpv-dev-x86_64 nào.")
+    plain = [name for name in names if "-v3-" not in name]
+    chosen = plain[0] if plain else names[0]
+    if not plain:
+        logger.info("Kho gương chỉ có biến thể -v3 (cần CPU hỗ trợ AVX2): %s", chosen)
+    return chosen, f"{MPV_SOURCEFORGE_FILES}/{chosen}/download"
 
 
 def _extract_7z(archive: Path, target_dir: Path) -> None:

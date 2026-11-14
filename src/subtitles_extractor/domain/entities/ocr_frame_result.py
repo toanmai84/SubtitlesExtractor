@@ -165,6 +165,9 @@ class OcrFrameResult:
     frame_index: int
     timestamp_sec: float
     text_boxes: list[OcrTextBox] = field(default_factory=list)
+    #: [v3.23.711] Điểm ảnh chữ của khung này giống khung đứng trước trong chuỗi (khung trùng, hoặc khung đọc lại theo
+    #: lịch mà chữ không đổi) → kết quả là một lần đọc nữa của CÙNG câu. ``False`` = chữ đổi / trống / không biết.
+    continues_previous: bool = False
 
     @property
     def is_empty(self) -> bool:

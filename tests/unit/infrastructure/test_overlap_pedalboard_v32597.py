@@ -77,10 +77,28 @@ def test_pedalboard_real_stretch_if_installed() -> None:
     pytest.importorskip("pedalboard")
     tone = (0.3 * np.sin(2 * np.pi * 220 * np.arange(_SR) / _SR)).astype(np.float32)
     out = _stretch_with_pedalboard(tone, _SR, 2.0)
-    assert out is not None
+    assert out is not None, _pedalboard_diagnosis()
     assert out.ndim == 1  # ép về mono 1D dù pedalboard trả (1, n)
     assert out.dtype == np.float32
     # 1.0s nén 2x -> ~0.5s (dung sai 10%).
     assert abs(out.size / _SR - 0.5) < 0.05
     # Năng lượng formant giữ được (Rubber Band) — peak không sụp đổ.
     assert float(np.abs(out).max()) > 0.15
+
+
+def _pedalboard_diagnosis() -> str:
+    """[v3.23.725] Lý do ``stretch_with_pedalboard`` trả ``None`` (lỗi chập chờn 1 lần trong bộ test đầy đủ 14/11/2026)."""
+    import os
+    import sys as _sys
+
+    parts = [f"SUBEXT_DISABLE_PEDALBOARD={os.environ.get('SUBEXT_DISABLE_PEDALBOARD')!r}",
+             f"sys.modules['pedalboard']={_sys.modules.get('pedalboard')!r}"]
+    try:
+        from pedalboard import time_stretch as _ts
+
+        tone = (0.3 * np.sin(2 * np.pi * 220 * np.arange(8000) / 8000)).astype(np.float32)
+        _ts(tone, 8000.0, stretch_factor=2.0)
+        parts.append("gọi lại time_stretch: OK")
+    except BaseException as exc:  # noqa: BLE001 — chỉ để chẩn đoán
+        parts.append(f"lỗi: {type(exc).__name__}: {exc}")
+    return "; ".join(parts)

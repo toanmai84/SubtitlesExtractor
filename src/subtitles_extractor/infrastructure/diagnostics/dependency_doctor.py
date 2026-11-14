@@ -13,7 +13,6 @@ bootstrap riêng.
 from __future__ import annotations
 
 import importlib.util
-import shutil
 import subprocess
 from subtitles_extractor.infrastructure.process.hidden_process import no_window_kwargs
 import sys

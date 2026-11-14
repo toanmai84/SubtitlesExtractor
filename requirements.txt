@@ -44,7 +44,7 @@ rapidfuzz>=3.0
 # ── Dịch phụ đề bằng AI (trang "Dịch phụ đề") ──
 # Bộ dịch đa giai đoạn dùng Google Gemini. Import lazy: nếu thiếu, trang Dịch
 # chỉ ở chế độ không khả dụng, phần còn lại của ứng dụng vẫn chạy bình thường.
-google-genai>=2.29,<3  # [v3.23.595] VoiceConfig.voice cho Gemini TTS 3.8
+google-genai>=2.29,<3  # [v3.23.595] VoiceConfig.voice cho Gemini TTS 3.8. [v3.23.708] GIỮ <3: bản 3.0.0 (06/11/2026) đổi API mặc định sang v1 và thay httpx bằng httpx2
 
 # ── Sửa JSON hỏng từ LLM (v3.23.143) ──
 # Thuần Python, zero phụ thuộc bắt buộc. Import tuỳ chọn: nếu thiếu, tự lùi về bộ

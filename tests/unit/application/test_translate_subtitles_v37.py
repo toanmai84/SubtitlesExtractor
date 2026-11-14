@@ -222,13 +222,13 @@ class TestAdapterPureFunctions:
         # mô hình theo KÝ TỰ cũ đã bị bác bỏ bằng dữ liệu (R²=0.07 vs 0.89).
         assert payload == {
             "line_no": 1, "text": "hi", "speaker": "Bob", "description": "laughs",
-            "max_chars": _ngan_sach(1.0),
+            "max_words": 5,   # [v3.23.702] khung 1 s ở 1,5× nhịp VieNeu
         }
 
     def test_line_to_payload_omits_empty_optional(self) -> None:
         line = TranslationLine(2, 0, 1000, "hi")
         payload = _bare_translator()._line_to_payload(line)
-        assert payload == {"line_no": 2, "text": "hi", "max_chars": _ngan_sach(1.0)}
+        assert payload == {"line_no": 2, "text": "hi", "max_words": 5}
 
     def test_context_window_zero_size(self) -> None:
         lines = [TranslationLine(i, 0, 1, str(i)) for i in range(1, 6)]

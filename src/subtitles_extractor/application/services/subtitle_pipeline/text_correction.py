@@ -66,7 +66,7 @@ def correct_hallucination_typos(source_text: str) -> str:
     for wrong_pattern, correct_pattern in OCR_HALLUCINATION_TYPO_MAP.items():
         if wrong_pattern in source_text:
             source_text = source_text.replace(wrong_pattern, correct_pattern)
-    return restore_bound_words(source_text)
+    return restore_reduplication(restore_bound_words(source_text))
 
 
 #: [v3.23.683] Từ hai chữ "dính liền" (连绵词): chữ được đánh dấu hầu như CHỈ xuất hiện trong từ đó, nên khi OCR đọc đúng
@@ -77,14 +77,22 @@ BOUND_WORDS: tuple[tuple[str, bool, bool], ...] = (
     ("觊觎", True, True), ("踌躇", True, True), ("忐忑", True, True), ("尴尬", True, True),
     ("蜻蜓", True, True), ("蝙蝠", True, True), ("蟋蟀", True, True), ("蚯蚓", True, True),
     ("蜈蚣", True, True), ("蝌蚪", True, True), ("鹦鹉", True, True),
-    ("琵琶", True, True), ("枇杷", True, True), ("琥珀", True, False), ("玳瑁", True, True),
+    ("琵琶", True, True), ("枇杷", True, True), ("玳瑁", True, True),
     ("囫囵", True, True), ("踉跄", True, True), ("蹒跚", True, True), ("徘徊", True, True),
     ("窈窕", True, True), ("旖旎", True, True), ("婀娜", True, False), ("憧憬", True, True),
     ("缥缈", True, False), ("氤氲", True, True), ("匍匐", True, True), ("蹉跎", True, True),
     ("傀儡", True, True), ("魍魉", True, True), ("魑魅", True, False), ("饕餮", True, True),
-    ("麒麟", True, False), ("蟾蜍", False, True), ("吩咐", True, False), ("彷徨", False, True),
-    ("鸳鸯", True, True), ("玫瑰", True, False), ("葡萄", False, True),
-    ("嘈杂", True, False), ("蹂躏", True, True), ("涟漪", False, True), ("龌龊", True, True),
+    ("蟾蜍", False, True), ("吩咐", True, False), ("彷徨", False, True),
+    ("鸳鸯", True, True), ("葡萄", False, True),
+    ("嘈杂", True, False), ("蹂躏", True, True), ("龌龊", True, True),
+)
+# [v3.23.696] Đã bỏ 琥珀, 麒麟, 玫瑰, 涟漪: 琥/麒/玫/漪 hay gặp trong TÊN người ("沈清漪", "麒儿", "玫姐") — luật cũ đổi
+# "沈清漪" thành "沈涟漪", "麒儿快走" thành "麒麟快走".
+
+#: [v3.23.696] Chữ rất thường gặp không bao giờ bị thay: chữ kề là một trong các chữ này thì đáng tin là chữ thật hơn là
+#: chữ dính đọc nhầm ("他很尴了" — OCR cắt mất 尬 — không được thành "他很尴尬" làm mất 了).
+_NEVER_REPLACED = frozenset(
+    "了的是不我你他她它们这那个一在有也就都还吗呢吧啊呀哦嘛啦么着过和与要会能说好人来去上下大小中"
 )
 
 
@@ -101,6 +109,32 @@ def _bound_partners() -> tuple[dict[str, str], dict[str, str]]:
 
 _RIGHT_OF, _LEFT_OF = _bound_partners()
 _BOUND_CHARS = frozenset(ch for word, _left, _right in BOUND_WORDS for ch in word)
+
+
+#: [v3.23.699] Chữ OCR hay đọc nhầm → chữ trông giống mà hay láy (AABB). MỘT chiều, chỉ hướng về chữ láy được
+#: ("白白", "日日", "人人"); bỏ cặp mơ hồ (千千万万 / 干干净净 đều đúng; 己/已, 未/末 không láy).
+_TO_REDUPLICATED = {"自": "白", "曰": "日", "入": "人"}
+
+
+def restore_reduplication(text: str) -> str:
+    """[v3.23.699] Sửa từ láy AABB bị đọc nhầm một chữ trông giống: "清清自白" → "清清白白".
+
+    Lượt trích xuất thật cả phim 86 tập (GPU, 3.23.690): câu "我跟秦执师兄清清白白的" bị đọc "清清自白" ở 33/45 khung (chỉ 3
+    khung đúng) nên bầu chọn giữa các khung không cứu được. Chỉ sửa khi hai chữ đầu là cùng một chữ Hán, chữ thứ ba khác
+    chữ thứ tư và một trong hai là chữ đọc nhầm của chữ kia (bảng một chiều ``_TO_REDUPLICATED``) — đối chiếu 3659 dòng đáp án: 0 dòng bị đổi.
+    """
+    if not text or len(text) < 4:
+        return text
+    chars = list(text)
+    for i in range(len(chars) - 3):
+        a, b, x, y = chars[i:i + 4]
+        if a != b or x == y or not is_single_cjk_char(a):
+            continue
+        if _TO_REDUPLICATED.get(x) == y:      # "清清自白" → "清清白白"
+            chars[i + 2] = y
+        elif _TO_REDUPLICATED.get(y) == x:    # "清清白自" → "清清白白"
+            chars[i + 3] = x
+    return "".join(chars)
 
 
 def restore_bound_words(text: str) -> str:
@@ -127,11 +161,14 @@ def restore_bound_words(text: str) -> str:
 
 def _replaceable(ch: str) -> bool:
     """Chữ kề được phép thay: chữ Hán, không phải chữ dính của từ nào (tránh hai luật giành nhau / đảo thứ tự)."""
-    return is_single_cjk_char(ch) and ch not in _BOUND_CHARS
+    return is_single_cjk_char(ch) and ch not in _BOUND_CHARS and ch not in _NEVER_REPLACED
 
 
 #: [v3.23.682] Phim coi là giản thể khi dòng có chữ phồn (trong bảng) ≤ tỉ lệ này so với dòng có chữ giản tương ứng.
 MINORITY_TRADITIONAL_RATIO = 0.02
+#: [v3.23.696] Chữ có trong bảng phồn→giản nhưng vẫn đúng trong văn bản GIẢN thể: 於 (họ Ư — "於谦"), 徵 (âm "徵" của
+#: ngũ âm 宫商角徵羽). Không coi là dấu hiệu chữ phồn và không bị đổi.
+_VALID_IN_SIMPLIFIED = frozenset("於徵")
 #: Cần ít nhất chừng này dòng giản thể mới đủ căn cứ.
 MINORITY_TRADITIONAL_MIN_SIMPLIFIED_LINES = 20
 
@@ -143,7 +180,7 @@ def unify_minority_traditional(texts: list[str]) -> dict[int, str]:
     giản tương ứng; ảnh trong phim cả 3 đều là giản thể. Khác lần thử v3.7 (đổi vô điều kiện, hỏng phim dùng lẫn
     phồn/giản): chỉ đổi khi phồn thể là THIỂU SỐ rõ rệt của CHÍNH phim đó; phim phồn thể / dùng lẫn thì giữ nguyên.
     """
-    traditional = {k for k, v in HAN_TRADITIONAL_TO_SIMPLIFIED.items() if k != v}
+    traditional = {k for k, v in HAN_TRADITIONAL_TO_SIMPLIFIED.items() if k != v and k not in _VALID_IN_SIMPLIFIED}
     simplified = {v for k, v in HAN_TRADITIONAL_TO_SIMPLIFIED.items() if k != v}
     trad_lines = [i for i, text in enumerate(texts) if any(ch in traditional for ch in text)]
     simp_lines = sum(1 for text in texts if any(ch in simplified for ch in text))
@@ -151,7 +188,10 @@ def unify_minority_traditional(texts: list[str]) -> dict[int, str]:
         return {}
     if len(trad_lines) > MINORITY_TRADITIONAL_RATIO * simp_lines:
         return {}
-    return {i: normalize_traditional_to_simplified(texts[i]) for i in trad_lines}
+    return {
+        i: "".join(ch if ch in _VALID_IN_SIMPLIFIED else HAN_TRADITIONAL_TO_SIMPLIFIED.get(ch, ch) for ch in texts[i])
+        for i in trad_lines
+    }
 
 
 def clean_edge_noise(text_input: str) -> str:
@@ -546,6 +586,7 @@ def collect_restored_texts() -> Iterator[set[str]]:
 
 
 __all__ = [
+    "restore_reduplication",
     "accumulate_confidence_bucket",
     "centering_reference",
     "collect_restored_texts",

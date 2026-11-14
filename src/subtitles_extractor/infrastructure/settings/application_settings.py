@@ -155,7 +155,7 @@ class PreprocessSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SE_PRE_", extra="ignore")
 
     upscale_small_text: bool = Field(default=False)
-    upscale_target_height_px: int = Field(default=128, ge=32, le=512)
+    upscale_target_height_px: int = Field(default=272, ge=32, le=512)  # [v3.23.721] ×2 vùng chữ 136 px (đo tốt nhất)
     add_white_border: bool = Field(default=False)
     border_thickness_px: int = Field(default=8, ge=0, le=64)
     apply_sharpen: bool = Field(default=False)
@@ -274,6 +274,9 @@ class TranslationSettings(BaseSettings):
     # [v3.23.648] Dịch có đính video: chỉ gửi khoảng video của lô (± lề) thay vì cả đoạn dài (đo: 91,6 → 18,1 nghìn
     # token prompt/request trên 30 phút đầu phim thật). Mặc định BẬT.
     clip_video_to_batch: bool = Field(default=True)
+    # [v3.23.703] Lượt "khớp giọng đọc" sau dịch: tự rút gọn dòng dài hơn khung TTS (tốn thêm ~50 % thời gian
+    # dịch). Mặc định BẬT; tắt khi chỉ cần phụ đề, không lồng tiếng.
+    fit_for_speech: bool = Field(default=True)
     # [v3.23.608] Bộ nhớ đệm TỪNG GIAI ĐOẠN dịch được giữ sau khi dịch xong (để sửa tay và
     # dùng lại: đổi một giai đoạn thì các giai đoạn khác không phải dịch lại). Dọn theo số
     # bộ phụ đề giữ lại và tuổi (ngày, tính từ lần ghi cuối).

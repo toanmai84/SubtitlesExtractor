@@ -15,8 +15,10 @@ dựng EditorPage nặng (cần MPV/GPU không có trong môi trường CI).
 
 from pathlib import Path
 
+from tests.unit.editor_page_source import EDITOR_PAGE_SOURCE
+
 _PAGES_DIR = Path(__file__).resolve().parents[3] / "src/subtitles_extractor/presentation/pages"
-_EDITOR = _PAGES_DIR / "editor_page.py"
+_EDITOR = EDITOR_PAGE_SOURCE  # [v3.23.693] editor_page.py + các phần đã tách (U6)
 _EXTRACT = _PAGES_DIR / "extract_page.py"
 _DEBUG = _PAGES_DIR / "debug_page.py"
 _TRANSLATE = _PAGES_DIR / "translate_page.py"

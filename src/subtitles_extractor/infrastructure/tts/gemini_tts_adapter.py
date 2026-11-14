@@ -261,6 +261,26 @@ class GeminiTTSAdapter(SubtitleTTSPort):
         self._active_client: Any = None
         self._daily_exhausted: set[str] = set()
 
+    def set_api_keys(self, api_key: str) -> None:
+        """[v3.23.698] Thay danh sách key (giữ nguyên trạng thái "hết hạn mức ngày" của key còn lại).
+
+        "TTS lại dòng chọn" / kiểm phát âm dùng lại adapter của lượt tổng hợp trước: trước đây danh sách key bị đóng
+        băng từ lượt đó — thêm key mới trong Cài đặt sau khi mọi key cạn hạn mức thì vẫn báo "hết hạn mức trên cả N
+        key", còn key đã gỡ (vd lộ key) vẫn được dùng tiếp.
+        """
+        keys: list[str] = []
+        for piece in (api_key or "").replace(",", "\n").splitlines():
+            piece = piece.strip()
+            if piece and piece not in keys:
+                keys.append(piece)
+        if keys == self._api_keys:
+            return
+        self._api_keys = keys
+        self._daily_exhausted &= set(keys)
+        if self._api_key not in keys:
+            self._api_key = keys[0] if keys else ""
+            self._active_client = None
+
     def is_available(self) -> bool:
         """Kiểm tra PACKAGE đã cài chưa (không phụ thuộc API key).
 

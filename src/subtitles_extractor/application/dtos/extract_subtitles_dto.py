@@ -30,7 +30,7 @@ class SubtitleBuilderConfig:
     line_similarity_threshold: float = 0.75
     sample_step_sec: float = 0.05
 
-    temporal_padding_sec: float = 0.05
+    temporal_padding_sec: float = 0.0   # [v3.23.720] đệm đuôi câu: 0 như cài đặt ứng dụng (chủ dự án chốt 13/11/2026)
     y_clustering_tolerance_ratio: float = 0.30
     y_clustering_tolerance_min_px: float = 5.0
     alignment_center_tolerance_ratio: float = 0.10
@@ -57,6 +57,9 @@ class ExtractSubtitlesRequest:
     """[v3.23.645] Lượt chạy kiểu Re-OCR (không xuất tệp) giữ khung đã giải mã trong bộ nhớ đệm để lần sau khỏi giải mã lại.
     Phép đo tốc độ OCR đặt False: nén JPEG khung vào bộ đệm sẽ tính vào giờ đo và xoá bộ đệm của người dùng."""
     raw_ocr_output_path: Path | None = None
+    verify_suspect_lines: bool = True
+    """[v3.23.708] Cuối lượt trích xuất, tự OCR lại (ảnh gốc, không tiền xử lý) các câu mà hình học hộp chữ cho thấy
+    đọc thiếu / thừa một chữ; chỉ thay chữ khi bản đọc lại khớp đúng dấu hiệu đó."""
     export_raw_images: bool = False
     """Nếu True và raw_ocr_output_path được cấu hình, hệ thống sẽ xuất thêm
     ảnh Input và Output (vẽ sẵn Box + Text) để dễ dàng Debug."""

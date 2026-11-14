@@ -283,6 +283,9 @@ class ReOcrUseCase:
             vram_border_thickness_px=request.sampling.vram_border_thickness_px,
             vram_sharpen=request.sampling.vram_sharpen,
             vram_contrast_factor=request.sampling.vram_contrast_factor,
+            vram_apply_clahe=bool(getattr(request.sampling, "vram_apply_clahe", False)),
+            vram_clahe_clip_limit=float(getattr(request.sampling, "vram_clahe_clip_limit", 3.0)),
+            vram_clahe_tile_size=int(getattr(request.sampling, "vram_clahe_tile_size", 8)),
         )
 
         dummy_output = request.video_path.with_suffix(".reocr.tmp")

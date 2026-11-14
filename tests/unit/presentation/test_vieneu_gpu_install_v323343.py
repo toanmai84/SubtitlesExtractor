@@ -20,10 +20,10 @@ import pytest
 
 
 def _page_source() -> str:
-    import subtitles_extractor.domain.entities.project_record as anchor
+    # [v3.23.692/695] Trang Lồng tiếng đã tách thành nhiều module (phần cài GPU ở ``tts_gpu_install.py``): quét tất cả.
+    from tests.unit.page_sources import TTS_PAGE_SOURCE
 
-    root = Path(anchor.__file__).resolve().parents[2]
-    return (root / "presentation" / "pages" / "tts_page.py").read_text(encoding="utf-8")
+    return TTS_PAGE_SOURCE.read_text(encoding="utf-8")
 
 
 def _worker_source() -> str:

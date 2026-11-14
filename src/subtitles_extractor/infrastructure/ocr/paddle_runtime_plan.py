@@ -36,6 +36,11 @@ PADDLE_RUNTIME_PACKAGE: Final[str] = "paddlepaddle-gpu==3.3.1"
 #: Index CHÍNH của Paddle (bản CUDA 12.9). paddlepaddle-gpu chỉ có ở đây, không có trên PyPI.
 PADDLE_INDEX_URL: Final[str] = "https://www.paddlepaddle.org.cn/packages/stable/cu129/"
 
+#: [v3.23.703] Kho lưu trữ GỐC của file wheel (trang chỉ mục ở trên chỉ trỏ tới đây). Ngày 10/11/2026 trang chỉ mục
+#: paddlepaddle.org.cn trả 502 / ngắt kết nối → pip lặng lẽ bỏ qua kho Paddle, chỉ thấy paddlepaddle-gpu 2.6.x trên
+#: PyPI và báo "No matching distribution … 3.3.1"; cùng lúc tải thẳng wheel từ đây vẫn được (HTTP 200, 810 MB).
+PADDLE_WHEEL_BASE_URL: Final[str] = "https://paddle-whl.bj.bcebos.com/stable/cu129/paddlepaddle-gpu/"
+
 #: Index phụ (PyPI) — phòng khi pip cần phân giải metadata phụ trợ.
 PADDLE_EXTRA_INDEX_URL: Final[str] = "https://pypi.org/simple"
 
@@ -117,8 +122,18 @@ def evaluate_paddle_runtime(
     return PaddleRuntimePlan(PaddleRuntimeStatus.NEEDS_DOWNLOAD, paddle_dir)
 
 
+def paddle_direct_wheel_url(target_python_version: str) -> str:
+    """[v3.23.703] URL wheel ``paddlepaddle-gpu`` Windows cho phiên bản Python ``"major.minor"`` (rỗng nếu sai dạng)."""
+    parts = target_python_version.strip().split(".")
+    if len(parts) < 2 or not all(part.isdigit() for part in parts[:2]):
+        return ""
+    tag = f"cp{parts[0]}{parts[1]}"
+    version = PADDLE_RUNTIME_PACKAGE.split("==", 1)[1]
+    return f"{PADDLE_WHEEL_BASE_URL}paddlepaddle_gpu-{version}-{tag}-{tag}-win_amd64.whl"
+
+
 def build_paddle_install_command(
-    python_exe: str, paddle_dir: Path, target_python_version: str
+    python_exe: str, paddle_dir: Path, target_python_version: str, *, direct_wheel: bool = False,
 ) -> tuple[str, ...]:
     """Lệnh pip tải lõi ``paddlepaddle-gpu`` + PHỤ THUỘC RIÊNG cho ĐÚNG phiên bản Python bundled.
 
@@ -139,7 +154,19 @@ def build_paddle_install_command(
         paddle_dir: Thư mục đích ``models/paddle_runtime``.
         target_python_version: Phiên bản Python BUNDLED dạng ``"major.minor"`` (vd ``"3.11"``)
             — thường lấy từ ``f"{sys.version_info.major}.{sys.version_info.minor}"`` của app.
+        direct_wheel: [v3.23.703] Cài thẳng file wheel trên kho lưu trữ gốc (dự phòng khi trang chỉ mục
+            Paddle sập); phụ thuộc lấy từ PyPI.
     """
+    if direct_wheel:
+        return (
+            python_exe, "-m", "pip", "install",
+            "--target", str(paddle_dir),
+            "--python-version", target_python_version,
+            "--only-binary=:all:",
+            "--upgrade",
+            paddle_direct_wheel_url(target_python_version),
+            "--index-url", PADDLE_EXTRA_INDEX_URL,
+        )
     return (
         python_exe, "-m", "pip", "install",
         "--target", str(paddle_dir),
@@ -159,6 +186,8 @@ __all__ = [
     "PADDLE_RUNTIME_DIRNAME",
     "PADDLE_RUNTIME_DOWNLOAD_GB",
     "PADDLE_RUNTIME_PACKAGE",
+    "PADDLE_WHEEL_BASE_URL",
+    "paddle_direct_wheel_url",
     "PaddleRuntimePlan",
     "PaddleRuntimeStatus",
     "build_paddle_install_command",

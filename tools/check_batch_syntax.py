@@ -88,6 +88,9 @@ def find_unbalanced_parentheses(lines: list[str]) -> list[BatchIssue]:
     for number, raw in enumerate(lines, 1):
         text = _strip_comment(raw)
         if text.lower().startswith("echo"):
+            # [v3.23.703] Trong khối if/for, ')' chưa thoát (^)) ở dòng echo ĐÓNG KHỐI SỚM — phần sau thành lệnh rác.
+            if depth > 0 and ")" in re.sub(r'"[^"]*"', "", text).replace("^)", ""):
+                return [BatchIssue(number, "Dấu ')' chưa thoát (^)) trong echo bên trong khối — đóng khối sớm.")]
             continue
         cleaned = re.sub(r'"[^"]*"', "", text).replace("^(", "").replace("^)", "")
         depth += cleaned.count("(") - cleaned.count(")")

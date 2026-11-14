@@ -285,8 +285,12 @@ def refit_series_roi(
     densest = detect_subtitle_band_from_boxes(confident, frame_width, frame_height)
     if densest is not None and not (top <= densest.y + densest.height / 2 <= bottom):
         return None
-    x0 = max(0, min(roi.x, int(min(b.coord_x_min for b in band))))
-    x1 = min(frame_width, max(roi.x + roi.width, int(round(max(b.coord_x_max for b in band)))))
+    # [v3.23.696] Chỉ nới theo hộp CHỒNG lên bề ngang ROI (câu dài hơn). Hộp nằm hẳn bên cạnh — logo kênh, chữ trong
+    # cảnh cùng độ cao — từng kéo ROI rộng dần qua mỗi tập (ROI học được truyền sang tập sau, chỉ nới không thu hẹp).
+    left, right = roi.x, roi.x + roi.width
+    widen = [b for b in band if b.coord_x_max > left and b.coord_x_min < right]
+    x0 = max(0, min(left, int(min((b.coord_x_min for b in widen), default=left))))
+    x1 = min(frame_width, max(right, int(round(max((b.coord_x_max for b in widen), default=right)))))
     return Roi(
         x=x0, y=roi.y, width=max(1, x1 - x0), height=roi.height,
         alignment=roi.alignment, orientation=roi.orientation,

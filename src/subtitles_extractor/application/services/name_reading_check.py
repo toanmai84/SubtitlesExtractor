@@ -280,6 +280,24 @@ _KINSHIP_CHARS = frozenset(
 )
 
 
+#: [v3.23.702] Âm HỌ của chữ có nhiều âm Hán-Việt (khi đứng đầu tên người chỉ đọc một âm). A/B phân tích 361 câu
+#: (3.5-flash-lite): bảng nhân vật ghi ``叶然 (Lâm Nhiên)`` — "Lâm" là âm của 林; 叶 có hai âm (hiệp/diệp) nên bộ sửa
+#: cũ không chọn được, tên nam chính sai ở 24/24 dòng nhắc tới.
+SURNAME_READINGS: dict[str, str] = {
+    "叶": "diệp", "葉": "diệp", "曾": "tăng", "解": "giải", "仇": "cừu", "区": "âu", "區": "âu", "查": "tra",
+    "朴": "phác", "盖": "cái", "蓋": "cái", "缪": "mâu", "繆": "mâu", "覃": "đàm", "华": "hoa", "華": "hoa",
+}   # Không đưa 长 (长安 = Trường An, 长兄 = danh xưng) hay 单 (单雄信 quen viết "Đan").
+
+
+def _surname_misread(alignment: _Alignment, char: str) -> bool:
+    """[v3.23.702] Tên HAI chữ đọc nhầm đúng chữ HỌ, chữ tên đã phiên âm đúng (vd ``叶然`` → "Lâm Nhiên")."""
+    name = alignment.name
+    return (
+        len(name) == 2 and len(alignment.wrong) == 1 and char == name[0]
+        and name[1] in alignment.matched and char in SURNAME_READINGS and name[1] not in _KINSHIP_CHARS
+    )
+
+
 def _sure_transliteration(alignment: _Alignment) -> bool:
     """Tên chắc chắn đang được PHIÊN ÂM, đủ để sửa âm đọc nhầm sang chữ khác.
 
@@ -324,10 +342,13 @@ def _other_character_reading(
     Returns:
         Âm đúng, hoặc rỗng nếu không đủ chắc.
     """
-    if not _sure_transliteration(alignment):
+    surname = _surname_misread(alignment, char)
+    if not surname and not _sure_transliteration(alignment):
         return ""
     wrote, _ = alignment.wrong[char]
     candidates = readings.suggestable(char)
+    if surname:
+        candidates = (SURNAME_READINGS[char],)   # [v3.23.702] chữ họ của tên hai chữ: một âm duy nhất
     if len(candidates) != 1 or not readings.is_hanviet_syllable(wrote):
         return ""
     return candidates[0]

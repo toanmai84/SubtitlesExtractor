@@ -249,7 +249,8 @@ class TestEditorReOcrBadRange:
     def test_empty_range_reports_error(
         self, editor: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        from subtitles_extractor.presentation.pages import editor_page
+        # [v3.23.693] Re-OCR đã tách sang editor_reocr.py — vá tên tại nơi dùng.
+        from subtitles_extractor.presentation.pages import editor_reocr
 
         class _Dialog:
             def __init__(self, **_kwargs: Any) -> None: ...
@@ -262,7 +263,7 @@ class TestEditorReOcrBadRange:
 
             def deleteLater(self) -> None: ...  # noqa: N802 — tên API Qt
 
-        monkeypatch.setattr(editor_page, "AdvancedReOcrDialog", _Dialog)
+        monkeypatch.setattr(editor_reocr, "AdvancedReOcrDialog", _Dialog)
         errors: list[str] = []
         monkeypatch.setattr(editor, "_show_error", errors.append)
         started: list[Any] = []

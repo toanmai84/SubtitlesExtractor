@@ -680,6 +680,20 @@ def _alias_keys(name: str) -> set[str]:
     return {key for key in (_label_key(part) for part in parts) if key}
 
 
+_ANNOTATION_RE = re.compile(r"[(（]([^)）]*)[)）]")
+
+
+def _annotations(name: str) -> set[str]:
+    """[v3.23.696] Chú thích trong ngoặc của tên vai (``"师父(张三)"`` → {"张三"})."""
+    return {part.strip() for part in _ANNOTATION_RE.findall(name or "") if part.strip()}
+
+
+def _same_person(name: str, saved_name: str) -> bool:
+    """Hai tên cùng có chú thích mà chú thích khác nhau là hai người ("师父(张三)" ≠ "师父(李四)")."""
+    mine, theirs = _annotations(name), _annotations(saved_name)
+    return not (mine and theirs and not mine & theirs)
+
+
 def match_saved_casting(role_names: list[str], saved: dict[str, str]) -> dict[str, str]:
     """[v3.23.687] Giọng đã lưu cho từng vai — khớp theo tên HOẶC bí danh chung, không cần trùng nguyên chuỗi.
 
@@ -706,7 +720,10 @@ def match_saved_casting(role_names: list[str], saved: dict[str, str]) -> dict[st
         if name in out:
             continue
         keys = _alias_keys(name)
-        matches = [key for key, aliases in saved_keys if key not in used and keys & aliases]
+        # [v3.23.696] Bảng giọng đã lưu dùng chung mọi phim: "师父(张三)" không được nhận giọng của "师父(李四)".
+        matches = [
+            key for key, aliases in saved_keys if key not in used and keys & aliases and _same_person(name, key)
+        ]
         if matches:
             chosen = matches[-1]
             out[name] = saved[chosen]

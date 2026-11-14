@@ -32,9 +32,11 @@ python-mpv
 # Bỏ comment dòng dưới để cài tự động (chỉ trên máy có GPU NVIDIA):
 pynvvideocodec
 
-# [v3.23.288] CuPy: BAT BUOC cho NVDEC GPU-First (xu ly frame GPU). Thieu CuPy -> app tu
-# fallback PyAV (van nhanh, on dinh). Bo comment de bat NVDEC toc do cao:
-# cupy-cuda12x  # khop CUDA 12.x (paddlepaddle-gpu cu129 dung CUDA 12.9)
+# [v3.23.288] CuPy: BAT BUOC cho NVDEC GPU-First (giai ma + tien xu ly khung tren VRAM).
+# [v3.23.723] BAT MAC DINH. Truoc day dong nay bi comment -> may chu du an chua bao gio chay NVDEC (luot 717 ghi
+# "frame_sampler: PyAvFrameSampler", khong co cupy trong danh sach goi) -> giai ma + tien xu ly deu tren CPU.
+# CuPy 14 tim NVRTC/cudart qua cuda-pathfinder (goi nvidia-*-cu12 ma paddlepaddle-gpu cu129 da keo ve).
+cupy-cuda12x>=13.4  # khop CUDA 12.x (paddlepaddle-gpu cu129 dung CUDA 12.9)
 
 # [v3.23.292] VieNeu-TTS: engine TTS tieng Viet OFFLINE (Apache 2.0 — an toan thuong mai).
 # CPU torch-free (chi ONNX Runtime). Model tai runtime lan dau tu HuggingFace.
@@ -69,7 +71,7 @@ rapidfuzz
 # ── Dịch phụ đề bằng AI (trang "Dịch phụ đề") ──
 # Bộ dịch đa giai đoạn dùng Google Gemini. Import lazy: nếu thiếu, trang Dịch
 # chỉ ở chế độ không khả dụng, phần còn lại của ứng dụng vẫn chạy bình thường.
-google-genai>=2.29,<3  # [v3.23.595] VoiceConfig.voice cho Gemini TTS 3.8
+google-genai>=2.29,<3  # [v3.23.595] VoiceConfig.voice cho Gemini TTS 3.8. [v3.23.708] GIỮ <3: bản 3.0.0 (06/11/2026) đổi API mặc định sang v1 và thay httpx bằng httpx2
 
 # ── Sửa JSON hỏng từ LLM (v3.23.143) ──
 # Thuần Python, zero phụ thuộc bắt buộc. Import tuỳ chọn: nếu thiếu, tự lùi về bộ

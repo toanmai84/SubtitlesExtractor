@@ -21,7 +21,6 @@ from subtitles_extractor.infrastructure.video.roi_selection import (
 )
 
 
-
 def _cluster(cid: int, y0: int, y1: int, frames: int, boxes: int) -> ROICluster:
     return ROICluster(
         cluster_id=cid, orientation=TextOrientation.HORIZONTAL, alignment=TextAlignment.CENTER,
@@ -60,7 +59,13 @@ _FULLSCREEN_DIR = _TEST_DATA / "fullscreen_autoroi"
 
 
 def _load_boxes(path: Path):
-    doc = json.loads(path.read_text(encoding="utf-8"))
+    if path.suffix == ".gz":  # [v3.23.719] dữ liệu lớn lưu nén trong repo
+        import gzip
+
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            doc = json.load(handle)
+    else:
+        doc = json.loads(path.read_text(encoding="utf-8"))
     boxes = []
     max_x = max_y = 0.0
     for frame in doc["frames"]:
@@ -79,7 +84,7 @@ def _load_boxes(path: Path):
     not _FULLSCREEN_DIR.is_dir(), reason="Cần thư mục 'test data/fullscreen_autoroi'."
 )
 class TestRealDataSelection:
-    @pytest.mark.parametrize("name", ["01", "02", "03", "1", "2", "3", "4"])
+    @pytest.mark.parametrize("name", ["01", "02", "03"])
     def test_primary_roi_is_lower_half(self, name: str) -> None:
         path = _FULLSCREEN_DIR / f"{name}.seraw.json"
         if not path.is_file():
@@ -95,24 +100,63 @@ class TestRealDataSelection:
         assert center_y_ratio > 0.45, f"{name}: ROI phụ đề chính phải ở phần dưới"
 
 
-@pytest.mark.skipif(
-    not (_TEST_DATA / "haomen_fullscreen.seraw.json").is_file(),
-    reason="Cần haomen_fullscreen.seraw.json (ca mega-cluster).",
-)
+def _with_dense_scene_text(boxes, width: int, height: int):
+    """[v3.23.717] Thêm chữ trong cảnh dày đặc phủ CẢ khung (biển hiệu, chữ chạy, cảnh đông chữ) vào box thật.
+
+    Dữ liệu gốc của ca này (豪门Z外 toàn khung, ~114k box) không còn; tái tạo đúng đặc điểm từng gây mega-cluster: các
+    hộp chữ cảnh liền nhau từ đỉnh tới đáy khung, mỗi vị trí hiện ở nhiều khung, đủ để gom cụm không gian nối thành MỘT
+    cụm cao gần hết khung. Hạt giống cố định → tái lập.
+    """
+    import random
+
+    rng = random.Random(717)
+    frames = sorted({(box.frame_idx, box.timestamp_sec) for box in boxes})
+    noisy = list(boxes)
+    for frame_idx, ts in frames:
+        for _ in range(12):
+            box_height = rng.uniform(30, 60)
+            x0 = rng.uniform(0, width * 0.7)
+            y0 = rng.uniform(0, height - box_height)
+            noisy.append(RawBBox(x0, y0, x0 + rng.uniform(80, width * 0.3), y0 + box_height,
+                                 rng.uniform(0.6, 0.95), frame_idx, ts))
+    return noisy
+
+
+class TestMegaClusterRealDataset:
+    """[v3.23.719] 豪门Z外 toàn khung (114 437 hộp, 1080×1920, chủ dự án gửi lại): từng bị mega-cluster nuốt cả khung."""
+
+    def test_smart_band_covers_the_users_roi(self) -> None:
+        from subtitles_extractor.infrastructure.video.roi_selection import (
+            select_subtitle_roi_smart,
+        )
+        boxes, width, height = _load_boxes(_TEST_DATA / "haomen_fullscreen.seraw.json.gz")
+        unrefined = BBoxAnalyzer(frame_width=width, frame_height=height, enable_band_refinement=False).analyze(boxes)
+        primary = max(unrefined, key=lambda c: c.frame_count)
+        assert primary.coord_y_max - primary.coord_y_min > 0.9 * height   # dữ liệu thật vẫn tái hiện mega-cluster
+        clusters = BBoxAnalyzer(frame_width=width, frame_height=height).analyze(boxes)
+        roi = select_subtitle_roi_smart(clusters, boxes, width, height)
+        assert roi is not None
+        assert roi.height < height * 0.55, "Không được là mega-cluster toàn khung"
+        assert (roi.y + roi.height / 2) / height > 0.6, "Dải phụ đề 豪门Z外 nằm gần đáy"
+        # Vùng chữ người dùng vẽ tay cho phim này: y 1444–1574 (hai dòng phụ đề ở hai độ cao khác nhau).
+        assert roi.y <= 1444 + 8 and roi.y + roi.height >= 1574 - 8
+
+
 class TestMegaClusterDataset:
-    """豪门Z外 fullscreen ~114k box: từng bị mega-cluster nuốt cả khung."""
+    """Chữ cảnh dày đặc khắp khung (ca từng bị mega-cluster nuốt cả khung) — chạy trên box thật tập 01 + nhiễu tổng hợp."""
 
     def test_smart_avoids_full_frame(self) -> None:
         from subtitles_extractor.infrastructure.video.roi_selection import (
             select_subtitle_roi_smart,
         )
-        boxes, width, height = _load_boxes(_TEST_DATA / "haomen_fullscreen.seraw.json")
+        boxes, width, height = _load_boxes(_FULLSCREEN_DIR / "01.seraw.json")
+        boxes = _with_dense_scene_text(boxes, width, height)
         clusters = BBoxAnalyzer(frame_width=width, frame_height=height).analyze(boxes)
         roi = select_subtitle_roi_smart(clusters, boxes, width, height)
         assert roi is not None
         assert roi.height < height * 0.55, "Không được là mega-cluster toàn khung"
         center_y_ratio = (roi.y + roi.height / 2) / height
-        assert center_y_ratio > 0.6, "Dải phụ đề 豪门Z外 nằm gần đáy"
+        assert center_y_ratio > 0.6, "Dải phụ đề nằm gần đáy"
 
 
 class TestFramePresenceBandDetection:

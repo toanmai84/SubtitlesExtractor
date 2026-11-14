@@ -61,6 +61,8 @@ class RawOcrMeta:
         preprocess:        [NEW] Cấu hình tiền xử lý ảnh lúc OCR.
         advanced_ocr:      [NEW] Các thông số OCR nâng cao (Det Thresh, Unclip...).
         boundary:          [v3.23.682] Dải ranh giới (``BoundaryTrack.to_dict``) — dựng lại phụ đề vẫn đặt mốc đúng khung.
+        run:               [v3.23.714] Hồ sơ lượt chạy — mọi cấu hình quyết định kết quả.
+        result:            [v3.23.714] Các câu đã dựng + nhật ký vòng soát của lượt chạy.
     """
 
     video_name: str
@@ -72,10 +74,15 @@ class RawOcrMeta:
     score_threshold: float
     saved_at: str
     roi_xywh: list[int] | None = None
-    app_version: str = "3.23.690"
+    app_version: str = "3.23.726"
     preprocess: dict[str, Any] | None = None
     advanced_ocr: dict[str, Any] | None = None
     boundary: dict[str, Any] | None = None
+    #: [v3.23.714] Hồ sơ lượt chạy (``run_provenance.collect_run_info``): cấu hình lấy mẫu / OCR / dựng phụ đề, vùng
+    #: chữ kèm căn lề, video, thư viện, phần cứng. Tệp cũ không có → ``None``.
+    run: dict[str, Any] | None = None
+    #: [v3.23.714] Kết quả đã dựng của chính lượt chạy đó (``run_provenance.summarize_result``): câu + cờ + nhật ký soát.
+    result: dict[str, Any] | None = None
 
 
 def save_raw_ocr(
@@ -189,11 +196,14 @@ def load_raw_ocr(input_path: Path) -> tuple[list[OcrFrameResult], RawOcrMeta]:
 
 def _serialize_frame(frame: OcrFrameResult) -> dict[str, Any]:
     """Serialize 1 OcrFrameResult thành dict JSON-safe."""
-    return {
+    data: dict[str, Any] = {
         "fi": frame.frame_index,
         "ts": round(frame.timestamp_sec, 6),
         "boxes": [_serialize_box(b) for b in frame.text_boxes],
     }
+    if frame.continues_previous:      # [v3.23.711] chỉ ghi khi đúng — tệp cũ không có khoá này đọc ra False
+        data["k"] = 1
+    return data
 
 
 def _serialize_box(box: OcrTextBox) -> dict[str, Any]:
@@ -217,6 +227,7 @@ def _deserialize_frame(data: dict[str, Any]) -> OcrFrameResult:
         frame_index=frame_index,
         timestamp_sec=timestamp_sec,
         text_boxes=text_boxes,
+        continues_previous=bool(data.get("k", 0)),
     )
 
 
@@ -247,6 +258,8 @@ def _deserialize_meta(data: dict[str, Any]) -> RawOcrMeta:
         preprocess=data.get("preprocess"),
         advanced_ocr=data.get("advanced_ocr"),
         boundary=data.get("boundary") if isinstance(data.get("boundary"), dict) else None,
+        run=data.get("run") if isinstance(data.get("run"), dict) else None,
+        result=data.get("result") if isinstance(data.get("result"), dict) else None,
     )
 
 

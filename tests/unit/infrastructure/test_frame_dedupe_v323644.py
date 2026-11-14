@@ -62,13 +62,20 @@ class TestWhiteTextGate:
         return FrameDeduper(FrameSamplingConfig(white_text_gate=True))
 
     def test_background_motion_alone_is_not_a_change(self) -> None:
-        deduper = self._gate()
-        first = _with_text(_background(0), "你好世界")
-        assert deduper.verdict(first, 0.0) is FrameVerdict.OCR
-        deduper.accept(first, 0.0)
-        for i in range(1, 20):                                       # nền đổi hoàn toàn mỗi khung, chữ giữ nguyên
-            moving = _with_text(_background(100 + i), "你好世界")
-            assert deduper.verdict(moving, i * 0.04) is FrameVerdict.DUPLICATE, i
+        def run(moving_background: bool) -> list[FrameVerdict]:
+            deduper, verdicts = self._gate(), []
+            for i in range(20):                                      # nền đổi hoàn toàn mỗi khung, chữ giữ nguyên
+                image = _with_text(_background(100 + i if moving_background and i else 0), "你好世界")
+                verdict = deduper.verdict(image, i * 0.04)
+                if verdict is FrameVerdict.OCR:
+                    deduper.accept(image, i * 0.04)
+                verdicts.append(verdict)
+            return verdicts
+
+        moving = run(True)
+        # [v3.23.710] Câu đứng yên được đọc lại theo LỊCH (khung xác nhận + định kỳ); nền chuyển động không thêm lượt nào.
+        assert moving == run(False)
+        assert moving.count(FrameVerdict.OCR) == 3 and moving[1] is FrameVerdict.DUPLICATE
 
     def test_different_text_triggers_ocr(self) -> None:
         deduper = self._gate()
@@ -87,13 +94,18 @@ class TestWhiteTextGate:
         assert deduper.verdict(_background(2), 0.08) is FrameVerdict.BLANK
         assert deduper.verdict(text, 0.12) is FrameVerdict.OCR        # cùng chữ như trước nhưng sau khoảng trống
 
-    def test_forced_refresh_after_max_gap(self) -> None:
+    def test_forced_refresh_never_later_than_max_gap(self) -> None:
+        # [v3.23.710] Chữ trắng còn hiện được đọc lại định kỳ (TEXT_REOCR_SEC) — luôn sớm hơn mốc MAX_GAP_SEC cũ.
         deduper = self._gate()
         text = _with_text(_background(0), "ABC")
-        deduper.verdict(text, 0.0)
-        deduper.accept(text, 0.0)
-        assert deduper.verdict(text, frame_dedupe.MAX_GAP_SEC - 0.1) is FrameVerdict.DUPLICATE
-        assert deduper.verdict(text, frame_dedupe.MAX_GAP_SEC + 0.01) is FrameVerdict.OCR
+        reads = []
+        for i in range(int(3 * frame_dedupe.MAX_GAP_SEC / 0.04)):
+            if deduper.verdict(text, i * 0.04) is FrameVerdict.OCR:
+                deduper.accept(text, i * 0.04)
+                reads.append(i * 0.04)
+        gaps = [b - a for a, b in zip(reads, reads[1:], strict=False)]
+        assert gaps and max(gaps) <= min(frame_dedupe.MAX_GAP_SEC, frame_dedupe.TEXT_REOCR_SEC + 0.04) + 1e-6
+        assert len(reads) < 0.25 * 3 * frame_dedupe.MAX_GAP_SEC / 0.04          # vẫn chép phần lớn khung
 
     def test_small_jitter_is_tolerated_but_a_new_character_is_not(self) -> None:
         deduper = self._gate()

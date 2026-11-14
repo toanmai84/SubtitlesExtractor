@@ -73,6 +73,118 @@ def _word_overlap(before: str, after: str) -> float:
     return sum(1 for w in new if w in old) / len(new) if new else 0.0
 
 
+#: [v3.23.702] Từ phủ định: số lượng phải giữ nguyên ("không qua nổi" → "qua nổi" đảo nghĩa — ca thật).
+_NEGATIONS = frozenset({"không", "chưa", "chẳng", "chả", "đừng", "chớ", "khỏi", "miễn"})
+#: Đại từ xưng hô: rút gọn không được THÊM đại từ mới (ca thật: "đồ nhi của ta" → "đồ tôi" đổi giọng, "Diệp Nhiên" →
+#: "Nó" đổi vai).
+_PRONOUNS = frozenset({
+    "tôi", "ta", "tao", "mày", "ngươi", "anh", "em", "chị", "ông", "bà", "cô", "chú", "bác", "con", "cháu", "nó",
+    "hắn", "họ", "ngài", "nàng", "chàng", "huynh", "đệ", "tỷ", "muội", "mình", "cậu", "bạn", "lão", "y",
+})
+
+
+#: [v3.23.706] Từ xưng hô / danh xưng Hán-Việt HAI tiếng: rút gọn không được giữ một nửa ("đệ tử" → "đệ").
+TITLE_COMPOUNDS = frozenset({
+    ("đệ", "tử"), ("đồ", "nhi"), ("đồ", "đệ"), ("sư", "phụ"), ("sư", "tôn"), ("sư", "huynh"), ("sư", "đệ"),
+    ("sư", "tỷ"), ("sư", "muội"), ("sư", "thúc"), ("sư", "bá"), ("sư", "bác"), ("sư", "điệt"), ("sư", "tổ"),
+    ("sư", "nương"), ("vi", "sư"), ("chưởng", "giáo"), ("chưởng", "môn"), ("trưởng", "lão"), ("tiền", "bối"),
+    ("vãn", "bối"), ("tại", "hạ"), ("các", "hạ"), ("thuộc", "hạ"), ("bổn", "tọa"), ("lão", "phu"),
+    ("tiểu", "thư"), ("công", "tử"), ("cô", "nương"), ("thiếu", "gia"), ("phu", "nhân"), ("đại", "nhân"),
+    ("bệ", "hạ"), ("điện", "hạ"), ("hoàng", "thượng"), ("túc", "chủ"), ("ký", "chủ"), ("tông", "chủ"),
+    ("môn", "chủ"), ("tông", "môn"), ("đại", "ca"), ("đại", "tẩu"), ("huynh", "đệ"), ("tỷ", "muội"),
+    ("tiểu", "nhân"), ("đạo", "hữu"),
+})
+
+
+def _standalone_counts(words: list[str]) -> dict[str, int]:
+    """Số lần mỗi từ đứng NGOÀI mọi từ ghép trong :data:`TITLE_COMPOUNDS`."""
+    counts: dict[str, int] = {}
+    for position, word in enumerate(words):
+        joined = (
+            (position > 0 and (words[position - 1], word) in TITLE_COMPOUNDS)
+            or (position + 1 < len(words) and (word, words[position + 1]) in TITLE_COMPOUNDS)
+        )
+        if not joined:
+            counts[word] = counts.get(word, 0) + 1
+    return counts
+
+
+def _breaks_title_compound(before: str, after: str) -> bool:
+    """[v3.23.706] Câu rút gọn CẮT ĐÔI một từ xưng hô hai tiếng: bỏ một nửa, nửa kia trơ trọi (hàm thuần).
+
+    Ca thật (A/B 361 câu, 3.5-flash-lite): "nể mặt ngươi là đệ tử của sư tỷ" → "Nể tình ngươi là đệ sư tỷ";
+    "xin hãy tìm cho đồ nhi" → "Tìm nơi cho đồ". Bộ kiểm cũ cho qua vì mọi từ còn lại đều có trong câu cũ.
+    Đã thử nhận diện từ ghép bằng thống kê trên chính bản dịch (cặp đi liền ≥ 2 lần): trên 361 câu nó bỏ sót cả hai
+    ca trên và chặn nhầm việc bỏ lượng từ ("hai trăm đạo lôi kiếp" → "hai trăm lôi kiếp") nên dùng danh sách cố định.
+    """
+    old_words, new_words = _words(before), _words(after)
+    old_pairs = list(zip(old_words, old_words[1:], strict=False))
+    new_pairs = list(zip(new_words, new_words[1:], strict=False))
+    old_alone, new_alone = _standalone_counts(old_words), _standalone_counts(new_words)
+    for pair in set(old_pairs) & TITLE_COMPOUNDS:
+        if new_pairs.count(pair) >= old_pairs.count(pair):
+            continue
+        if any(new_alone.get(half, 0) > old_alone.get(half, 0) for half in pair):
+            return True
+    return False
+
+
+def _keep_leading_case(before: str, text: str) -> str:
+    """[v3.23.706] Câu cũ mở bằng chữ thường (dòng nối tiếp) thì câu rút gọn cũng mở bằng chữ thường (hàm thuần).
+
+    Giữ nguyên khi từ đầu là tên riêng: từng viết hoa giữa câu cũ, hoặc từ thứ hai cũng viết hoa ("Diệp Nhiên").
+    """
+    tag = _SPEAKER_TAG_RE.match(text)
+    head = tag.group(0) if tag else ""
+    body = text[len(head):]
+    old_first = _SPEAKER_TAG_RE.sub("", before).lstrip()[:1]
+    stripped = body.lstrip()
+    if not (old_first.isalpha() and old_first.islower() and stripped[:1].isupper()):
+        return text
+    tokens = stripped.split()
+    first = tokens[0].strip(".,!?…:;\"'()“”‘’«»—–-~") if tokens else ""
+    if not first or any(ch.isupper() for ch in first[1:]) or len(first[:1].lower()) != 1:
+        return text
+    if len(tokens) > 1 and tokens[1][:1].isupper():
+        return text
+    old_tokens = _SPEAKER_TAG_RE.sub("", before).split()
+    if any(token.strip(".,!?…:;\"'()“”‘’«»—–-~") == first for token in old_tokens[1:]):
+        return text
+    return head + body[: len(body) - len(stripped)] + stripped[:1].lower() + stripped[1:]
+
+
+#: [v3.23.706] Từ mở mệnh đề điều kiện / nhượng bộ: bỏ đi là đổi nghĩa câu (ca thật: "Nếu như con không chống đỡ nổi
+#: nữa," → "Con không chống nổi nữa,"; "nếu ngươi không chịu nổi" → "Không chịu nổi").
+_CLAUSE_MARKERS = frozenset({"nếu", "dù", "tuy"})
+
+
+def _changes_meaning_markers(before: str, after: str) -> bool:
+    """[v3.23.702] Câu rút gọn đổi dấu hiệu nghĩa: phủ định, kiểu câu hỏi, thêm đại từ, mất tên riêng (hàm thuần).
+
+    Đo trên A/B 361 câu (3.5-flash-lite): bộ kiểm cũ cho qua "thậm chí một đạo lôi kiếp cũng không qua nổi" →
+    "qua nổi một kiếp", "Không lẽ ngay cả đạo lôi kiếp đầu tiên" → "Đạo lôi kiếp đầu à?", "Diệp Nhiên là đồ nhi của
+    ta" → "Diệp Nhiên là đồ tôi".
+    """
+    old_words, new_words = _words(before), _words(after)
+    if sum(w in _NEGATIONS for w in old_words) != sum(w in _NEGATIONS for w in new_words):
+        return True
+    if ("?" in before) != ("?" in after):
+        return True
+    if any(marker in old_words and marker not in new_words for marker in _CLAUSE_MARKERS):
+        return True
+    if any(w in _PRONOUNS and w not in old_words for w in new_words):
+        return True
+    strip = ".,!?…:;\"'()“”‘’«»—–-~"
+    body = _SPEAKER_TAG_RE.sub("", before).split()
+    # Chữ hoa giữa câu = tên riêng; chữ hoa ngay sau dấu kết câu chỉ là đầu câu mới.
+    names = {
+        word.strip(strip).casefold() for prev, word in zip(body, body[1:])
+        if word[:1].isupper() and not prev.rstrip("\"'”’»)").endswith((".", "!", "?", "…"))
+    }
+    after_tokens = {w.strip(strip).casefold() for w in _SPEAKER_TAG_RE.sub("", after).split()}
+    return any(name and name not in after_tokens for name in names)
+
+
 def validate_shortened(fit: LineFit, before: str, candidate: str) -> str:
     """Câu rút gọn hợp lệ (đã chuẩn hoá) hoặc chuỗi rỗng nếu phải bỏ (hàm thuần).
 
@@ -92,6 +204,11 @@ def validate_shortened(fit: LineFit, before: str, candidate: str) -> str:
     new_syl = dem_am_tiet(_SPEAKER_TAG_RE.sub("", text).strip())
     if _word_overlap(before, text) < MIN_WORD_OVERLAP or _new_words(before, text) > MAX_NEW_WORDS:
         return ""
+    if _changes_meaning_markers(before, text):
+        return ""
+    if _breaks_title_compound(before, text):
+        return ""  # [v3.23.706] cắt đôi từ xưng hô ("đệ tử" → "đệ")
+    text = _keep_leading_case(before, text)
     if new_syl <= 0 or new_syl >= old_syl:
         return ""
     if new_syl < old_syl * 0.4:
@@ -194,4 +311,6 @@ class ShortenForSpeechUseCase:
         return accepted
 
 
-__all__ = ["MIN_WORD_OVERLAP", "ShortenForSpeechUseCase", "ShortenedLine", "validate_shortened"]
+__all__ = [
+    "MIN_WORD_OVERLAP", "ShortenForSpeechUseCase", "ShortenedLine", "TITLE_COMPOUNDS", "validate_shortened",
+]

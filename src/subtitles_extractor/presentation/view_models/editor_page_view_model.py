@@ -16,9 +16,6 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal, QRunnable, QThreadPool, QTimer
 
-from subtitles_extractor.application.dtos.extract_subtitles_dto import (
-    SubtitleBuilderConfig,
-)
 from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
 from subtitles_extractor.application.services.subtitle_editor_service import (
     SubtitleEditorService,
@@ -547,28 +544,19 @@ class EditorPageViewModel(QObject):
     ):
         from subtitles_extractor.application.dtos.reocr_dto import ReOcrRequest
         snapshot = self._container.settings_service.current
-        post = snapshot.post_process
         from subtitles_extractor.application.services.ocr_model_resolver import models_for_reocr
-        from subtitles_extractor.domain.ports.ocr_engine_port import PreprocessConfig
 
         # [v3.23.104] Khi Studio chỉ định version (model_override), map ĐÚNG qua nguồn sự
         # thật chung (hỗ trợ PP-OCRv6); không còn rơi về PP-OCRv5 như bug trước.
         # [v3.23.657] Cùng phiên bản với Cài đặt → giữ bộ dò chữ chọn riêng (xem ``models_for_reocr``).
         det_model, rec_model = models_for_reocr(snapshot.ocr, model_override)
 
-        from importlib.util import find_spec
-        has_cupy = find_spec("cupy") is not None
-        is_nvdec = snapshot.hardware.frame_decoder_backend == "pynvvideocodec" and has_cupy
+        from subtitles_extractor.composition.preprocess_routing import nvdec_sampler_selected, route_preprocessing
 
-        vram_upscale = bool(tweaks.get("upscale", snapshot.preprocess.upscale_small_text)) if is_nvdec else False
-        vram_border = bool(tweaks.get("border", snapshot.preprocess.add_white_border)) if is_nvdec else False
-        vram_sharpen = bool(tweaks.get("sharpen", snapshot.preprocess.apply_sharpen)) if is_nvdec else False
-        vram_contrast_factor = float(tweaks.get("contrast_factor", snapshot.preprocess.contrast_factor)) if (is_nvdec and tweaks.get("contrast", snapshot.preprocess.apply_contrast_boost)) else 1.0
-
-        cpu_upscale = bool(tweaks.get("upscale", snapshot.preprocess.upscale_small_text)) if not is_nvdec else False
-        cpu_border = bool(tweaks.get("border", snapshot.preprocess.add_white_border)) if not is_nvdec else False
-        cpu_sharpen = bool(tweaks.get("sharpen", snapshot.preprocess.apply_sharpen)) if not is_nvdec else False
-        cpu_contrast = bool(tweaks.get("contrast", snapshot.preprocess.apply_contrast_boost)) if not is_nvdec else False
+        # [v3.23.723] Giải mã NVDEC → mọi tiền xử lý chạy CUDA trên VRAM; một nguồn chia cờ với trang Trích xuất.
+        vram_fields, pre_cfg = route_preprocessing(
+            snapshot.preprocess, on_gpu=nvdec_sampler_selected(snapshot), overrides=dict(tweaks),
+        )
 
         sampling_cfg = FrameSamplingConfig(
             sample_step_sec=snapshot.frame.sample_step_sec, phash_distance_threshold=snapshot.frame.phash_distance,
@@ -576,24 +564,10 @@ class EditorPageViewModel(QObject):
             white_text_gate=snapshot.frame.white_text_gate, white_text_luma=snapshot.frame.white_text_luma,
             apply_median_blend=bool(tweaks.get("median_blend", snapshot.preprocess.apply_median_blend)),
             median_blend_frames=snapshot.preprocess.median_blend_frames,
-            vram_upscale_small_text=vram_upscale, vram_upscale_target_height_px=int(tweaks.get("upscale_h", snapshot.preprocess.upscale_target_height_px)),
-            vram_add_border=vram_border, vram_border_thickness_px=int(tweaks.get("border", snapshot.preprocess.border_thickness_px)),
-            vram_sharpen=vram_sharpen, vram_contrast_factor=vram_contrast_factor,
+            **vram_fields,
         )
 
         min_conf = float(tweaks.get("min_conf", snapshot.threshold.ocr_min_confidence))
-        pre_cfg = PreprocessConfig(
-            upscale_small_text=cpu_upscale,
-            upscale_target_height_px=int(tweaks.get("upscale_h", snapshot.preprocess.upscale_target_height_px)),
-            add_white_border=cpu_border,
-            border_thickness_px=int(tweaks.get("border", snapshot.preprocess.border_thickness_px)),
-            apply_clahe=bool(tweaks.get("clahe", snapshot.preprocess.apply_clahe)),
-            clahe_clip_limit=float(tweaks.get("clahe_clip", snapshot.preprocess.clahe_clip_limit)),
-            clahe_tile_size=int(tweaks.get("clahe_tile", snapshot.preprocess.clahe_tile_size)),
-            apply_sharpen=cpu_sharpen, apply_contrast_boost=cpu_contrast,
-            contrast_factor=float(tweaks.get("contrast_factor", snapshot.preprocess.contrast_factor)),
-        )
-
         ocr_cfg = OcrEngineConfig(
             device=DeviceKind(snapshot.hardware.device.value),
             detection_model_name=det_model,
@@ -617,17 +591,9 @@ class EditorPageViewModel(QObject):
             preprocess=pre_cfg,
         )
 
-        builder_cfg = SubtitleBuilderConfig(
-            similarity_threshold=min(post.similarity_threshold, snapshot.threshold.text_similarity),
-            min_duration_sec=post.min_duration_sec, max_duration_sec=post.max_duration_sec,
-            merge_gap_sec=post.merge_gap_sec, merge_progressive=bool(getattr(post, "merge_progressive", False)), min_confidence=min_conf,
-            use_viterbi=post.use_viterbi, viterbi_open_penalty=post.viterbi_open_penalty,
-            min_text_chars=snapshot.threshold.drop_short_text_chars, line_similarity_threshold=snapshot.threshold.line_similarity,
-            sample_step_sec=snapshot.frame.sample_step_sec, temporal_padding_sec=post.temporal_padding_sec,
-            y_clustering_tolerance_ratio=post.y_clustering_tolerance_ratio, y_clustering_tolerance_min_px=post.y_clustering_tolerance_min_px,
-            alignment_center_tolerance_ratio=post.alignment_center_tolerance_ratio, alignment_margin_tolerance_ratio=post.alignment_margin_tolerance_ratio,
-            alignment_tolerance_min_px=post.alignment_tolerance_min_px
-        )
+        from subtitles_extractor.composition.builder_config import builder_config_from_settings
+
+        builder_cfg = builder_config_from_settings(snapshot, min_confidence=min_conf)
 
         return ReOcrRequest(
             video_path=video_path, time_ranges=time_ranges, replace_uids=replace_uids, roi=roi, sampling=sampling_cfg,

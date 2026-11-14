@@ -36,6 +36,10 @@ _SAMPLE_MIN_CJK = 3
 _SAMPLE_MIN_CONF = 0.9
 MIN_HEIGHT_RATIO = 0.55
 MIN_CHAR_WIDTH_RATIO = 0.4
+#: [v3.23.716] Hộp ≥ 2 chữ, TOÀN chữ Hán: mỗi chữ phải rộng ít nhất chừng này lần cỡ chữ. Đo trên 5 bộ dữ liệu thô của
+#: phim mẫu (≈ 104 000 hộp câu thật mỗi bộ): nhỏ nhất 0,61 ("一晚上"), bách phân vị 0,1 % là 0,74–0,83; chữ DỌC trong
+#: cảnh ("肃疏" 59 × 136 px → 0,44) nằm dưới 0,5 ở 70 / 89 mẫu rác.
+MIN_CJK_RUN_CHAR_WIDTH_RATIO = 0.5
 MAX_CHAR_WIDTH_RATIO = 2.0
 WIDE_KEEP_CONFIDENCE = 0.97
 _LATIN_WIDTH = 0.55
@@ -65,7 +69,15 @@ def typical_glyph_height(frames: Sequence[OcrFrameResult]) -> float | None:
     return statistics.median(heights) if len(heights) >= _MIN_SAMPLES else None
 
 
-def is_plausible_subtitle_box(box: OcrTextBox, glyph_height: float) -> bool:
+def typical_char_pitch(frames: Sequence[OcrFrameResult]) -> float | None:
+    """[v3.23.718] Bề rộng một chữ của phụ đề: trung vị (bề rộng hộp / số chữ) của các hộp chắc chắn là câu thoại."""
+    pitches = [
+        size[0] / len(_CJK.findall(box.text)) for box in _sample_boxes(frames) if (size := _size(box))
+    ]
+    return statistics.median(pitches) if len(pitches) >= _MIN_SAMPLES else None
+
+
+def is_plausible_subtitle_box(box: OcrTextBox, glyph_height: float, char_pitch: float | None = None) -> bool:
     """Hộp có thể là một dòng phụ đề ngang có cỡ chữ ``glyph_height`` không."""
     size = _size(box)
     if size is None or glyph_height <= 0:
@@ -78,22 +90,31 @@ def is_plausible_subtitle_box(box: OcrTextBox, glyph_height: float) -> bool:
         return False
     if per_char < MIN_CHAR_WIDTH_RATIO * min(height, glyph_height):
         return False
-    return not (per_char > MAX_CHAR_WIDTH_RATIO * glyph_height and float(box.confidence) < WIDE_KEEP_CONFIDENCE)
+    if len(text) >= 2 and all(_CJK.match(ch) for ch in text) and (
+        per_char < MIN_CJK_RUN_CHAR_WIDTH_RATIO * min(height, glyph_height)
+    ):
+        return False
+    # [v3.23.718] Chữ quá rộng so với cỡ chữ: lấy số lớn hơn giữa chiều cao và bề rộng một chữ đo được. Vùng chữ vẽ hụt
+    # cắt chân chữ thì chiều cao đo được co lại (45 px) mà bề rộng không đổi (55 px) — hộp "哼" bình thường (93 px) từng
+    # bị coi là quá rộng và mất câu (thử sức: cắt 25 px chân vùng chữ trên OCR thật).
+    reference = max(glyph_height, char_pitch or 0.0)
+    return not (per_char > MAX_CHAR_WIDTH_RATIO * reference and float(box.confidence) < WIDE_KEEP_CONFIDENCE)
 
 
 def drop_implausible_boxes(frames: Sequence[OcrFrameResult]) -> tuple[list[OcrFrameResult], int]:
     """Bỏ hộp sai hình dạng; khung không còn hộp nào thì bỏ khung. Trả (khung, số hộp đã bỏ)."""
     glyph_height = typical_glyph_height(frames)
+    char_pitch = typical_char_pitch(frames)
     if glyph_height is None:
         return list(frames), 0
     samples = _sample_boxes(frames)
-    rejected = sum(1 for box in samples if not is_plausible_subtitle_box(box, glyph_height))
+    rejected = sum(1 for box in samples if not is_plausible_subtitle_box(box, glyph_height, char_pitch))
     if rejected > MAX_SAMPLE_REJECT_RATIO * len(samples):
         return list(frames), 0
     out: list[OcrFrameResult] = []
     dropped = 0
     for frame in frames:
-        kept = [box for box in frame.text_boxes if is_plausible_subtitle_box(box, glyph_height)]
+        kept = [box for box in frame.text_boxes if is_plausible_subtitle_box(box, glyph_height, char_pitch)]
         dropped += len(frame.text_boxes) - len(kept)
         if len(kept) == len(frame.text_boxes):
             out.append(frame)
@@ -107,6 +128,10 @@ MAX_DRIFT_WIDTH_RATIO = 0.4
 #: ...và chuyển động đều (độ lệch quanh đường thẳng ≤ bấy nhiêu phần quãng trôi) — rung hộp OCR thì không đều.
 MAX_DRIFT_RESIDUAL_RATIO = 0.5
 _DRIFT_MIN_FRAMES = 3
+#: [v3.23.696] Trôi đều: ≥ bấy nhiêu bước liền khung cùng chiều (dời ≥ ``_DRIFT_MIN_STEP_PX``), và ≥ chừng ấy phần số bước.
+_DRIFT_MIN_STEPS = 2
+_DRIFT_MIN_STEP_SHARE = 0.5
+_DRIFT_MIN_STEP_PX = 1.5
 #: Khung được tính khi các hộp khớp phủ ≥ bấy nhiêu phần chữ của câu (phim 86 tập: mảnh "心" hộp rộng 210 px ngay trước
 #: "叶然小心" từng làm câu thật bị coi là trôi).
 _DRIFT_MIN_COVERAGE = 0.8
@@ -143,23 +168,44 @@ def _event_box_track(
     return track
 
 
-def drift_ratio(track: Sequence[tuple[float, float, float]]) -> float:
-    """Quãng trôi ngang (theo đường thẳng khớp bình phương nhỏ nhất) chia bề rộng trung vị; 0 nếu rung không đều."""
-    if len(track) < _DRIFT_MIN_FRAMES:
-        return 0.0
-    ts = [t for t, _x, _w in track]
-    xs = [x for _t, x, _w in track]
+def _edge_drift(ts: Sequence[float], xs: Sequence[float]) -> float:
+    """Quãng trôi CÓ DẤU của một mép hộp (đường thẳng khớp bình phương nhỏ nhất); 0 nếu không trôi đều.
+
+    Đều nghĩa là: độ lệch quanh đường thẳng ≤ ``MAX_DRIFT_RESIDUAL_RATIO`` × quãng trôi, và phần lớn các bước giữa hai
+    khung liền nhau cùng chiều trôi (ít nhất ``_DRIFT_MIN_STEPS`` bước) — một khung lệch hay phình đơn lẻ chỉ là một bước.
+    """
     mt, mx = statistics.fmean(ts), statistics.fmean(xs)
     den = sum((t - mt) ** 2 for t in ts)
     if den <= 0:
         return 0.0
     slope = sum((t - mt) * (x - mx) for t, x in zip(ts, xs, strict=True)) / den
-    drift = abs(slope) * (ts[-1] - ts[0])
+    drift = slope * (ts[-1] - ts[0])
     residual = statistics.pstdev([x - (mx + slope * (t - mt)) for t, x in zip(ts, xs, strict=True)])
-    width = statistics.median(w for _t, _x, w in track)
-    if drift <= 0 or width <= 0 or residual > MAX_DRIFT_RESIDUAL_RATIO * drift:
+    if drift == 0 or residual > MAX_DRIFT_RESIDUAL_RATIO * abs(drift):
         return 0.0
-    return drift / width
+    steps = [b - a for a, b in zip(xs, xs[1:], strict=False)]
+    along = sum(1 for d in steps if d * drift > 0 and abs(d) >= _DRIFT_MIN_STEP_PX)
+    if along < _DRIFT_MIN_STEPS or along < _DRIFT_MIN_STEP_SHARE * len(steps):
+        return 0.0
+    return drift
+
+
+def drift_ratio(track: Sequence[tuple[float, float, float]]) -> float:
+    """Quãng trôi ngang chia bề rộng trung vị của hộp; 0 nếu không trôi đều.
+
+    [v3.23.696] Đo riêng HAI MÉP hộp và lấy mép trôi ít hơn: vật trôi theo cảnh dời cả hộp, còn hộp OCR phình một phía
+    (dính vật sáng bên cạnh) chỉ dời một mép. Trước đây đo tâm hộp: "哦" 68 px có một khung phình 209 px ở cuối bị coi là
+    trôi (đường thẳng khớp 3 điểm (a, a, a+d) luôn lệch chỉ 0,24·d) và câu thật bị xoá.
+    """
+    if len(track) < _DRIFT_MIN_FRAMES:
+        return 0.0
+    ts = [t for t, _x, _w in track]
+    left = _edge_drift(ts, [x - w / 2.0 for _t, x, w in track])
+    right = _edge_drift(ts, [x + w / 2.0 for _t, x, w in track])
+    width = statistics.median(w for _t, _x, w in track)
+    if left * right <= 0 or width <= 0:
+        return 0.0
+    return min(abs(left), abs(right)) / width
 
 
 def drop_drifting_events(

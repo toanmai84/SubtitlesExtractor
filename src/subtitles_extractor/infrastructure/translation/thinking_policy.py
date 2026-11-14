@@ -39,6 +39,7 @@ __all__ = [
     "ThinkingSettings",
     "resolve_thinking",
     "supports_minimal_level",
+    "thinks_only_at_high",
 ]
 
 #: Các mức ``thinking_level`` của Gemini 3, từ thấp tới cao.
@@ -100,6 +101,17 @@ def supports_minimal_level(model_name: str) -> bool:
     if version is not None and version[0] >= 4 and "lite" not in name:
         return False
     return True
+
+
+#: [v3.23.702] Model CHỈ thật sự suy nghĩ ở mức "high": đo trực tiếp (11/2026) gemini-3.5-flash-lite với
+#: minimal/low/medium trả 0 token suy nghĩ, "high" ~2000 token.
+_THINKS_ONLY_AT_HIGH = ("gemini-3.5-flash-lite",)
+
+
+def thinks_only_at_high(model_name: str) -> bool:
+    """Model chỉ suy nghĩ khi mức là ``high`` (mức thấp hơn = không suy nghĩ)."""
+    name = (model_name or "").strip().lower().removeprefix("models/")
+    return any(name == known or name.startswith(known + "-") for known in _THINKS_ONLY_AT_HIGH)
 
 
 def _level_for(model_name: str, requested: str, minimal_rejected: bool) -> str:

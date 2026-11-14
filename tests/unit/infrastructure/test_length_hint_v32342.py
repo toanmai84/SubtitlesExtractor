@@ -76,15 +76,15 @@ class TestLengthHint:
     def test_payload_includes_hint(self) -> None:
         line = TranslationLine(index=1, start_ms=0, end_ms=1000, text="你好")
         payload = _bare_translator()._line_to_payload(line)
-        assert payload["max_chars"] == _ngan_sach(1.0)
+        assert payload["max_words"] == 5   # [v3.23.702] khung 1 s: (1,5 − 0,235) / 0,247 = 5 tiếng, thay max_chars
         assert payload["line_no"] == 1
         assert payload["text"] == "你好"
 
     def test_dual_payload_includes_hint(self) -> None:
         line = TranslationLine(index=1, start_ms=0, end_ms=2000, text="bản nháp")
         payload = _bare_translator()._line_to_dual_payload(line)
-        assert payload["max_chars"] == _ngan_sach(2.0)
+        assert payload["max_words"] == 11
 
     def test_no_hint_field_when_no_timing(self) -> None:
         line = TranslationLine(index=1, start_ms=5, end_ms=5, text="x")
-        assert "max_chars" not in _bare_translator()._line_to_payload(line)
+        assert "max_words" not in _bare_translator()._line_to_payload(line)

@@ -1,4 +1,4 @@
-# Subtitles Extractor — v3.23.690
+# Subtitles Extractor — v3.23.726
 
 **English** | [Tiếng Việt](README.vi.md)
 
@@ -16,6 +16,8 @@ The complete workflow in one app: **Extract → Edit → Translate → Dub**.
 - Smart frame sampling with time intervals, perceptual-hash deduplication, and pixel comparison.
 - Greedy and Viterbi subtitle grouping algorithms.
 - Automatic subtitle-region (ROI) detection; batch processing can validate and reuse a previous episode's ROI when appropriate.
+- Experimental/optional NVIDIA GPU path with NVDEC and CuPy for video decoding and image preprocessing on the GPU; falls back to PyAV/CPU when GPU components are unavailable.
+- OCR result voting counts independent OCR reads rather than duplicated frames, reducing bias when identical frames are reused.
 - Handles CJK (Chinese, Japanese, and Korean) and Latin text throughout the pipeline.
 - Flags suspicious OCR lines for AI review and improves OCR safety when re-OCR or settings changes overlap with extraction.
 - Filters moving scene objects that can otherwise be mistaken for subtitles.
@@ -29,6 +31,7 @@ The complete workflow in one app: **Extract → Edit → Translate → Dub**.
 ### AI translation
 - Multi-stage translation: **preprocessing → draft translation → style refinement → localization**.
 - Choose **Google Gemini** or a custom provider with an OpenAI-compatible API. Configure its API URL and key, then load the provider's available text models in the Translate page.
+- Gemini model selection includes supported free and paid text-generation models, with quota guidance in the model catalog.
 - Global context analysis can identify languages and characters and create plot summaries and glossaries.
 - Video-based visual cues help the AI understand scene context, forms of address, and speakers when using Gemini.
 - If a Gemini model reaches its daily quota, the app can automatically switch to the configured fallback model for translation and analysis, when fallback is enabled and available.
@@ -41,6 +44,7 @@ The complete workflow in one app: **Extract → Edit → Translate → Dub**.
 - Process episodes in sequence through extraction, translation, and publishing.
 - Review results between stages or stop the workflow after translation.
 - Validate and reuse the subtitle region from a previous episode when it matches, reducing repeated full-frame searches.
+- Batch merging of adjacent subtitle fragments avoids repeated full-table refreshes on long projects.
 
 ### Text-to-speech (TTS)
 - Generate synchronized speech with Edge TTS, Gemini TTS, and VieNeu.
@@ -53,6 +57,7 @@ The complete workflow in one app: **Extract → Edit → Translate → Dub**.
 ### Settings, diagnostics, and recovery
 - Runtime settings use `pydantic-settings` and can be overridden with environment variables such as `SE_HW_*`, `SE_OCR_*`, `SE_VIDCTX_*`, and `SE_TRANS_*`.
 - Settings are saved automatically with QSettings. The interface supports Vietnamese and light, dark, and automatic themes.
+- The Windows build bundles CuPy's required Python modules while excluding large CUDA DLLs; CUDA runtime components are loaded separately when GPU acceleration is enabled.
 - Safer MPV playback and throttled seeking help reduce Windows playback crashes; the app can fall back to another video preview backend when needed.
 - Native crash logs help diagnose unexpected exits.
 - SQLite databases are backed up and can be recovered when corruption is detected.

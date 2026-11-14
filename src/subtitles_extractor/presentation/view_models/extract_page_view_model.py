@@ -20,8 +20,8 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal
 from subtitles_extractor.application.dtos.extract_subtitles_dto import (
     ExtractSubtitlesRequest,
     ExtractSubtitlesResponse,
-    SubtitleBuilderConfig,
 )
+from subtitles_extractor.composition.builder_config import builder_config_from_settings
 from subtitles_extractor.composition.container import ApplicationContainer
 from subtitles_extractor.domain.entities.video_metadata import VideoMetadata
 from subtitles_extractor.domain.entities.video_state import VideoState
@@ -138,6 +138,8 @@ class ExtractPageViewModel(QObject):
     hardsub_detected = Signal(object)
     auto_roi_detected = Signal(object)
     detection_failed = Signal(str)
+    #: [v3.23.698] Đã huỷ tự dò vùng phụ đề (nút Huỷ).
+    detection_cancelled = Signal()
     roi_changed = Signal(object)
     detected_rois_changed = Signal(object)
     has_last_analysis = Signal(bool)
@@ -325,18 +327,14 @@ class ExtractPageViewModel(QObject):
         self._start_detection_worker(worker)
 
     def _auto_roi_vram_flags(self) -> FrameSamplingConfig | None:
+        from subtitles_extractor.composition.preprocess_routing import nvdec_sampler_selected, route_preprocessing
+
         settings = self._container.settings_service.current
-        if getattr(settings.hardware, "frame_decoder_backend", "") != "pynvvideocodec":
+        if not nvdec_sampler_selected(settings):        # [v3.23.723] đúng điều kiện container chọn NVDEC
             return None
         # [SỬA LỖI TỌA ĐỘ VRAM]: Tắt Upscale và Border trên VRAM để bảo vệ hệ tọa độ
-        return FrameSamplingConfig(
-            vram_upscale_small_text=False,
-            vram_upscale_target_height_px=settings.preprocess.upscale_target_height_px,
-            vram_add_border=False,
-            vram_border_thickness_px=settings.preprocess.border_thickness_px,
-            vram_sharpen=settings.preprocess.apply_sharpen,
-            vram_contrast_factor=settings.preprocess.contrast_factor if settings.preprocess.apply_contrast_boost else 1.0,
-        )
+        vram_fields, _ = route_preprocessing(settings.preprocess, on_gpu=True, overrides={"upscale": False, "border": 0})
+        return FrameSamplingConfig(**vram_fields)
 
     def detect_series_roi(self, previous_roi: Roi | None) -> bool:
         """[v3.23.686] Hàng loạt phim bộ: kiểm nhanh ROI tập trước (≈ 24 khung), không khớp thì dò đầy đủ — một tác vụ.
@@ -471,6 +469,9 @@ class ExtractPageViewModel(QObject):
         self._thread_keeper.keep(thread, worker)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_detection_thread_finished)
+        cancelled_signal = getattr(worker, "cancelled", None)
+        if cancelled_signal is not None:   # [v3.23.698] dò vùng huỷ được
+            cancelled_signal.connect(self.detection_cancelled)
 
         self.active_detect_thread = thread
         self._detect_worker = worker
@@ -932,7 +933,9 @@ class ExtractPageViewModel(QObject):
             self._benchmark_reporter.request_cancel()
         # [v3.22] Hủy cả worker nguồn mới (embedded OCR bitmap / STT WhisperX) — chúng
         # hỗ trợ dừng mềm giữa chừng qua request_cancel.
-        for worker_attr in ("_embedded_worker", "_transcribe_worker", "_rebuild_worker"):
+        # [v3.23.698] … và lượt TỰ DÒ VÙNG PHỤ ĐỀ: nút Huỷ vẫn bật trong lúc dò (trang đang bận) nhưng trước đây không dừng
+        # được nó — lượt dò đầy đủ ~5 phút trên CPU chạy hết rồi mới trả quyền.
+        for worker_attr in ("_embedded_worker", "_transcribe_worker", "_rebuild_worker", "_detect_worker"):
             worker = getattr(self, worker_attr, None)
             if worker is not None and hasattr(worker, "request_cancel"):
                 worker.request_cancel()
@@ -1003,29 +1006,16 @@ class ExtractPageViewModel(QObject):
 
     def _build_single_request(self, roi: Roi | None, raw_ocr_output_path: Path | None = None, export_images: bool = False) -> ExtractSubtitlesRequest:
         snapshot = self._container.settings_service.current
-        post = snapshot.post_process
         from subtitles_extractor.application.services.ocr_model_resolver import (
             resolve_ocr_model_names,
         )
-        from subtitles_extractor.domain.ports.ocr_engine_port import PreprocessConfig
         det_model, rec_model = resolve_ocr_model_names(snapshot.ocr)
 
-        from importlib.util import find_spec
-        has_cupy = find_spec("cupy") is not None
+        from subtitles_extractor.composition.preprocess_routing import nvdec_sampler_selected, route_preprocessing
 
-        is_nvdec = snapshot.hardware.frame_decoder_backend == "pynvvideocodec" and has_cupy
-
-        # [GIẢI PHÓNG VRAM]: Cấp toàn quyền Tiền xử lý cho VRAM để tốc độ đạt đỉnh,
-        # Trừ hao tọa độ sẽ được lớp ExtractSubtitlesUseCase tự động nội suy.
-        vram_upscale = snapshot.preprocess.upscale_small_text if is_nvdec else False 
-        vram_border = snapshot.preprocess.add_white_border if is_nvdec else False
-        vram_sharpen = snapshot.preprocess.apply_sharpen if is_nvdec else False
-        vram_contrast_factor = snapshot.preprocess.contrast_factor if (is_nvdec and snapshot.preprocess.apply_contrast_boost) else 1.0
-
-        cpu_upscale = snapshot.preprocess.upscale_small_text if not is_nvdec else False
-        cpu_border = snapshot.preprocess.add_white_border if not is_nvdec else False
-        cpu_sharpen = snapshot.preprocess.apply_sharpen if not is_nvdec else False
-        cpu_contrast = snapshot.preprocess.apply_contrast_boost if not is_nvdec else False
+        # [v3.23.723] Giải mã NVDEC → mọi tiền xử lý chạy CUDA trên VRAM (phóng, CLAHE, làm nét, tương phản, viền), chỉ chép
+        # về RAM một lần. Điều kiện NVDEC lấy đúng như container chọn bộ giải mã (trước đây lệch → mất tiền xử lý).
+        vram_fields, cpu_preprocess = route_preprocessing(snapshot.preprocess, on_gpu=nvdec_sampler_selected(snapshot))
 
         return ExtractSubtitlesRequest(
             video_path=self._video.path, output_path=Path("Database"), output_format=SubtitleFormat.SRT, roi=roi,
@@ -1035,9 +1025,7 @@ class ExtractPageViewModel(QObject):
                 white_text_gate=snapshot.frame.white_text_gate, white_text_luma=snapshot.frame.white_text_luma,
                 apply_median_blend=snapshot.preprocess.apply_median_blend,
                 median_blend_frames=snapshot.preprocess.median_blend_frames,
-                vram_upscale_small_text=vram_upscale, vram_upscale_target_height_px=snapshot.preprocess.upscale_target_height_px,
-                vram_add_border=vram_border, vram_border_thickness_px=snapshot.preprocess.border_thickness_px,
-                vram_sharpen=vram_sharpen, vram_contrast_factor=vram_contrast_factor,
+                **vram_fields,
             ),
             ocr=OcrEngineConfig(
                 device=DeviceKind(snapshot.hardware.device.value),
@@ -1059,24 +1047,9 @@ class ExtractPageViewModel(QObject):
                 batch_size=snapshot.hardware.batch_size_ocr,
                 det_batch_size=snapshot.hardware.det_batch_size,
                 parallel_workers=snapshot.hardware.workers,
-                preprocess=PreprocessConfig(
-                    upscale_small_text=cpu_upscale, upscale_target_height_px=snapshot.preprocess.upscale_target_height_px,
-                    add_white_border=cpu_border, border_thickness_px=snapshot.preprocess.border_thickness_px,
-                    apply_clahe=snapshot.preprocess.apply_clahe, clahe_clip_limit=snapshot.preprocess.clahe_clip_limit, clahe_tile_size=snapshot.preprocess.clahe_tile_size,
-                    apply_sharpen=cpu_sharpen, apply_contrast_boost=cpu_contrast, contrast_factor=snapshot.preprocess.contrast_factor,
-                ),
+                preprocess=cpu_preprocess,
             ),
-            builder=SubtitleBuilderConfig(
-                similarity_threshold=min(post.similarity_threshold, snapshot.threshold.text_similarity),
-                min_duration_sec=post.min_duration_sec, max_duration_sec=post.max_duration_sec,
-                merge_gap_sec=post.merge_gap_sec, merge_progressive=bool(getattr(post, "merge_progressive", False)), min_confidence=snapshot.threshold.ocr_min_confidence,
-                use_viterbi=post.use_viterbi, viterbi_open_penalty=post.viterbi_open_penalty,
-                min_text_chars=snapshot.threshold.drop_short_text_chars, line_similarity_threshold=snapshot.threshold.line_similarity,
-                sample_step_sec=snapshot.frame.sample_step_sec, temporal_padding_sec=post.temporal_padding_sec,
-                y_clustering_tolerance_ratio=post.y_clustering_tolerance_ratio, y_clustering_tolerance_min_px=post.y_clustering_tolerance_min_px,
-                alignment_center_tolerance_ratio=post.alignment_center_tolerance_ratio, alignment_margin_tolerance_ratio=post.alignment_margin_tolerance_ratio,
-                alignment_tolerance_min_px=post.alignment_tolerance_min_px
-            ),
+            builder=builder_config_from_settings(snapshot),
             auto_tune_batch=snapshot.hardware.auto_tune_batch, save_debug_frames=snapshot.advanced.save_debug_frames,
             debug_frames_dir=snapshot.advanced.debug_frames_dir, keep_temp_files=snapshot.advanced.keep_temp_files,
             skip_export=True, raw_ocr_output_path=raw_ocr_output_path, export_raw_images=export_images,

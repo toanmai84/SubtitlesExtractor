@@ -16,11 +16,14 @@ Có 2 lớp filter không gian:
 from __future__ import annotations
 
 import dataclasses
+import itertools
+import re
 from collections.abc import Sequence
 
 from subtitles_extractor.application.dtos.extract_subtitles_dto import (
     SubtitleBuilderConfig,
 )
+from subtitles_extractor.application.services.subtitle_pipeline.box_geometry import typical_char_pitch
 from subtitles_extractor.application.services.outlier_detection import (
     filter_y_position_outliers,
 )
@@ -28,13 +31,221 @@ from subtitles_extractor.domain.entities.ocr_frame_result import (
     OcrFrameResult,
     OcrTextBox,
 )
-from subtitles_extractor.domain.value_objects.roi import Roi, TextAlignment
+from subtitles_extractor.domain.value_objects.roi import Roi, TextAlignment, TextOrientation
+
+
+#: [v3.23.710] Đo tâm phụ đề của phim: cần chừng này hộp ≥ 3 chữ tin cậy cao, và 90% trong số đó nằm sát tâm đo được.
+CENTER_MIN_BOXES: int = 200
+CENTER_MIN_CONFIDENCE: float = 0.90
+CENTER_MAX_SPREAD_HEIGHTS: float = 0.50
+
+
+def measure_subtitle_center(frames: Sequence[OcrFrameResult], roi: Roi | None) -> float | None:
+    """[v3.23.710] Tâm x THẬT của phụ đề căn giữa, đo từ chính các hộp chữ của phim.
+
+    Bộ lọc căn giữa từng so với tâm VÙNG CHỮ (``roi.width / 2``). Vùng chữ do người dùng vẽ tay hiếm khi đối xứng
+    quanh phụ đề, và dữ liệu OCR thô của các bản trước 3.23.710 có toạ độ hộp bị co (xem ``PaddleOcrAdapter``) —
+    trên phim mẫu tâm thật là 290 trong khi tâm vùng chữ là 322: câu một chữ tin cậy thấp (dung sai 26 px) bị loại
+    oan dù nằm đúng giữa. Trả ``None`` (dùng tâm vùng chữ như cũ) khi phụ đề không căn giữa hoặc chưa đủ dữ liệu.
+    """
+    if (
+        roi is None or roi.alignment not in (TextAlignment.CENTER, TextAlignment.UNKNOWN)
+        or roi.orientation != TextOrientation.HORIZONTAL      # phụ đề dọc: tâm x là vị trí cột chữ, giữ luật cũ
+    ):
+        return None
+    centers: list[float] = []
+    heights: list[float] = []
+    for frame in frames:
+        boxes = [box for box in frame.text_boxes if box.polygon]
+        if len(boxes) != 1:
+            continue                       # khung nhiều hộp: hộp lẻ là mảnh của câu, tâm không đại diện
+        box = boxes[0]
+        if len(box.text.strip()) < 3 or float(box.confidence) < CENTER_MIN_CONFIDENCE:
+            continue
+        xs = [point[0] for point in box.polygon]
+        ys = [point[1] for point in box.polygon]
+        centers.append((min(xs) + max(xs)) / 2.0)
+        heights.append(float(max(ys) - min(ys)))
+    if len(centers) < CENTER_MIN_BOXES:
+        return None
+    centers.sort()
+    heights.sort()
+    center, height = centers[len(centers) // 2], heights[len(heights) // 2]
+    deviations = sorted(abs(value - center) for value in centers)
+    if height <= 0 or deviations[int(0.9 * (len(deviations) - 1))] > CENTER_MAX_SPREAD_HEIGHTS * height:
+        return None
+    return center
+
+
+#: [v3.23.710] Hộp rìa tin cậy thấp kéo lệch tâm một dòng vốn đúng giữa → bỏ hộp rìa đó.
+WEAK_EDGE_MAX_CONFIDENCE: float = 0.60
+WEAK_EDGE_CENTERED_HEIGHTS: float = 0.25
+WEAK_EDGE_OFF_CENTER_HEIGHTS: float = 0.50
+
+_SpatialTuple = tuple[float, float, float, float, OcrTextBox]
+
+
+def _strip_weak_edge_boxes(line: list[_SpatialTuple], center_x: float) -> list[_SpatialTuple]:
+    """[v3.23.710] Bỏ hộp RÌA tin cậy thấp khi phần còn lại nằm đúng tâm phụ đề còn cả dòng thì lệch.
+
+    Phim mẫu 3122 s: "元婴大圆满" (0,97, đúng tâm) + hộp vật trong cảnh "小川" (0,49) bên phải → cả dòng lệch 50 px
+    nhưng vẫn trong dung sai câu dài nên ra "元婴大圆满小川". Chỉ xét hộp rìa trái/phải, mỗi lần một hộp.
+    """
+    ordered = sorted(line, key=lambda spatial_tuple: spatial_tuple[2])
+
+    def offset(boxes: list[_SpatialTuple]) -> float:
+        return abs((min(b[2] for b in boxes) + max(b[3] for b in boxes)) / 2.0 - center_x)
+
+    while len(ordered) >= 2:
+        height = max(1.0, max(b[1] for b in ordered) - min(b[0] for b in ordered))
+        if offset(ordered) <= WEAK_EDGE_OFF_CENTER_HEIGHTS * height:
+            break
+        for edge, rest in ((ordered[0], ordered[1:]), (ordered[-1], ordered[:-1])):
+            if (
+                float(edge[4].confidence) < WEAK_EDGE_MAX_CONFIDENCE
+                and min(float(b[4].confidence) for b in rest) >= WEAK_EDGE_MAX_CONFIDENCE
+                and offset(rest) <= WEAK_EDGE_CENTERED_HEIGHTS * height
+            ):
+                ordered = rest
+                break
+        else:
+            break
+    return ordered
+
+
+#: [v3.23.718] Hộp chữ y hệt (cùng chữ, cùng chỗ) hiện LIÊN TỤC lâu hơn chừng này giây là lớp phủ tĩnh (logo kênh, tên
+#: tài khoản), không phải phụ đề. Đo trên 4 bộ dữ liệu thô thật (≈ 208 000 khung mỗi bộ): lượt liên tục dài nhất của
+#: một câu thật là 4,9 s ("圣子选拔战现在开赛"); thời lượng tối đa một câu của bộ dựng là 7 s.
+STATIC_OVERLAY_MIN_RUN_SEC: float = 10.0
+#: Lượt "liên tục" cho phép hở tối đa chừng này lần bước lấy mẫu (OCR hụt / khung mất).
+STATIC_OVERLAY_MAX_GAP_STEPS: float = 3.0
+#: Hộp cùng chỗ (IoU ≥ ngưỡng) và chữ giống (≥ ngưỡng) với lớp phủ cũng bị gỡ — lần đọc lệch của chính lớp phủ.
+STATIC_OVERLAY_IOU: float = 0.7
+STATIC_OVERLAY_TEXT_RATIO: float = 0.6
+
+
+def _box_iou(left: tuple[float, float, float, float], right: tuple[float, float, float, float]) -> float:
+    width = min(left[2], right[2]) - max(left[0], right[0])
+    height = min(left[3], right[3]) - max(left[1], right[1])
+    if width <= 0 or height <= 0:
+        return 0.0
+    inter = width * height
+    union = (left[2] - left[0]) * (left[3] - left[1]) + (right[2] - right[0]) * (right[3] - right[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def strip_static_overlays(
+    frames: Sequence[OcrFrameResult], sample_step_sec: float, max_line_sec: float = 7.0,
+) -> tuple[list[OcrFrameResult], list[str]]:
+    """[v3.23.718] Gỡ lớp phủ tĩnh (logo kênh / tài khoản cố định trong vùng chữ) khỏi MỌI khung trước khi dựng.
+
+    Thử sức trên OCR thật (thêm "@DuanJu88" cố định ở góc vùng chữ vào mọi khung): mất 6 câu một chữ ("是", "打", "好",
+    "你", "那") và 12 câu lệch mốc — các luật hộp phình / dải phụ đề / gộp lần đọc chỉ xét khung có MỘT hộp nên hộp logo
+    làm chúng tắt hết. Bộ lọc câu watermark có sẵn chạy ở cuối khâu dựng, quá muộn.
+
+    Trả ``(khung, chữ của các lớp phủ đã gỡ)``. Không gỡ gì khi không biết bước lấy mẫu.
+    """
+    if sample_step_sec <= 0 or len(frames) < 2:
+        return list(frames), []
+    min_run = max(STATIC_OVERLAY_MIN_RUN_SEC, 1.5 * max_line_sec)
+    max_gap = STATIC_OVERLAY_MAX_GAP_STEPS * sample_step_sec
+    quantum = 8.0
+    run_start: dict[tuple[str, int, int, int, int], float] = {}
+    last_seen: dict[tuple[str, int, int, int, int], float] = {}
+    overlays: dict[tuple[str, int, int, int, int], tuple[float, float, float, float]] = {}
+    for frame in frames:
+        for box in frame.text_boxes:
+            bbox = box.bounding_box
+            if bbox is None or not box.text.strip():
+                continue
+            x0, y0, x1, y1 = bbox
+            key = (
+                box.text.strip(), round(x0 / quantum), round(y0 / quantum), round(x1 / quantum), round(y1 / quantum),
+            )
+            if key in last_seen and frame.timestamp_sec - last_seen[key] <= max_gap:
+                if frame.timestamp_sec - run_start[key] >= min_run:
+                    overlays[key] = (float(x0), float(y0), float(x1), float(y1))
+            else:
+                run_start[key] = frame.timestamp_sec
+            last_seen[key] = frame.timestamp_sec
+    if not overlays:
+        return list(frames), []
+    from rapidfuzz import fuzz
+
+    targets = [(key[0], bbox) for key, bbox in overlays.items()]
+
+    def is_overlay(box: OcrTextBox) -> bool:
+        bbox = box.bounding_box
+        if bbox is None:
+            return False
+        text = box.text.strip()
+        box_xyxy = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        return any(
+            _box_iou(box_xyxy, target_box) >= STATIC_OVERLAY_IOU
+            and (text == target_text or fuzz.ratio(text, target_text) >= 100 * STATIC_OVERLAY_TEXT_RATIO)
+            for target_text, target_box in targets
+        )
+
+    result: list[OcrFrameResult] = []
+    for frame in frames:
+        kept = [box for box in frame.text_boxes if not is_overlay(box)]
+        result.append(frame if len(kept) == len(frame.text_boxes) else dataclasses.replace(frame, text_boxes=kept))
+    return result, sorted({key[0] for key in overlays})
+
+
+#: [v3.23.717] Hộp CHÍNH (nhiều chữ nhất) tự nó đã đúng tâm phụ đề trong chừng này lần chiều cao hộp → nó là cả dòng.
+#: Đo trên hai bộ dữ liệu thô (≈ 106 500 hộp câu thật mỗi bộ): lệch tâm trung vị 1 px, 99 % ≤ 5 px, 99,9 % ≤ 9,5 px
+#: (cỡ chữ ≈ 67 px → 0,14).
+MAIN_BOX_CENTERED_HEIGHTS: float = 0.12
+MAIN_BOX_MIN_CONFIDENCE: float = 0.9
+CONTAINED_BOX_OVERLAP: float = 0.6
+
+
+def _keep_centered_main_box(line: list[_SpatialTuple], center_x: float) -> list[_SpatialTuple]:
+    """[v3.23.717] Dòng nhiều hộp mà hộp chính tự nó đã đúng tâm, còn cả dòng thì lệch → chỉ giữ hộp chính.
+
+    Phụ đề căn giữa bị tách hai hộp (có dấu cách) thì KHÔNG hộp nào tự đúng tâm (mỗi hộp lệch ít nhất nửa hộp kia), nên
+    luật không đụng tới. Hộp vật trong cảnh nằm cạnh câu (kể cả tin cậy cao — ``_strip_weak_edge_boxes`` chỉ bỏ hộp
+    tin cậy < 0,6) thì kéo tâm cả dòng lệch đi: thử sức trên OCR thật (thêm 1–2 hộp nhiễu vào 5 % lần đọc) ra 9 câu
+    dính chữ thừa ("三台上还剩一人") kèm mốc lệch 0,5 s vì lần đọc dính nhiễu bị tách thành câu riêng.
+    """
+    if len(line) < 2:
+        return line
+
+    def chars(item: _SpatialTuple) -> int:
+        return sum(1 for char in item[4].text if char.isalnum())
+
+    main = max(line, key=lambda item: (chars(item), float(item[4].confidence)))
+    if float(main[4].confidence) < MAIN_BOX_MIN_CONFIDENCE or chars(main) < 1:
+        return line
+    # Hộp ít chữ hơn nằm CHỒNG trong bề ngang hộp chính (≥ 60 % bề rộng của nó): một dòng ngang không thể có hai hộp
+    # chồng nhau — ba bộ dữ liệu thô thật (≈ 208 000 khung mỗi bộ) không có ca nào, nên đây chỉ có thể là vật trong cảnh.
+    line = [
+        item for item in line
+        if item is main or chars(item) >= chars(main)
+        or min(main[3], item[3]) - max(main[2], item[2]) < CONTAINED_BOX_OVERLAP * max(1.0, item[3] - item[2])
+    ]
+    if len(line) < 2:
+        return line
+    if sum(1 for item in line if chars(item) == chars(main)) > 1:
+        return line                                  # hai hộp ngang cỡ: không biết hộp nào là câu
+    tolerance = MAIN_BOX_CENTERED_HEIGHTS * max(1.0, main[1] - main[0])
+    main_offset = abs((main[2] + main[3]) / 2.0 - center_x)
+    line_offset = abs((min(item[2] for item in line) + max(item[3] for item in line)) / 2.0 - center_x)
+    if main_offset <= tolerance and line_offset > main_offset + tolerance:
+        return [main]
+    return line
+
+
+#: [v3.23.716] Khe trống tối đa giữa hai hộp kề nhau của một dòng căn giữa, tính theo chiều cao hộp cao nhất của dòng.
+MAX_INNER_GAP_HEIGHTS = 3.0
 
 
 def clean_spatial_outliers(
     frame_result: OcrFrameResult,
     roi: Roi | None,
     config: SubtitleBuilderConfig,
+    center_x: float | None = None,
 ) -> OcrFrameResult:
     """Lọc các line text lệch khỏi căn lề của ROI trong một frame.
 
@@ -53,6 +264,7 @@ def clean_spatial_outliers(
         frame_result: Frame OCR cần lọc.
         roi: ROI với alignment đã được xác định. Nếu ``None`` thì không lọc.
         config: Cấu hình builder (cho các ngưỡng tolerance).
+        center_x: [v3.23.710] Tâm phụ đề đo từ phim; ``None`` = tâm vùng chữ.
 
     Returns:
         Frame mới với các box hợp lệ. Nếu không có ROI hoặc không có
@@ -113,8 +325,10 @@ def clean_spatial_outliers(
 
     verified_text_boxes: list[OcrTextBox] = []
     roi_width_float_value = float(roi.width)
+    # [v3.23.710] Tâm phụ đề đo từ phim (``measure_subtitle_center``); không có thì tâm vùng chữ như cũ.
+    subtitle_center_x = center_x if center_x is not None else roi_width_float_value / 2.0
 
-    for text_line_cluster in clustered_text_lines:
+    def _line_is_valid(text_line_cluster: list[tuple[float, float, float, float, OcrTextBox]]) -> bool:
         line_x_minimum = min(spatial_tuple[2] for spatial_tuple in text_line_cluster)
         line_x_maximum = max(spatial_tuple[3] for spatial_tuple in text_line_cluster)
         line_x_center_point = (line_x_minimum + line_x_maximum) / 2.0
@@ -135,7 +349,17 @@ def clean_spatial_outliers(
         )
 
         is_text_line_valid = True
-        if total_line_width > roi_width_float_value * 1.02:
+        # [v3.23.716] Một dòng phụ đề không có khe trống rộng giữa các hộp (đo thật: khe lớn nhất giữa hai hộp của cùng
+        # một câu là 0,15 lần cỡ chữ). Hộp ở hai mép cảnh cách nhau > 3 lần chiều cao hộp ("C气" mép trái + "下" mép
+        # phải, khe 473 px) từng tạo "dòng" có tâm đúng giữa → qua kiểm căn lề.
+        ordered_by_x = sorted(text_line_cluster, key=lambda spatial_tuple: spatial_tuple[2])
+        widest_inner_gap = max(
+            (right[2] - left[3] for left, right in itertools.pairwise(ordered_by_x)), default=0.0,
+        )
+        tallest_box = max(spatial_tuple[1] - spatial_tuple[0] for spatial_tuple in text_line_cluster)
+        if total_line_width > roi_width_float_value * 1.02 or (
+            active_alignment == TextAlignment.CENTER and widest_inner_gap > MAX_INNER_GAP_HEIGHTS * tallest_box
+        ):
             is_text_line_valid = False
         else:
             if active_alignment == TextAlignment.CENTER:
@@ -161,10 +385,7 @@ def clean_spatial_outliers(
                 else:
                     dynamic_allowed_deviation = base_allowed_deviation
 
-                if (
-                    abs(line_x_center_point - (roi_width_float_value / 2.0))
-                    > dynamic_allowed_deviation
-                ):
+                if abs(line_x_center_point - subtitle_center_x) > dynamic_allowed_deviation:
                     is_text_line_valid = False
 
             elif active_alignment == TextAlignment.LEFT:
@@ -185,10 +406,34 @@ def clean_spatial_outliers(
                 ):
                     is_text_line_valid = False
 
-        if is_text_line_valid:
-            verified_text_boxes.extend(
-                spatial_tuple[4] for spatial_tuple in text_line_cluster
-            )
+        return is_text_line_valid
+
+    for text_line_cluster in clustered_text_lines:
+        if _line_is_valid(text_line_cluster):
+            if center_x is not None and len(text_line_cluster) >= 2:
+                text_line_cluster = _strip_weak_edge_boxes(text_line_cluster, center_x)
+                if active_alignment == TextAlignment.CENTER:
+                    text_line_cluster = _keep_centered_main_box(text_line_cluster, center_x)
+            verified_text_boxes.extend(spatial_tuple[4] for spatial_tuple in text_line_cluster)
+            continue
+        # [v3.23.701] Dòng gộp nhiều hộp mà lệch tâm: hộp vật thể trong cảnh chồng dọc với phụ đề bị gom chung một
+        # dòng (vd "二" của hoa văn + "叶然" đúng giữa → "二叶然" lệch 83 px → mất câu). Thử các dãy hộp liền nhau
+        # theo trục x, giữ dãy hợp lệ có nhiều chữ nhất — chỉ CỨU thêm, không loại thêm hộp nào.
+        if len(text_line_cluster) < 2:
+            continue
+        ordered = sorted(text_line_cluster, key=lambda spatial_tuple: spatial_tuple[2])
+        best_subset: list[tuple[float, float, float, float, OcrTextBox]] = []
+        best_key = (0, 0.0)
+        for first in range(len(ordered)):
+            for last in range(first + 1, len(ordered) + 1):
+                subset = ordered[first:last]
+                if len(subset) == len(ordered):
+                    continue
+                chars = len("".join(spatial_tuple[4].text for spatial_tuple in subset).strip())
+                conf = sum(float(spatial_tuple[4].confidence) for spatial_tuple in subset) / len(subset)
+                if chars and (chars, conf) > best_key and _line_is_valid(subset):
+                    best_subset, best_key = subset, (chars, conf)
+        verified_text_boxes.extend(spatial_tuple[4] for spatial_tuple in best_subset)
 
     return dataclasses.replace(frame_result, text_boxes=verified_text_boxes)
 
@@ -276,6 +521,25 @@ def _rescue_wrapped_multiline_boxes(
     kept_box_memory_ids.update(newly_rescued_ids)
 
 
+#: [v3.23.719] Cỡ chữ mà các hằng số pixel của bộ lọc mật độ Y (bin 5 px…) được tinh chỉnh, đo bằng BỀ RỘNG MỘT CHỮ
+#: (:func:`typical_char_pitch`): bộ 86 tập 720×1280 ≈ 52–58 px (chữ cao 60–68 px), 豪门Z外 1080 px ≈ 73 px (cao 86 px).
+#: Đo bằng bề rộng chứ không bằng chiều cao: vùng chữ vẽ hụt cắt chân chữ thì chiều cao co lại (67 → 46 px, thử sức
+#: ``clip:25``) mà bề rộng không đổi (58,2 px) — đo theo chiều cao làm dải giữ hẹp lại và mất lần đọc "哼".
+DENSITY_REFERENCE_CHAR_PITCH_PX = 58.3
+#: Chiều cao hộp / bề rộng một chữ trên dữ liệu không bị cắt (đo 7 bộ thật: 1,16–1,18) — dùng khi không đo được bề rộng.
+_HEIGHT_PER_PITCH = 1.17
+
+
+def _density_pixel_scale(frames: Sequence[OcrFrameResult], box_heights: Sequence[float]) -> float:
+    """[v3.23.719] Hệ số đổi hằng số pixel của bộ lọc mật độ Y theo cỡ chữ phim (1.0 = cỡ chữ tinh chỉnh)."""
+    pitch = typical_char_pitch(frames)
+    if pitch is None or pitch <= 0:
+        ordered = sorted(box_heights)
+        median_height = ordered[len(ordered) // 2] if ordered else 0.0
+        pitch = median_height / _HEIGHT_PER_PITCH
+    return pitch / DENSITY_REFERENCE_CHAR_PITCH_PX if pitch > 0 else 1.0
+
+
 def filter_cross_frame_spatial_outliers(
     frames_sequence: Sequence[OcrFrameResult],
     roi: Roi | None = None,
@@ -317,10 +581,17 @@ def filter_cross_frame_spatial_outliers(
         spatial_tuple[2] for spatial_tuple in aggregated_spatial_boxes
     ]
     roi_height_floor = float(roi.height) / 2.0 if roi is not None else 0.0
+    # [v3.23.719] Bộ lọc mật độ Y tính theo CỠ CHỮ, không theo pixel: cùng một phim ở độ phân giải khác cho cùng kết quả.
+    box_heights = [
+        float(bbox[3] - bbox[1])
+        for spatial_tuple in aggregated_spatial_boxes
+        if (bbox := spatial_tuple[1].bounding_box) is not None
+    ]
     keep_spatial_mask = filter_y_position_outliers(
         extracted_y_centers,
         k=4.0,
         minimum_threshold_distance=roi_height_floor,
+        pixel_scale=_density_pixel_scale(frames_list, box_heights),
     )
 
     kept_box_memory_ids: set[int] = set()
@@ -342,6 +613,8 @@ def filter_cross_frame_spatial_outliers(
             frames_list, kept_box_memory_ids, kept_y_centers, float(roi.height) if roi else 0.0
         )
 
+    _rescue_stable_offband_lines(frames_list, aggregated_spatial_boxes, kept_box_memory_ids)
+
     purified_frames_sequence: list[OcrFrameResult] = []
     for current_frame in frames_list:
         surviving_boxes = [
@@ -355,6 +628,62 @@ def filter_cross_frame_spatial_outliers(
             )
 
     return purified_frames_sequence if purified_frames_sequence else frames_list
+
+
+#: [v3.23.701] Dòng phụ đề đặt lệch vị trí thường lệ (vd câu cuối phim nằm cao hơn) được cứu khi đủ mọi điều kiện:
+OFFBAND_MIN_FRAMES = 8
+OFFBAND_MIN_SPAN_SEC = 0.5
+OFFBAND_MIN_CONFIDENCE = 0.9
+OFFBAND_MAX_FRAME_GAP_SEC = 0.3
+OFFBAND_HEIGHT_RATIO = (0.7, 1.4)
+_CJK_PATTERN = re.compile(r"[\u3400-\u9fff]")
+
+
+def _rescue_stable_offband_lines(
+    frames_list: Sequence[OcrFrameResult],
+    aggregated_spatial_boxes: Sequence[tuple[OcrFrameResult, OcrTextBox, float]],
+    kept_box_memory_ids: set[int],
+) -> None:
+    """[v3.23.701] Cứu dòng phụ đề THẬT nằm lệch vị trí thường lệ mà bộ lọc Y toàn phim loại nhầm.
+
+    Ca thật (phim nối 86 tập): câu cuối "我真的是冤枉的" đặt cao hơn mọi câu khác (tâm y ≈ 806 so với ≈ 868); OCR
+    đọc đúng ở 65 khung (tin cậy 1,0) nhưng bộ lọc Y toàn phim coi là ngoại lai → mất câu. Chỉ cứu khi: cùng một chữ
+    hiện liên tục ≥ 0,5 s, tin cậy cao, ≥ 2 chữ Hán, hộp ngang cao xấp xỉ cỡ chữ phụ đề, và khung đó KHÔNG còn phụ đề
+    nào khác (chữ trong cảnh đi kèm phụ đề thường lệ không được cứu).
+    """
+    kept_heights = sorted(
+        box.bounding_box[3] - box.bounding_box[1]
+        for _frame, box, _y in aggregated_spatial_boxes
+        if id(box) in kept_box_memory_ids and box.bounding_box
+    )
+    if not kept_heights:
+        return
+    typical_height = kept_heights[len(kept_heights) // 2]
+    frames_with_kept = {id(frame) for frame, box, _y in aggregated_spatial_boxes if id(box) in kept_box_memory_ids}
+    runs: dict[str, list[list[tuple[OcrFrameResult, OcrTextBox]]]] = {}
+    for frame, box, _y in aggregated_spatial_boxes:
+        if id(box) in kept_box_memory_ids or id(frame) in frames_with_kept or not box.bounding_box:
+            continue
+        text = box.text.strip()
+        x0, y0, x1, y1 = box.bounding_box
+        height = y1 - y0
+        if (
+            len(_CJK_PATTERN.findall(text)) < 2
+            or float(box.confidence) < OFFBAND_MIN_CONFIDENCE
+            or not (OFFBAND_HEIGHT_RATIO[0] * typical_height <= height <= OFFBAND_HEIGHT_RATIO[1] * typical_height)
+            or (x1 - x0) < 1.5 * height
+        ):
+            continue
+        text_runs = runs.setdefault(text, [])
+        if text_runs and frame.timestamp_sec - text_runs[-1][-1][0].timestamp_sec <= OFFBAND_MAX_FRAME_GAP_SEC:
+            text_runs[-1].append((frame, box))
+        else:
+            text_runs.append([(frame, box)])
+    for text_runs in runs.values():
+        for run in text_runs:
+            span = run[-1][0].timestamp_sec - run[0][0].timestamp_sec
+            if len(run) >= OFFBAND_MIN_FRAMES and span >= OFFBAND_MIN_SPAN_SEC:
+                kept_box_memory_ids.update(id(box) for _frame, box in run)
 
 
 def filter_noise_by_confidence(
@@ -396,4 +725,5 @@ __all__ = [
     "clean_spatial_outliers",
     "filter_cross_frame_spatial_outliers",
     "filter_noise_by_confidence",
+    "strip_static_overlays",
 ]

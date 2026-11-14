@@ -24,6 +24,7 @@ Tầng này KHÔNG biết Gemini là gì — chỉ phụ thuộc ``SubtitleTrans
 from __future__ import annotations
 
 import json
+import math
 import logging
 import re
 import time
@@ -133,6 +134,19 @@ CancellationCallback = Callable[[], bool]
 _PASSTHROUGH_WARN_RATIO = 0.98
 
 
+def _keep_final_punctuation(before: str, after: str) -> str:
+    """[v3.23.702] Câu rút gọn giữ dấu kết của câu cũ (bước đóng câu đã chạy trước bước khớp giọng đọc)."""
+    tail = re.search(r"[.,!?…;:~]+$", before.strip())
+    text = after.rstrip()
+    if tail and not re.search(r"[.,!?…;:~]$", text):
+        return text + tail.group(0)
+    return text
+
+
+#: [v3.23.702] Dòng dịch được dài hơn ngân sách giọng đọc tối đa ngần này tiếng mà không phải rút gọn.
+SPEECH_FIT_SLACK_WORDS = 1
+
+
 @dataclass(frozen=True)
 class TranslateSubtitlesRequest:
     """Đầu vào cho use case dịch.
@@ -173,6 +187,9 @@ class TranslateSubtitlesRequest:
     # dòng kề nhau trong tập con không phải hai dòng kề nhau trong phim, nên các bước sửa
     # theo dòng trước/sau (đóng câu, viết hoa đầu câu) không được chạy ở đây.
     contiguous: bool = True
+    # [v3.23.702] Sau khi dịch: dòng còn dài hơn khung giọng đọc (≤ 1,5× nhịp VieNeu) > 1 tiếng → nhờ AI rút gọn
+    # riêng các dòng đó (có kiểm giữ nghĩa). Tắt khi chỉ cần phụ đề chữ.
+    fit_for_speech: bool = True
 
 
 @dataclass(frozen=True)
@@ -460,6 +477,16 @@ class TranslateSubtitlesUseCase:
             return bool(fn(model_name))
         except (AttributeError, TypeError, ValueError):
             return True
+
+    def daily_quota_fallback(self, model_name: str) -> str | None:
+        """[v3.23.696] Model dự phòng còn hạn mức ngày cho ``model_name`` (``None`` = tắt dự phòng / không có / không rõ)."""
+        fn = getattr(self._translator, "daily_quota_fallback", None)
+        if fn is None:
+            return None
+        try:
+            return fn(model_name) or None
+        except (AttributeError, TypeError, ValueError):
+            return None
 
     def _retranslation_stage(
         self,
@@ -963,6 +990,79 @@ class TranslateSubtitlesUseCase:
             for line in current_lines
         ]
 
+    def _fit_lines_for_speech(
+        self,
+        current_lines: list[TranslationLine],
+        source_lines: list[TranslationLine],
+        request: TranslateSubtitlesRequest,
+        cancel_cb: CancellationCallback | None,
+    ) -> list[TranslationLine]:
+        """[v3.23.702] Rút gọn (bằng AI, có kiểm) các dòng dịch còn dài hơn khung giọng đọc.
+
+        Ngân sách = đúng ``max_words`` đã gửi cho model dịch (VieNeu ≤ 1,5× nhịp tự nhiên). Chỉ xử lý dòng vượt
+        > :data:`SPEECH_FIT_SLACK_WORDS` tiếng; câu mới phải qua ``validate_shortened`` (giữ từ khoá, không bịa, không
+        cắt quá 40 %), hỏng thì giữ câu cũ. Lỗi API không làm hỏng lượt dịch — chỉ bỏ qua bước này.
+        """
+        budgets_of = getattr(self._translator, "line_word_budgets", None)
+        if not callable(budgets_of) or not callable(getattr(self._translator, "shorten_for_speech", None)):
+            return current_lines
+        from subtitles_extractor.application.services.translation_process_log import record_event
+        from subtitles_extractor.application.use_cases.shorten_for_speech import ShortenForSpeechUseCase
+        from subtitles_extractor.infrastructure.tts.text_prep import dem_am_tiet
+        from subtitles_extractor.infrastructure.tts.tts_fit import (
+            MIN_KEEP_RATIO,
+            MIN_SYLLABLES_TO_SHORTEN,
+            REASON_PREDICTED,
+            LineFit,
+            is_vietnamese_target,
+        )
+
+        if not is_vietnamese_target(request.context.target_lang):
+            return current_lines   # ngân sách "số tiếng" theo nhịp VieNeu chỉ đúng cho tiếng Việt
+        if not request.contiguous:
+            return current_lines   # dịch lại vài dòng rời: "dòng kế tiếp" trong tập con không phải dòng kế trong phim
+
+        budgets = budgets_of(source_lines)
+        texts = [line.text or "" for line in current_lines]
+        fits: list[LineFit] = []
+        for position, line in enumerate(current_lines):
+            budget = budgets.get(line.index, 0)
+            words = dem_am_tiet(texts[position])
+            if budget and words >= MIN_SYLLABLES_TO_SHORTEN and words > budget + SPEECH_FIT_SLACK_WORDS:
+                target = max(budget, math.ceil(words * MIN_KEEP_RATIO))   # không xin cắt quá 40 %
+                fits.append(LineFit(position, words, target, 0.0, REASON_PREDICTED))
+        if not fits:
+            return current_lines
+        model = next((stage.model_name for stage in reversed(request.stages)
+                      if stage.kind is not TranslationStageKind.PREPROCESS), "")
+        source_by_index = {line.index: line for line in source_lines}
+        try:
+            shortened = ShortenForSpeechUseCase(self._translator).execute(
+                fits, texts, request.context.target_lang, model,
+                source_texts=[(source_by_index.get(line.index) or line).text or "" for line in current_lines],
+                speakers=[line.speaker or "" for line in current_lines],
+                addressees=[line.addressee or "" for line in current_lines],
+                cancel_cb=cancel_cb,
+            )
+        except TranslationCancelledError:
+            raise
+        except (RuntimeError, ValueError, OSError, SubtitleTranslationError) as exc:
+            # Hết hạn mức / lỗi nhà cung cấp ở bước phụ này không được làm hỏng bản dịch đã xong.
+            logger.warning("Khớp giọng đọc: bỏ qua bước rút gọn (%s) — giữ bản dịch như cũ.", exc)
+            return current_lines
+        if not shortened:
+            logger.info("Khớp giọng đọc: %d dòng dài hơn khung, không câu rút gọn nào đạt kiểm.", len(fits))
+            return current_lines
+        new_text = {item.position: _keep_final_punctuation(item.before, item.after) for item in shortened}
+        logger.info(
+            "Khớp giọng đọc: rút gọn %d/%d dòng dài hơn khung (bớt %d tiếng).",
+            len(new_text), len(fits), sum(item.syllables_before - item.syllables_after for item in shortened),
+        )
+        record_event("speech_fit_shortened", requested=len(fits),
+                     lines=sorted(current_lines[pos].index for pos in new_text))
+        return [replace(line, text=new_text[pos]) if pos in new_text else line
+                for pos, line in enumerate(current_lines)]
+
     @staticmethod
     def _capitalize_sentence_starts(
         current_lines: list[TranslationLine], context: TranslationContext
@@ -994,6 +1094,40 @@ class TranslateSubtitlesUseCase:
             len(indices), ", ".join(str(index) for index in indices[:10]),
         )
         _record_guard_event("sentence_starts_capitalized", lines=indices)
+        return [
+            replace(line, text=fixed[position]) if position in fixed else line
+            for position, line in enumerate(current_lines)
+        ]
+
+    @staticmethod
+    def _restore_continuation_case(
+        current_lines: list[TranslationLine], first_texts: list[str], context: TranslationContext
+    ) -> list[TranslationLine]:
+        """[v3.23.706] Trả lại chữ thường đầu dòng nối tiếp mà khâu phong cách / bản địa hoá lỡ viết hoa.
+
+        Xem :func:`sentence_case_guard.restore_continuation_case`.
+
+        Args:
+            current_lines: Bản dịch cuối theo thứ tự thời gian.
+            first_texts: Lời từng dòng của khâu dịch ĐẦU TIÊN (cùng thứ tự).
+            context: Ngữ cảnh dịch (ngôn ngữ đích).
+        """
+        from subtitles_extractor.application.services.sentence_case_guard import (
+            restore_continuation_case,
+            supports_sentence_case,
+        )
+
+        if not supports_sentence_case(context.target_lang):
+            return current_lines
+        fixed = restore_continuation_case(first_texts, [line.text or "" for line in current_lines])
+        if not fixed:
+            return current_lines
+        indices = sorted(current_lines[position].index for position in fixed)
+        logger.info(
+            "Trả lại chữ thường đầu %d dòng nối tiếp (bản dịch thô viết thường): %s",
+            len(indices), ", ".join(str(index) for index in indices[:10]),
+        )
+        _record_guard_event("continuation_case_restored", lines=indices)
         return [
             replace(line, text=fixed[position]) if position in fixed else line
             for position, line in enumerate(current_lines)
@@ -2958,6 +3092,7 @@ class TranslateSubtitlesUseCase:
         current_lines = source_lines
         completed: list[TranslationStageKind] = []
         stage_outputs: dict[TranslationStageKind, list[SubtitleEvent]] = {}
+        stage_texts: dict[TranslationStageKind, list[str]] = {}  # [v3.23.706] lời THÔ từng khâu (không tag)
         has_prior_translation = False
         # [v3.23.504] Đánh dấu ĐÃ CÓ khâu hiệu đính phía trước, để giai đoạn dịch thô biết là
         # dòng nguồn nó nhận KHÔNG còn nguyên bản và cần đối chiếu với bản gốc thô.
@@ -3011,6 +3146,7 @@ class TranslateSubtitlesUseCase:
                     stage_outputs[stage.kind] = self._lines_to_events(
                         request.events, stage_output, request.context
                     )
+                    stage_texts[stage.kind] = [line.text or "" for line in stage_output]
                     current_lines = stage_output
                     completed.append(stage.kind)
                     if stage.kind is TranslationStageKind.PREPROCESS:
@@ -3190,6 +3326,7 @@ class TranslateSubtitlesUseCase:
             stage_outputs[stage.kind] = self._lines_to_events(
                 request.events, stage_output, request.context
             )
+            stage_texts[stage.kind] = [line.text or "" for line in stage_output]
 
             current_lines = stage_output
             completed.append(stage.kind)
@@ -3234,6 +3371,17 @@ class TranslateSubtitlesUseCase:
             current_lines = self._strip_glossary_notes(
                 current_lines, source_lines, request.context.glossary or "", "Bản cuối"
             )
+
+        # [v3.23.702] Khớp giọng đọc: rút gọn riêng các dòng còn dài hơn khung TTS (sau mọi bước dịch lại).
+        if request.fit_for_speech and completed and completed[-1] is not TranslationStageKind.PREPROCESS:
+            current_lines = self._fit_lines_for_speech(current_lines, source_lines, request, cancel_cb)
+
+        # [v3.23.706] Dòng nối tiếp mà bản dịch thô viết thường thì khâu sau không được viết hoa lại.
+        if request.contiguous:
+            first_kind = next((kind for kind in completed if kind is not TranslationStageKind.PREPROCESS), None)
+            first_texts = stage_texts.get(first_kind) if first_kind is not None else None
+            if first_texts is not None and len(first_texts) == len(current_lines):
+                current_lines = self._restore_continuation_case(current_lines, first_texts, request.context)
 
         # [v3.23.616] Viết hoa chữ đầu dòng mở câu mới — sau mọi bước có thể sửa chữ.
         if request.contiguous:

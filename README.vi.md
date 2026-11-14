@@ -1,4 +1,4 @@
-# Subtitles Extractor — v3.23.690
+# Subtitles Extractor — v3.23.726
 
 [English](README.md) | **Tiếng Việt**
 
@@ -19,6 +19,10 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
 - Lấy mẫu khung hình thông minh: bước thời gian + loại trùng pHash + so sánh pixel.
 - Hai thuật toán gộp câu: **Greedy** (mặc định, nhanh) và **Viterbi** (tối ưu khi OCR nhiễu).
 - **Tự phát hiện ROI** vùng phụ đề bằng clustering Connected Components, lấy mẫu phân tầng theo thời gian.
+- Nhánh GPU tuỳ chọn dùng NVDEC và CuPy để giải mã video, tiền xử lý ảnh trên GPU; tự lùi về PyAV/CPU
+  nếu thiếu thành phần GPU cần thiết.
+- Bỏ phiếu kết quả OCR theo **lần đọc OCR độc lập**, không đếm các khung hình chỉ sao chép kết quả,
+  giúp tránh thiên lệch khi có nhiều khung trùng nhau.
 - Nhận biết và xử lý riêng văn bản **CJK** (Trung/Nhật/Hàn) và Latin xuyên suốt pipeline.
 - Có thể kiểm tra lại dòng OCR đáng ngờ bằng AI; điều phối Re-OCR và cài đặt an toàn hơn khi đang
   trích xuất.
@@ -38,6 +42,8 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
 - Chọn **Google Gemini** hoặc nhà cung cấp tuỳ chỉnh dùng API kiểu OpenAI; nhập API URL, API key
   và tải danh sách model ngay trong trang Dịch. Các thao tác xử lý văn bản dùng được với nhà cung
   cấp tuỳ chỉnh; tính năng cần phân tích video/âm thanh vẫn cần Gemini.
+- Danh mục model Gemini gồm các model sinh văn bản miễn phí và trả phí được hỗ trợ, kèm thông tin
+  hạn mức trong danh sách chọn model.
 - Khi model Gemini hết hạn mức theo ngày, ứng dụng có thể tự chuyển sang model dự phòng đã cấu hình
   cho dịch và phân tích; có thể tắt tính năng dự phòng trong cài đặt.
 - `thinking_level` tối ưu cho Gemini 3.x (nhanh/rẻ cho dịch), `thinking_budget` cho Gemini 2.5.
@@ -58,6 +64,7 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
 - Giao diện quản lý: xem/xoá bộ nhớ dịch theo từng phim bộ.
 - **Dây chuyền phim bộ**: xử lý liên tiếp các tập qua trích xuất, dịch và xuất bản; có thể dừng
   sau khâu Dịch để rà soát trước khi tiếp tục.
+- Gộp nhiều cụm phụ đề trong một lượt, tránh vẽ lại bảng nhiều lần với dự án dài.
 - Tự gán lại giọng đã chọn cho nhân vật giữa các tập kể cả khi tên có bí danh; Gemini TTS có tuỳ
   chọn đọc theo sắc thái từng câu (mặc định tắt).
 
@@ -79,6 +86,8 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
 ### 🛡️ Ổn định, chẩn đoán & phục hồi
 - mpv được cấu hình an toàn hơn; lệnh seek được gộp khi kéo thanh thời gian để giảm tải và hạn chế
   crash trên Windows. Có thể tự chuyển sang trình xem dự phòng nếu phát hiện lỗi mpv.
+- Bản Windows đóng gói đủ mô-đun Python cần cho CuPy nhưng loại các DLL CUDA dung lượng lớn; runtime
+  CUDA được nạp riêng khi bật tăng tốc GPU.
 - Ghi nhật ký crash native và cảnh báo khi lần chạy trước kết thúc bất thường.
 - Sao lưu xoay vòng và phục hồi cơ sở dữ liệu SQLite khi phát hiện hỏng; giữ lại bản dữ liệu lỗi
   để có thể kiểm tra.

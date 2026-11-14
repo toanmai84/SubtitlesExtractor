@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import re
 
+from subtitles_extractor.application.services.subtitle_pipeline.han_t2s_table import (
+    OPENCC_TRADITIONAL_TO_SIMPLIFIED,
+)
+
 # ---------------------------------------------------------------------------
 # Regex patterns — biên dịch sẵn để tối ưu vòng lặp nóng.
 # ---------------------------------------------------------------------------
@@ -194,6 +198,8 @@ HAN_TRADITIONAL_TO_SIMPLIFIED: dict[str, str] = {
     "縝": "缜", "縣": "县", "縱": "纵", "總": "总", "績": "绩",
     "繞": "绕", "繡": "绣", "織": "织", "繪": "绘", "繳": "缴",
 }
+# [v3.23.701] Bổ sung toàn bộ chữ phồn một-một của OpenCC (2903 chữ, xem han_t2s_table); cặp viết tay ở trên ưu tiên.
+HAN_TRADITIONAL_TO_SIMPLIFIED = {**OPENCC_TRADITIONAL_TO_SIMPLIFIED, **HAN_TRADITIONAL_TO_SIMPLIFIED}
 """Bảng Hán Phồn → Hán Giản (mỗi cặp 1-1, không ambiguity).
 
 Áp dụng trên TEXT-LEVEL sau khi join các box thành câu — chuẩn hoá output

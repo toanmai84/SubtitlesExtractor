@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,6 +32,11 @@ from subtitles_extractor.application.services.frame_prefetch import (
     DEFAULT_PREFETCH,
     prefetched,
 )
+from subtitles_extractor.application.services.run_provenance import (
+    collect_run_info,
+    new_run_id,
+    summarize_result,
+)
 from subtitles_extractor.application.services.subtitle_builder import (
     SubtitleBuilder,
 )
@@ -43,6 +48,7 @@ from subtitles_extractor.domain.exceptions import (
     OcrInferenceError,
     OcrModelLoadError,
     SubtitlesExtractorError,
+    VideoDecodeError,
 )
 from subtitles_extractor.domain.ports.frame_sampler_port import (
     SAMPLE_TIME_TOLERANCE_SEC,
@@ -71,6 +77,12 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _app_version() -> str:
+    from subtitles_extractor import __version__
+
+    return str(__version__)
 
 _AUTO_TUNE_TARGET_SECONDS: float = 1.5
 _AUTO_TUNE_MIN_BATCH_SIZE: int = 1
@@ -234,6 +246,13 @@ class _ReOcrFrameCacheManager:
 
 _GLOBAL_FRAME_CACHE = _ReOcrFrameCacheManager()
 
+#: [v3.23.708] Vòng tự soát: số khung đọc lại cho mỗi câu, và trần số câu (nhiều hơn thế là lỗi hệ thống của cấu
+#: hình OCR, không phải vài câu lẻ — để người dùng xử lý ở Cài đặt).
+_VERIFY_FRAMES_PER_LINE = 5
+#: [v3.23.713] Câu có hai bản đọc mâu thuẫn: đọc lại nhiều khung hơn để bỏ phiếu.
+_VERIFY_FRAMES_DISPUTED = 12
+_MAX_VERIFY_SUSPECTS = 200
+
 
 def clear_reocr_frame_cache() -> None:
     """[v3.23.645] Xoá bộ đệm khung RAM của lần OCR lại (phép đo tốc độ phải giải mã khung thật mỗi kịch bản)."""
@@ -263,6 +282,9 @@ def _sampling_signature(cfg: FrameSamplingConfig) -> str:
             cfg.vram_border_thickness_px,
             cfg.vram_sharpen,
             cfg.vram_contrast_factor,
+            cfg.vram_apply_clahe,
+            cfg.vram_clahe_clip_limit,
+            cfg.vram_clahe_tile_size,
             cfg.white_text_gate,
             cfg.white_text_luma,
         )
@@ -296,6 +318,9 @@ class ExtractSubtitlesUseCase:
             subtitle_exporter = self._resolve_exporter(request.output_format.value)
 
         start_time_seconds = time.perf_counter()
+        # [v3.23.714] Hồ sơ lượt chạy ghi kèm tệp OCR thô (xem ``run_provenance``).
+        run_id = new_run_id()
+        run_started_at = datetime.now(tz=UTC)
         progress_reporter.report(0, 100, "Đang chuẩn bị dữ liệu…")
 
         video_metadata = self._load_metadata_use_case.execute(request.video_path)
@@ -353,19 +378,50 @@ class ExtractSubtitlesUseCase:
         progress_reporter.report(95, 100, "Đang tối ưu không gian và gộp câu phụ đề…")
 
         boundary_track = boundary_sink[-1] if boundary_sink else None
+        subtitle_builder = self._builder_for(request)
         raw_ocr_file_path: Path | None = None
+        run_info: dict | None = None
         if request.raw_ocr_output_path is not None:
+            run_info = collect_run_info(
+                run_id=run_id, app_version=_app_version(), request=request, metadata=video_metadata,
+                builder_config=getattr(subtitle_builder, "_config", None), frame_sampler=self._frame_sampler_port,
+                ocr_engine=self._ocr_engine_port, started_at=run_started_at,
+                ocr_elapsed_sec=time.perf_counter() - start_time_seconds, frames=ocr_frame_results,
+            )
+            # Ghi NGAY (chưa có kết quả dựng): khâu dựng / soát có hỏng thì dữ liệu OCR nhiều giờ vẫn còn.
             raw_ocr_file_path = self._save_raw_ocr_payload(
                 ocr_results=ocr_frame_results, output_file_path=request.raw_ocr_output_path,
-                request=request, metadata=video_metadata, boundary_track=boundary_track,
+                request=request, metadata=video_metadata, boundary_track=boundary_track, run=run_info,
             )
             if raw_ocr_file_path is not None and checkpoint is not None:
                 checkpoint.discard()   # [v3.23.632] kết quả đầy đủ đã nằm trong cache → hết cần điểm dừng
 
+        build_started = time.perf_counter()
         built_subtitle_events = (
-            self._subtitle_builder.build(ocr_frame_results, roi=request.roi, boundary_track=boundary_track)
-            if boundary_track is not None else self._subtitle_builder.build(ocr_frame_results, roi=request.roi)
+            subtitle_builder.build(ocr_frame_results, roi=request.roi, boundary_track=boundary_track)
+            if boundary_track is not None else subtitle_builder.build(ocr_frame_results, roi=request.roi)
         )
+        # [v3.23.708] Vòng tự soát: OCR lại riêng các câu có dấu hiệu hình học đọc thiếu / thừa chữ.
+        verify_log: list[dict] = []
+        if request.verify_suspect_lines and (request.raw_ocr_output_path is not None or not request.skip_export):
+            try:
+                self._verify_suspect_lines(
+                    built_subtitle_events, request, video_metadata, progress_reporter, verify_log,
+                )
+            except (OcrInferenceError, OcrModelLoadError, VideoDecodeError, OSError, RuntimeError, ValueError) as exc:
+                # Bước soát là phần thêm: hỏng thì giữ nguyên kết quả đã dựng (các câu vẫn mang cờ nghi ngờ).
+                logger.warning("Bỏ qua bước tự OCR lại câu nghi ngờ: %s", exc)
+                verify_log.append({"error": f"{type(exc).__name__}: {exc}"})
+        # [v3.23.714] Ghi lại tệp OCR thô kèm KẾT QUẢ của chính lượt này (câu đã dựng + nhật ký soát): khi phân tích
+        # đối chiếu được ngay với tệp phụ đề, không phải đoán lượt chạy đã dựng bằng cấu hình nào.
+        if raw_ocr_file_path is not None and not progress_reporter.is_cancelled():
+            self._save_raw_ocr_payload(
+                ocr_results=ocr_frame_results, output_file_path=raw_ocr_file_path,
+                request=request, metadata=video_metadata, boundary_track=boundary_track, run=run_info,
+                result=summarize_result(
+                    built_subtitle_events, verify_log, build_elapsed_sec=time.perf_counter() - build_started,
+                ),
+            )
         final_output_path = request.output_path
 
         if not request.skip_export and subtitle_exporter is not None:
@@ -377,6 +433,167 @@ class ExtractSubtitlesUseCase:
             events=built_subtitle_events, output_path=final_output_path,
             elapsed_seconds=elapsed_time_seconds, frames_processed=len(ocr_frame_results), raw_ocr_path=raw_ocr_file_path,
         )
+
+    def _builder_for(self, request: ExtractSubtitlesRequest) -> SubtitleBuilder:
+        """[v3.23.714] Bộ dựng với ĐÚNG bước lấy mẫu của lượt này.
+
+        Bộ dựng được tiêm sẵn mang bước lấy mẫu của Cài đặt; lượt chạy có bước khác (phép đo A/B nhiều bước, lượt
+        gọi không qua giao diện) từng dựng bằng bước sai — đo thật tập 02: bước chạy 0,03 s, bước Cài đặt 0,12 s →
+        hai câu "师叔" cách nhau 0,12 s bị gộp làm một, khác hẳn kết quả dựng lại từ tệp OCR thô của chính lượt đó.
+        """
+        builder = self._subtitle_builder
+        config = getattr(builder, "_config", None)
+        step = float(request.sampling.sample_step_sec or 0.0)
+        if (
+            isinstance(builder, SubtitleBuilder) and dataclasses.is_dataclass(config) and step > 0.0
+            and abs(float(getattr(config, "sample_step_sec", step)) - step) > 1e-9
+        ):
+            return SubtitleBuilder(dataclasses.replace(config, sample_step_sec=step))
+        return builder
+
+    def _verify_suspect_lines(
+        self, events: list, request: ExtractSubtitlesRequest, metadata: VideoMetadata,
+        reporter: ProgressReporterPort, log: list[dict] | None = None,
+    ) -> int:
+        """[v3.23.708] OCR lại các câu nghi đọc thiếu / thừa chữ bằng ẢNH GỐC (không tiền xử lý); trả số câu đã sửa.
+
+        Ý tưởng "nhắm vào mẫu model làm sai": khâu dựng phụ đề gắn cờ câu có hộp chữ không khớp số chữ đọc được
+        (:mod:`~subtitles_extractor.application.services.subtitle_pipeline.geometry_check`); ở đây đọc lại đúng
+        các câu đó với cấu hình khác và chỉ thay chữ khi bản đọc lại giải thích đúng dấu hiệu
+        (:func:`~.geometry_check.accept_reocr_text`). Cấu hình đã không tiền xử lý thì không có "ý kiến thứ hai"
+        nên bỏ qua.
+        """
+        from subtitles_extractor.application.services.subtitle_pipeline.geometry_check import (
+            OCR_NOTE_DISPUTED,
+            OCR_NOTE_EXTRA_CHAR,
+            OCR_NOTE_MISSING_CHAR,
+            OCR_NOTE_REOCR_FIXED,
+            accept_disputed_reread,
+            accept_reocr_text,
+        )
+        from subtitles_extractor.domain.ports.ocr_engine_port import PreprocessConfig
+
+        # [v3.23.713] Thêm câu có hai bản đọc mâu thuẫn (lẫn chữ gần giống trên cùng một hình): đọc lại NHIỀU khung
+        # bằng ảnh gốc rồi bỏ phiếu. Cờ hình học đứng trước để một câu mang cả hai cờ được soát thiếu/thừa chữ trước.
+        flags = (OCR_NOTE_MISSING_CHAR, OCR_NOTE_EXTRA_CHAR, OCR_NOTE_DISPUTED)
+        suspects = [
+            (position, next(note for note in event.ocr_notes if note in flags))
+            for position, event in enumerate(events)
+            if any(note in flags for note in (getattr(event, "ocr_notes", ()) or ()))
+        ]
+        if not suspects or len(suspects) > _MAX_VERIFY_SUSPECTS:
+            return 0
+        raw_preprocess = PreprocessConfig(
+            upscale_small_text=False, add_white_border=False, apply_sharpen=False,
+            apply_contrast_boost=False, apply_clahe=False,
+        )
+        sampling = request.sampling
+        already_raw = (
+            request.ocr.preprocess == raw_preprocess
+            or not (
+                request.ocr.preprocess.upscale_small_text or request.ocr.preprocess.add_white_border
+                or request.ocr.preprocess.apply_sharpen or request.ocr.preprocess.apply_contrast_boost
+                or request.ocr.preprocess.apply_clahe
+            )
+        ) and not (
+            sampling.vram_upscale_small_text or sampling.vram_add_border or sampling.vram_sharpen
+            or abs(float(sampling.vram_contrast_factor) - 1.0) > 1e-6 or sampling.vram_apply_clahe
+        )
+        if already_raw:
+            # Ảnh vốn đã không tiền xử lý: đọc lại câu thiếu/thừa chữ không cho "ý kiến thứ hai"; câu có hai bản đọc mâu
+            # thuẫn thì vẫn được lợi từ việc bỏ phiếu trên nhiều khung hơn.
+            suspects = [item for item in suspects if item[1] == OCR_NOTE_DISPUTED]
+            if not suspects:
+                return 0
+        duration = float(metadata.duration_sec or 0.0)
+        if duration <= 0.0:
+            return 0
+        raw_ocr = dataclasses.replace(request.ocr, preprocess=raw_preprocess)
+        fixed = 0
+        for done, (position, note) in enumerate(suspects, start=1):
+            if reporter.is_cancelled():
+                break
+            event = events[position]
+            start, end = float(event.start_sec), float(event.end_sec)
+            span = max(end - start, 1e-3)
+            entry: dict = {"line": position + 1, "start": round(start, 3), "end": round(end, 3),
+                           "text": str(event.text or ""), "flag": note, "outcome": "no_frames"}
+            if log is not None:
+                log.append(entry)
+            wanted_frames = _VERIFY_FRAMES_DISPUTED if note == OCR_NOTE_DISPUTED else _VERIFY_FRAMES_PER_LINE
+            sub_sampling = dataclasses.replace(
+                sampling,
+                sample_step_sec=max(span / wanted_frames, 0.02),
+                skip_intro_sec=start + span * 0.1, skip_outro_sec=max(0.0, duration - (end - span * 0.1)),
+                phash_distance_threshold=0, pixel_diff_threshold=0.0, white_text_gate=False,
+                vram_upscale_small_text=False, vram_add_border=False, vram_sharpen=False, vram_contrast_factor=1.0,
+                vram_apply_clahe=False,
+            )
+            sub_request = dataclasses.replace(
+                request, sampling=sub_sampling, ocr=raw_ocr, skip_export=True, raw_ocr_output_path=None,
+                save_debug_frames=False, export_raw_images=False, use_frame_cache=False,
+            )
+            frames = [
+                frame for frame in self._frame_sampler_port.iter_frames(
+                    metadata=metadata, roi=metadata.roi, config=sub_sampling,
+                ) if _needs_ocr(frame)
+            ][:wanted_frames + 2]
+            if not frames:
+                continue
+            results = self._execute_ocr_inference_on_batch(frames, None, sub_request, metadata)
+            reread = [
+                "".join(
+                    str(box.text or "")
+                    for box in sorted(
+                        result.text_boxes,
+                        key=lambda box: min((p[0] for p in (getattr(box, "polygon", None) or ())), default=0),
+                    )
+                )
+                for result in results
+            ]
+            reporter.report(96, 100, f"Đang soát lại câu nghi ngờ {done}/{len(suspects)}…")
+            entry["reread"] = list(reread)
+            if note == OCR_NOTE_DISPUTED:
+                verdict = accept_disputed_reread(str(event.text or ""), reread)
+                if verdict is None:
+                    logger.info("Soát câu %d %r (hai bản đọc): %s — chưa đủ phiếu, giữ cờ.", position + 1, event.text, reread)
+                    entry["outcome"] = "undecided"
+                    continue
+                # Bản đọc lại có thể ra chữ phồn thể ("別") trong khi khâu dựng đã quy về giản thể ("别"): quy về cùng dạng.
+                from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
+                    normalize_traditional_to_simplified,
+                )
+
+                verdict = normalize_traditional_to_simplified(verdict)
+                current_key = normalize_traditional_to_simplified("".join(str(event.text or "").split()))
+                event.ocr_notes = tuple(n for n in event.ocr_notes if n != OCR_NOTE_DISPUTED)
+                if verdict == current_key:
+                    logger.info("Soát câu %d %r (hai bản đọc): %d khung đọc lại xác nhận.", position + 1, event.text, len(reread))
+                    entry["outcome"] = "confirmed"
+                    continue
+                logger.info("Soát câu %d: %r → %r (hai bản đọc, %d khung đọc lại).", position + 1, event.text, verdict,
+                            len(reread))
+                event.text = verdict
+                entry["outcome"], entry["new_text"] = "changed", verdict
+                if OCR_NOTE_REOCR_FIXED not in event.ocr_notes:
+                    event.ocr_notes = (*event.ocr_notes, OCR_NOTE_REOCR_FIXED)
+                fixed += 1
+                continue
+            replacement = accept_reocr_text(str(event.text or ""), note, reread)
+            if replacement is None:
+                logger.info("Soát câu %d %r (%s): bản đọc lại %s — giữ nguyên.", position + 1, event.text, note, reread)
+                entry["outcome"] = "kept"
+                continue
+            logger.info("Soát câu %d: %r → %r (%s, %d khung đọc lại).", position + 1, event.text, replacement, note,
+                        len(reread))
+            event.text = replacement
+            entry["outcome"], entry["new_text"] = "changed", replacement
+            notes = tuple(n for n in event.ocr_notes if n not in flags)
+            event.ocr_notes = notes if OCR_NOTE_REOCR_FIXED in notes else (*notes, OCR_NOTE_REOCR_FIXED)
+            fixed += 1
+        if suspects:
+            logger.info("Tự OCR lại %d câu nghi đọc thiếu/thừa chữ: sửa được %d.", len(suspects), fixed)
+        return fixed
 
     def _resolve_exporter(self, format_key: str) -> SubtitleExporterPort:
         try:
@@ -510,10 +727,13 @@ class ExtractSubtitlesUseCase:
             for frame in pending:
                 if _needs_ocr(frame):
                     result = next(produced)
+                    # [v3.23.711] Khung đọc lại theo lịch, chữ không đổi: đánh dấu để khâu dựng gộp các lần đọc.
+                    if frame.continues_text and reference is not None:
+                        result = dataclasses.replace(result, continues_previous=True)
                 elif frame.is_duplicate and reference is not None:
                     result = OcrFrameResult(
                         frame_index=frame.frame_index, timestamp_sec=frame.timestamp_sec,
-                        text_boxes=list(reference.text_boxes),
+                        text_boxes=list(reference.text_boxes), continues_previous=True,
                     )
                 else:   # lỗi giải mã / khung trống / trùng khi chưa có kết quả trước → rỗng, KHÔNG bỏ khung
                     result = OcrFrameResult(
@@ -872,10 +1092,9 @@ class ExtractSubtitlesUseCase:
     @staticmethod
     def _save_raw_ocr_payload(
         ocr_results: list[OcrFrameResult], output_file_path: Path, request: ExtractSubtitlesRequest, metadata: VideoMetadata,
-        boundary_track: BoundaryTrack | None = None,
+        boundary_track: BoundaryTrack | None = None, run: dict | None = None, result: dict | None = None,
     ) -> Path | None:
         try:
-            from datetime import datetime
 
             from subtitles_extractor.infrastructure.serializers.raw_ocr_serializer import (
                 RawOcrMeta,
@@ -892,9 +1111,11 @@ class ExtractSubtitlesUseCase:
                 "apply_sharpen": request.ocr.preprocess.apply_sharpen or request.sampling.vram_sharpen,
                 "apply_contrast_boost": request.ocr.preprocess.apply_contrast_boost or (request.sampling.vram_contrast_factor != 1.0),
                 "contrast_factor": request.ocr.preprocess.contrast_factor or request.sampling.vram_contrast_factor,
-                "apply_clahe": request.ocr.preprocess.apply_clahe,
-                "clahe_clip_limit": request.ocr.preprocess.clahe_clip_limit,
-                "clahe_tile_size": request.ocr.preprocess.clahe_tile_size,
+                "apply_clahe": request.ocr.preprocess.apply_clahe or request.sampling.vram_apply_clahe,
+                "clahe_clip_limit": (request.sampling.vram_clahe_clip_limit if request.sampling.vram_apply_clahe
+                                     else request.ocr.preprocess.clahe_clip_limit),
+                "clahe_tile_size": (request.sampling.vram_clahe_tile_size if request.sampling.vram_apply_clahe
+                                    else request.ocr.preprocess.clahe_tile_size),
                 "apply_median_blend": request.sampling.apply_median_blend,
             }
 
@@ -914,6 +1135,7 @@ class ExtractSubtitlesUseCase:
                 preprocess=preprocess_dict,
                 advanced_ocr=advanced_ocr_dict,
                 boundary=boundary_track.to_dict() if boundary_track is not None else None,
+                run=run, result=result,
             )
             save_raw_ocr(frames=ocr_results, output_path=output_file_path, meta=metadata_payload)
             return output_file_path

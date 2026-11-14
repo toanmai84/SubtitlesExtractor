@@ -1,5 +1,10 @@
-# Bundled runtime and third-party dependencies — copy manually when building.
+# Binary native lớn trong vendor/ — không đưa vào git (tải bằng tools/fetch_vendor_binaries.py).
+# [v3.23.717] Bỏ qua cả thư mục: gói tải về còn header, thư viện liên kết, tài liệu (~300 MB).
 vendor/
+vendor/**/*.dll
+vendor/**/*.exe
+vendor/**/*.so
+vendor/**/*.dylib
 
 # Model tải về trong models/ — không đưa vào git (chạy tools/prefetch_*.py để tải lại).
 # Giữ lại README + cấu trúc thư mục.
@@ -12,35 +17,11 @@ models/**
 build_cache/
 build/
 dist/
-build_env/
 *.spec.bak
 
-# Python / virtual environments
+# Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
-.mypy_cache/
-.coverage
-.coverage.*
-htmlcov/
 *.egg-info/
-.venv/
-venv/
-env/
-ENV/
-
-# Environment / secrets
-.env
-.env.*
-*.pem
-
-# IDE / OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-logs/

@@ -5,10 +5,9 @@ Bug 2: _replace_all dùng mixed source (ViewModel + table cache) → IndexError/
 """
 from pathlib import Path
 
-_PAGE = (
-    Path(__file__).resolve().parents[3]
-    / "src/subtitles_extractor/presentation/pages/editor_page.py"
-)
+from tests.unit.editor_page_source import EDITOR_PAGE_SOURCE
+
+_PAGE = EDITOR_PAGE_SOURCE  # [v3.23.693] editor_page.py + các phần đã tách (U6)
 
 
 def _get_method_snippet(source: str, method_name: str) -> str:

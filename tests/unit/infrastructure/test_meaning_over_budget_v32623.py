@@ -70,7 +70,9 @@ def test_ca_that_72_khong_con_bi_ep_cat_nghia() -> None:
 # ── Prompt: NGHĨA thắng giới hạn ────────────────────────────────────────────
 def test_prompt_uu_tien_nghia_tren_gioi_han() -> None:
     assert "NGHĨA LUÔN THẮNG GIỚI HẠN" in _TRANSLATOR_SRC
-    assert "GIỮ NGHĨA và chấp" in _TRANSLATOR_SRC
+    # [v3.23.702] Không còn "chấp nhận vượt — phần mềm sẽ tự nén": được vượt nhưng ÍT NHẤT có thể (1-2 tiếng).
+    assert "vượt ÍT NHẤT có thể" in _TRANSLATOR_SRC
+    assert "phần mềm sẽ tự nén giọng" not in _TRANSLATOR_SRC
 
 
 def test_prompt_cam_cac_kieu_cat_nghia_da_ghi_nhan() -> None:

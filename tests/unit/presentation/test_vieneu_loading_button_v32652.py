@@ -20,11 +20,10 @@ dùng đã chuyển sang Edge/Gemini.
 
 from __future__ import annotations
 
-import pathlib
 
-_PAGE_SRC = pathlib.Path(
-    "src/subtitles_extractor/presentation/pages/tts_page.py"
-).read_text(encoding="utf-8")
+from tests.unit.page_sources import TTS_PAGE_SOURCE
+
+_PAGE_SRC = TTS_PAGE_SOURCE.read_text(encoding="utf-8")  # [v3.23.695] tts_page.py + các phần đã tách (U6)
 
 
 def test_khoá_nút_khi_bắt_đầu_nạp() -> None:

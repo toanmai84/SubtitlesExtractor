@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "subtitles-extractor"
-version = "3.23.690"
+version = "3.23.726"
 description = "Subtitle Studio — trích xuất, dịch, lồng tiếng và xuất bản phụ đề video (Clean Architecture)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -73,6 +73,8 @@ dev = [
     "ruff>=0.4",
     "black>=24.0",
     "mypy>=1.8",
+    # [v3.23.717] Test kiểm phồn/giản của bộ đo trần chất lượng OCR (thiếu thì test bị bỏ qua).
+    "zhconv>=1.4",
 ]
 
 [project.scripts]

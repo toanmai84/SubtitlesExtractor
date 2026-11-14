@@ -8,6 +8,8 @@ bắt được gì. Tín hiệu dùng ở đây là HÌNH THÁI của kết qu�
 * ``near_duplicate``: gần giống câu liền kề mà không trùng (OCR tách một câu thành hai biến thể);
 * ``mixed_script``: chữ Latin/số lẫn trong câu chữ Hán (watermark dính: ``嗯不对OVONET``);
 * ``low_confidence``: độ tin cậy dưới ngưỡng (khi engine có trả điểm thật);
+* ``missing_char`` / ``extra_char``: [v3.23.708] hộp chữ rộng / lệch tâm / hẹp hơn số chữ đọc được — OCR đọc thiếu hoặc
+  thừa một chữ (xem ``subtitle_pipeline.geometry_check``);
 * ``restored_char``: [v3.23.655] khâu dựng phụ đề đã khôi phục một ký tự OCR làm rơi (vd ``一`` đầu câu) — đúng phần lớn
   nhưng thỉnh thoảng thêm nhầm, nên đưa ra soát.
 """
@@ -25,6 +27,9 @@ SUSPECT_NEAR_DUPLICATE = "near_duplicate"
 SUSPECT_MIXED_SCRIPT = "mixed_script"
 SUSPECT_LOW_CONFIDENCE = "low_confidence"
 SUSPECT_RESTORED_CHAR = "restored_char"   # [v3.23.655] = OCR_NOTE_RESTORED của khâu dựng phụ đề
+SUSPECT_MISSING_CHAR = "missing_char"     # [v3.23.708] = geometry_check.OCR_NOTE_MISSING_CHAR
+SUSPECT_EXTRA_CHAR = "extra_char"         # [v3.23.708] = geometry_check.OCR_NOTE_EXTRA_CHAR
+SUSPECT_READS_DISAGREE = "reads_disagree"  # [v3.23.713] = geometry_check.OCR_NOTE_DISPUTED (hai bản đọc mâu thuẫn)
 
 _FEW_FRAMES = 3
 _NEIGHBOR_GAP_SEC = 0.5
@@ -58,8 +63,10 @@ def ocr_suspicions(events: Sequence[object]) -> dict[int, list[str]]:
         confidence = float(getattr(event, "confidence", 1.0) or 0.0)
         if 0.0 < confidence < _LOW_CONFIDENCE:
             add(position, SUSPECT_LOW_CONFIDENCE)
-        if SUSPECT_RESTORED_CHAR in (getattr(event, "ocr_notes", ()) or ()):
-            add(position, SUSPECT_RESTORED_CHAR)
+        notes = getattr(event, "ocr_notes", ()) or ()
+        for reason in (SUSPECT_MISSING_CHAR, SUSPECT_EXTRA_CHAR, SUSPECT_READS_DISAGREE, SUSPECT_RESTORED_CHAR):
+            if reason in notes:
+                add(position, reason)
         if _CJK.search(text) and _LATIN_RUN.search(text):
             add(position, SUSPECT_MIXED_SCRIPT)
         if position + 1 < len(events):
@@ -75,8 +82,11 @@ def ocr_suspicions(events: Sequence[object]) -> dict[int, list[str]]:
 
 
 __all__ = [
+    "SUSPECT_EXTRA_CHAR",
     "SUSPECT_FEW_FRAMES",
     "SUSPECT_LOW_CONFIDENCE",
+    "SUSPECT_MISSING_CHAR",
+    "SUSPECT_READS_DISAGREE",
     "SUSPECT_MIXED_SCRIPT",
     "SUSPECT_NEAR_DUPLICATE",
     "SUSPECT_PROGRESSIVE",

@@ -49,6 +49,19 @@ class InstallPaddleRuntimeWorker(QObject):
     def cancel(self) -> None:
         self._cancelled = True
 
+    @staticmethod
+    def _run_pip(command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3600,
+            check=False,
+            **no_window_kwargs(),
+        )
+
     def run(self) -> None:
         """Thực hiện tải. Gọi trong QThread, KHÔNG gọi trực tiếp."""
         try:
@@ -64,16 +77,16 @@ class InstallPaddleRuntimeWorker(QObject):
                 5, f"Đang tải lõi paddlepaddle-gpu (~{PADDLE_RUNTIME_DOWNLOAD_GB:.1f}GB)…"
             )
             logger.info("Tải paddle runtime: %s", " ".join(command))
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=3600,
-                check=False,
-                **no_window_kwargs(),
-            )
+            result = self._run_pip(command)
+            if result.returncode != 0 and not self._cancelled and sys.platform == "win32":
+                # [v3.23.703] Trang chỉ mục Paddle sập (502) → thử thẳng file wheel trên kho lưu trữ gốc.
+                logger.warning("Cài qua kho chỉ mục Paddle thất bại — thử tải thẳng file wheel từ kho lưu trữ gốc.")
+                self.progress.emit(10, "Kho Paddle không phản hồi — đang tải thẳng file lõi paddle…")
+                command = build_paddle_install_command(
+                    self._python_exe, self._paddle_dir, target_py, direct_wheel=True,
+                )
+                logger.info("Tải paddle runtime (dự phòng): %s", " ".join(command))
+                result = self._run_pip(command)
             if self._cancelled:
                 self.failed.emit("Đã huỷ tải paddle runtime theo yêu cầu.")
                 return

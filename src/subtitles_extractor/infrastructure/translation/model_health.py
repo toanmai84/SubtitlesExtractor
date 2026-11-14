@@ -164,6 +164,13 @@ class ModelHealth:
             with self._lock:
                 self._known = names
 
+    def add_known_model(self, model: str) -> None:
+        """[v3.23.698] Thêm một model biết là dùng được (người dùng tự chọn làm dự phòng) mà không thay cả danh sách."""
+        name = (model or "").strip()
+        if name:
+            with self._lock:
+                self._known.add(name)
+
     @property
     def known_models(self) -> tuple[str, ...]:
         """Các model biết là dùng được."""

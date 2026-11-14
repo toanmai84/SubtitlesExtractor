@@ -36,9 +36,10 @@ def _res(index: int, speed: float = 1.0, truncated: bool = False, overlap: float
 
 class TestFitModel:
     def test_natural_duration_matches_the_measured_voice(self) -> None:
-        # Đo 141 dòng thật: 0,312 + 0,177 x âm tiết.
-        assert natural_seconds(5) == pytest.approx(1.197)
-        assert target_syllables_for(1.2, 1.0) == 5
+        # [v3.23.698] Khớp lại trên 3664 dòng lồng tiếng thật (VieNeu, 14 giọng): 0,235 + 0,247 x âm tiết
+        # (bản 3.23.629: 141 dòng một giọng — 0,312 + 0,177, ngắn hơn thực tế 19 %).
+        assert natural_seconds(5) == pytest.approx(1.47)
+        assert target_syllables_for(1.2, 1.0) == 3
         assert target_syllables_for(0.2) == 1
 
     def test_predict_flags_only_clearly_too_long_lines(self) -> None:

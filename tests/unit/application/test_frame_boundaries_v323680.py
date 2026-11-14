@@ -294,33 +294,37 @@ def test_pyav_sampler_records_every_frame(flash_video: Path) -> None:
     assert sampler.last_boundary_track is None
 
 
-# ── Đường NVDEC: độ sáng ROI lấy thẳng từ mặt phẳng Y trên GPU (mô phỏng CuPy bằng numpy) ──
+# ── Đường NVDEC: độ sáng ROI lấy thẳng từ mặt phẳng Y trên GPU (v3.23.723: chạy đúng bộ xử lý khung với NumPy) ──
 def test_nvdec_luma_sink_crops_roi_and_expands_range(monkeypatch: pytest.MonkeyPatch) -> None:
     from types import SimpleNamespace
 
     from subtitles_extractor.infrastructure.video.decoders import pynvvideocodec_frame_sampler as module
 
-    fake_cp = SimpleNamespace(
-        from_dlpack=np.from_dlpack, asnumpy=np.asarray, asarray=np.asarray, uint8=np.uint8, uint16=np.uint16,
-    )
-    monkeypatch.setattr(module, "cp", fake_cp, raising=False)
-    monkeypatch.setattr(module, "_get_cuda_nv12_to_rgb_kernel", lambda: None)
     h, w, pitch = 64, 96, 128                                  # pitch > bề rộng như NVDEC thật
     nv12 = np.full((h + h // 2, pitch), 128, np.uint8)
     nv12[:h, :w] = 16                                          # đen dải hẹp
     nv12[40:56, 20:60] = 235                                   # chữ trắng dải hẹp
-    sampler = object.__new__(module.PyNvVideoCodecFrameSampler)
+    y_plane, uv_plane = module._split_nv12(nv12, h)
     roi = Roi(x=8, y=32, width=80, height=32)
+
+    def processor(sink: list[np.ndarray]):
+        prober = SimpleNamespace(sampled=lambda luma, ts: sink.append(luma), skipped=lambda luma, ts: None)
+        return module._FrameProcessor(
+            config=FrameSamplingConfig(sample_step_sec=0.04), roi=roi, video_width=w, video_height=h, matrix="bt601",
+            full_range=False, prober=prober, xp=np, start_sec=0.0,
+        )
+
     sink: list[np.ndarray] = []
-    rgb = sampler._convert_and_crop_cupy(nv12, h, w, False, False, roi, np.zeros((h, w, 3), np.uint8), sink)
-    assert rgb is not None and rgb.shape == (32, 80, 3)        # khung OCR vẫn ra như cũ
+    frame = processor(sink).handle_nv12(y_plane[:h, :w], uv_plane[:, :w], 0.0)
+    assert frame is not None and frame.image_rgb.shape == (32, 80, 3)        # khung OCR vẫn ra như cũ
     [luma] = sink
     assert luma.shape == (32, 80)
     assert luma.max() == 255 and luma.min() == 0               # 16–235 → 0–255 như PyAV ``gray``
     assert int(text_mask(luma).sum()) == (16 // 4) * (40 // 4)
+    assert int(frame.image_rgb.max()) == 255 and int(frame.image_rgb.min()) == 0   # RGB cũng giãn dải như PyAV
 
-    # Mặt phẳng lạ (1 chiều) → chỉ bỏ đầu dò, KHÔNG làm mất khung OCR.
+    # Lỗi đầu dò → chỉ bỏ đầu dò, KHÔNG làm mất khung OCR.
     monkeypatch.setattr(module, "expand_studio_luma", lambda _y: (_ for _ in ()).throw(TypeError("lạ")))
     sink2: list[np.ndarray] = []
-    assert sampler._convert_and_crop_cupy(nv12, h, w, False, False, roi, np.zeros((h, w, 3), np.uint8), sink2) is not None
+    assert processor(sink2).handle_nv12(y_plane[:h, :w], uv_plane[:, :w], 0.0) is not None
     assert sink2 == []

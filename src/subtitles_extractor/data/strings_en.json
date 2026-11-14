@@ -197,7 +197,8 @@
     "ex_tt_bench": "Measure OCR configurations (no orientation classifier, detector batch, bright-text frame filter) on a short stretch using your video + ROI + settings, then recommend the fastest one that keeps the subtitles unchanged.",
     "ss_busy_cannot_load": "Extraction is running — cannot load another video. Wait for it to finish or cancel.",
     "ss_roi_locked_extracting": "Extraction running — auto ROI detection is locked until it finishes (including batch runs).",
-    "ss_reocr_running": "Re-OCR is running on the Editor page — extraction / auto ROI / benchmark are locked until it finishes (shared OCR engine)."
+    "ss_reocr_running": "Re-OCR is running on the Editor page — extraction / auto ROI / benchmark are locked until it finishes (shared OCR engine).",
+    "ss_roi_detect_cancelled": "Subtitle area detection cancelled — the current area is kept."
   },
   "editor": {
     "title": "Edit subtitles",
@@ -444,6 +445,9 @@
     "ed_suspect_near_duplicate": "near-duplicate of neighbour",
     "ed_suspect_mixed_script": "Latin/digits mixed in",
     "ed_suspect_low_confidence": "low confidence",
+    "ed_suspect_missing_char": "possibly a missing character (box wide/off-centre)",
+    "ed_suspect_reads_disagree": "two conflicting readings (look-alike characters)",
+    "ed_suspect_extra_char": "possibly an extra character (box narrow)",
     "ed_suspect_restored_char": "restored character"
   },
   "debug": {
@@ -811,7 +815,12 @@
     "co_det_follow_version": "Same as OCR version",
     "rl_det_override": "Text detector:",
     "tip_det_override": "Use a different text detector from the OCR version (e.g. v6 small detection + v6 medium recognition). Smaller detectors are noticeably faster on GPU; only change it when \"OCR speed test\" shows identical results.",
-    "tab_ai_access": "API keys and AI"
+    "tab_ai_access": "API keys and AI",
+    "preprocess_measured_note": "Recommended: keep the steps below OFF. Measured on an 86-episode series (611 lines, v6 small model): raw frames 598 correct, sharpen + contrast + border 594; lines with thin horizontal strokes (\"一\", \"三\") drop to 2/10 from 10/10. Enable only for tiny/blurry text after checking it helps.",
+    "btn_preprocess_recommended": "Use recommended settings (turn off Border, Sharpen, Contrast boost)",
+    "tip_preprocess_recommended": "Unchecks Border, Sharpen and Contrast boost. Not saved yet:\nreview, then press Save, or Cancel changes to keep the old values. You can still re-enable any step.\n\nMeasured on 915 real subtitle frames (v3.23.713): all 3 steps off read 909 frames correctly;\nBorder + Sharpen + Contrast boost read 896. Contrast boost alone drops a leading “一”\nin 7 of 35 lines (off: 1 of 35). Upscale is left as it is (see its tooltip).",
+    "tip_upscale": "Upscales the subtitle area (bicubic) to the target height before OCR. Best at twice the area height\n(136 px area → 272 px). A target below the area height does nothing.\n\nMeasured in v3.23.721 (86-episode series, 5 episodes of real OCR, 4064 mid-line frames): correct reads\n98.28 % → 99.53 %, wrong/extra-character frames 70 → 19. In exchange OCR is about 3× slower (CPU: 474 s → 1399 s for 5 episodes)\nand reads more background junk outside lines (the subtitle builder removed all of it: 154/154 lines\ncorrect either way).",
+    "tip_preprocess_off_recommended": "Recommended: OFF for white subtitles with a dark outline (see the measurements above).\nTurn on if the text is very small/blurry and OCR gets better in your test."
   },
   "common": {
     "task_done_extract": "Extraction finished",
@@ -1038,6 +1047,9 @@
     "tr_analysis_think": "Analysis thinking level:",
     "tr_address_style": "Name address style:",
     "native_address": "Native Vietnamese address (anh Kiếm, chị Hồng — modern films)",
+    "tr_fit_for_speech": "Fit to speech:",
+    "fit_for_speech": "Auto-shorten lines longer than the dubbing slot (~50% more translation time)",
+    "fit_for_speech_tip": "After translation, lines that cannot be read within their time slot\n(including the gap to the next line) are sent back to the model to be\nshortened while keeping meaning, negation, questions and names. Keeps the\ndubbed voice from reading too fast. Vietnamese targets only. Turn off if you\nonly need subtitles.",
     "toast_native_title": "Address style saved",
     "toast_native_on_body": "The roster and current translation now use native Vietnamese address; the next analysis/translation will too.",
     "toast_native_off_body": "The next analysis/translation goes back to Sino-Vietnamese address (Kiếm ca, Hồng đại tẩu); the current translation is kept.",
@@ -1382,6 +1394,10 @@
     "btn_timing_tip": "Change the start/end of ONE selected line (line order stays).",
     "btn_merge_lines": "🔗 Merge lines",
     "btn_merge_lines_tip": "Merge the selected ADJACENT lines into one (text joined, timing covers both).",
+    "btn_merge_fragments": "🧩 Read phrases as one",
+    "btn_merge_fragments_tip": "Merges FRAGMENTS of one sentence that the source subtitles split across adjacent lines, so\nthe voice reads them in one breath and short fragments borrow time from long ones. Only when:\nSAME speaker, lines touch (gap ≤ 0.12 s), the previous line does not end the sentence, and a\nline in the group needs more than 1.5× speed. Up to 4 lines per group. The number in brackets\nis how many groups will be merged. One Undo restores everything; exported subtitles follow\nthe merged lines.",
+    "fragments_merged": "Merged {n} phrase groups to be read as one (Undo to restore).",
+    "fragments_none": "No phrase groups need merging.",
     "btn_split_line": "✂ Split line…",
     "btn_split_line_tip": "Split the selected line into two at a time point.",
     "menu_timing": "Edit timing…",

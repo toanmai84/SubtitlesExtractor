@@ -16,12 +16,11 @@ from pathlib import Path
 
 import pytest
 
+from tests.unit.editor_page_source import EDITOR_PAGE_SOURCE
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-EDITOR_PAGE_PATH = (
-    PROJECT_ROOT / "src" / "subtitles_extractor" / "presentation"
-    / "pages" / "editor_page.py"
-)
+EDITOR_PAGE_PATH = EDITOR_PAGE_SOURCE  # [v3.23.693] editor_page.py + các phần đã tách (U6)
 
 
 @pytest.fixture()

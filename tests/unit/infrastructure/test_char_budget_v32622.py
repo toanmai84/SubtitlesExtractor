@@ -128,7 +128,7 @@ def test_payload_kem_max_chars() -> None:
     payload = _bare_translator()._line_to_payload(
         _line(10_000, 12_000, "xin chào"), next_start_ms=12_500
     )
-    assert payload["max_chars"] > MIN_CHAR_BUDGET
+    assert payload["max_words"] >= 2   # [v3.23.702] ngân sách gửi model nay theo số tiếng
     assert payload["line_no"] == 1
 
 

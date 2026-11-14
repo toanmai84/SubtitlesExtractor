@@ -134,6 +134,7 @@ def filter_y_position_outliers(
     y_centers: Sequence[float],
     k: float = _MAD_K,
     minimum_threshold_distance: float = 0.0,
+    pixel_scale: float = 1.0,
 ) -> list[bool]:
     """Đánh dấu outlier theo Y-center, ưu tiên density-aware cluster detection.
 
@@ -161,6 +162,11 @@ def filter_y_position_outliers(
         y_centers: Danh sách Y-center các box.
         k: Hệ số MAD threshold cho fallback.
         minimum_threshold_distance: Sàn tối thiểu cho MAD fallback (legacy).
+        pixel_scale: [v3.23.719] Hệ số đổi các hằng số pixel (bề rộng bin 5 px, sàn MAD 2 px, sàn ngưỡng 10 px) theo
+            cỡ chữ của phim. Các hằng số này được tinh chỉnh ở cỡ chữ ~68 px; phim chữ nhỏ / lớn hơn (độ phân giải
+            khác) mà dùng nguyên pixel thì dải giữ lại rộng / hẹp khác hẳn tính theo chữ → cùng một phim ở hai độ phân
+            giải cho hai kết quả khác nhau (thử sức ``scale:0.5`` trên 豪门Z外 giữ rác Latin "TOUTS" ở mép trên).
+            1.0 = hành vi cũ.
 
     Returns:
         Danh sách boolean: True = giữ, False = drop.
@@ -169,7 +175,8 @@ def filter_y_position_outliers(
         return [True] * len(y_centers)
 
     # [FIX v2.25] Pass 1: cluster discovery bằng histogram bins.
-    histogram_bin_width_pixels = 5.0
+    unit = pixel_scale if pixel_scale > 0 else 1.0
+    histogram_bin_width_pixels = 5.0 * unit
     min_cluster_density_count = max(30, len(y_centers) // 100)
 
     box_count_by_bin: dict[int, int] = {}
@@ -203,7 +210,7 @@ def filter_y_position_outliers(
                 "Density Y filter: drop {}/{} box (dense_clusters={}, "
                 "min_density={}, bin_width={}px)",
                 dropped_count, len(y_centers), len(dense_cluster_bin_indices),
-                min_cluster_density_count, int(histogram_bin_width_pixels),
+                min_cluster_density_count, round(histogram_bin_width_pixels, 1),
             )
         return mask
 
@@ -213,11 +220,11 @@ def filter_y_position_outliers(
 
     deviations = sorted(abs(y - med) for y in y_centers)
     mad = _median_sorted(deviations)
-    effective_mad = max(mad, 2.0)
+    effective_mad = max(mad, 2.0 * unit)
 
     threshold_distance = max(
         k * _MAD_CONSISTENCY * effective_mad,
-        10.0,
+        10.0 * unit,
         float(minimum_threshold_distance),
     )
 

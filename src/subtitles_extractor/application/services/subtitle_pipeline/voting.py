@@ -19,7 +19,7 @@ Pipeline:
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 
 import rapidfuzz.distance.Levenshtein as lev
 import rapidfuzz.fuzz as fuzz
@@ -204,6 +204,11 @@ def _text_geometry(
     return {text: (c / n, w / n) for text, (c, w, n) in sums.items() if n}
 
 
+def _heaviest(weights: dict[str, float]) -> tuple[str, float]:
+    """Phần tử có trọng số lớn nhất (hoà: phần tử thêm vào trước — như ``Counter.most_common(1)``)."""
+    return max(weights.items(), key=lambda item: item[1])
+
+
 def vote_best_text_rover(
     target_frames: list[OcrFrameResult],
     y_tolerance_ratio: float,
@@ -219,10 +224,15 @@ def vote_best_text_rover(
     Returns:
         Text canonical đã được vote và post-process (Yi-restore + Space-restore + edge cleanup).
     """
+    # [v3.23.726] Chỉ LẦN ĐỌC thật được bỏ phiếu: khung chép kết quả của khung trước (cùng điểm ảnh, không OCR lại)
+    # không phải bằng chứng mới. Trước đây một lần đọc "亨" 0,51 chép ra 11 khung thắng hai lần đọc "哼" (2 + 2 khung).
+    from subtitles_extractor.application.services.subtitle_pipeline.read_fusion import fresh_read_flags
+
+    fresh = fresh_read_flags(target_frames)
     valid_frames = [
         frame
-        for frame in target_frames
-        if extract_joined_text_from_frame(
+        for frame, is_fresh in zip(target_frames, fresh, strict=True)
+        if is_fresh and extract_joined_text_from_frame(
             frame, y_tolerance_ratio, y_tolerance_min_px
         ).strip()
     ]
@@ -272,12 +282,14 @@ def vote_best_text_rover(
         conf for text, conf in texts_with_confidences if text == anchor_sequence
     )
 
-    voting_matrix: list[Counter[str]] = [
-        Counter({char: anchor_confidence_score * _ANCHOR_WEIGHT_MULTIPLIER})
+    # [v3.23.726] Trọng số là số thực: ``Counter`` (kiểu số nguyên) làm mypy báo 3 lỗi gán; ``defaultdict(float)`` + chọn
+    # bằng ``max`` (cùng thứ tự hoà như ``Counter.most_common(1)``, vốn cũng dùng ``max``).
+    voting_matrix: list[defaultdict[str, float]] = [
+        defaultdict(float, {char: anchor_confidence_score * _ANCHOR_WEIGHT_MULTIPLIER})
         for char in anchor_sequence
     ]
-    insertion_matrix: list[Counter[str]] = [
-        Counter() for _ in range(len(anchor_sequence) + 1)
+    insertion_matrix: list[defaultdict[str, float]] = [
+        defaultdict(float) for _ in range(len(anchor_sequence) + 1)
     ]
 
     for comparison_text, current_confidence_score in texts_with_confidences[1:]:
@@ -338,18 +350,14 @@ def vote_best_text_rover(
     reconstructed_characters: list[str] = []
     for sequence_index in range(len(anchor_sequence)):
         if insertion_matrix[sequence_index]:
-            best_insertion_string, best_insertion_score = insertion_matrix[
-                sequence_index
-            ].most_common(1)[0]
+            best_insertion_string, best_insertion_score = _heaviest(insertion_matrix[sequence_index])
             if best_insertion_score > insertion_acceptance_threshold:
                 reconstructed_characters.append(best_insertion_string)
-        best_character, _ = voting_matrix[sequence_index].most_common(1)[0]
+        best_character, _ = _heaviest(voting_matrix[sequence_index])
         reconstructed_characters.append(best_character)
 
     if insertion_matrix[-1]:
-        final_insertion_string, final_insertion_score = insertion_matrix[-1].most_common(
-            1
-        )[0]
+        final_insertion_string, final_insertion_score = _heaviest(insertion_matrix[-1])
         if final_insertion_score > insertion_acceptance_threshold:
             reconstructed_characters.append(final_insertion_string)
 

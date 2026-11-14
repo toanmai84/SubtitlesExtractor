@@ -22,6 +22,9 @@ class SampledFrame:
     #: [v3.23.644] Khung KHÔNG có chữ (bộ lọc chữ trắng): kết quả OCR là RỖNG, không cần chạy OCR và
     #: KHÔNG được sao chép kết quả khung trước như khung trùng.
     is_blank: bool = False
+    #: [v3.23.711] Khung ĐƯỢC ĐƯA ĐI OCR nhưng điểm ảnh chữ không đổi so với khung OCR trước (đọc lại theo lịch): kết quả
+    #: là một lần đọc nữa của cùng câu. Khung trùng thì hiển nhiên đúng nên không cần đặt.
+    continues_text: bool = False
 
 @dataclass(frozen=True, slots=True)
 class FrameSamplingConfig:
@@ -41,6 +44,10 @@ class FrameSamplingConfig:
     vram_border_thickness_px: int = 8
     vram_sharpen: bool = False
     vram_contrast_factor: float = 1.0
+    #: [v3.23.723] CLAHE trên VRAM (trước đây không có bản GPU → chạy trên CPU, SAU cả viền, sai thứ tự).
+    vram_apply_clahe: bool = False
+    vram_clahe_clip_limit: float = 3.0
+    vram_clahe_tile_size: int = 8
 
     #: [v3.23.644] Lọc khung theo CHỮ TRẮNG: chỉ OCR khi các điểm ảnh sáng (chữ phụ đề trắng) trong ROI
     #: thật sự đổi; khung không có chữ bỏ qua. Mặc định TẮT (giả định phụ đề trắng/sáng).

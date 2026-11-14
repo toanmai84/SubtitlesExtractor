@@ -16,14 +16,16 @@ from __future__ import annotations
 
 import pathlib
 
+from tests.unit.page_sources import TTS_PAGE_SOURCE
+
 from subtitles_extractor.presentation.pages.tts_page import (
     _EDGE_ONLY_FIELDS,
     _EDGE_ONLY_HINT,
 )
 
-_SRC = pathlib.Path(
-    "src/subtitles_extractor/presentation/pages/tts_page.py"
-).read_text(encoding="utf-8")
+# [v3.23.692] Trang Lồng tiếng tách một phần sang lớp trộn (``tts_*.py``): quét cả trang lẫn các phần tách.
+# [v3.23.692/695] Trang Lồng tiếng đã tách thành nhiều module — đọc cả trang lẫn các phần tách.
+_SRC = TTS_PAGE_SOURCE.read_text(encoding="utf-8")
 
 _ADAPTERS = {
     name: pathlib.Path(

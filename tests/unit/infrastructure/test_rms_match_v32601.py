@@ -76,6 +76,24 @@ def test_pedalboard_stretch_preserves_rms() -> None:
     r0 = _rms(sig)
     for ratio in (2.0, 3.0):
         out = stretch_with_pedalboard(sig, _SR, ratio)
-        assert out is not None
+        assert out is not None, _pedalboard_diagnosis()
         # Trước fix: -16%% @2x / -22%% @3x. Sau fix: giữ trong ±5%%.
         assert abs(_rms(out) - r0) / r0 < 0.05
+
+
+def _pedalboard_diagnosis() -> str:
+    """[v3.23.725] Lý do ``stretch_with_pedalboard`` trả ``None`` (lỗi chập chờn 1 lần trong bộ test đầy đủ 14/11/2026)."""
+    import os
+    import sys as _sys
+
+    parts = [f"SUBEXT_DISABLE_PEDALBOARD={os.environ.get('SUBEXT_DISABLE_PEDALBOARD')!r}",
+             f"sys.modules['pedalboard']={_sys.modules.get('pedalboard')!r}"]
+    try:
+        from pedalboard import time_stretch as _ts
+
+        tone = (0.3 * np.sin(2 * np.pi * 220 * np.arange(8000) / 8000)).astype(np.float32)
+        _ts(tone, 8000.0, stretch_factor=2.0)
+        parts.append("gọi lại time_stretch: OK")
+    except BaseException as exc:  # noqa: BLE001 — chỉ để chẩn đoán
+        parts.append(f"lỗi: {type(exc).__name__}: {exc}")
+    return "; ".join(parts)

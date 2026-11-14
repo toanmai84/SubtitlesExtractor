@@ -17,12 +17,12 @@ from __future__ import annotations
 
 import pathlib
 
+from tests.unit.page_sources import TTS_PAGE_SOURCE
+
 _ADAPTER_SRC = pathlib.Path(
     "src/subtitles_extractor/infrastructure/tts/vieneu_tts_adapter.py"
 ).read_text(encoding="utf-8")
-_PAGE_SRC = pathlib.Path(
-    "src/subtitles_extractor/presentation/pages/tts_page.py"
-).read_text(encoding="utf-8")
+_PAGE_SRC = TTS_PAGE_SOURCE.read_text(encoding="utf-8")  # [v3.23.695] tts_page.py + các phần đã tách (U6)
 
 # Ghép chuỗi để không tự match chính docstring/assert của test này.
 _BAD_LICENSE = "CC BY" + "-NC"

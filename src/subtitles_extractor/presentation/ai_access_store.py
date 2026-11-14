@@ -66,7 +66,9 @@ class AiAccessStore(QObject):
         s = self._settings()
         main = str(s.value("api_key", "", type=str) or "")
         extra = str(s.value("api_keys_extra", "", type=str) or "")
-        return _dedupe([main, *extra.splitlines()])
+        # [v3.23.698] Tách cả dấu phẩy ở key chính: dán "key1, key2" vào ô key chính (hoặc cấu hình cũ lưu danh sách phẩy)
+        # từng thành MỘT "key" — kiểm phát âm gửi nguyên chuỗi đó (key không hợp lệ), tóm tắt ghi "1 key", hạn mức luôn 0.
+        return split_keys("\n".join((main, extra)))
 
     def custom_url(self) -> str:
         return str(self._settings().value("custom_base_url", "", type=str) or "").strip()
@@ -75,11 +77,18 @@ class AiAccessStore(QObject):
         return str(self._settings().value("custom_api_key", "", type=str) or "").strip()
 
     def custom_complete(self) -> bool:
-        return bool(self.custom_url() and self.custom_key())
+        """[v3.23.698] Cùng phép kiểm với bộ dịch (``CustomProviderConfig.is_complete``): http(s) + tên máy + key ASCII.
+
+        Trước đây chỉ kiểm "không rỗng": địa chỉ thiếu ``https://`` hay key dính ký tự vô hình vẫn hiện 🟢 trong Cài đặt
+        trong khi mọi thao tác Dịch/Phân tích/Tải model đều từ chối và đẩy người dùng về Cài đặt.
+        """
+        from subtitles_extractor.infrastructure.translation.openai_compat_client import CustomProviderConfig
+
+        return CustomProviderConfig(self.custom_url(), self.custom_key()).is_complete
 
     # ── Ghi ──
     def set_gemini_keys(self, keys: list[str]) -> None:
-        clean = _dedupe(list(keys))
+        clean = split_keys("\n".join(k or "" for k in keys))   # [v3.23.698] mỗi phần tử có thể chứa nhiều key
         s = self._settings()
         s.setValue("api_key", clean[0] if clean else "")
         s.setValue("api_keys_extra", "\n".join(clean[1:]))

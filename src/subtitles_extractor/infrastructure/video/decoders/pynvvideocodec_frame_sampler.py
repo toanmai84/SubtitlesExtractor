@@ -18,7 +18,6 @@ import struct
 from collections.abc import Iterator
 from typing import Any
 
-import cv2
 import numpy as np
 
 from subtitles_extractor.domain.entities.video_metadata import VideoMetadata
@@ -34,12 +33,19 @@ from subtitles_extractor.domain.value_objects.roi import Roi
 # [V3.28] Import Pipeline GPU mới tạo
 from subtitles_extractor.infrastructure.ocr.preprocessing.gpu_image_filters import (
     apply_gpu_preprocessing_pipeline,
+    color_matrix_for,
+    is_full_range,
+    nv12_roi_to_rgb,
 )
 from subtitles_extractor.infrastructure.video.decoders.boundary_probe import (
     BoundaryProber,
     expand_studio_luma,
     probe_av_frame,
     probing_enabled,
+)
+from subtitles_extractor.infrastructure.video.decoders.pyav_frame_sampler import (
+    _KEYFRAME_ONLY_MIN_STEP_SEC,
+    _next_target,
 )
 from subtitles_extractor.infrastructure.video.frame_dedupe import (
     FrameDeduper,
@@ -48,15 +54,12 @@ from subtitles_extractor.infrastructure.video.frame_dedupe import (
 
 logger = logging.getLogger(__name__)
 
-try:
-    import cupy as cp
-    HAS_CUPY = True
-except ImportError:
-    HAS_CUPY = False
-    logger.debug(
-        "Thư viện 'cupy' chưa được cài đặt — backend PyNvVideoCodec sẽ dùng "
-        "fallback CPU (chậm hơn). Cài bằng 'pip install cupy-cuda12x' nếu cần."
-    )
+# [v3.23.724] Dùng chung bộ nạp CuPy an toàn của ``gpu_image_filters`` (bắt MỌI lỗi khởi tạo — trước đây chỉ bắt
+# ImportError nên FileNotFoundError của CuPy trong bản đóng gói làm sập lượt trích xuất).
+from subtitles_extractor.infrastructure.ocr.preprocessing import gpu_image_filters as _gpu  # noqa: E402
+
+cp = _gpu.cp
+HAS_CUPY = bool(_gpu.HAS_CUPY)
 
 _CUDA_D2H_FLAG: int = 2
 EMPTY_ARRAY = np.empty(0, dtype=np.uint8)
@@ -80,36 +83,8 @@ def _get_av_errors() -> tuple[type[Exception], ...]:
 # QUẢN LÝ KERNEL CHUYỂN MÀU & TRỘN ẢNH BẢO VỆ CHỐNG RUNG (MEDIAN BLEND)
 # ==============================================================================
 
-@functools.lru_cache(maxsize=1)
-def _get_cuda_nv12_to_rgb_kernel() -> Any:
-    if not HAS_CUPY: return None
-    return cp.RawKernel(r'''
-    extern "C" __global__
-    void nv12_to_rgb(
-        const unsigned char* __restrict__ Y,
-        const unsigned char* __restrict__ UV,
-        unsigned char* __restrict__ RGB,
-        int width, int height, int pitch
-    ) {
-        int x = blockIdx.x * blockDim.x + threadIdx.x;
-        int y = blockIdx.y * blockDim.y + threadIdx.y;
-        if (x >= width || y >= height) return;
-        int y_idx = y * pitch + x;
-        int uv_idx = (y >> 1) * pitch + (x & ~1);
-        int y_scaled = Y[y_idx] << 13;
-        int u_val = UV[uv_idx] - 128;
-        int v_val = UV[uv_idx + 1] - 128;
-
-        int r = (y_scaled + 11485 * v_val) >> 13;
-        int g = (y_scaled - 2819 * u_val - 5850 * v_val) >> 13;
-        int b = (y_scaled + 14516 * u_val) >> 13;
-
-        int rgb_idx = (y * width + x) * 3;
-        RGB[rgb_idx]     = (unsigned char)max(0, min(255, r));
-        RGB[rgb_idx + 1] = (unsigned char)max(0, min(255, g));
-        RGB[rgb_idx + 2] = (unsigned char)max(0, min(255, b));
-    }
-    ''', 'nv12_to_rgb')
+# [v3.23.723] Nhân CUDA ``nv12_to_rgb`` (đổi CẢ khung bằng công thức dải đầy BT.601) đã bỏ: thay bằng
+# ``gpu_image_filters.nv12_roi_to_rgb`` — chỉ vùng ROI, trùng khít PyAV/swscale.
 
 @functools.lru_cache(maxsize=1)
 def _get_median3_kernel() -> Any:
@@ -370,6 +345,204 @@ def _get_nv_codec_map() -> dict[str, Any]:
     except ImportError: return {}
 
 
+
+# ==============================================================================
+# [v3.23.723] XỬ LÝ MỘT KHUNG: CHUNG CHO ĐƯỜNG NVDEC, XẢ EOS, VIDEO 10-BIT/HDR VÀ KHI THIẾU CUPY
+# ==============================================================================
+
+
+def _split_nv12(buffer: Any, video_height: int) -> tuple[Any, Any]:
+    """Tách bộ đệm NV12 (``H·3/2`` hàng × pitch, hoặc phẳng 1 chiều) thành mặt phẳng Y và UV xen kẽ."""
+    chroma_rows = (video_height + 1) // 2                # [v3.23.723] chiều cao lẻ: thêm một hàng sắc độ
+    if buffer.ndim == 1:
+        pitch = buffer.size // (video_height + chroma_rows)
+        buffer = buffer.reshape((video_height + chroma_rows, pitch))
+    elif buffer.ndim == 3:
+        buffer = buffer.squeeze()
+    return buffer[:video_height], buffer[video_height:video_height + chroma_rows]
+
+
+def _crop_nv12(y_plane: Any, uv_plane: Any, video_width: int, video_height: int) -> tuple[Any, Any]:
+    """[v3.23.723] Cắt bỏ phần đệm pitch. Bề rộng / chiều cao LẺ: UV giữ ``(W+1)//2`` cặp và ``(H+1)//2`` hàng — trước đây
+    cắt ``H//2`` hàng × ``W`` cột → ROI chạm mép phải / dưới đọc sắc độ ngoài mảng (NumPy: IndexError → cả lượt lùi
+    PyAV; CuPy: chỉ số âm thầm quấn về cột / hàng 0)."""
+    return y_plane[:video_height, :video_width], uv_plane[: (video_height + 1) // 2, : ((video_width + 1) // 2) * 2]
+
+
+def vram_preprocessing_enabled(config: FrameSamplingConfig) -> bool:
+    """Cấu hình lấy mẫu có giao bước tiền xử lý nào cho VRAM không."""
+    return bool(
+        config.vram_upscale_small_text or config.vram_add_border or config.vram_sharpen
+        or abs(float(config.vram_contrast_factor) - 1.0) >= 1e-4 or getattr(config, "vram_apply_clahe", False)
+    )
+
+
+class _FrameProcessor:
+    """Quyết định lấy mẫu + chuyển màu + khử trùng + tiền xử lý cho TỪNG khung giải mã — đúng như ``PyAvFrameSampler``.
+
+    Lỗi cũ của nhánh NVDEC (đã đo trên khung thật phim 86 tập):
+
+    * Đổi màu cả khung bằng công thức dải đầy → ảnh lệch PyAV TB 7–13 mức xám, "lõi chữ trắng" ≥ 240 ít đi 6–20 lần →
+      bộ khử trùng (``white_text_gate``) chọn khung OCR khác hẳn nhánh CPU.
+    * Đổi màu MỌI khung giải mã, kể cả khung chưa tới lượt lấy mẫu; đổi cả khung 720×1280 rồi mới cắt ROI.
+    * Bộ khử trùng xét ảnh ĐÃ tiền xử lý (phóng / làm nét / tương phản) trong khi nhánh PyAV xét ảnh gốc → ngưỡng chói
+      200 / 240 cho kết quả khác nhau giữa hai nhánh; khung trùng cũng bị tiền xử lý vô ích.
+    * Mốc lấy mẫu kế tiếp không theo luật "chỉ khung khoá" của PyAV khi bước thưa.
+
+    Nay: chỉ khung tới lượt mới đổi màu, chỉ vùng ROI; khử trùng trên ảnh gốc; chỉ khung cần OCR mới tiền xử lý trên VRAM
+    rồi chép về RAM đúng một lần. ``xp`` = CuPy (GPU) hoặc NumPy (máy thiếu CuPy — cùng công thức).
+    """
+
+    def __init__(
+        self, *, config: FrameSamplingConfig, roi: Roi | None, video_width: int, video_height: int, matrix: str,
+        full_range: bool, prober: BoundaryProber | None, xp: Any, start_sec: float,
+    ) -> None:
+        self._config = config
+        self.xp = xp
+        self._matrix = matrix
+        self._full_range = full_range
+        self._prober = prober
+        box = roi.clip_to(video_width, video_height) if roi is not None else None
+        self._box = (box.x, box.y, box.x2, box.y2) if box is not None else (0, 0, video_width, video_height)
+        self._roi = roi
+        self.step_sec = max(0.001, config.sample_step_sec)
+        self.keyframe_only = self.step_sec >= _KEYFRAME_ONLY_MIN_STEP_SEC
+        self.start_sec = start_sec
+        self.next_target_sec = start_sec
+        self.last_emitted_sec = start_sec
+        self.frame_index = 0
+        self._deduper = FrameDeduper(config)
+        self._preprocess = vram_preprocessing_enabled(config)
+        self._buffers: dict[str, Any] = {}
+        self._blend = max(3, min(7, config.median_blend_frames)) if config.apply_median_blend else 1
+        self._history: Any = None
+        self._history_count = 0
+
+    # ── khung NV12 (NVDEC) ──────────────────────────────────────────────────
+    def handle_nv12(self, y_plane: Any, uv_plane: Any, timestamp_sec: float) -> SampledFrame | None:
+        due = is_sample_due(timestamp_sec, self.next_target_sec)
+        blending = self._blend > 1
+        if self._prober is not None:
+            self._probe_luma(y_plane, timestamp_sec, due and (not blending or self._history_count + 1 >= self._blend))
+        if not due and not blending:
+            return None                                   # không đổi màu khung chưa tới lượt
+        x0, y0, x1, y1 = self._box
+        raw = nv12_roi_to_rgb(y_plane, uv_plane, x0, y0, x1, y1, matrix=self._matrix, full_range=self._full_range,
+                              xp=self.xp)
+        if blending:
+            raw = self._blend_history(raw, due)
+            if raw is None:
+                return None
+        return self._finish(raw, timestamp_sec)
+
+    # ── khung RGB đã có trên RAM (video 10-bit / HDR giải mã bằng PyAV) ─────
+    def handle_rgb(self, rgb_full: np.ndarray, timestamp_sec: float) -> SampledFrame | None:
+        if not is_sample_due(timestamp_sec, self.next_target_sec):
+            return None
+        if self._roi is not None:
+            box = self._roi.clip_to(rgb_full.shape[1], rgb_full.shape[0])
+            rgb_full = rgb_full[box.y:box.y2, box.x:box.x2]
+        raw = self.xp.asarray(np.ascontiguousarray(rgb_full))
+        return self._finish(raw, timestamp_sec)
+
+    def error_frame(self, packet_sec: float, end_sec: float) -> SampledFrame | None:
+        """Khung lỗi khi NVDEC giải mã một gói thất bại (mốc không lùi — v3.23.655)."""
+        error_sec = error_frame_time(packet_sec, self.last_emitted_sec, self.start_sec)
+        if error_sec is None or error_sec > end_sec:
+            return None
+        frame = SampledFrame(frame_index=self.frame_index, timestamp_sec=error_sec, image_rgb=EMPTY_ARRAY, is_error=True)
+        self.frame_index += 1
+        self.last_emitted_sec = error_sec
+        self.next_target_sec = max(self.next_target_sec, error_sec + self.step_sec)
+        return frame
+
+    # ── nội bộ ─────────────────────────────────────────────────────────────
+    def _finish(self, raw: Any, timestamp_sec: float) -> SampledFrame:
+        xp = self.xp
+        raw_host = raw if xp is np else xp.asnumpy(raw)
+        verdict = self._deduper.verdict(raw_host, timestamp_sec)
+        needs_ocr = verdict is FrameVerdict.OCR
+        image = EMPTY_ARRAY
+        if needs_ocr:
+            image = raw_host
+            if self._preprocess:
+                config = self._config
+                prepared = apply_gpu_preprocessing_pipeline(
+                    raw, self._buffers,
+                    upscale_small_text=config.vram_upscale_small_text,
+                    upscale_target_height_px=config.vram_upscale_target_height_px,
+                    sharpen=config.vram_sharpen,
+                    contrast_factor=config.vram_contrast_factor,
+                    add_border=config.vram_add_border,
+                    border_thickness_px=config.vram_border_thickness_px,
+                    apply_clahe=bool(getattr(config, "vram_apply_clahe", False)),
+                    clahe_clip_limit=float(getattr(config, "vram_clahe_clip_limit", 3.0)),
+                    clahe_tile_size=int(getattr(config, "vram_clahe_tile_size", 8)),
+                    xp=xp,
+                )
+                image = prepared if xp is np else xp.asnumpy(prepared)      # chép về RAM đúng một lần
+        frame = SampledFrame(
+            frame_index=self.frame_index,
+            timestamp_sec=timestamp_sec,
+            image_rgb=np.ascontiguousarray(image) if needs_ocr else EMPTY_ARRAY,
+            is_duplicate=verdict is FrameVerdict.DUPLICATE,
+            is_blank=verdict is FrameVerdict.BLANK,
+            continues_text=needs_ocr and self._deduper.continues_text,
+        )
+        if needs_ocr:
+            self._deduper.accept(raw_host, timestamp_sec)
+        self.frame_index += 1
+        self.last_emitted_sec = max(self.last_emitted_sec, timestamp_sec)
+        self.next_target_sec = _next_target(self.next_target_sec, timestamp_sec, self.step_sec, self.keyframe_only)
+        return frame
+
+    def _probe_luma(self, y_plane: Any, timestamp_sec: float, sampled: bool) -> None:
+        prober = self._prober
+        if prober is None:
+            return
+        try:                               # lỗi ở đây chỉ bỏ đầu dò của khung này, KHÔNG làm mất khung OCR
+            x0, y0, x1, y1 = self._box
+            luma = y_plane[y0:y1, x0:x1]
+            luma = luma if self._full_range else expand_studio_luma(luma)
+            host = luma if self.xp is np else self.xp.asnumpy(luma)
+            (prober.sampled if sampled else prober.skipped)(np.ascontiguousarray(host), timestamp_sec)
+        except (RuntimeError, ValueError, AttributeError, IndexError, TypeError) as exc:
+            logger.debug("Bỏ đầu dò ranh giới (NVDEC): %s", exc)
+
+    def _blend_history(self, raw: Any, due: bool) -> Any | None:
+        """Trộn trung vị nhiều khung liền nhau (có căn chỉnh dịch chuyển) — chỉ trên GPU như trước."""
+        xp = self.xp
+        if self._history is None:
+            self._history = xp.empty((self._blend, *raw.shape), dtype=raw.dtype)
+        if self._history.shape[1:] != raw.shape:
+            self._history = xp.empty((self._blend, *raw.shape), dtype=raw.dtype)
+            self._history_count = 0
+        self._history[self._history_count % self._blend] = raw
+        self._history_count += 1
+        if not due or self._history_count < self._blend:
+            return None
+        count = self._history_count
+        target_idx = (count - self._blend // 2 - 1) % self._blend
+        target = self._history[target_idx]
+        if xp is np:
+            return xp.median(self._history, axis=0).astype(np.uint8)
+        aligned = []
+        for i in range(self._blend):
+            idx = (count - self._blend + i) % self._blend
+            frame_i = self._history[idx]
+            aligned.append(frame_i if idx == target_idx else _align_and_shift_cupy(frame_i, target, self._buffers))
+        if self._blend == 3:
+            key = f"blended_{target.shape[1]}_{target.shape[0]}"
+            if key not in self._buffers:
+                self._buffers[key] = cp.empty_like(target)
+            blended = self._buffers[key]
+            h, w = target.shape[:2]
+            block, grid = (32, 32), (math.ceil(w / 32), math.ceil(h / 32))
+            _get_median3_kernel()(grid, block, (aligned[0], aligned[1], aligned[2], blended, w, h))
+            return blended.copy()
+        return cp.median(cp.stack(aligned, axis=0), axis=0).astype(cp.uint8)
+
+
 # ==============================================================================
 # CLASS CHÍNH
 # ==============================================================================
@@ -451,8 +624,9 @@ class PyNvVideoCodecFrameSampler:
             annexb_header, nal_length_size = extract_func(extra_data_bytes)
             needs_annexb_conversion = True
 
-        logger.info("NVDEC GPU-First: Codec=%s, VRAM_Preprocess=%s, CuPy=%s",
-                    codec_name, config.vram_sharpen or config.vram_upscale_small_text, HAS_CUPY)
+        logger.info("NVDEC GPU-First: Codec=%s, VRAM_Preprocess=%s, CuPy=%s, KeyframeOnly=%s",
+                    codec_name, vram_preprocessing_enabled(config), HAS_CUPY,
+                    max(0.001, config.sample_step_sec) >= _KEYFRAME_ONLY_MIN_STEP_SEC)
 
         try:
             nv_decoder = CreateDecoder(gpuid=self._gpu_id, codec=nv_codec_enum, usedevicememory=True)
@@ -525,13 +699,20 @@ class PyNvVideoCodecFrameSampler:
         graph, graph_sink = (None, None)
         if is_hdr:
             graph, graph_sink = self._build_hdr_tonemap_graph(stream)
-        step_sec = max(0.001, config.sample_step_sec)
         start_sec = max(0.0, config.skip_intro_sec)
         end_sec = (metadata.duration_sec - config.skip_outro_sec
                    if config.skip_outro_sec > 0 else metadata.duration_sec)
-        next_target_sec = start_sec
-        frame_idx = 0
-        last_hash: int | None = None
+        # [v3.23.723] Cùng bộ xử lý khung với đường NVDEC: khử trùng ``FrameDeduper`` (trước đây băm thô và BỎ HẲN khung
+        # trùng → mất mốc "chữ còn hiện", lọc chữ trắng không có tác dụng), tiền xử lý VRAM như cài đặt (trước đây bị bỏ
+        # qua hoàn toàn cho video 10-bit/HDR), mốc lấy mẫu theo khung thật thay vì cộng dồn lưới.
+        processor = _FrameProcessor(
+            config=config, roi=roi, video_width=int(stream.width or 0), video_height=int(stream.height or 0),
+            matrix="bt709", full_range=True, prober=None, xp=cp if HAS_CUPY else np, start_sec=start_sec,
+        )
+
+        if processor.keyframe_only:              # [v3.23.723] bước thưa: chỉ giải mã khung khoá như PyAV
+            with contextlib.suppress(AttributeError, ValueError, TypeError):
+                stream.codec_context.skip_frame = "NONKEY"
 
         try:
             for frame in container.decode(stream):
@@ -542,34 +723,25 @@ class PyNvVideoCodecFrameSampler:
                     continue
                 if ts > end_sec:
                     break
-                if not is_sample_due(ts, next_target_sec):
-                    if prober is not None:
-                        probe_av_frame(prober.skipped, frame, ts)
-                    continue
-                next_target_sec += step_sec
+                due = is_sample_due(ts, processor.next_target_sec)
                 if prober is not None:
-                    probe_av_frame(prober.sampled, frame, ts)
-
+                    probe_av_frame(prober.sampled if due else prober.skipped, frame, ts)
+                if not due:
+                    continue
                 rgb = self._tonemap_frame_to_rgb(frame, graph, graph_sink)
                 if rgb is None:
+                    processor.next_target_sec = ts + processor.step_sec
                     continue
-                if roi is not None:
-                    clipped = roi.clip_to(rgb.shape[1], rgb.shape[0])
-                    rgb = rgb[clipped.y:clipped.y2, clipped.x:clipped.x2]
-
-                # Khử trùng frame liền kề (đỡ OCR thừa) — hash thô theo mẫu điểm ảnh.
-                h = int(rgb[::16, ::16, 0].sum()) if rgb.size else 0
-                if h == last_hash:
-                    frame_idx += 1
-                    continue
-                last_hash = h
-
-                yield SampledFrame(
-                    image_rgb=np.ascontiguousarray(rgb),
-                    frame_index=frame_idx,
-                    timestamp_sec=ts,
-                )
-                frame_idx += 1
+                try:
+                    sampled = processor.handle_rgb(rgb, ts)
+                except Exception as exc:  # noqa: BLE001 — lỗi GPU: làm tiếp bằng NumPy, GIỮ tonemap HDR
+                    if processor.xp is np:
+                        raise VideoDecodeError(f"Xử lý khung 10-bit/HDR thất bại ở {ts:.3f} s: {exc}") from exc
+                    logger.warning("GPU lỗi khi xử lý khung 10-bit/HDR (%s) — làm tiếp trên CPU, giữ tonemap.", exc)
+                    processor.xp = np
+                    sampled = processor.handle_rgb(rgb, ts)
+                if sampled is not None:
+                    yield sampled
         finally:
             with contextlib.suppress(*_get_av_errors(), AttributeError):
                 container.close()
@@ -615,20 +787,6 @@ class PyNvVideoCodecFrameSampler:
             except Exception:  # noqa: BLE001
                 return None
 
-    def _apply_vram_preprocessing(self, gpu_array: Any, config: FrameSamplingConfig, vram_buffers: dict[str, Any]) -> Any:
-        """Sử dụng Pipeline Đồng Bộ từ gpu_image_filters.py"""
-        if not HAS_CUPY: return gpu_array
-
-        return apply_gpu_preprocessing_pipeline(
-            gpu_array, vram_buffers,
-            upscale_small_text=config.vram_upscale_small_text,
-            upscale_target_height_px=config.vram_upscale_target_height_px,
-            sharpen=config.vram_sharpen,
-            contrast_factor=config.vram_contrast_factor,
-            add_border=config.vram_add_border,
-            border_thickness_px=config.vram_border_thickness_px
-        )
-
     def _decode_loop(
         self, *, av_container: Any, av_stream: Any, nv_decoder: Any,
         video_width: int, video_height: int, time_base: float,
@@ -638,22 +796,15 @@ class PyNvVideoCodecFrameSampler:
         metadata: VideoMetadata, roi: Roi | None, config: FrameSamplingConfig,
         prober: BoundaryProber | None = None,
     ) -> Iterator[SampledFrame]:
-
-        step_sec = max(0.001, config.sample_step_sec)
         start_sec = max(0.0, config.skip_intro_sec)
         end_sec = metadata.duration_sec - config.skip_outro_sec if config.skip_outro_sec > 0 else metadata.duration_sec
-
-        # [v3.23.644] Quyết định OCR / trùng / trống dùng chung với bộ PyAV (xem ``frame_dedupe``).
-        deduper = FrameDeduper(config)
-        next_target_sec = start_sec
-        frame_counter_idx = 0
-
-        vram_buffers: dict[str, Any] = {}
-        rgb_gpu_buffer = cp.empty((video_height, video_width, 3), dtype=cp.uint8) if HAS_CUPY else None
-
-        history_ring_buffer = None
-        history_count = 0
-        num_blend_frames = max(3, min(7, config.median_blend_frames)) if config.apply_median_blend else 1
+        codec_context = av_stream.codec_context
+        processor = _FrameProcessor(
+            config=config, roi=roi, video_width=video_width, video_height=video_height,
+            matrix=color_matrix_for(getattr(codec_context, "colorspace", None)),
+            full_range=is_full_range(getattr(codec_context, "color_range", None), getattr(codec_context, "pix_fmt", "")),
+            prober=prober, xp=cp if HAS_CUPY else np, start_sec=start_sec,
+        )
 
         if start_sec > 0:
             try:
@@ -666,9 +817,10 @@ class PyNvVideoCodecFrameSampler:
                 logger.warning("Bỏ qua lỗi PyAV khi Seek: %s.", exc)
 
         stream_has_pts = False   # [v3.23.655] có gói mang PTS → PTS 0 của khung là mốc thật, không phải "thiếu"
-        last_emitted_sec = start_sec
         for av_packet in av_container.demux(av_stream):
             if av_packet.size == 0: continue
+            # [v3.23.723] Bước thưa (tự dò vùng) → chỉ nạp khung khoá cho NVDEC, như PyAV (``skip_frame = NONKEY``).
+            if processor.keyframe_only and not av_packet.is_keyframe: continue
 
             stream_has_pts = stream_has_pts or av_packet.pts is not None
             packet_timestamp_sec = float(av_packet.pts * time_base) if av_packet.pts is not None else -1.0
@@ -686,100 +838,20 @@ class PyNvVideoCodecFrameSampler:
                 decoded_frames = nv_decoder.Decode(packet_data)
             except RuntimeError as exc:
                 logger.debug("NVDEC Decode thất bại: %s", exc)
-                error_sec = error_frame_time(packet_timestamp_sec, last_emitted_sec, start_sec)
-                if error_sec is None or error_sec > end_sec:
-                    continue
-                yield SampledFrame(frame_index=frame_counter_idx, timestamp_sec=error_sec, image_rgb=EMPTY_ARRAY, is_error=True)
-                frame_counter_idx += 1; last_emitted_sec = error_sec
-                next_target_sec = max(next_target_sec, error_sec + step_sec)
+                error = processor.error_frame(packet_timestamp_sec, end_sec)
+                if error is not None:
+                    yield error
                 continue
 
-            if not decoded_frames: continue
-
-            for device_frame in decoded_frames:
+            for device_frame in decoded_frames or ():
                 frame_timestamp_sec = nvdec_frame_time(
                     device_frame.getPTS(), time_base, packet_timestamp_sec, stream_has_pts,
                 )
-
                 if frame_timestamp_sec < start_sec: continue
                 if frame_timestamp_sec > end_sec: return
-
-                if HAS_CUPY:
-                    luma: list[np.ndarray] | None = [] if prober is not None else None
-                    cropped_gpu = self._convert_and_crop_cupy(
-                        device_frame, video_height, video_width, is_16bit, is_hdr, roi, rgb_gpu_buffer, luma,
-                    )
-                    if cropped_gpu is None: continue
-                    if luma:
-                        will_sample = is_sample_due(frame_timestamp_sec, next_target_sec) and (
-                            not config.apply_median_blend or history_count + 1 >= num_blend_frames
-                        )
-                        (prober.sampled if will_sample else prober.skipped)(luma[0], frame_timestamp_sec)  # type: ignore[union-attr]
-
-                    if config.apply_median_blend:
-                        if history_ring_buffer is None:
-                            history_ring_buffer = cp.empty((num_blend_frames, *cropped_gpu.shape), dtype=cropped_gpu.dtype)
-
-                        insert_idx = history_count % num_blend_frames
-                        history_ring_buffer[insert_idx] = cropped_gpu
-                        history_count += 1
-
-                        due = is_sample_due(frame_timestamp_sec, next_target_sec)
-                        if not due or history_count < num_blend_frames:
-                            continue
-
-                        target_idx = (history_count - num_blend_frames // 2 - 1) % num_blend_frames
-                        target_frame = history_ring_buffer[target_idx]
-
-                        aligned_frames = []
-                        for i in range(num_blend_frames):
-                            idx = (history_count - num_blend_frames + i) % num_blend_frames
-                            frame_i = history_ring_buffer[idx]
-                            aligned_frames.append(frame_i if idx == target_idx else _align_and_shift_cupy(frame_i, target_frame, vram_buffers))
-
-                        if num_blend_frames == 3:
-                            blended_key = f"blended_{target_frame.shape[1]}_{target_frame.shape[0]}"
-                            if blended_key not in vram_buffers: vram_buffers[blended_key] = cp.empty_like(target_frame)
-                            blended_gpu = vram_buffers[blended_key]
-
-                            h, w = target_frame.shape[:2]
-                            block, grid = (32, 32), (math.ceil(w / 32), math.ceil(h / 32))
-                            _get_median3_kernel()(grid, block, (aligned_frames[0], aligned_frames[1], aligned_frames[2], blended_gpu, w, h))
-                        else:
-                            stacked = cp.stack(aligned_frames, axis=0)
-                            blended_gpu = cp.median(stacked, axis=0).astype(cp.uint8)
-
-                        blended_gpu = self._apply_vram_preprocessing(blended_gpu, config, vram_buffers)
-                        final_rgb_numpy = cp.asnumpy(blended_gpu)
-
-                    else:
-                        if not is_sample_due(frame_timestamp_sec, next_target_sec):
-                            continue
-                        cropped_gpu = self._apply_vram_preprocessing(cropped_gpu, config, vram_buffers)
-                        final_rgb_numpy = cp.asnumpy(cropped_gpu)
-                else:
-                    if not is_sample_due(frame_timestamp_sec, next_target_sec):
-                        continue
-                    final_rgb_numpy = self._convert_and_crop_cpu_fallback(device_frame, video_height, video_width, is_16bit, is_hdr, roi)
-                    if final_rgb_numpy is None: continue
-
-                verdict = deduper.verdict(final_rgb_numpy, frame_timestamp_sec)
-                needs_ocr = verdict is FrameVerdict.OCR
-
-                yield SampledFrame(
-                    frame_index=frame_counter_idx,
-                    timestamp_sec=frame_timestamp_sec,
-                    image_rgb=final_rgb_numpy if needs_ocr else EMPTY_ARRAY,
-                    is_duplicate=verdict is FrameVerdict.DUPLICATE,
-                    is_blank=verdict is FrameVerdict.BLANK,
-                )
-
-                if needs_ocr:
-                    deduper.accept(final_rgb_numpy, frame_timestamp_sec)
-
-                frame_counter_idx += 1
-                last_emitted_sec = max(last_emitted_sec, frame_timestamp_sec)
-                next_target_sec = frame_timestamp_sec + step_sec
+                sampled = self._handle_device_frame(processor, device_frame, video_width, video_height, frame_timestamp_sec)
+                if sampled is not None:
+                    yield sampled
 
         # Flush EOS
         try:
@@ -787,109 +859,100 @@ class PyNvVideoCodecFrameSampler:
             eos_dummy = np.zeros(1, dtype=np.uint8)
             packet_eos.bsl_data = eos_dummy.ctypes.data
             packet_eos.bsl = 0; packet_eos.decode_flag = enum_eos
+            flushed = nv_decoder.Decode(packet_eos) or []
+        except RuntimeError:
+            flushed = []
+        for device_frame in flushed:
+            frame_timestamp_sec = nvdec_frame_time(device_frame.getPTS(), time_base, end_sec, stream_has_pts)
+            if frame_timestamp_sec > end_sec: break
+            if frame_timestamp_sec < start_sec: continue
+            sampled = self._handle_device_frame(processor, device_frame, video_width, video_height, frame_timestamp_sec)
+            if sampled is not None:
+                yield sampled
 
-            for device_frame in nv_decoder.Decode(packet_eos) or []:
-                frame_timestamp_sec = nvdec_frame_time(device_frame.getPTS(), time_base, end_sec, stream_has_pts)
-                if frame_timestamp_sec > end_sec: break
-                if not is_sample_due(frame_timestamp_sec, next_target_sec):
-                    continue
-
-                if HAS_CUPY:
-                    eos_luma: list[np.ndarray] | None = [] if prober is not None else None
-                    cropped_gpu = self._convert_and_crop_cupy(
-                        device_frame, video_height, video_width, is_16bit, is_hdr, roi, rgb_gpu_buffer, eos_luma,
-                    )
-                    if cropped_gpu is None: continue
-                    if eos_luma:
-                        prober.sampled(eos_luma[0], frame_timestamp_sec)  # type: ignore[union-attr]
-                    cropped_gpu = self._apply_vram_preprocessing(cropped_gpu, config, vram_buffers)
-                    final_rgb_numpy = cp.asnumpy(cropped_gpu)
-                else:
-                    final_rgb_numpy = self._convert_and_crop_cpu_fallback(device_frame, video_height, video_width, is_16bit, is_hdr, roi)
-                    if final_rgb_numpy is None: continue
-
-                verdict = deduper.verdict(final_rgb_numpy, frame_timestamp_sec)
-                needs_ocr = verdict is FrameVerdict.OCR
-                yield SampledFrame(
-                    frame_index=frame_counter_idx,
-                    timestamp_sec=frame_timestamp_sec,
-                    image_rgb=final_rgb_numpy if needs_ocr else EMPTY_ARRAY,
-                    is_duplicate=verdict is FrameVerdict.DUPLICATE,
-                    is_blank=verdict is FrameVerdict.BLANK,
-                )
-                if needs_ocr:
-                    deduper.accept(final_rgb_numpy, frame_timestamp_sec)
-                frame_counter_idx += 1
-                next_target_sec = frame_timestamp_sec + step_sec
-        except RuntimeError: pass
-
-    def _convert_and_crop_cupy(
-        self, device_frame: Any, video_height: int, video_width: int, is_16bit: bool, is_hdr: bool, roi: Roi | None,
-        rgb_gpu_buffer: Any, luma_sink: list[np.ndarray] | None = None,
-    ) -> Any | None:
-        """NV12 (GPU) → RGB vùng ROI. ``luma_sink`` (v3.23.680): nhận thêm độ sáng dải đầy của ROI (numpy) cho bộ dò ranh giới."""
+    def _handle_device_frame(
+        self, processor: _FrameProcessor, device_frame: Any, video_width: int, video_height: int, timestamp_sec: float,
+    ) -> SampledFrame | None:
+        """[v3.23.723] Một khung NVDEC → ``SampledFrame``. Lỗi GPU (CuPy/NVRTC/CUDA) KHÔNG còn bị nuốt im lặng (trước đây
+        trả ``None`` → khung bị bỏ, phụ đề mất mà không báo): ném ``VideoDecodeError`` để bộ lấy mẫu dự phòng
+        (``FallbackFrameSampler``) chuyển sang PyAV từ đúng mốc này."""
         try:
-            interleaved_arr = None
-            if hasattr(device_frame, '__dlpack__'):
-                interleaved_arr = cp.from_dlpack(device_frame)
+            planes = (self._nv12_planes_device(device_frame, video_width, video_height) if HAS_CUPY
+                      else self._nv12_planes_host(device_frame, video_width, video_height))
+            if planes is None:
+                raise VideoDecodeError("Không đọc được mặt phẳng NV12 của khung NVDEC.")
+            return processor.handle_nv12(planes[0], planes[1], timestamp_sec)
+        except VideoDecodeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — CuPy/NVRTC/CUDA ném nhiều loại lỗi khác nhau
+            raise VideoDecodeError(f"Xử lý khung NVDEC trên GPU thất bại ở {timestamp_sec:.3f} s: {exc}") from exc
+
+    @staticmethod
+    def _nv12_planes_device(device_frame: Any, video_width: int, video_height: int) -> tuple[Any, Any] | None:
+        """Mặt phẳng Y và UV (xen kẽ) của khung NVDEC trên VRAM — không chép (DLPack / CUDA array interface)."""
+        interleaved = None
+        y_plane = uv_plane = None
+        if hasattr(device_frame, "__dlpack__"):
+            interleaved = cp.from_dlpack(device_frame)
+        else:
+            cuda_data = device_frame.cuda()
+            if hasattr(cuda_data, "__dlpack__"):
+                interleaved = cp.from_dlpack(cuda_data)
+            elif hasattr(cuda_data, "__cuda_array_interface__"):
+                interleaved = cp.asarray(cuda_data)
+            elif isinstance(cuda_data, (list, tuple)):
+                if len(cuda_data) >= 2:
+                    y_plane, uv_plane = _wrap_cuda_array(cuda_data[0]), _wrap_cuda_array(cuda_data[1])
+                elif len(cuda_data) == 1:
+                    plane = cuda_data[0]
+                    if hasattr(plane, "__dlpack__"):
+                        interleaved = cp.from_dlpack(plane)
+                    elif hasattr(plane, "__cuda_array_interface__"):
+                        interleaved = cp.asarray(plane)
+                    else:
+                        interleaved = _wrap_cuda_array(plane)
             else:
-                cuda_data = device_frame.cuda()
-                if hasattr(cuda_data, '__dlpack__'): interleaved_arr = cp.from_dlpack(cuda_data)
-                elif hasattr(cuda_data, '__cuda_array_interface__'): interleaved_arr = cp.asarray(cuda_data)
-                elif isinstance(cuda_data, (list, tuple)):
-                    y_plane = _wrap_cuda_array(cuda_data[0]) if len(cuda_data) >= 2 else None
-                    uv_plane = _wrap_cuda_array(cuda_data[1]) if len(cuda_data) >= 2 else None
-
-                    if len(cuda_data) == 1:
-                        plane_obj = cuda_data[0]
-                        if hasattr(plane_obj, '__dlpack__'): interleaved_arr = cp.from_dlpack(plane_obj)
-                        elif hasattr(plane_obj, '__cuda_array_interface__'): interleaved_arr = cp.asarray(plane_obj)
-                        else: interleaved_arr = _wrap_cuda_array(plane_obj)
-                else:
-                    interleaved_arr = _wrap_cuda_array(cuda_data)
-
-            if interleaved_arr is not None:
-                if interleaved_arr.ndim == 1:
-                    pitch = interleaved_arr.size // (video_height + video_height // 2)
-                    interleaved_arr = interleaved_arr.reshape((video_height + video_height // 2, pitch))
-                elif interleaved_arr.ndim == 3:
-                    interleaved_arr = interleaved_arr.squeeze()
-
-                y_plane = interleaved_arr[:video_height]
-                uv_plane = interleaved_arr[video_height:video_height + video_height//2]
-
-            if y_plane is None or uv_plane is None: return None
-
-            if is_16bit:
-                # [v3.23.23] 10-bit: lấy 8 bit cao. HDR (PQ/BT.2020) được xử lý ở
-                # nhánh riêng (uỷ quyền PyAV tonemap) TRƯỚC khi vào đây, nên ở đây chỉ
-                # còn SDR 10-bit — dịch bit là đúng.
-                y_plane = (y_plane.view(cp.uint16) >> 8).astype(cp.uint8)
-                uv_plane = (uv_plane.view(cp.uint16) >> 8).astype(cp.uint8)
-
-            if luma_sink is not None:
-                # Lỗi ở đây chỉ bỏ đầu dò của khung này — KHÔNG được làm mất khung OCR.
-                try:
-                    box = roi.clip_to(video_width, video_height) if roi is not None else None
-                    y_roi = y_plane[box.y:box.y2, box.x:box.x2] if box is not None else y_plane[:video_height, :video_width]
-                    if y_roi.ndim == 2:
-                        luma_sink.append(cp.asnumpy(expand_studio_luma(y_roi)))
-                except (RuntimeError, ValueError, AttributeError, IndexError, TypeError) as exc:
-                    logger.debug("Bỏ đầu dò ranh giới (NVDEC): %s", exc)
-
-            pitch = y_plane.shape[1]
-            block, grid = (32, 32), (math.ceil(video_width / 32), math.ceil(video_height / 32))
-
-            kernel = _get_cuda_nv12_to_rgb_kernel()
-            if kernel: kernel(grid, block, (y_plane, uv_plane, rgb_gpu_buffer, video_width, video_height, pitch))
-
-            if roi is None:
-                return rgb_gpu_buffer.copy()
-            clipped = roi.clip_to(video_width, video_height)
-            return rgb_gpu_buffer[clipped.y : clipped.y2, clipped.x : clipped.x2].copy()
-        except (RuntimeError, ValueError, AttributeError, MemoryError) as exc:
-            logger.debug("CuPy Kernel chuyển đổi màu lỗi: %s.", exc)
+                interleaved = _wrap_cuda_array(cuda_data)
+        if interleaved is not None:
+            y_plane, uv_plane = _split_nv12(interleaved, video_height)
+        if y_plane is None or uv_plane is None:
             return None
+        return _crop_nv12(y_plane, uv_plane, video_width, video_height)
+
+    @staticmethod
+    def _nv12_planes_host(device_frame: Any, video_width: int, video_height: int) -> tuple[Any, Any] | None:
+        """Máy thiếu CuPy: chép khung NV12 về RAM (DLPack / ``__array__`` / ``cudaMemcpy``) rồi tách Y, UV."""
+        host_buffer = None
+        if hasattr(device_frame, "to_ndarray"):
+            with contextlib.suppress(RuntimeError, ValueError, AttributeError):
+                host_buffer = np.asarray(device_frame.to_ndarray())
+        if host_buffer is None and hasattr(np, "from_dlpack") and hasattr(device_frame, "__dlpack__"):
+            host_buffer = np.from_dlpack(device_frame)
+        if host_buffer is None and hasattr(device_frame, "__array__"):
+            host_buffer = np.asarray(device_frame)
+        if host_buffer is None and hasattr(device_frame, "cuda"):
+            cuda_data = device_frame.cuda()
+            plane_obj = cuda_data[0] if isinstance(cuda_data, (list, tuple)) else cuda_data
+            if hasattr(np, "from_dlpack") and hasattr(plane_obj, "__dlpack__"):
+                host_buffer = np.from_dlpack(plane_obj)
+            elif hasattr(plane_obj, "__array__"):
+                host_buffer = np.asarray(plane_obj)
+            elif _memcpy_func is not None:
+                cuda_interface = getattr(plane_obj, "__cuda_array_interface__", {})
+                strides, shape = cuda_interface.get("strides"), cuda_interface.get("shape")
+                if "data" in cuda_interface and (strides or shape):
+                    pitch_bytes = int(strides[0]) if strides else int(shape[1])
+                    buffer = np.empty((video_height + video_height // 2, pitch_bytes), dtype=np.uint8)
+                    copied = _memcpy_func(
+                        ctypes.c_void_p(buffer.ctypes.data), ctypes.c_void_p(int(cuda_interface["data"][0])),
+                        ctypes.c_size_t(buffer.nbytes), ctypes.c_int(_CUDA_D2H_FLAG),
+                    )
+                    if copied == 0:
+                        host_buffer = buffer
+        if host_buffer is None:
+            return None
+        y_plane, uv_plane = _split_nv12(host_buffer, video_height)
+        return _crop_nv12(y_plane, uv_plane, video_width, video_height)
 
     @staticmethod
     def _detect_hdr_transfer(av_stream: Any) -> bool:
@@ -916,67 +979,5 @@ class PyNvVideoCodecFrameSampler:
         if is_10bit and ("2020" in prim_name or "2020" in trc_name):
             return True
         return False
-
-    def _convert_and_crop_cpu_fallback(
-        self, device_frame: Any, video_height: int, video_width: int, is_16bit: bool, is_hdr: bool, roi: Roi | None
-    ) -> np.ndarray | None:
-        try:
-            host_buffer = None
-            if hasattr(device_frame, 'to_ndarray'):
-                try:
-                    return device_frame.to_ndarray()
-                except (RuntimeError, ValueError, AttributeError) as conv_exc:
-                    logger.debug("to_ndarray fallback fail: %s.", conv_exc)
-
-            if hasattr(np, 'from_dlpack') and hasattr(device_frame, '__dlpack__'):
-                host_buffer = np.from_dlpack(device_frame)
-            elif hasattr(device_frame, '__array__'):
-                host_buffer = np.asarray(device_frame)
-
-            if host_buffer is None:
-                cuda_data = device_frame.cuda()
-                plane_obj = cuda_data[0] if isinstance(cuda_data, (list, tuple)) else cuda_data
-
-                if hasattr(np, 'from_dlpack') and hasattr(plane_obj, '__dlpack__'): host_buffer = np.from_dlpack(plane_obj)
-                elif hasattr(plane_obj, '__array__'): host_buffer = np.asarray(plane_obj)
-
-                if host_buffer is None and _memcpy_func is not None:
-                    cuda_interface = getattr(plane_obj, "__cuda_array_interface__", {})
-                    if "data" in cuda_interface:
-                        strides, shape = cuda_interface.get("strides"), cuda_interface.get("shape")
-                        pitch_bytes = strides[0] if strides else shape[1] * (2 if is_16bit else 1)
-                        nv12_height = video_height + video_height // 2
-
-                        host_buffer_bytes = np.empty((nv12_height, pitch_bytes), dtype=np.uint8)
-                        mem_copy_result = _memcpy_func(
-                            ctypes.c_void_p(host_buffer_bytes.ctypes.data),
-                            ctypes.c_void_p(int(cuda_interface["data"][0])),
-                            ctypes.c_size_t(host_buffer_bytes.nbytes), ctypes.c_int(_CUDA_D2H_FLAG)
-                        )
-                        if mem_copy_result == 0:
-                            if is_16bit:
-                                host_buffer = (host_buffer_bytes.view(np.uint16) >> 8).astype(np.uint8)
-                            else:
-                                host_buffer = host_buffer_bytes
-
-            if host_buffer is None: return None
-
-            if host_buffer.ndim == 1:
-                pitch = host_buffer.size // (video_height + video_height // 2)
-                host_buffer = host_buffer.reshape((video_height + video_height // 2, pitch))
-            elif host_buffer.ndim == 3:
-                host_buffer = host_buffer.squeeze()
-
-            if host_buffer.shape[1] > video_width: host_buffer = host_buffer[:, :video_width]
-            if is_16bit: host_buffer = (host_buffer.view(np.uint16) >> 8).astype(np.uint8)
-
-            rgb_image = cv2.cvtColor(np.ascontiguousarray(host_buffer), cv2.COLOR_YUV2RGB_NV12)
-            if roi is None: return rgb_image
-
-            clipped = roi.clip_to(video_width, video_height)
-            return rgb_image[clipped.y : clipped.y2, clipped.x : clipped.x2].copy()
-        except (RuntimeError, ValueError, AttributeError, MemoryError, IndexError) as exc:
-            logger.debug("CPU Fallback lỗi: %s.", exc)
-            return None
 
 __all__ = ["PyNvVideoCodecFrameSampler"]

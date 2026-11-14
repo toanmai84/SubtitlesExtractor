@@ -17,11 +17,13 @@ from subtitles_extractor.infrastructure.translation.gemini_translation_adapter i
 
 
 def test_translate_page_has_required_names() -> None:
-    import subtitles_extractor.presentation.pages.translate_page as tp
-
     # Hai tên này từng gây NameError lúc mở hộp thoại (chưa import).
-    assert hasattr(tp, "caption_style"), "thiếu import caption_style"
-    assert hasattr(tp, "QMessageBox"), "thiếu import QMessageBox"
+    # [v3.23.694] Hộp thoại hạn mức (caption_style) và các hộp xác nhận (QMessageBox) đã tách khỏi translate_page:
+    # kiểm ở module đang dùng chúng.
+    from subtitles_extractor.presentation.pages import translate_keys, translate_tools
+
+    assert hasattr(translate_keys, "caption_style"), "thiếu import caption_style"
+    assert hasattr(translate_tools, "QMessageBox"), "thiếu import QMessageBox"
 
 
 def test_no_undefined_names_in_presentation_pages() -> None:

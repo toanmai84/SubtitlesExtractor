@@ -308,7 +308,8 @@ class TestStageRevertInPipeline:
         use_case = TranslateSubtitlesUseCase(translator=_Pipeline())  # type: ignore[arg-type]
         response = use_case.execute(replace(_request(), events=events))
         assert [event.text for event in response.events] == [
-            "Còn mày thì sao?", "Ông nội, cháu gái", "Biết sai rồi.", "Ông nội, ông nội,"
+            # [v3.23.706] Dòng 3 nối tiếp dòng 2 (bản dịch thô viết thường) → không còn bị viết hoa giữa câu.
+            "Còn mày thì sao?", "Ông nội, cháu gái", "biết sai rồi.", "Ông nội, ông nội,"
         ]
         reverts = [e for e in get_process_log().snapshot()["events"]
                    if e["event"] == "echo_revert"]

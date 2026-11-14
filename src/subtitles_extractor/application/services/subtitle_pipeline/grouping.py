@@ -246,8 +246,10 @@ def group_using_viterbi(
     y_ratio = config.y_clustering_tolerance_ratio
     y_min_px = config.y_clustering_tolerance_min_px
 
-    for cluster_label_id in sorted(clustered_frame_buckets.keys()):
-        frames_in_current_bucket = clustered_frame_buckets[cluster_label_id]
+    ordered_buckets = [clustered_frame_buckets[label] for label in sorted(clustered_frame_buckets.keys())]
+    ordered_buckets = _return_boundary_frames_to_their_line(ordered_buckets, y_ratio, y_min_px)
+
+    for frames_in_current_bucket in ordered_buckets:
         optimal_voted_text = vote_best_text_rover(
             frames_in_current_bucket, y_ratio, y_min_px
         )
@@ -287,6 +289,46 @@ def group_using_viterbi(
             )
         )
     return final_constructed_groups
+
+
+def _return_boundary_frames_to_their_line(
+    buckets: list[list[OcrFrameResult]], y_ratio: float, y_min_px: float,
+) -> list[list[OcrFrameResult]]:
+    """[v3.23.716] Trả khung sát ranh giới về đúng câu của nó.
+
+    Hai câu liền nhau có chung chữ ("历史至强雷劫" → "四灵天雷劫", "哎呀师叔" → "师叔"): Viterbi đôi khi gán khung CUỐI của
+    câu trước (đọc đúng nguyên văn câu trước, tin cậy 0,99) vào nhóm câu sau vì độ giống vượt ngưỡng nhập nhóm. Ảnh thật
+    (tập 1, 16,80 s) xác nhận khung đó vẫn là câu trước → cả hai mốc lệch một khung, trên mọi bộ dữ liệu thô của phim mẫu.
+
+    Chỉ dời khung mà chữ đọc được TRÙNG NGUYÊN VĂN câu kề bên và KHÁC câu của nhóm đang giữ nó, liền một mạch từ ranh
+    giới; nhóm không bao giờ bị dời hết khung.
+    """
+    if len(buckets) < 2:
+        return buckets
+
+    def text_of(frame: OcrFrameResult) -> str:
+        return extract_joined_text_from_frame(frame, y_ratio, y_min_px)
+
+    voted = [vote_best_text_rover(bucket, y_ratio, y_min_px) for bucket in buckets]
+    for index in range(len(buckets) - 1):
+        left, right = buckets[index], buckets[index + 1]
+        left_text, right_text = voted[index], voted[index + 1]
+        if not left_text or not right_text or left_text == right_text:
+            continue
+        if not left or not right or left[-1].timestamp_sec > right[0].timestamp_sec:
+            continue                                    # hai nhóm đan xen thời gian: không phải ranh giới đơn
+        lead = 0
+        while lead < len(right) - 1 and text_of(right[lead]) == left_text:
+            lead += 1
+        if lead:
+            buckets[index], buckets[index + 1] = left + right[:lead], right[lead:]
+            continue
+        trail = 0
+        while trail < len(left) - 1 and text_of(left[-1 - trail]) == right_text:
+            trail += 1
+        if trail:
+            buckets[index], buckets[index + 1] = left[:-trail], left[-trail:] + right
+    return buckets
 
 
 __all__ = ["create_initial_frame_group", "group_using_greedy", "group_using_viterbi"]

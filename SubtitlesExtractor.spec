@@ -13,7 +13,7 @@ Các công tắc môi trường (env) khi build:
 Xem docs/BUILD_PLAN.md để hiểu các quyết định đóng gói. Nguyên tắc:
 - Bản NHỎ 1-file để dễ lưu trữ/chia sẻ: KHÔNG nhúng paddle/CUDA/model — tải lúc chạy vào
   models/ CẠNH exe (bền cho cả one-file, xem infrastructure/model_store._frozen_runtime_root).
-- KHÔNG bundle whisperx/torch/cupy: nặng + cần CUDA, cài ở môi trường riêng whisperx_env.
+- KHÔNG bundle whisperx/torch: nặng + cần CUDA, cài ở môi trường riêng whisperx_env. [v3.23.723] CuPy CÓ bundle (NVDEC).
 - KHÔNG UPX cho paddle: UPX nén DLL paddle gây crash.
 """
 
@@ -433,6 +433,69 @@ try:
 except Exception as exc:  # noqa: BLE001 — khong cai (may khong GPU) thi bo qua
     print(f"[spec] Bỏ qua PyNvVideoCodec (không cài): {exc}")
 
+# [v3.23.723] CuPy (NVDEC + tien xu ly tren VRAM): goi con cupy._core/cupy_backends nap dong, thu muc header
+# (cupy/_core/include) can khi NVRTC bien dich nhan luc chay -> collect_all. Thieu thi app tu lui PyAV (co canh bao).
+for _cupy_pkg in ("cupy", "cupy_backends", "fastrlock", "cuda.pathfinder"):
+    try:
+        _add_all(_cupy_pkg)
+    except Exception as exc:  # noqa: BLE001 — khong cai (may khong GPU) thi bo qua
+        print(f"[spec] Bỏ qua {_cupy_pkg} (không cài): {exc}")
+
+# [v3.23.725] Mô-đun THƯ VIỆN CHUẨN mà CuPy import từ mã Cython đã biên dịch (.pyd): PyInstaller không đọc được import
+# trong .pyd nên bỏ sót. Bản 3.23.724 thiếu ``graphlib`` (``cupy/cuda/function.pyx``) → ``import cupy`` lỗi
+# "No module named 'graphlib'" → NVDEC lùi PyAV (log 14/11/2026). Danh sách sàn = đo thật trên CuPy 14.2 (``import cupy``
+# + các mô-đun con biên dịch nhân); lúc build còn dò thêm bằng tiến trình con với đúng CuPy đang cài.
+_CUPY_STDLIB_FLOOR = (
+    "ast", "atexit", "binascii", "bisect", "bz2", "collections", "contextlib", "contextvars", "copy", "copyreg",
+    "ctypes", "dataclasses", "datetime", "dis", "email", "enum", "fnmatch", "functools", "gc", "glob", "graphlib",
+    "hashlib", "importlib", "inspect", "itertools", "json", "keyword", "linecache", "locale", "lzma", "math", "ntpath",
+    "numbers", "opcode", "operator", "pathlib", "pickle", "platform", "random", "re", "reprlib", "select",
+    "selectors", "shutil", "signal", "string", "struct", "subprocess", "sysconfig", "tempfile", "textwrap",
+    "threading", "token", "tokenize", "traceback", "types", "typing", "weakref", "zipfile", "zlib",
+)
+_CUPY_STDLIB_PROBE = (
+    "import importlib, json, sys, warnings\n"
+    "warnings.simplefilter('ignore')\n"
+    "before = set(sys.modules)\n"
+    "import cupy\n"
+    "for name in ('cupy.cuda.compiler', 'cupy._core._kernel', 'cupy._core.fusion', 'cupy.cuda.memory'):\n"
+    "    try:\n"
+    "        importlib.import_module(name)\n"
+    "    except Exception:\n"
+    "        pass\n"
+    "std = set(sys.stdlib_module_names)\n"
+    "print(json.dumps(sorted({m.split('.')[0] for m in set(sys.modules) - before} & std)))\n"
+)
+
+
+def _cupy_stdlib_hiddenimports(python_exe: str) -> list[str]:
+    """Mô-đun chuẩn CuPy cần: danh sách sàn + dò thật (bỏ mô-đun nội bộ ``_x`` — chúng đi theo mô-đun cha)."""
+    import json as _json
+    import subprocess as _subprocess
+
+    found: set[str] = set()
+    try:
+        done = _subprocess.run(
+            [python_exe, "-c", _CUPY_STDLIB_PROBE], capture_output=True, text=True, timeout=180, check=False,
+        )
+        lines = [line for line in done.stdout.splitlines() if line.startswith("[")]
+        if done.returncode == 0 and lines:
+            found = set(_json.loads(lines[-1]))
+        else:
+            print(f"[spec] Không dò được mô-đun chuẩn của CuPy (mã {done.returncode}) — dùng danh sách sàn.")
+    except Exception as exc:  # noqa: BLE001 — dò hỏng thì vẫn còn danh sách sàn
+        print(f"[spec] Không dò được mô-đun chuẩn của CuPy ({exc}) — dùng danh sách sàn.")
+    names = sorted({n for n in found | set(_CUPY_STDLIB_FLOOR) if not n.startswith("_")})
+    return [n for n in names if _importlib_util.find_spec(n) is not None]
+
+
+if _importlib_util.find_spec("cupy") is not None:
+    import sys as _sys
+
+    _cupy_std = _cupy_stdlib_hiddenimports(_sys.executable)
+    hiddenimports.extend(_cupy_std)
+    print(f"[spec] CuPy: thêm {len(_cupy_std)} mô-đun thư viện chuẩn import từ .pyd (có graphlib: {'graphlib' in _cupy_std}).")
+
 # [v3.23.607] Du lieu mui gio cho zoneinfo (Windows khong co san): moc doi ngay han muc
 # Gemini la 00:00 gio Thai Binh Duong. Thieu goi thi app van chay nho quy tac du phong.
 try:
@@ -515,6 +578,33 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# [v3.23.724] Lọc DLL CUDA mà PyInstaller kéo theo khi PHÂN TÍCH PHỤ THUỘC của CuPy (các .pyd của CuPy liên kết
+# cuBLAS / cuSOLVER / cuSPARSE / cuFFT / cuRAND / NVRTC…). Bản 3.23.723: ~2 GB DLL bị chép vào GỐC gói → bản build
+# 2,2 GB, và CuPy thấy nvrtc ở %TEMP%\_MEIxxxx nên suy thư mục CUDA là %TEMP% → add_dll_directory("%TEMP%\bin") ném
+# FileNotFoundError → bấm Trích xuất là sập. CUDA runtime vẫn tải lúc chạy ("Bật tăng tốc GPU") như trước; bản build
+# SUBEXT_BUNDLE_CUDA=1 giữ các DLL đã gom đúng chỗ (nvidia/<thành phần>/bin), chỉ bỏ bản trùng ở gốc gói.
+import re as _re
+
+_CUDA_DLL_RE = _re.compile(
+    r"^(cublas|cublaslt|cusolver|cusolvermg|cusparse|cufft|cufftw|curand|nvrtc|nvrtc-builtins|nvjitlink|cudart|cudnn"
+    r"|cudnn_\w+|cutensor|cutensormg|nvtoolsext|nvjpeg|cupti|npp\w*)(64)?[_\w.-]*\.dll$",
+    _re.IGNORECASE,
+)
+
+
+def _is_unwanted_cuda_dll(dest_name: str) -> bool:
+    base = _os.path.basename(dest_name.replace("\\", "/"))
+    if not _CUDA_DLL_RE.match(base):
+        return False
+    at_root = _os.path.dirname(dest_name.replace("\\", "/")) in ("", ".")
+    return at_root or not _BUNDLE_CUDA
+
+
+_before = len(a.binaries)
+_dropped = [entry[0] for entry in a.binaries if _is_unwanted_cuda_dll(entry[0])]
+a.binaries = [entry for entry in a.binaries if not _is_unwanted_cuda_dll(entry[0])]
+print(f"[spec] Bỏ {len(_dropped)} DLL CUDA khỏi gói (kéo theo do phụ thuộc CuPy): {sorted(set(_dropped))[:12]}")
 
 pyz = PYZ(a.pure)
 

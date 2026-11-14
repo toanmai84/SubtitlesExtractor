@@ -749,6 +749,7 @@ class ExtractPage(QWidget):
         self._view_model.hardsub_detected.connect(self._on_hardsub_detected)
         self._view_model.auto_roi_detected.connect(self._on_auto_roi_detected)
         self._view_model.detection_failed.connect(self._on_detection_failed)
+        self._view_model.detection_cancelled.connect(self._on_detection_cancelled)  # [v3.23.698]
         self._view_model.roi_changed.connect(self._on_roi_changed)
         self._view_model.detected_rois_changed.connect(self._on_detected_rois_changed)
 
@@ -2461,6 +2462,10 @@ class ExtractPage(QWidget):
     def _on_roi_button_clicked(self, roi_index: int) -> None:
         self._view_model.select_detected_roi(roi_index)
         self._on_detected_rois_changed(self._view_model.detected_rois)
+
+    def _on_detection_cancelled(self) -> None:
+        """[v3.23.698] Lượt tự dò vùng bị huỷ: giữ nguyên ROI hiện có, chỉ báo trạng thái."""
+        self._set_status(self._translator.translate("extract.ss_roi_detect_cancelled"))
 
     def _on_detection_failed(self, message: str) -> None:
         # [#5] AI báo lỗi → đồng bộ ComboBox về self._translator.translate("extract.ex_roi_full") (tránh trạng thái ảo).

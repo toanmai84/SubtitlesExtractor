@@ -26,9 +26,9 @@ from typing import Any
 from PySide6.QtCore import QObject, Qt, Signal, QThread
 from PySide6.QtGui import QImage, QPainter, QPen, QColor, QFont
 
-from subtitles_extractor.application.dtos.extract_subtitles_dto import SubtitleBuilderConfig
 from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
 from subtitles_extractor.application.services.subtitle_builder import SubtitleBuilder
+from subtitles_extractor.composition.builder_config import builder_config_from_settings
 from subtitles_extractor.composition.container import ApplicationContainer
 from subtitles_extractor.domain.entities.ocr_frame_result import OcrFrameResult, OcrTextBox
 from subtitles_extractor.domain.ports.ocr_engine_port import OcrEngineConfig, PreprocessConfig
@@ -41,7 +41,7 @@ from subtitles_extractor.presentation.utils.time_format import seconds_to_displa
 from subtitles_extractor.domain.ports.frame_sampler_port import FrameSamplingConfig
 
 from subtitles_extractor.infrastructure.ocr.preprocessing.image_filters import (
-    upscale_to_min_height, apply_clahe, apply_sharpen, apply_contrast_boost
+    apply_cpu_preprocessing_pipeline,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,7 +95,6 @@ class _SingleFrameReocrWorker(QObject):
         try:
             full_frame_rgb = None
             is_already_cropped = False
-            used_vram_preprocessing = False
 
             # 1. Trích xuất Full Frame từ Video Gốc bằng ĐÚNG BACKEND CÀI ĐẶT
             if self.base_img_dir and self.meta and hasattr(self.meta, 'video_name'):
@@ -116,31 +115,19 @@ class _SingleFrameReocrWorker(QObject):
                             rx, ry, rw, rh = self.meta.roi_xywh
                             target_roi = Roi(x=rx, y=ry, width=rw, height=rh)
 
-                        # Determine NVDEC Backend
-                        from importlib.util import find_spec
-                        has_cupy = find_spec("cupy") is not None
-                        is_nvdec = self.settings.hardware.frame_decoder_backend == "pynvvideocodec" and has_cupy
-
-                        # [SỬA LỖI TỌA ĐỘ VRAM]: Upscale và Border BẮT BUỘC chạy trên CPU
-                        # để OCR Engine có thể tịnh tiến ngược tọa độ Box về kích thước gốc.
-                        vram_upscale = False 
-                        vram_sharpen = bool(self.tweaks.get("sharpen", False)) if is_nvdec else False
-                        vram_contrast = bool(self.tweaks.get("contrast", False)) if is_nvdec else False
-                        vram_contrast_factor = float(self.tweaks.get("contrast_factor", 1.2)) if vram_contrast else 1.0
-
-                        # Cấu hình quét siêu hẹp quanh mục tiêu
+                        # [v3.23.723] Lấy khung GỐC (không tiền xử lý ở bộ lấy mẫu) và ép mọi khung có ảnh: bộ khử trùng
+                        # mặc định trả khung "trùng" với ảnh rỗng → có lúc chọn đúng khung rỗng và báo không giải mã được.
                         cfg = FrameSamplingConfig(
                             sample_step_sec=0.01,
                             skip_intro_sec=max(0.0, target_ts - 1.0),
                             skip_outro_sec=max(0.0, metadata.duration_sec - target_ts - 1.0),
-                            vram_upscale_small_text=vram_upscale,
-                            vram_upscale_target_height_px=int(self.tweaks.get("upscale_h", 96)),
-                            vram_sharpen=vram_sharpen,
-                            vram_contrast_factor=vram_contrast_factor,
+                            phash_distance_threshold=-1, pixel_diff_threshold=-1.0,
                         )
 
                         min_diff = float("inf")
                         for s_frame in sampler.iter_frames(metadata, target_roi, cfg):
+                            if s_frame.image_rgb is None or not s_frame.image_rgb.size:
+                                continue
                             diff = abs(s_frame.timestamp_sec - target_ts)
                             # Ưu tiên khớp chính xác bằng Timestamp (Do VFR, Frame Index bị reset)
                             if diff < min_diff:
@@ -155,8 +142,6 @@ class _SingleFrameReocrWorker(QObject):
                             if target_roi:
                                 self._current_offset_x = target_roi.x
                                 self._current_offset_y = target_roi.y
-                            if is_nvdec:
-                                used_vram_preprocessing = True
 
                     except Exception as e:
                         logger.debug("Lỗi đọc Frame bằng Backend: %s", e)
@@ -205,20 +190,10 @@ class _SingleFrameReocrWorker(QObject):
                 cropped_rgb = img_rgb[ry:ry+rh, rx:rx+rw]
                 self._current_offset_x, self._current_offset_y = rx, ry
 
-            # 4. Tiền xử lý Ảnh (Chỉ để hiển thị cho User xem)
-            prep_rgb = cropped_rgb.copy()
-            
-            if not used_vram_preprocessing:
-                if self.tweaks.get("upscale") and prep_rgb.shape[0] < self.tweaks.get("upscale_h", 96):
-                    prep_rgb = upscale_to_min_height(prep_rgb, self.tweaks.get("upscale_h", 96))
-                if self.tweaks.get("sharpen"):
-                    prep_rgb = apply_sharpen(prep_rgb)
-                if self.tweaks.get("contrast"):
-                    prep_rgb = apply_contrast_boost(prep_rgb, self.tweaks.get("contrast_factor", 1.2))
-
-            # CLAHE luôn chạy trên CPU (Vì VRAM chưa hỗ trợ CLAHE)
-            if self.tweaks.get("clahe"):
-                prep_rgb = apply_clahe(prep_rgb, self.tweaks.get("clahe_clip", 3.0), self.tweaks.get("clahe_tile", 8))
+            # 4. Tiền xử lý — [v3.23.723] ảnh xem trước CHÍNH LÀ ảnh đưa vào OCR. Nhánh GPU (NVDEC): toàn bộ trên VRAM bằng
+            # CUDA; nhánh CPU: cùng pipeline với lượt trích xuất. Trước đây làm nét / tương phản chạy trên VRAM TRƯỚC khi
+            # phóng (sai thứ tự), phần còn lại trên CPU.
+            prep_rgb = self._preprocess_for_trial(cropped_rgb)
 
             qimg_input = _ndarray_to_qimage(prep_rgb)
             if qimg_input.isNull():
@@ -229,18 +204,11 @@ class _SingleFrameReocrWorker(QObject):
             from subtitles_extractor.application.services.ocr_model_resolver import resolve_ocr_model_names
             det_model, rec_model = resolve_ocr_model_names(self.settings.ocr)
 
-            # VRAM xử lý cái gì thì tắt cái đó đi ở CPU để tránh bị xử lý 2 lần 
+            # Ảnh đã tiền xử lý xong ở bước 4 → bộ OCR chỉ thêm viền (để hộp chữ được trừ viền đúng cách).
             temp_pre_cfg = PreprocessConfig(
-                upscale_small_text=self.tweaks.get("upscale", False),
-                upscale_target_height_px=self.tweaks.get("upscale_h", self.settings.preprocess.upscale_target_height_px),
-                add_white_border=self.settings.preprocess.add_white_border,
+                upscale_small_text=False, add_white_border=self.settings.preprocess.add_white_border,
                 border_thickness_px=self.settings.preprocess.border_thickness_px,
-                apply_clahe=self.tweaks.get("clahe", False),
-                clahe_clip_limit=self.tweaks.get("clahe_clip", self.settings.preprocess.clahe_clip_limit),
-                clahe_tile_size=self.tweaks.get("clahe_tile", self.settings.preprocess.clahe_tile_size),
-                apply_sharpen=self.tweaks.get("sharpen", False) if not used_vram_preprocessing else False,
-                apply_contrast_boost=self.tweaks.get("contrast", False) if not used_vram_preprocessing else False,
-                contrast_factor=self.tweaks.get("contrast_factor", self.settings.preprocess.contrast_factor),
+                apply_clahe=False, apply_sharpen=False, apply_contrast_boost=False,
             )
 
             # [v3.23.656] Dựng TỪ cấu hình đầy đủ của ứng dụng rồi chỉ thay phần thử: thiếu batch/luồng CPU… (về mặc
@@ -271,8 +239,17 @@ class _SingleFrameReocrWorker(QObject):
             # 6. Chạy Inference — [v3.23.656] cấu hình thử đi kèm lượt này, KHÔNG đổi engine dùng chung (trước đây
             # thử ở trang Gỡ lỗi đổi luôn cấu hình của lượt trích xuất đang chạy).
             new_frame_result = ocr_engine.infer(
-                cropped_rgb, self.old_frame.frame_index, self.old_frame.timestamp_sec, config=temp_ocr_cfg,
+                prep_rgb, self.old_frame.frame_index, self.old_frame.timestamp_sec, config=temp_ocr_cfg,
             )
+            # Hộp chữ trên ảnh đã phóng → quy về toạ độ vùng cắt gốc.
+            ratio_x = cropped_rgb.shape[1] / max(1, prep_rgb.shape[1])
+            ratio_y = cropped_rgb.shape[0] / max(1, prep_rgb.shape[0])
+            if abs(ratio_x - 1.0) > 1e-6 or abs(ratio_y - 1.0) > 1e-6:
+                new_frame_result = dataclasses.replace(new_frame_result, text_boxes=[
+                    dataclasses.replace(box, polygon=[(int(round(x * ratio_x)), int(round(y * ratio_y))) for x, y in box.polygon])
+                    if box.polygon else box
+                    for box in new_frame_result.text_boxes
+                ])
 
             # 7. Vẽ Output Image bằng QPainter
             qimg_output = qimg_input.convertToFormat(QImage.Format.Format_RGB32)
@@ -371,6 +348,38 @@ class _SingleFrameReocrWorker(QObject):
         except Exception as e:
             logger.exception("Background Worker ReOCR Error")
             self.failed.emit(f"Lỗi hệ thống: {e}")
+
+
+    def _preprocess_for_trial(self, cropped_rgb: np.ndarray) -> np.ndarray:
+        """[v3.23.723] Tiền xử lý thử theo tinh chỉnh (không viền). NVDEC + CuPy → CUDA trên VRAM; còn lại → CPU."""
+        from subtitles_extractor.composition.preprocess_routing import nvdec_sampler_selected
+        from subtitles_extractor.infrastructure.ocr.preprocessing import gpu_image_filters
+
+        params = dict(
+            upscale_small_text=bool(self.tweaks.get("upscale")),
+            upscale_target_height_px=int(self.tweaks.get("upscale_h", self.settings.preprocess.upscale_target_height_px)),
+            sharpen=bool(self.tweaks.get("sharpen")),
+            contrast_factor=float(self.tweaks.get("contrast_factor", 1.2)) if self.tweaks.get("contrast") else 1.0,
+            add_border=False, border_thickness_px=0,
+            apply_clahe=bool(self.tweaks.get("clahe")),
+            clahe_clip_limit=float(self.tweaks.get("clahe_clip", 3.0)),
+            clahe_tile_size=int(self.tweaks.get("clahe_tile", 8)),
+        )
+        cupy = getattr(gpu_image_filters, "cp", None)
+        if gpu_image_filters.HAS_CUPY and cupy is not None and nvdec_sampler_selected(self.settings):
+            try:
+                prepared = gpu_image_filters.apply_gpu_preprocessing_pipeline(cupy.asarray(cropped_rgb), {}, xp=cupy, **params)
+                return np.ascontiguousarray(cupy.asnumpy(prepared))
+            except Exception as exc:  # noqa: BLE001 — NVRTC/CUDA lỗi: thử trên CPU (cùng kết quả), không hỏng lượt thử
+                logger.warning("Tiền xử lý thử trên GPU lỗi (%s) — dùng CPU.", exc)
+        return apply_cpu_preprocessing_pipeline(
+            cropped_rgb.copy(),
+            upscale_small_text=params["upscale_small_text"], upscale_target_height_px=params["upscale_target_height_px"],
+            apply_clahe_flag=params["apply_clahe"], clahe_clip_limit=params["clahe_clip_limit"],
+            clahe_tile_size=params["clahe_tile_size"], apply_sharpen_flag=params["sharpen"],
+            apply_contrast_boost_flag=params["contrast_factor"] != 1.0, contrast_factor=params["contrast_factor"],
+            add_white_border=False, border_thickness_px=0,
+        )
 
 
 # ==============================================================================
@@ -610,27 +619,7 @@ class DebugPageViewModel(QObject):
             return
         try:
             snapshot = self._container.settings_service.current
-            post = snapshot.post_process
-            threshold = snapshot.threshold
-
-            builder_cfg = SubtitleBuilderConfig(
-                similarity_threshold=min(post.similarity_threshold, threshold.text_similarity),
-                min_duration_sec=post.min_duration_sec,
-                max_duration_sec=post.max_duration_sec,
-                merge_gap_sec=post.merge_gap_sec, merge_progressive=bool(getattr(post, "merge_progressive", False)),
-                min_confidence=threshold.ocr_min_confidence,
-                use_viterbi=post.use_viterbi,
-                viterbi_open_penalty=post.viterbi_open_penalty,
-                min_text_chars=threshold.drop_short_text_chars,
-                line_similarity_threshold=threshold.line_similarity,
-                sample_step_sec=snapshot.frame.sample_step_sec,
-                temporal_padding_sec=post.temporal_padding_sec,
-                y_clustering_tolerance_ratio=post.y_clustering_tolerance_ratio,
-                y_clustering_tolerance_min_px=post.y_clustering_tolerance_min_px,
-                alignment_center_tolerance_ratio=post.alignment_center_tolerance_ratio,
-                alignment_margin_tolerance_ratio=post.alignment_margin_tolerance_ratio,
-                alignment_tolerance_min_px=post.alignment_tolerance_min_px
-            )
+            builder_cfg = builder_config_from_settings(snapshot)
 
             roi = None
             if self._meta and self._meta.roi_xywh:

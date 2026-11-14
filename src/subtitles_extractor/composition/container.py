@@ -469,7 +469,7 @@ class ApplicationContainer:
         from subtitles_extractor.application.use_cases.benchmark_ocr import BenchmarkOcrUseCase
 
         engine = self.ocr_engine
-        configure = getattr(engine, "apply_config", None) or getattr(engine, "update_preprocess_config")
+        configure = getattr(engine, "apply_config", None) or engine.update_preprocess_config
         builder_config = self._build_subtitle_builder_config()
 
         def factory(counting_engine: object) -> ExtractSubtitlesUseCase:
@@ -657,8 +657,15 @@ class ApplicationContainer:
         """
         previous = getattr(self, "_custom_text_provider", None)
         self._custom_text_provider = config
-        if config != previous and getattr(self, "_custom_model_health", None) is not None:
-            self._custom_model_health = None  # đổi nhà cung cấp → danh sách model cũ vô nghĩa
+        # [v3.23.698] Chỉ quên danh sách model khi ĐỔI ĐỊA CHỈ nhà cung cấp. Trước đây đổi key, hay bật/tắt qua lại
+        # Gemini ↔ tuỳ chỉnh, cũng xoá → bộ chọn dự phòng không biết model nào, lặng lẽ không chuyển khi quá tải.
+        if config is not None and getattr(self, "_custom_model_health", None) is not None:
+            old_url = getattr(previous, "normalized_base_url", None) or getattr(
+                self, "_custom_health_url", None)
+            if old_url is not None and old_url != config.normalized_base_url:
+                self._custom_model_health = None
+        if config is not None:
+            self._custom_health_url = config.normalized_base_url
 
     @property
     def custom_text_provider(self):
@@ -677,9 +684,9 @@ class ApplicationContainer:
                 ModelHealth,
             )
 
+            # [v3.23.698] Không chép lựa chọn dự phòng của Gemini (tên model Gemini không có ở nhà cung cấp khác);
+            # trang Dịch áp lựa chọn riêng qua ``set_fallback_model``.
             existing = ModelHealth(same_family_only=True)
-            preferred = self.gemini_model_health.preferred_fallback
-            existing.set_preferred_fallback(preferred)
             self._custom_model_health = existing
         return existing
 
@@ -1043,15 +1050,38 @@ class ApplicationContainer:
         # stream). Thieu CuPy -> np.from_dlpack(stream=0) gay loi "ExternalBuffer::dlpack
         # Passed value of 0". Chi chon PyNvVideoCodec khi co CA hai; nguoc lai fallback PyAV
         # (van dung NVDEC qua FFmpeg neu co, on dinh hon).
-        if (
-            backend == "pynvvideocodec"
-            and self._is_module_available("PyNvVideoCodec")
-            and self._is_module_available("cupy")
-        ):
+        from subtitles_extractor.composition.preprocess_routing import nvdec_sampler_selected
+
+        # [v3.23.723] Cùng điều kiện với nơi chia tiền xử lý VRAM/CPU (``preprocess_routing``).
+        if nvdec_sampler_selected(snapshot):
             from subtitles_extractor.infrastructure.video.decoders.pynvvideocodec_frame_sampler import (
                 PyNvVideoCodecFrameSampler,
             )
+
+            if self._is_module_available("av"):
+                from subtitles_extractor.infrastructure.video.decoders.fallback_frame_sampler import (
+                    FallbackFrameSampler,
+                )
+                from subtitles_extractor.infrastructure.video.decoders.pyav_frame_sampler import PyAvFrameSampler
+
+                # [v3.23.723] NVDEC hỏng (codec, NVRTC, CUDA) → PyAV tiếp tục, giữ nguyên tiền xử lý.
+                return FallbackFrameSampler(PyNvVideoCodecFrameSampler(gpu_id=0), PyAvFrameSampler)
             return PyNvVideoCodecFrameSampler(gpu_id=0)
+        if backend == "pynvvideocodec":
+            # [v3.23.723] Trước đây âm thầm lùi về PyAV (máy chủ dự án chạy lượt 717 bằng PyAV mà không biết vì thiếu CuPy).
+            missing = [name for name in ("PyNvVideoCodec", "cupy") if not self._is_module_available(name)]
+            if not missing:     # [v3.23.724] có gói CuPy nhưng không nạp được / không thấy GPU: nêu đúng lý do
+                from subtitles_extractor.infrastructure.ocr.preprocessing import gpu_image_filters
+
+                missing = [f"CuPy dùng được ({gpu_image_filters.CUPY_UNAVAILABLE_REASON or 'không rõ'})"]
+            # [v3.23.725] Chỉ khuyên cài gói khi thật sự THIẾU gói; có gói mà nạp hỏng thì lý do đã nêu ở trên.
+            hint = (
+                " Cài 'cupy-cuda12x' và 'pynvvideocodec' để bật NVDEC + tiền xử lý trên VRAM."
+                if any(name in ("PyNvVideoCodec", "cupy") for name in missing) else ""
+            )
+            logger.warning(
+                "Đã chọn giải mã NVDEC nhưng thiếu %s — giải mã bằng PyAV (CPU).%s", " + ".join(missing), hint,
+            )
 
         # [v3.23.289] Khi NVDEC khong kha dung (thieu CuPy) VA backend != 'mpv' tuong minh,
         # uu tien PyAV hon mpv cho sampling headless — PyAV on dinh hon (mpv vo=null co the
@@ -1079,7 +1109,6 @@ class ApplicationContainer:
         from subtitles_extractor.application.services.ocr_model_resolver import (
             resolve_ocr_model_names,
         )
-        from subtitles_extractor.domain.ports.ocr_engine_port import PreprocessConfig
         det_model, rec_model = resolve_ocr_model_names(snapshot.ocr)
         pre = snapshot.preprocess
         return OcrEngineConfig(
@@ -1102,35 +1131,21 @@ class ApplicationContainer:
             use_textline_orientation=snapshot.ocr.use_textline_orientation,
             use_doc_orientation_classify=snapshot.ocr.use_doc_orientation_classify,
             use_doc_unwarping=snapshot.ocr.use_doc_unwarping,
-            preprocess=PreprocessConfig(
-                upscale_small_text=pre.upscale_small_text, upscale_target_height_px=pre.upscale_target_height_px,
-                add_white_border=pre.add_white_border, border_thickness_px=pre.border_thickness_px,
-                apply_sharpen=pre.apply_sharpen, apply_contrast_boost=pre.apply_contrast_boost,
-                contrast_factor=pre.contrast_factor,
-                apply_clahe=pre.apply_clahe,
-                clahe_clip_limit=pre.clahe_clip_limit,
-                clahe_tile_size=pre.clahe_tile_size,
-            ),
+            # [v3.23.723] Cùng phép chia VRAM/CPU với lượt trích xuất: giải mã NVDEC thì các bước đã chạy trên VRAM
+            # (tự dò vùng gọi OCR không kèm cấu hình) — trước đây CPU làm LẠI CLAHE / làm nét / tương phản lần nữa.
+            preprocess=self._routed_cpu_preprocess(snapshot, pre),
         )
+
+    @staticmethod
+    def _routed_cpu_preprocess(snapshot: Any, pre: Any) -> Any:
+        from subtitles_extractor.composition.preprocess_routing import nvdec_sampler_selected, route_preprocessing
+
+        _, cpu = route_preprocessing(pre, on_gpu=nvdec_sampler_selected(snapshot))
+        return cpu
 
     def _build_subtitle_builder_config(self) -> SubtitleBuilderConfig:
-        snapshot = self.settings_service.current
-        post = snapshot.post_process
-        threshold = snapshot.threshold
+        from subtitles_extractor.composition.builder_config import builder_config_from_settings
 
-        return SubtitleBuilderConfig(
-            similarity_threshold=min(post.similarity_threshold, threshold.text_similarity),
-            min_duration_sec=post.min_duration_sec, max_duration_sec=post.max_duration_sec,
-            min_confidence=threshold.ocr_min_confidence, merge_gap_sec=post.merge_gap_sec, merge_progressive=bool(getattr(post, "merge_progressive", False)),
-            use_viterbi=post.use_viterbi, viterbi_open_penalty=post.viterbi_open_penalty,
-            min_text_chars=threshold.drop_short_text_chars, line_similarity_threshold=threshold.line_similarity,
-            sample_step_sec=snapshot.frame.sample_step_sec,
-            temporal_padding_sec=post.temporal_padding_sec,
-            y_clustering_tolerance_ratio=post.y_clustering_tolerance_ratio,
-            y_clustering_tolerance_min_px=post.y_clustering_tolerance_min_px,
-            alignment_center_tolerance_ratio=post.alignment_center_tolerance_ratio,
-            alignment_margin_tolerance_ratio=post.alignment_margin_tolerance_ratio,
-            alignment_tolerance_min_px=post.alignment_tolerance_min_px,
-        )
+        return builder_config_from_settings(self.settings_service.current)
 
 __all__ = ["ApplicationContainer"]

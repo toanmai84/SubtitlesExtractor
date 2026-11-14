@@ -146,6 +146,14 @@ def main() -> int:
     _ensure_std_streams()
     _setup_python_path()
 
+    # [v3.23.709] TRƯỚC mọi import kéo thư viện bên thứ ba: paddle tự chạy `where nvcc` / `where ccache` lúc nạp, không
+    # ẩn cửa sổ → cửa sổ cmd chớp lên sau khi mở ứng dụng.
+    from subtitles_extractor.infrastructure.process.hidden_process import (
+        install_hidden_console_default,
+    )
+
+    install_hidden_console_default()
+
     # [v3.23.301] KHO MODEL TẬP TRUNG: trỏ PaddleOCR (models/paddle) và HuggingFace
     # (models/huggingface — VieNeu-TTS, fastembed) về thư mục models/ nếu đã prefetch.
     # PHẢI chạy TRƯỚC mọi import kéo paddle/paddlex/huggingface_hub vì các thư viện

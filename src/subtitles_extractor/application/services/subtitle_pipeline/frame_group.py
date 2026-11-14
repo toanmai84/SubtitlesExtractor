@@ -45,6 +45,9 @@ class FrameGroup:
     #: viên — cho phép pass hậu kỳ phát hiện group chứa 2+ khối text ổn định
     #: (progressive utterance bị merge nhầm) và tách lại thành nhiều câu.
     member_texts: list[tuple[float, str]] = dataclasses.field(default_factory=list)
+    #: [v3.23.717] Bằng chứng theo từng bản đọc đã gộp vào group: ``chữ → [(số khung, tin cậy trung bình)]``. Bước tách
+    #: "khối ổn định" dùng để nhận ra khối là MỘT LẦN ĐỌC SAI (tin cậy thấp rõ rệt) chứ không phải câu thật thứ hai.
+    variant_evidence: dict[str, list[tuple[int, float]]] = dataclasses.field(default_factory=dict)
 
     def calculate_mean_confidence(self) -> float:
         """Trả về confidence trung bình của các frame trong group."""

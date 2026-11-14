@@ -140,9 +140,10 @@ class TestDubbingTab:
 
 class TestPageWiring:
     def test_tts_page_sends_line_voices_and_has_the_tab(self) -> None:
-        import subtitles_extractor.presentation.pages.tts_page as page_module
+        # [v3.23.695] Trang Lồng tiếng đã tách thành nhiều module — đọc cả trang lẫn các phần tách.
+        from tests.unit.page_sources import TTS_PAGE_SOURCE
 
-        source = Path(page_module.__file__).read_text(encoding="utf-8")
+        source = TTS_PAGE_SOURCE.read_text(encoding="utf-8")
         assert 'kwargs["line_voices"] = self._dubbing.line_voices()' in source
         assert 'self._translator.translate("tts.tab_dubbing")' in source
         assert "loader.catalog_loaded.connect(self._on_vieneu_catalog_loaded)" in source

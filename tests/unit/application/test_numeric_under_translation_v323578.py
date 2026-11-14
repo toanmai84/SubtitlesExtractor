@@ -210,8 +210,8 @@ class TestRestoreWarning:
             strings = json.loads((data_dir / name).read_text(encoding="utf-8"))
             assert strings["translate"]["toast_restored_no_address_title"]
             assert "{count}" in strings["translate"]["toast_restored_no_address_body"]
-        page = pathlib.Path(
-            "src/subtitles_extractor/presentation/pages/translate_page.py"
-        ).read_text(encoding="utf-8")
+        from tests.unit.page_sources import TRANSLATE_PAGE_SOURCE
+
+        page = TRANSLATE_PAGE_SOURCE.read_text(encoding="utf-8")  # [v3.23.694] trang + các phần đã tách
         assert "roster_without_address_rules(" in page
         assert "translate.toast_restored_no_address_body" in page

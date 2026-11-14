@@ -1,5 +1,1911 @@
 # Changelog
 
+## [3.23.726] — 🎯 Dữ liệu thật lượt NVDEC đầu tiên: bỏ phiếu theo LẦN ĐỌC OCR, không theo số khung chép (sửa "腌攒", "亨")
+
+Chủ dự án gửi dữ liệu lượt chạy thật 14/11/2026 bằng bản 3.23.725 (phim nối 86 tập): `tron_bo.original.srt`,
+`tron_bo.seraw.json.gz` và log. Đã lưu vào `/home/user/series/ref_user_20261114/` và ghi vào CLAUDE.md.
+
+### 1. Lượt chạy: NVDEC đã chạy thật
+- `meta.run.environment.frame_sampler = PyNvVideoCodecFrameSampler`, CuPy 14.2.0, log ghi `VRAM_Preprocess=True,
+  CuPy=True`. Bản đóng gói đã nạp được CuPy (sửa của 3.23.725).
+- OCR 1479 s cho phim 8351 s (5,6 lần thời gian thực).
+- Cấu hình khác lượt 10/11 (bản 690, PyAV), do chủ dự án chọn:
+  - ROI 0,774,720×136, so với 34,773,645×148;
+  - tiền xử lý **chỉ phóng to**, so với lượt cũ có cả viền, làm nét và tăng tương phản 1,2.
+
+### 2. Chấm theo đáp án đã kiểm bằng ảnh (3659 câu, dời mốc theo từng tập)
+- **Lượt 690:** 3657 câu đúng.
+- **Lượt 725:** 3657 câu đúng.
+  - Sửa được 2 lỗi cũ: câu "我" 1098 s bị mất đã có lại; "清清自白" đã thành "清清白白".
+  - Sinh 2 lỗi mới: "哼" thành "亨", và "做这等腌臜之事" thành "腌攒".
+- So trực tiếp hai lượt: 3654 câu trùng khít, chỉ khác 8 chỗ, đã rà từng chỗ tới khung.
+
+### 3. Gốc lỗi: đếm khung chép như lần đọc thật
+- Khung trùng điểm ảnh (`continues_previous`) **không được OCR lại**: nó chép nguyên hộp chữ của khung trước. Chỉ khung đọc
+  lại theo lịch (khoảng 0,44 s một lần) mới là lần đọc mới.
+- Bộ dựng phụ đề lại đếm **số khung**, nên một lần đọc rơi vào đầu một đợt chép dài được nhân lên 11 lần. Dữ liệu thô của
+  lượt 725 (độ tin cậy từng lần đọc):
+
+  | Câu | Các lần đọc thật | Theo lần đọc | Theo khung |
+  |---|---|---|---|
+  | 腌臜 | 臜 0,931 → 攒 0,968 → 臜 0,963 → 攒 0,961 → 臜 0,914 | **臜 3, 攒 2** | 攒 21, 臜 15 |
+  | 哼 | 哼 0,569 → 亨 0,508 → 哼 0,634 | **哼 2, 亨 1** | 亨 11, 哼 4 |
+
+- **腌臜:** độ tin cậy cao nhất chỉ chênh 0,01 (dưới ngưỡng 0,02), nên phân xử rơi xuống bước "bản nhiều khung hơn" và
+  chọn sai.
+- **哼:** cả ba lần đọc đều dưới 0,80, nên bước gộp chuỗi bỏ qua. Hai đoạn "哼" chỉ 2 khung (0,08 s) bị loại vì quá
+  ngắn, còn lại câu "亨".
+- Lượt cũ có làm nét và tăng tương phản nên mọi khung đều đọc đúng, lỗi đếm này chưa lộ ra.
+
+### 4. Sửa
+- `read_fusion.fresh_read_flags`: khung là **bản chép** khi mang `continues_previous` VÀ hộp chữ trùng khít khung ngay trước
+  (chữ, độ tin cậy, toạ độ). Seraw bản cũ không có cờ này thì mọi khung vẫn là lần đọc, dựng như trước.
+- Ba chỗ bỏ phiếu chuyển sang đếm **lần đọc**:
+  - gộp chuỗi cùng điểm ảnh (`_fuse_chain`, `_pick_substitution`);
+  - gộp cặp chữ dễ lẫn hình (`unify_confusable_variants`);
+  - bầu chữ ROVER (`vote_best_text_rover`).
+- **Chuỗi chỉ có lần đọc yếu** (dưới 0,80) mà hai bản đọc cùng số chữ **xen kẽ** nhau (A→B→A) trên cùng điểm ảnh thì là
+  một câu.
+  - Chọn theo ngữ liệu phim, rồi số lần đọc, rồi độ tin cậy.
+  - Chặn nhiễu bằng các điều kiện:
+    - mọi lần đọc ≥ 0,40;
+    - hộp chữ đúng chỗ và đúng cỡ phụ đề;
+    - chỉ đổi chữ các khung có chữ, không lan sang khung rỗng;
+    - đổi một chiều (A→B) thì để nguyên.
+  - Câu được gắn cờ nghi ngờ.
+- `voting.py`: sửa 3 lỗi kiểu mypy có sẵn (ma trận trọng số số thực khai báo bằng `Counter` kiểu nguyên), đổi sang
+  `defaultdict(float)`. Phát lại cả phim kiểm lại cho kết quả trùng khít.
+- `tools/stress_subtitle_builder.py`: kịch bản cần tham số mà thiếu (vd `lowconf`) trước đây sập `TypeError` giữa chừng.
+  Nay báo rõ "cần tham số, ví dụ `lowconf:0.03`" ngay từ đầu.
+
+### 5. Kiểm chứng (phát lại, không OCR lại)
+- **Phim nối 86 tập (seraw 725), đúng cấu hình `meta.run.builder`:** chỉ 2 câu đổi, cả hai về đáp án ("哼", "腌臜"). Mốc của
+  "哼" cũng trở lại như lượt 690.
+  - Chấm theo đáp án: **3658/3659**. Câu còn thiếu "一鞋板的货色" là do vòng soát đọc lại từ video sửa trong lượt thật,
+    nên ứng dụng thật sẽ đúng đủ 3659.
+- **Mọi seraw đang có:** 652 tệp, gồm 634 hợp lệ, trong đó 320 có cờ khung trùng.
+  - Chỉ 3 tệp dữ liệu thật đổi kết quả, tất cả **về đúng đáp án**: phim nối 86 tập (2 câu), tập 47 lượt 3.23.712 ("腌攒"
+    → "腌臜").
+  - Còn đổi một tệp tổng hợp của test, nơi các câu "câu 0".."câu 9" hoà phiếu sau khi bỏ khung chép; không có đáp án.
+- **`stress_subtitle_builder` trên seraw 725:**
+  - các kịch bản bất biến `scale:1.5`, `tshift:3600`, `shuffle`, `fps30`, `dupts:0.05` ra **trùng khít** `none` (cùng md5);
+  - 13 kịch bản nhiễu, chấm theo đáp án, mã mới **không tệ hơn ở kịch bản nào**:
+    - dropout, framedrop, lowconf, tall, jitter, noise, punct, split, edgecut, gap: +1 đến +2 câu đúng;
+    - subst: 3648 → 3651;
+    - nok và vfr: bằng mã cũ.
+- Test `test_fresh_reads_v323726.py` (9 ca) dựng từ đúng các lần đọc thật. Trên mã cũ, 3 ca hành vi đều đỏ (ra "腌攒",
+  "亨", "亨").
+- Toàn bộ test: **8888 đạt, 0 lỗi, 0 bỏ qua** (18 phút 38 giây). `compileall` sạch; mypy sạch trên `read_fusion.py` và `voting.py`.
+
+## [3.23.725] — 🔧 Bản đóng gói nạp được CuPy: gom đủ mô-đun thư viện chuẩn mà CuPy import từ mã đã biên dịch (thiếu `graphlib`)
+
+Chủ dự án báo (14/11/2026, log `app_log.20261114_090320.txt`): bản 3.23.724 không còn sập, nhưng log ghi "Đã chọn giải mã
+NVDEC nhưng thiếu CuPy dùng được (chưa cài CuPy ... `ModuleNotFoundError: No module named 'graphlib'`)". Giải mã và tiền
+xử lý vì thế chạy CPU.
+
+### Gốc lỗi
+- `cupy/cuda/function` là mô-đun Cython **đã biên dịch** (`.pyd`) và có import `graphlib` (thư viện chuẩn Python). Dò bằng
+  `MetaPathFinder` trên CuPy 14.2: `cupy/__init__` → `cupy.cuda` → `cupy.cuda.compiler` → `cupy.cuda.function` → `graphlib`.
+- PyInstaller chỉ đọc được import trong mã `.py`, không đọc được trong `.pyd`. Mã của ứng dụng lẫn các gói khác đều không
+  import `graphlib`, nên nó không được gom vào gói.
+- CuPy bọc lỗi này thành `ImportError` kèm khối chẩn đoán dài, và ứng dụng ghi nhầm là "chưa cài CuPy".
+- **Tái hiện trên PyInstaller 6.22 + CuPy 14.2** (môi trường riêng): đóng gói script `import cupy` với `--collect-all
+  cupy cupy_backends fastrlock cuda.pathfinder`, đúng như spec. Kết quả:
+  `CUPY_FAIL ImportError | cause: ModuleNotFoundError No module named 'graphlib'`, trùng khít log của anh.
+
+### Sửa
+- `SubtitlesExtractor.spec` thêm vào `hiddenimports` các mô-đun thư viện chuẩn mà CuPy cần, lấy từ hai nguồn:
+  - **danh sách sàn**: 60 mô-đun đo thật khi `import cupy` 14.2 cùng các mô-đun con biên dịch nhân (`compiler`, `_kernel`,
+    `fusion`, `memory`);
+  - **dò lúc build**: tiến trình con `import cupy` bằng đúng Python và CuPy của `build_env`, nên CuPy bản mới import thêm
+    mô-đun nào cũng tự được gom. Dò hỏng thì vẫn còn danh sách sàn.
+  - Khi build, spec in dòng `[spec] CuPy: thêm N mô-đun thư viện chuẩn import từ .pyd (có graphlib: True)`.
+- **Kiểm lại trên PyInstaller thật** bằng danh sách do chính đoạn mã trong spec tính ra (63 mô-đun): bản đóng gói chạy
+  `import cupy` → `CUPY_OK 14.2.0`.
+- Lý do lỗi ghi đúng hơn:
+  - có CuPy mà thiếu mô-đun phụ thuộc thì log ghi "CuPy có nhưng thiếu mô-đun 'graphlib' (bản đóng gói sót mô-đun này)",
+    không còn báo "chưa cài CuPy" kèm khối chẩn đoán của CuPy;
+  - chỉ khuyên "Cài 'cupy-cuda12x' …" khi thật sự thiếu gói.
+- Sửa thêm hai lỗi mypy ở bộ nạp CuPy của bản 3.23.724 (thiếu kiểu trả về; `type: ignore` thừa).
+- Test `test_cupy_stdlib_bundle_v323725.py` (8 ca). Trên mã cũ cả 7 ca liên quan đều đỏ. Các ca kiểm:
+  - danh sách sàn phủ số đo thật;
+  - dò hỏng vẫn có `graphlib`;
+  - CuPy giả import thêm mô-đun chuẩn khác thì lúc build tự dò ra;
+  - danh sách được nối vào `hiddenimports` trước `Analysis`;
+  - lý do lỗi nêu đúng mô-đun thiếu.
+
+### Test pedalboard chập chờn (phát hiện khi chạy bộ test đầy đủ)
+- Lượt chạy đầu: 2 test pedalboard đỏ (`test_pedalboard_real_stretch_if_installed`, `test_pedalboard_stretch_preserves_rms`).
+  `stretch_with_pedalboard` trả `None`, đồng thời 3 test TTS khác chạy đường dự phòng librosa, tức pedalboard hỏng suốt
+  một đoạn của lượt chạy.
+- Đã loại trừ:
+  - biến `SUBEXT_DISABLE_PEDALBOARD`: chỉ đặt qua `monkeypatch`;
+  - bộ chặn torch: nạp pedalboard dưới bộ chặn vẫn OK;
+  - `sys.modules` bị thay: không test nào thay `pedalboard`;
+  - test mới của bản này: chạy kèm vẫn xanh.
+- Không tái hiện được: chạy lại toàn bộ, chạy tiền tố đúng thứ tự (7123 test) và từng nhóm thư mục đều xanh.
+- Hai test giờ in **lý do cụ thể** khi hỏng: biến cờ, mô-đun trong `sys.modules`, kết quả gọi lại `time_stretch`. Nếu lỗi
+  quay lại sẽ có bằng chứng để sửa tận gốc. Đã kiểm bằng cách ép cờ tắt.
+
+### Kiểm chứng
+- Toàn bộ test (lượt chạy lại): **8879 đạt, 0 lỗi, 0 bỏ qua** (15 phút 36 giây).
+- Sau đó chỉ sửa thêm phần chẩn đoán ở 2 tệp test pedalboard; hai tệp này chạy lại xanh (13/13).
+- `compileall` sạch; ruff và mypy sạch trên phần sửa.
+
+## [3.23.724] — 🛠️ Sửa sập khi bấm Trích xuất (CuPy trong bản đóng gói), gói nhẹ lại (bỏ ~2 GB DLL CUDA), thêm model Gemini trả phí + thế hệ 4, hết đơ nút "Đọc liền cụm câu"
+
+Chủ dự án báo (14/11/2026, kèm log `app_log.20261114_074338.txt` và ảnh Rate Limit của AI Studio): bản build nặng 2,2 GB;
+không trích xuất được video; cần các model Text-out mới của Gemini, cả miễn phí lẫn trả phí; nút TTS "🧩 Đọc liền cụm câu"
+làm đơ ứng dụng.
+
+### 1. Bấm Trích xuất là sập (`FileNotFoundError: ...\AppData\Local\Temp\bin`)
+- **Gốc lỗi**:
+  - CuPy 14 tự suy thư mục CUDA từ vị trí `nvrtc` mà `cuda-pathfinder` tìm được, rồi gọi `os.add_dll_directory(<thư mục>/bin)`.
+  - Bản 3.23.723 để PyInstaller chép DLL CUDA (NVRTC…) vào **gốc** gói (`%TEMP%\_MEIxxxx`). CuPy vì thế tính ra
+    `%TEMP%\bin`, thư mục không tồn tại, nên `import cupy` ném `FileNotFoundError`.
+  - Mã cũ chỉ bắt `ImportError` → ngoại lệ lọt lên slot của nút Bắt đầu và làm sập lượt trích xuất.
+- **Sửa**:
+  - `gpu_image_filters._load_cupy()` là bộ nạp CuPy **duy nhất** của ứng dụng; bộ giải mã NVDEC và PaddleOCR dùng chung nó.
+    - Trong lúc import, `os.add_dll_directory` với thư mục không tồn tại được bỏ qua (ghi log), không còn ném lỗi.
+    - Mọi lỗi khởi tạo đều bị bắt và ghi lý do. Có gói mà GPU không dùng được (`cuda.is_available()` sai) thì cũng coi như không có.
+  - Container chỉ chọn NVDEC khi CuPy **nạp được và thấy GPU** (`preprocess_routing.cupy_usable`). Không thì lùi PyAV và tiền xử
+    lý CPU, cảnh báo trong log nêu lý do thật (thay cho "thiếu gói").
+  - Gốc lỗi đóng gói được sửa ở mục 2.
+- Test `test_cupy_frozen_v323724.py`:
+  - giả CuPy gọi `add_dll_directory` vào thư mục không tồn tại, với `add_dll_directory` "nghiêm" như Windows;
+  - giả CuPy ném `OSError`;
+  - NVDEC không được chọn khi CuPy hỏng.
+  - Trên mã cũ cả ba ca đều ném lỗi.
+
+### 2. Gói build 2,2 GB
+- **Gốc lỗi**: PyInstaller phân tích phụ thuộc nhị phân của các `.pyd` CuPy rồi kéo theo toàn bộ DLL CUDA mà chúng liên kết
+  (cuBLAS/cuBLASLt, cuSOLVER, cuSPARSE, cuFFT, cuRAND, NVRTC, nvJitLink, cudart…), khoảng 2 GB, đặt ở gốc gói. Đây cũng
+  chính là nguyên nhân của lỗi ở mục 1.
+- **Sửa** (`SubtitlesExtractor.spec`): lọc `a.binaries`, bỏ các DLL CUDA đó.
+  - Ứng dụng vẫn dùng runtime CUDA tải về lúc chạy (`models/cuda_runtime/nvidia/<thành phần>/bin`, bật bằng nút "Bật tăng tốc
+    GPU"); bootstrap thêm sẵn các thư mục này vào đường dẫn DLL.
+  - `SUBEXT_BUNDLE_CUDA=1` vẫn cho gói kèm có chủ đích, nhưng tuyệt đối không ở gốc gói.
+  - Khi build, spec in dòng `[spec] Bỏ N DLL CUDA ...`.
+  - Đã kiểm bộ lọc không đụng `python313.dll`, DLL của PyAV, libmpv, Qt hay PyNvVideoCodec (test chạy chính khối mã của spec ở
+    cả hai chế độ).
+  - **Dung lượng mới phải đo trên máy build Windows**: môi trường phát triển là Linux, không dựng được exe.
+
+### 3. Model Gemini sinh văn bản: miễn phí + trả phí
+- **Gốc lỗi**: danh sách model chỉ giữ `*flash*` miễn phí, nên mất hẳn các model trả phí (2.5 Pro, 3.1 Pro, Gemini 4 Argon /
+  Carbon) và cả model **miễn phí** không có chữ "flash" (Gemini 4 Hydrogen). Model Pro dùng key trả phí còn bị điều tiết theo
+  hạn mức miễn phí (5 request/phút, 20 request/ngày).
+- **Sửa**: thêm danh mục `infrastructure/translation/gemini_model_catalog.py`, lập theo bảng Rate Limit của AI Studio và
+  `models.list` ngày 14/11/2026.
+  - **Miễn phí** (RPM / TPM / RPD):
+
+    | Model | RPM | TPM | RPD |
+    |---|---|---|---|
+    | 3.1 Flash Lite | 15 | 250K | 500 |
+    | 3.5 Flash Lite | 15 | 250K | 500 |
+    | 3.8 Flash | 5 | 250K | 20 |
+    | 4 Hydrogen | 5 | 250K | 20 |
+    | 3.6 Flash | 5 | 250K | 20 |
+    | 3 Flash | 5 | 250K | 20 |
+    | 2.5 Flash | 5 | 250K | 20 |
+    | 2.5 Flash Lite | 10 | 250K | 20 |
+
+  - **Chỉ trả phí** (bản miễn phí 0/0): 4 Argon, 4 Carbon, 3.1 Pro, 2.5 Pro. Điều tiết mặc định ở mức Tier 1 (150 RPM, 2M TPM,
+    1000 RPD); vượt mức thì bộ hạn mức học lại từ lỗi 429 như cũ.
+  - Danh sách tải từ API giữ **mọi** model sinh văn bản, gồm cả `*-latest`, và bỏ model ảnh, giọng nói, Live, nhúng, Gemma,
+    robot, đời 1.x/2.0, cùng 3.5/3.7 Flash (đã ngừng).
+    - Thứ tự hiển thị: miễn phí → trả phí → model lạ.
+    - Mỗi mục có chú thích hạn mức, ví dụ "CHỈ dùng với key trả phí" hoặc "miễn phí 15 request/phút · 250K token/phút · 500
+      request/ngày".
+    - Áp cho ô model Dịch, Phân tích, Dự phòng và Tự kiểm tra.
+  - Mặc định không đổi: dịch 3.1 Flash Lite, phân tích 3.8 Flash. Gemini 4 dùng `thinking_level`.
+  - Đã gọi thật `gemini-4-hydrogen`: structured JSON và `thinking_level` chạy đúng.
+- Test `test_gemini_model_catalog_v323724.py` (14 ca), dùng danh sách `models.list` thật:
+  - bộ lọc mới giữ đủ 15 model văn bản, còn bộ lọc cũ bỏ Hydrogen và Pro;
+  - kiểm thứ tự sắp xếp, hạn mức theo danh mục, ca lùi về suy theo tên, chú thích ô chọn.
+
+### 4. Nút "🧩 Đọc liền cụm câu" làm đơ trang TTS
+- **Gốc lỗi**: nút gộp **từng cụm một** qua `merge_lines`. Mỗi cụm phải:
+  - tính lại người nói cả phim;
+  - đổi tên cache audio trên đĩa;
+  - phát `structure_changed`, khiến trang **vẽ lại cả bảng** dòng.
+  Phim nối 86 tập có khoảng 330 cụm (lượt thật 3.23.705: 329), tức là vẽ lại bảng 3664 dòng hàng trăm lần trên luồng giao diện.
+- **Tái hiện** trên trang TTS thật (3664 dòng, 916 cụm): mã cũ **đơ 222,7 s**, vẽ lại bảng 916 lần.
+- **Sửa**: `_merge_spans` gộp mọi cụm trong **một lượt**.
+  - Ghi lời và mốc thời gian cho mọi dòng đầu cụm, rồi xoá mọi dòng đuôi bằng **một** lần `delete_lines`: một ánh xạ, một lần
+    đổi cache, một lần vẽ lại.
+  - Vẫn là một bước hoàn tác. `merge_lines` (gộp tay) dùng chung đường này.
+  - Ca đo trên: **0,29 s**, vẽ lại 1 lần (nhanh hơn ~770 lần).
+- Kế hoạch gộp và đếm dòng không vừa khung khi làm mới nút: khoảng 10 ms và 15 ms mỗi lần trên 3664 dòng, nên không phải điểm nghẽn.
+- Test `test_fragment_merge_batch_v323724.py`:
+  - đúng một lần `structure_changed` cho 916 cụm;
+  - kết quả **trùng khít** cách làm cũ (từng cụm một) trên 6 phim ngẫu nhiên có ghim người nói: lời, mốc, dòng cần TTS lại,
+    người nói, vị trí trả về;
+  - trang thật gộp 300 cụm trong dưới 5 s (mã cũ ước khoảng 70 s, theo tỉ lệ 222,7 s cho 916 cụm).
+
+### Kiểm chứng
+- Toàn bộ test: **8872 đạt, 0 lỗi, 0 bỏ qua** (16 phút 31 giây).
+- `compileall` sạch; ruff sạch trên phần mới (trừ độ dài dòng, theo quy ước sẵn có của dự án).
+
+## [3.23.723] — 🚀 Nhánh GPU (NVDEC) chạy đúng và trùng khít nhánh CPU: bật CuPy, đổi màu chuẩn swscale, CLAHE/làm nét/tương phản trên VRAM, lùi PyAV an toàn
+
+Chủ dự án yêu cầu (13/11/2026): rà việc tận dụng NVDEC khi chọn nhánh GPU, có vấn đề thì sửa ngay, cải tiến hiệu năng và
+chất lượng bằng CUDA. Kết quả rà soát:
+
+### 1. Máy chủ dự án chưa từng chạy NVDEC
+- `requirements-gpu.txt` để dòng `cupy-cuda12x` dưới dạng chú thích. Thiếu CuPy, container **âm thầm** chọn PyAV. Lượt 717 ghi
+  `frame_sampler: PyAvFrameSampler`, và danh sách gói không có `cupy-cuda12x`: giải mã lẫn tiền xử lý đều chạy CPU.
+- Sửa:
+  - bật `cupy-cuda12x>=13.4` (CuPy 14 tìm NVRTC/cudart qua `cuda-pathfinder`);
+  - PyInstaller gom `cupy`, `cupy_backends`, `fastrlock`, `cuda.pathfinder` (kèm thư mục header để NVRTC biên dịch nhân);
+  - chọn NVDEC mà thiếu thư viện thì ghi **cảnh báo** nêu rõ gói thiếu.
+
+### 2. Lỗi chất lượng của nhánh NVDEC (sẽ lộ ra ngay khi bật CuPy)
+Đo trên 12 khung thật của phim 86 tập:
+- **Đổi màu sai.** Nhân CUDA dùng công thức dải đầy BT.601 cho video dải TV (16–235) và bỏ qua nhãn màu.
+  - Ảnh lệch PyAV trung bình 7–13 mức xám, tối đa 21.
+  - Số điểm ảnh "lõi chữ trắng" ≥ 240 chỉ bằng 1/7 (7 404 so với 50 391), nên bộ lọc chữ trắng chọn khung OCR khác hẳn nhánh CPU.
+  - Nay `nv12_roi_to_rgb` chép đúng phép tính 16 bit SIMD của swscale và **trùng khít PyAV (lệch 0)**: 12 khung thật; khung
+    ngẫu nhiên gắn nhãn BT.601/709/2020/SMPTE170M, dải TV/đầy; bề rộng 320/720/326.
+- **Làm nét và tương phản khác bản CPU.** Nhánh VRAM dùng Laplace 5 điểm thay vì Gauss σ1, và co giãn quanh 127,5 thay vì |ảnh·k|.
+  Nay viết lại cho khớp OpenCV: tương phản trùng khít, làm nét lệch tối đa ±1.
+- **CLAHE không có bản GPU.** Nó chạy sau trên CPU, sau cả viền, tức là sai thứ tự. Nay CLAHE chạy CUDA trên VRAM và trùng khít
+  `cv2.createCLAHE`:
+  - histogram, cắt và chia phần dư, nội suy 4 ô, độn mép `REFLECT_101`;
+  - LAB hai chiều chép đường số nguyên 8 bit của OpenCV, trùng khít trên cả 16,7 triệu màu.
+- **Bộ khử trùng xét ảnh đã tiền xử lý**, khác nhánh PyAV. Nay xét ảnh gốc của ROI; chỉ khung cần OCR mới qua tiền xử lý.
+- **Đường video 10-bit/HDR** (PyAV + tonemap trong bộ NVDEC):
+  - bỏ qua toàn bộ tiền xử lý;
+  - khử trùng bằng băm thô và **bỏ hẳn khung trùng**, nên mất mốc "chữ còn hiện".
+  - Nay dùng chung bộ xử lý khung.
+- **Lỗi GPU bị nuốt im lặng.** Bộ chuyển màu trả `None`, khung bị bỏ, phụ đề có thể ra rỗng mà không báo. Nay ném
+  `VideoDecodeError`, và `FallbackFrameSampler` chuyển sang PyAV:
+  - hỏng ngay từ đầu (codec NVDEC không hỗ trợ, thiếu NVRTC…) thì PyAV chạy từ đầu;
+  - hỏng giữa chừng thì PyAV tiếp tục ngay sau khung cuối, đánh số khung nối tiếp;
+  - các bước "VRAM" được làm lại trên CPU bằng cùng mã.
+- **Điều kiện "có NVDEC" lệch nhau.** Trang Trích xuất/Chỉnh sửa coi "có CuPy" là NVDEC, còn container cần cả PyNvVideoCodec.
+  Có CuPy mà thiếu PyNvVideoCodec thì tiền xử lý **mất sạch**. Nay một nguồn duy nhất (`composition/preprocess_routing.py`)
+  dùng đúng điều kiện của container, cho cả trang Trích xuất, Chỉnh sửa/ReOCR và tự dò vùng.
+- **Trang Debug:**
+  - bộ lấy mẫu có thể chọn trúng khung "trùng" có ảnh rỗng;
+  - làm nét/tương phản chạy trên VRAM trước khi phóng.
+  - Nay ảnh xem trước chính là ảnh đưa vào OCR: nhánh GPU xử lý toàn bộ bằng CUDA.
+
+### 3. Hiệu năng nhánh GPU
+- Chỉ đổi màu vùng ROI (720×136 thay vì 720×1280, ít hơn 9,4 lần điểm ảnh), và chỉ đổi khung tới lượt lấy mẫu (trước đây đổi
+  mọi khung giải mã; bước 0,12 s ở 25 fps bỏ được 2/3).
+- Chỉ khung cần OCR mới qua tiền xử lý (xem ghi chú chép bộ nhớ ở mục 4).
+- Bước thưa (tự dò vùng, ≥ 5 s) chỉ nạp khung khoá cho NVDEC, như PyAV.
+- Bảng nội suy, bảng LAB và hệ số swscale tính một lần (bộ đệm theo cỡ ảnh).
+
+### 4. Rà độc lập (agent) — đã sửa hết
+- Trần phóng to trên VRAM là ×3, trong khi CPU là ×4: ROI thấp hơn 1/3 đích cho ra ảnh khác cỡ (30×200, đích 128: 90×600 so
+  với 120×800). Nay cùng trần.
+- Khung có **bề rộng/chiều cao lẻ** (vd 853×480):
+  - UV bị cắt `H//2 × W`, nên ROI chạm mép đọc ngoài mảng (NumPy: IndexError, cả lượt lùi PyAV; CuPy: chỉ số âm thầm quấn về
+    cột 0). Tự dò vùng dùng cả khung nên luôn dính.
+  - Nay giữ đủ `(W+1)//2` cặp sắc độ và `(H+1)//2` hàng: bề rộng lẻ trùng khít PyAV, chiều cao lẻ không còn lỗi.
+- `meta.run.environment.frame_sampler` sẽ chỉ ghi "FallbackFrameSampler", không biết NVDEC có chạy thật không. Nay ghi bộ
+  giải mã thật đã chạy (vd `PyNvVideoCodecFrameSampler→PyAvFrameSampler@1234.560`) kèm `frame_sampler_fallback_reason`.
+- Tự dò vùng trên NVDEC làm **CLAHE hai lần** (VRAM rồi CPU), vì cấu hình OCR mặc định của container không chia VRAM/CPU.
+  Nay dùng chung `route_preprocessing`.
+- Lùi PyAV giữa chừng tiếp tục ở `mốc + 1 ms`, nên lấy thêm một khung ngay sau và lệch lưới lấy mẫu. Nay tiếp tục đúng
+  `mốc + bước`; test với bước 0,2 s và 0,12 s cho mốc trùng PyAV.
+- Đường 10-bit/HDR:
+  - bước thưa vẫn giải mã mọi khung, nay chỉ khung khoá;
+  - GPU lỗi thì lùi sang PyAV thường và **mất tonemap**, nay làm tiếp bằng NumPy và giữ tonemap.
+- Trang Debug: GPU lỗi làm cả lượt thử hỏng, nay chuyển sang CPU.
+- Bảng LAB, nhân Gauss và chỉ số độn mép được đưa lên VRAM **một lần** (trước đây khoảng 10 lần chép nhỏ RAM→VRAM mỗi khung).
+- Độn mép `REFLECT_101` phản xạ lặp đúng như `cv2.borderInterpolate` với ảnh rất thấp (1–4 px).
+- Ghi chú về chép bộ nhớ: mỗi khung OCR chép VRAM→RAM **hai lần** (ROI gốc khoảng 290 KB cho bộ khử trùng, rồi ảnh đã xử lý),
+  vì bộ khử trùng dùng chung với nhánh CPU. Khung trùng/trống chỉ chép một lần và không qua tiền xử lý.
+
+### Kiểm chứng
+- `test_nvdec_parity_v323723.py` (31 test; 15 test ban đầu + 16 test cho các lỗi ở mục 4) chạy **đúng vòng giải mã NVDEC** với bộ giải mã giả (giải mã gói bằng PyAV, trả NV12
+  pitch rộng qua DLPack) và NumPy thay CuPy, trên video thử 100 khung:
+  - mốc thời gian, phán quyết OCR/trùng/trống và **điểm ảnh trùng khít** `PyAvFrameSampler`, ở chế độ lọc chữ trắng và chế độ cổ điển;
+  - tiền xử lý VRAM (phóng + CLAHE + làm nét + viền) khớp nhánh CPU;
+  - lỗi GPU giữa chừng lùi PyAV đủ khung;
+  - bước thưa chỉ nạp khung khoá;
+  - đường HDR phát đủ khung trùng/trống;
+  - công thức nhân cũ bị chặn quay lại.
+- Viết lại `test_nvdec_luma_sink_crops_roi_and_expands_range` (bản 680) theo API mới; `test_upscale_rule_v323721.py` sửa điều
+  kiện giả lập NVDEC (cần cả PyNvVideoCodec).
+- Môi trường kiểm thử không có GPU. Mã chạy trên VRAM chính là mã được kiểm với NumPy (mô-đun mảng `xp`), nhưng tốc độ trên
+  RTX 3070 Ti chưa đo được ở đây.
+
+## [3.23.722] — ⚡ Nhánh GPU: phóng ảnh bicubic bằng CUDA trên VRAM (zero-copy), bỏ việc đẩy tiền xử lý về CPU
+
+Chủ dự án chốt (13/11/2026): ở nhánh GPU, tiền xử lý phải chạy CUDA để tận dụng tăng tốc đồ hoạ, zero-copy, tránh nghẽn cổ
+chai. Bản 3.23.721 làm ngược lại: hễ bật "Phóng to" với giải mã NVDEC là đẩy cả tiền xử lý về CPU (vì nhân phóng trên VRAM là
+song tuyến, kém bicubic). Bản này sửa cho đúng:
+
+- **Phóng ảnh trên VRAM khớp `cv2.resize`**: `separable_resize` nội suy hai lượt một chiều.
+  - Nội suy bicubic (A = −0,75) khi phóng ≤ ×2, song tuyến khi lớn hơn, giống hệt nhánh CPU.
+  - Ánh xạ tâm điểm ảnh và kẹp chỉ số ở mép như OpenCV.
+  - Chạy hoàn toàn bằng CuPy trên VRAM, không chép về RAM giữa chừng. Bảng chỉ số/trọng số dựng một lần cho mỗi cỡ ảnh và
+    giữ trong `vram_buffers`.
+  - Đã đo: khớp `cv2.resize` tới **±1 mức xám** (do làm tròn số học điểm cố định), trên ảnh ngẫu nhiên và ảnh phụ đề, ở các
+    cỡ 1440×272, 1080×204, 2400×453 (song tuyến) và 97×31.
+  - Thay nhân `resize_bilinear_rgb` cũ (song tuyến kiểu align-corners). Đo bằng song tuyến của OpenCV trên bộ 1188 khung khó:
+    964 khung đúng, so với 988 của bicubic.
+- Bỏ việc đẩy về CPU ở trang Trích xuất và Chỉnh sửa (ReOCR). Với NVDEC, mọi bước phóng → làm nét / tương phản → viền chạy
+  CUDA trên VRAM và chỉ chép về RAM một lần ở cuối, như trước bản 721. Trang Debug trở về như 3.23.720.
+- Quy tắc ghi vào CLAUDE.md (Nguyên tắc bắt buộc).
+- Còn trên CPU (không đổi so với trước): CLAHE (chưa có bản VRAM; mặc định tắt, số đo 3.23.721 không khuyên bật).
+
+### Kiểm chứng
+- `test_upscale_rule_v323721.py`:
+  - đổi 2 test định tuyến thành "NVDEC giữ tiền xử lý trên VRAM, không làm 2 lần ở CPU";
+  - thêm 2 test chạy đúng mã nhánh VRAM với NumPy thay CuPy: `separable_resize` ≈ `cv2.resize` (±1), và
+    `apply_gpu_preprocessing_pipeline` ≈ `apply_cpu_preprocessing_pipeline` (±1, có viền) ở đích 272 / 204 / 136.
+
+## [3.23.721] — 🔍 Tiền xử lý OCR: "Phóng to ảnh" vốn không có tác dụng, đánh giá 23 profile trên OCR thật
+
+Yêu cầu của chủ dự án: nâng chất lượng OCR thô bằng tiền xử lý ảnh, đánh giá các profile. Đo trên phim 86 tập, có đáp án v4
+(3664 câu, kiểm bằng ảnh thật). Cấu hình OCR như lượt 717 trên máy chủ dự án: PP-OCRv6_small, ngưỡng 0,35, det 0,3/0,6/1,5,
+lọc chữ trắng 200, bước 0,03 s; CPU (môi trường kiểm thử không có GPU).
+
+### 1. Lỗi: "Phóng to ảnh" bật mà không phóng (cả nhánh CPU lẫn VRAM)
+- Cả `apply_cpu_preprocessing_pipeline` và `apply_gpu_preprocessing_pipeline` chỉ phóng khi ảnh thấp hơn **một nửa** đích
+  (`h < đích // 2`). Vùng chữ của bộ 86 tập cao 136 px → mọi đích 128–272 px **không đổi kích thước**, còn đích 274 px nhảy
+  vọt ×2,01. Mặc định 128 px nên bật tuỳ chọn không có tác dụng; lượt "đích 256" trước đây thực chất là ảnh gốc. Trang Debug
+  lại phóng theo quy tắc `h < đích` → xem trước khác lượt trích xuất.
+- Sửa: một quy tắc chung `upscale_size` (phóng khi thấp hơn đích, trần ×4 CPU / ×3 VRAM) dùng cho cả hai nhánh.
+- Nhánh NVDEC phóng bằng nhân **song tuyến**, kém bicubic rõ rệt (bộ 1188 khung khó: đúng 964 so với 988). Nay khi bật phóng
+  to, toàn bộ tiền xử lý chạy CPU (bicubic, đúng thứ tự phóng → CLAHE → làm nét → tương phản → viền). Phóng ảnh 720×136
+  mất khoảng 1 ms. Áp dụng ở trang Trích xuất, Chỉnh sửa (ReOCR) và Debug.
+- Xem trước ở trang Debug dùng đúng pipeline của lượt OCR thật (trước đây tự chép tay, CLAHE chạy sau cùng, và bỏ qua phóng to
+  khi khung đã qua VRAM).
+- **Ảnh hưởng tới cấu hình đã lưu**: ai đã bật "Phóng to" với đích lớn hơn chiều cao vùng chữ thì nay ảnh được phóng thật →
+  OCR chậm hơn nhưng đọc đúng hơn (xem §2).
+
+### 2. Đánh giá profile tiền xử lý
+**a) Bộ khung khó** (1688 khung cắt từ video: 600 khung lượt GPU đọc đúng, 588 khung đọc sai, 500 khung ngoài câu). Mỗi khung
+OCR lại theo từng profile:
+
+| Profile | Đúng /1188 | Thừa rác | Sai chữ | Thiếu | Ngoài câu có chữ | Giữ đúng /600 | Sửa được /588 | Thời gian |
+|---|---|---|---|---|---|---|---|---|
+| ảnh gốc | 832 | 142 | 155 | 39 | 138 | 599 | 233 | 1× |
+| viền đen 8 | 861 | 117 | 156 | 36 | 149 | 596 | 265 | 1,1× |
+| viền trắng 8 | 929 | 96 | 114 | 19 | 275 | 572 | 357 | 1,1× |
+| làm nét | 858 | 139 | 125 | 52 | 116 | 597 | 261 | 0,9× |
+| tương phản 1,2 | 840 | 130 | 134 | 57 | 110 | 597 | 243 | 1× |
+| CLAHE 3/8 | 880 | 108 | 121 | 60 | 86 | 594 | 286 | 0,9× |
+| CLAHE 7/2 | 909 | 92 | 113 | 53 | 79 | 590 | 319 | 0,8× |
+| tách chữ trắng (mặt nạ HSV, 4 biến thể) | 866–910 | 102–169 | 85–104 | 40–47 | 70–104 | 528–571 | 311–339 | 1× |
+| gamma 1,6 / xám | 875 / 840 | 116 / 135 | 149 / 151 | 29 / 44 | 114 / 137 | 597 / 595 | 278 / 245 | 0,9× |
+| ngưỡng hộp dò 0,7 | 861 | 106 | 155 | 39 | 89 | 598 | 263 | 0,9× |
+| chỉ phóng ở bước dò (min 272 / 408) | 965 / 974 | 70 / 66 | 123 / 99 | 14 / 31 | 175 / 170 | 597 / 593 | 368 / 381 | 3× / 7,4× |
+| phóng ×1,5 | 923 | 79 | 154 | 15 | 151 | 597 | 326 | 1,7× |
+| **phóng ×2 bicubic** | **988** | **57** | **109** | **16** | 167 | **599** | **389** | 2,9× |
+| phóng ×2 song tuyến (như nhân VRAM cũ) | 964 | 71 | 123 | 14 | 165 | 598 | 366 | 2,9× |
+| phóng ×2 + CLAHE 7/2 | 1004 | 47 | 95 | 28 | 109 | 595 | 409 | 2,8× |
+| phóng ×3 | 989 | 57 | 93 | 30 | 153 | 596 | 393 | 7,1× |
+
+Kết luận: phóng ×2 bicubic là bước duy nhất vừa sửa nhiều vừa không làm hỏng khung vốn đúng. Thêm CLAHE thì thắng ở bộ
+khung khó nhưng làm rơi chữ đầu/cuối (thiếu 16 → 28). Tách chữ trắng làm hỏng 29–72 khung vốn đúng nên bị loại.
+
+**b) OCR thật cả tập** (tập 06, 24, 42, 57 [30 fps], 77; 154 câu; khâu dựng hồ sơ A):
+
+| Profile | Khung giữa câu đọc đúng /4064 | Thừa rác | Sai chữ | Thiếu | Ngoài câu có chữ /4458 | Phụ đề | Lệch mốc TB | Thời gian (CPU) |
+|---|---|---|---|---|---|---|---|---|
+| ảnh gốc | 3994 (98,28 %) | 63 | 7 | 0 | 215 | 154/154 đúng | 16 ms | 474 s |
+| **phóng ×2** | **4045 (99,53 %)** | 19 | **0** | 0 | 675 | 154/154 đúng | 16 ms | 1399 s |
+| phóng ×2 + CLAHE 7/2 | 4030 (99,16 %) | 13 | 0 | 21 | 404 | 154/154 đúng | 16 ms | 1348 s |
+
+- Phóng ×2: khung lỗi trong câu 70 → 19 (−73 %), hết hẳn sai chữ. Đổi lại OCR đọc thêm rác nền ngoài câu (phần lớn hộp tin
+  cậy 0,4–0,5, cao bằng cả vùng chữ). Khâu dựng đã lọc hết: 154/154 câu đúng ở cả ba cách. Với 5 tập này phụ đề cuối không
+  đổi, vì khâu dựng vốn đã sửa được mọi lỗi OCR ở đây.
+- Nâng ngưỡng tin cậy hộp lên 0,6 thì phóng ×2 đạt 99,78 % và rác ngoài câu còn 203. Nhưng áp ngưỡng 0,6 lên dữ liệu thô của
+  13 bộ phim khác (phát lại hồ sơ A) thì **mất 6 câu đúng** (test3 −4, test4 −2; thiếu câu +9) → **giữ nguyên ngưỡng**.
+
+### 3. Đổi theo số đo
+- Nút "Dùng cài đặt gợi ý" **không còn tắt Phóng to** (số đo 3.23.713 làm căn cứ cho gợi ý đó đo phóng to lúc nó còn vô hiệu).
+  Nút chỉ tắt Viền, Làm nét, Tăng tương phản.
+- Đích phóng to mặc định 128 → **272 px** (×2 vùng chữ 136 px), chú thích có số đo ở ô chọn và ô đích.
+- "Phóng to" vẫn **tắt mặc định**: trên dữ liệu có đáp án, phụ đề cuối như nhau mà OCR chậm khoảng 3 lần, nên đây là lựa chọn
+  của người dùng (nên bật cho phim chữ nhỏ / OCR thô kém).
+
+### 4. Khác
+- CLAUDE.md: cập nhật cạm bẫy phát lại theo hồ sơ A/M (từ 3.23.720).
+
+### Kiểm chứng
+- Test mới: `test_upscale_rule_v323721.py` (6 test, đều thất bại trên mã cũ), `test_preprocess_recommendation_v323721.py`
+  (3 test). Sửa kỳ vọng `test_preprocess_recommendation_v323704.py` (3 bước thay vì 4).
+
+## [3.23.720] — 🧭 Đệm đuôi câu mặc định 0, một nguồn cấu hình dựng, chọn chữ theo số khung của cả dòng (12 bộ dữ liệu mới)
+
+Chủ dự án chốt (13/11/2026): **đệm đuôi câu mặc định = 0**. Kèm `test_data.zip`: 13 bộ OCR theo ROI có phụ đề chuẩn
+(1–5, chinese_vid1–3 ngắn; test, test1 = 豪门Z外 ROI 226 px, test2, test3, test4 phim dài 2–3,3 giờ; OCR từ bản 2.21 → 3.6.4)
+và ~90 tệp OCR toàn khung cho tự dò vùng.
+
+### 1. Mặc định đệm 0 + một nguồn cấu hình dựng (lỗi đo đạc có hệ thống)
+- `SubtitleBuilderConfig.temporal_padding_sec` 0,05 → **0** (cài đặt ứng dụng vốn đã 0).
+- Rà kỹ thì mặc định DTO lệch mặc định ứng dụng ở **5 trường**: khoảng gộp 0,6 / 0,2; viterbi tắt / **bật**; số chữ tối
+  thiểu 2 / 0; đệm 0,05 / 0; bước lấy mẫu. Ứng dụng không bị (4 nơi tự chép tay ánh xạ cài đặt → cấu hình), nhưng mọi công cụ
+  (phát lại, thử sức, hiệu chỉnh) dùng mặc định DTO → **số đo phát lại seraw không có `meta.run` từ trước tới giờ là của một
+  cấu hình ứng dụng không bao giờ chạy** (viterbi tắt). Nay: `composition/builder_config.py` là nguồn duy nhất
+  (`builder_config_from_settings`, `app_default_builder_config`); container, trang Trích xuất / Chỉnh sửa (ReOCR) / Debug và
+  ba công cụ đều dùng nó; công cụ phát lại / thử sức lấy `meta.run.builder` nếu seraw có, không thì mặc định ứng dụng; tham
+  số dòng lệnh chỉ ghi đè khi được truyền.
+- Hồ sơ phát lại mới: **A** = mặc định ứng dụng, **M** = cấu hình máy chủ dự án (ghi trong seraw lượt 3.23.717). Thay D/U cũ
+  (cả hai đều viterbi tắt, số chữ tối thiểu 2).
+
+### 2. Một dòng bị viterbi chia theo bản đọc OCR (hơn / kém một chữ ở mép) → chọn sai chữ, tách đôi câu
+Rà 13 bộ mới: lỗi lớn nhất của phim dài là **cụt chữ ở mép** (test3: 119 câu, phần thiếu hay gặp nhất "了" cuối câu 44,
+"一" đầu câu 30). Đo trên OCR thô: 71 / 119 câu có bản đọc đúng ngay trong OCR — lỗi khâu dựng, không phải OCR. Ba gốc:
+1. **`absorb_flickers` giữ chữ câu "chủ"** khi hấp thụ khung chớp. "我来了" 16 khung xen "我来" 4 khung (viterbi chia 5 nhóm
+   xen kẽ) → "我来" + "我来了". Nay chữ câu gộp bầu theo số khung qua mọi lần hấp thụ nối tiếp (hoà → giữ câu chủ).
+2. **Nhánh "nhảy qua câu ngắn" của `post_merge_duplicates` vứt bản đọc thật** để nối hai mảnh giống nhau: hai lượt "瑶儿"
+   (2 và 6 khung) bị bỏ để nối các mảnh "瑶". Nay câu bị nhảy qua mà là biến thể mép của chính câu đó thì được gộp vào.
+3. **So trọng số dồn**: câu đã gộp mang chữ một bản nhưng `frame_count` cộng cả khung bản kia → bản đó thắng mãi. Nay cặp
+   biến thể mép quyết theo số khung OCR đọc ra mỗi bản trên **cả dòng** (`line_reads`: mở rộng hai phía khi khung kề còn đọc
+   ra một trong hai bản, lọt ≤ 2 khung rác, dừng ở chỗ hở mốc): bản dài thắng khi ≥ 3 khung, ≥ 0,6 lần bản ngắn và tin cậy
+   trung bình ≥ 0,8; bản ngắn được nhiều khung hơn thì bản ngắn. Cặp khác chữ giữ luật cũ.
+- Đã thử và loại (đo trên test3): đếm khung nguyên câu cho MỌI cặp khác chữ → hỏng "你去我的府上住" → "你法…", "阵" → "车"
+  (các biến thể chia nhau phiếu); đếm trong khoảng gộp tạm thời → "你" → "你人" (3 / 3 ở bước đầu, cả dòng 8 / 3), "岁月" → "岁".
+
+### Đo kiểm
+- **13 bộ ROI mới** (phát lại hồ sơ A / M, so phụ đề chuẩn), số câu khớp đúng chữ — 3.23.719 → 3.23.720:
+
+  | Bộ | Hồ sơ A | Hồ sơ M |
+  |---|---|---|
+  | test3 (6534 câu) | 6257 → **6261** (sai chữ 246 → 242) | 6258 → **6260** |
+  | test2 (4645 câu) | 4553 = | 4553 → **4554** |
+  | test, test1, test4, 1–5, chinese_vid1–3 | không đổi | không đổi |
+
+  Câu đổi trên test3 (đối chiếu từng câu với OCR thô + phụ đề chuẩn): đúng thêm "瑶儿", "我来了", "小姐吩咐了",
+  "我路过", "林恒没有说谎", "交给我", "起雷动", "岁月"; hết tách đôi "瑶 / 瑶儿", "我来 / 我来了". Xấu đi không câu nào
+  theo phụ đề chuẩn; "一个厂原则" (trước "个原则") và "你" + "你方" (trước "你方") vẫn sai như cũ — OCR chỉ có bản đọc lỗi.
+- Câu lẻ hình thành do hấp thụ khung chớp nay cũng được kéo tới thời lượng tối thiểu như mọi câu ngắn (trước đây câu gộp
+  không bao giờ được xét lại; lỗi bị đệm đuôi 0,05 s che đi, lộ ra khi đổi đệm về 0 — test `test_v219_isolated_short_event_extended`).
+- Phát lại **54 tệp OCR thô cũ** trên mã cuối: 7 lượt 86 tập × A/M, 2 lượt theo `meta.run` (714, 717), 豪门Z外 × A/M,
+  18 tệp của 3 bộ cũ (full681, v619_t050, v680) × A/M — **y hệt 3.23.719 ở cả 54 tệp**. Theo đáp án v4: lượt 717
+  3662 / 3664, 0 câu lệch mốc > 0,1 s (như cũ).
+- Thử sức 30 kịch bản trên lượt 714 (86 tập, cấu hình `meta.run`): **y hệt 3.23.719**. 豪门Z外 (nay dựng bằng mặc định ứng
+  dụng): bất biến `scale` ×0,5 / ×1,5, `tshift`, `shuffle`, `dupts` ra y hệt `none`; `fps30` từ 1459 câu lệch mốc > 0,1 s xuống
+  **10** (= `none`) — phần lệch cũ là đệm 0,05 s bị giãn ×1,2 khi đổi mốc, hết khi đệm = 0 (còn chênh 1 ms do làm tròn).
+
+### Còn lại (ghi để đo tiếp, chưa sửa)
+- "一" đầu câu OCR KHÔNG đọc ra ở bất kỳ khung nào (test3 ≈ 20 câu: "天到晚", "个男人身上", "模一样"…): hình học chứng minh
+  thiếu một chữ bên trái (mép phải cố định, hộp lệch phải nửa chữ so với tâm phụ đề) nhưng chữ thiếu phải ĐOÁN — cần đo tỉ lệ
+  đoán nhầm trên mọi bộ có đáp án trước khi làm.
+- Phụ đề chuẩn của các bộ mới có lỗi riêng (庆 / 大, 自已 / 自己, 脈 phồn thể, "林恒没脊说谎") — số "sai chữ" tính cả các câu ứng
+  dụng đúng.
+
+### Test
+- Mới: `test_builder_config_defaults_v323720.py` (5), `test_edge_variant_vote_v323720.py` (5, dùng đúng chuỗi câu / chữ từng khung
+  của OCR thật test3). Các test hành vi thất bại trên mã 3.23.719.
+- Toàn bộ test: **8800 đạt, 0 bỏ qua, 0 lỗi** (`QT_QPA_PLATFORM=offscreen`, 20 phút 51 giây). `compileall` sạch; mypy các tệp
+  dựng phụ đề đã sửa không thêm lỗi so với 3.23.719; ruff (F, B) sạch ở các tệp đã sửa (sửa thêm 3 chỗ có từ trước:
+  f-string rỗng, `zip` không `strict`, `getattr` hằng).
+
+## [3.23.719] — 🎯 Dữ liệu thật 豪门Z外 + lượt 3.23.717: đuôi câu lấn khung trống, bất biến độ phân giải / khung lặp
+
+Dữ liệu chủ dự án gửi: 豪门Z外 (OCR toàn khung + OCR theo ROI người dùng chọn + phụ đề tham khảo "chưa chắc chuẩn"),
+lượt chạy thật 3.23.717 trên phim nối 86 tập (`tron_bo.original.srt` + `tron_bo.seraw.json.gz`).
+
+### Rà lượt thật 3.23.717 (86 tập, đáp án v4)
+- Phụ đề của lượt chạy khớp đúng **3662/3664 câu**, 0 câu lệch mốc > 0,03 s; phát lại seraw bằng cấu hình ghi trong
+  `meta.run.builder` (mã 717, 718, 719) ra y hệt SRT của lượt chạy.
+- 2 câu thiếu là hai câu "诶" (5529,8 s và 5660,28 s): OCR đọc thành "矣" độ tin 0,42 ở mọi khung — giới hạn của mô
+  hình nhận dạng, không có bản đọc đúng nào để khâu dựng chọn.
+
+### Rà 豪门Z外 (ROI người dùng, PP-OCRv5 mobile, 1080 px, 24 fps)
+- So phụ đề tham khảo: 2105/2122 câu khớp; phần lệch còn lại phần lớn do phụ đề tham khảo: chữ phồn thể (註, 換, 強,
+  凈, 戶, 沒, 丟, 虛, 屍), rác "オ"/"BOR", gõ sai ("干麻", "阿啊"), thiếu chữ ("群废物" — ảnh OCR là câu căn giữa
+  "一群废物"). Mốc của ứng dụng khớp OCR thô ở các câu đã đối chiếu ("阿姨" 883,23 s, "把我们忘了呀", "这个杨成", "好").
+- "小辰" 5471,3 s (độ tin 0,99, 12 khung) có thật trong OCR nhưng phụ đề tham khảo thiếu — ứng dụng giữ đúng.
+- OCR toàn khung: test tự dò vùng chạy trên dữ liệu thật (`test data/haomen_fullscreen.seraw.json.gz`) — cụm sơ cấp
+  chưa tinh chỉnh phủ > 90 % chiều cao khung (mega-cluster), vùng thông minh thu về y 1426–1572 bao trọn ROI người dùng
+  chọn (1444–1574).
+
+### Lỗi sửa (gốc lỗi, bằng chứng)
+1. **Đuôi câu lấn sang khung đã thấy TRỐNG (dữ liệu thật).** Mảnh 1 khung ở cuối câu bị `absorb_flickers` đệm tới thời
+   lượng tối thiểu, rồi `post_merge_duplicates` gộp nó vào câu cùng chữ qua nhánh "nhảy qua câu ngắn" — nhánh này
+   không bỏ phần đệm như nhánh gộp trực tiếp (3.23.715). 豪门Z外 "嗯" 726,40 s: OCR có chữ tới 727,148 s, khung 727,19 s
+   trống, ứng dụng ra 727,34 s → nay **727,19 s**. Thử sức `tall` "啊" 936,48 s: 937,34 → 937,19 s (OCR trống từ
+   937,19 s); `edgecut` "叫你贫嘴": 930,38 → 930,23 s.
+2. **Khung lặp đổi chữ của câu.** Khung cùng mốc cùng nội dung (bộ giải mã trả lặp, chạy tiếp từ checkpoint) được đếm
+   hai lần → lệch phiếu bầu khi hai bản đọc gần hoà ("混蛋龌龊的家伙" thành "混蛋 龌龊的家伙"). Nay khử ngay đầu khâu
+   dựng (`drop_duplicate_samples`); khung cùng mốc mà KHÁC nội dung vẫn giữ.
+3. **Cùng phim, độ phân giải khác → kết quả khác.** Bộ lọc mật độ Y dùng bin 5 px / sàn 10 px cố định: phim ×0,5 giữ
+   rác Latin "TOUTS" sát mép trên vùng chữ. Nay các hằng số pixel nhân theo cỡ chữ của phim, đo bằng **bề rộng một
+   chữ** (`typical_char_pitch`; mốc 58,3 px là cỡ chữ các bộ 86 tập đã tinh chỉnh). Không đo theo chiều cao hộp: vùng
+   chữ cắt chân thì chiều cao co 67 → 46 px mà bề rộng giữ 58,2 px — bản thử đo theo chiều cao làm mất lần đọc "哼"
+   ở `clip:25` (đã bắt và đổi trước khi giao).
+
+### Đo kiểm (mã 3.23.718 → 3.23.719)
+- Phát lại **44 tệp OCR thô thật**: 7 lượt 86 tập (690, 708, 710, 711, 713, 714, 717) × cấu hình D/U hoặc cấu hình ghi
+  trong seraw, 36 tệp của 3 bộ cũ (full681, v619_t050, v680), 豪门Z外 × D/U. **Không câu nào đổi** ngoài câu "嗯"
+  727,19 s ở trên (sửa đúng theo OCR thô). Điểm theo đáp án v4 giữ nguyên ở mọi lượt (lượt 717: 3662/3664, 0 lệch).
+- Thử sức 30 kịch bản trên lượt 714 (86 tập, đáp án v4): **y hệt 3.23.718 ở cả 30 kịch bản**.
+- Thử sức trên 豪门Z外 (so phụ đề tham khảo, chỉ so tương đối), số câu lệch mốc > 0,1 s:
+
+  | Kịch bản | 3.23.717 | 3.23.718 | 3.23.719 |
+  |---|---|---|---|
+  | `tall:0.05` | 10 | 11 | **10** |
+  | `noise:0.05` | 12 (thừa 3) | 11 (thừa 2) | **10** (thừa 2) |
+  | `edgecut:0.5` | 22 | 22 | **21** |
+  | `vfr:8` | 17 | 18 | **17** |
+  | `gap:0.03` | 11 | 10 | 10 |
+  | `scale:0.5` | thừa 3 | thừa 3 | **thừa 2 (= none)** |
+  | `watermark` | thừa 1 | thừa 2 | thừa 2 — câu thêm là "小辰" thật (717 làm mất) |
+
+  Các kịch bản còn lại không đổi.
+- Bất biến `scale` (×0,5, ×1,5), `tshift`, `shuffle`, `dupts` nay ra y hệt `none` trên CẢ 豪门Z外 (trước: `scale:0.5`
+  thêm câu rác + lệch 9 ms, `dupts` đổi chữ một câu) lẫn 86 tập. `fps30` trên 豪门Z外 lệch đều 10 ms là do công cụ: đệm
+  OCR 0,05 s (thiết lập người dùng, tính bằng giây) bị giãn ×1,2 khi đổi mốc về; máy chủ dự án đặt đệm 0.
+
+### Test
+- `test_skip_merge_padding_v323719.py` (3), `test_builder_invariance_v323719.py` (7, có 3 s OCR thật 豪门Z外 kèm khung
+  lặp trong `test data/haomen_dupts_2841s.json`), `test_roi_selection_v314.py` thêm ca dữ liệu toàn khung thật.
+  Các test mới đều thất bại trên mã 3.23.718.
+- Toàn bộ test: **8789 đạt, 0 bỏ qua, 0 lỗi** (`QT_QPA_PLATFORM=offscreen`, 21 phút 44 giây). `compileall` sạch; mypy
+  các tệp đã sửa không thêm lỗi so với 3.23.718.
+
+## [3.23.718] — 🧪 Thử sức đợt 2: mất khung, dấu câu thừa, logo cố định, đổi bố cục giữa phim, vùng chữ cắt chân, chữ phồn lẻ tẻ
+
+Không có dữ liệu mới từ máy chủ dự án. Tiếp tục đón đầu lỗi CHƯA phát sinh: thêm 9 kịch bản giả định vào
+`tools/stress_subtitle_builder.py`, chạy trên OCR thô thật của lượt 3.23.714 (cấu hình dựng ghi trong seraw), so đáp án v4.
+
+### Kịch bản mới và kết quả trên mã 3.23.717
+| Kịch bản | Mô phỏng | 3.23.717 |
+|---|---|---|
+| `gap:0.03` | bộ giải mã bỏ 3 % khung / chạy tiếp từ checkpoint hụt khung | **74 câu lệch mốc > 0,1 s** |
+| `punct:0.05` | OCR thêm dấu câu vào 5 % lần đọc | **58 câu sai chữ** |
+| `watermark` | logo chữ Latin cố định ở góc vùng chữ, mọi khung | **mất 5 câu**, 12 câu lệch mốc |
+| `yshift:25`, `xshift:40` | nửa sau phim (tập khác khi nối phim) đặt phụ đề cao hơn 25 px / lệch ngang 40 px | **mất 2 câu** |
+| `clip:25` | vùng chữ vẽ hụt cắt 25 px chân chữ | mất 1 câu, 2 lệch mốc |
+| `trad:0.05` | 5 % lần đọc lệch một chữ sang phồn thể | 2 câu lệch mốc |
+| `split`, `clip:10`, `vfr:8` | hộp câu bị tách đôi; cắt chân ít; mốc rung ± 8 ms | đã đạt |
+
+### Gốc lỗi và cách sửa
+1. **Mất khung → câu kéo dài / bắt đầu sớm.** Cờ "cùng điểm ảnh khung trước" trỏ vào khung không còn trong dữ liệu: mất khung
+   đổi hình ngay sau "瑶瑶" thì các khung trống sau đó bị coi là bản chép của "瑶瑶", bước gộp lần đọc lấp chữ vào. Nay
+   cờ bị cắt ở khung đứng sau chỗ hụt mốc > 1,5 bước (`break_same_pixel_chains_at_gaps`).
+2. **Mất khung → câu bị tách đôi.** Luật "câu lặp" đếm khung trống bằng khoảng hở ÷ bước, nên 3 khung MẤT thành 3 khung
+   TRỐNG ("一天都拦不住"). Nay đếm thẳng các khung trống có trong dữ liệu (`observed_frames_between`), cho cả luật câu
+   lặp, luật mảnh OCR hụt và khoảng gộp hai nhóm cùng chữ; không thấy khung trống nào thì không phải câu lặp. Hết luôn
+   chuyện làm tròn khoảng hở khi mốc rung (điểm yếu "散了吧" ghi từ 3.23.715).
+3. **Dấu gạch đầu câu thành "一".** Luật khôi phục "一" bị đọc thành gạch (3.23.707) nay đòi thêm bằng chứng hình học:
+   "一" rơi mất thật thì hộp câu lệch PHẢI nửa chữ (đo thật: "天呐" thiếu "一" lệch +20 px ở bộ 3.23.690, +26 px ở bộ
+   3.23.711; câu "天呐" thật lệch ≤ 1 px). Các câu "一天呐", "一晚上", "一码是一码" của bộ dữ liệu thật vẫn được khôi phục.
+4. **Logo cố định tắt các luật "khung một hộp".** Gỡ lớp phủ tĩnh ngay đầu khâu dựng (`strip_static_overlays`): hộp
+   cùng chữ, cùng chỗ hiện liên tục ≥ 10 s (≥ 1,5 × thời lượng tối đa một câu). Đo trên 4 bộ dữ liệu thô thật: lượt liên
+   tục dài nhất của một câu thật là 4,9 s — không câu nào bị chạm.
+5. **Đổi bố cục giữa phim.** Tâm phụ đề, dải phụ đề, cỡ chữ đo MỘT lần cho cả phim. Nay `find_layout_cuts` so số đo theo
+   cửa sổ 120 s; tâm x hoặc mép trên / dưới dời ≥ 0,35 cỡ chữ là bố cục khác → dựng từng đoạn riêng, cắt ở khoảng trống
+   chữ dài nhất giữa câu cuối của bố cục cũ và câu đầu của bố cục mới. Không phát hiện nhầm ở bộ dữ liệu thật nào (6 bộ).
+6. **Vùng chữ cắt chân.** Luật "hộp quá rộng so với một chữ" so với chiều cao chữ; chiều cao co lại khi chân chữ bị cắt
+   (45 px) mà bề rộng không đổi (55 px). Nay so với số lớn hơn giữa chiều cao và bề rộng một chữ đo được (trên dữ liệu
+   đầy đủ chiều cao luôn lớn hơn → không đổi).
+7. **Chữ phồn lẻ tẻ tách câu.** Gộp nhóm so chữ sau khi quy phồn → giản ("出來了是吧" giữa "出来了是吧").
+
+### Số đo — bộ thử sức (lượt 714, đáp án v4; 717 → 718)
+| Kịch bản | Khớp chữ | Mất câu | Lệch mốc > 0,1 s |
+|---|---|---|---|
+| Mất 3 % khung | 3662 = 3662 | 0 | **74 → 0** |
+| Dấu câu thừa ở 5 % lần đọc | **3604 → 3661** | 0 | 3 = 3 |
+| Logo cố định | **3656 → 3662** | **5 → 0** | **12 → 0** |
+| Phụ đề cao hơn 25 px ở nửa sau phim | **3660 → 3662** | **2 → 0** | 0 = 0 |
+| Phụ đề lệch ngang 40 px ở nửa sau phim | **3660 → 3662** | **2 → 0** | **3 → 0** |
+| Vùng chữ cắt 25 px chân chữ | **3661 → 3662** | **1 → 0** | 2 → 1 |
+| 5 % lần đọc lệch sang phồn thể | 3662 = 3662 | 0 | **2 → 0** |
+| 21 kịch bản còn lại (đợt 1 + bất biến) | không đổi | | không đổi |
+
+### Số đo — phát lại dữ liệu thật (717 → 718): **giống hệt**
+Lượt 714 (cấu hình ghi trong seraw), 713 / 711 / 710 / 708 / 690 × mặc định / giống máy chủ dự án: 0 khác biệt. 3 bộ dữ
+liệu thô khác (36 tệp × 2 bước): 0 khác biệt.
+
+### Giới hạn còn lại (ghi thẳng)
+* 20 % lần đọc lệch sang phồn thể (`trad:0.2`): 210 câu giữ chữ phồn, như 3.23.717. Ngưỡng "phim giản thể, phồn lẻ tẻ"
+  (2 % câu) giữ để không hỏng phim dùng lẫn phồn / giản; chưa có dữ liệu loại phim đó để nới an toàn.
+* `vfr:8` báo "gộp" 1 cặp: câu "我走着走着" kết thúc trễ 5 ms (chính độ rung) chồng vào câu "诶" mà mô hình không đọc
+  được — lệch chấm điểm, không phải lỗi dựng.
+* Từ đợt 1: 3 câu thừa do hộp nhiễu đứng MỘT MÌNH giữa khung trống; hụt cả lần đọc dài (tới 12 khung) vẫn lệch mốc.
+
+### Kiểm thử
+* Toàn bộ: **8778 đạt, 0 bỏ qua, 0 lỗi**, `compileall` sạch.
+* `test_builder_stress_v323718.py`: 14 test (11 đỏ trên mã 3.23.717; 3 test chặn chiều ngược lại: câu lặp có mốc rung,
+  khôi phục "一" bị rơi thật).
+* `test_merge_char_restore_v323707.py`: ca "-天呐" từng đặt mọi bản đọc đúng tâm (không như ảnh thật) nên đỏ với luật mới;
+  nay dựng theo hình học đo thật (bản đọc thiếu "一" lệch phải nửa chữ) và thêm ca ngược: câu "天呐" thật đúng tâm có gạch
+  ở một phần lần đọc → giữ "天呐". Luật dùng tâm của chính bản đọc không gạch (ghi theo từng bản đọc khi gộp nhóm).
+
+## [3.23.717] — 🧪 Bộ thử sức khâu dựng phụ đề; đón đầu OCR hụt, đọc lẫn chữ, nhiễu cảnh; bộ test chạy đủ 0 bỏ qua
+
+Không có dữ liệu mới từ máy chủ dự án. Bản này đi tìm lỗi CHƯA phát sinh: gây nhiễu giả định lên OCR thô THẬT của lượt
+3.23.714 (208 752 khung, cấu hình dựng ghi trong `meta.run.builder`), dựng lại và so đáp án v4.
+
+### Bộ thử sức `tools/stress_subtitle_builder.py`
+* Nhiễu tác động lên LẦN ĐỌC (khung được OCR + các bản chép "cùng điểm ảnh" của nó), giữ nguyên cờ cùng điểm ảnh —
+  đúng cách dữ liệu thật hình thành.
+* Nhóm bất biến (phải ra y như dữ liệu gốc): phim độ phân giải ×0,5 / ×1,5 / ×3, mốc thời gian +10 giờ, khung xáo trộn
+  thứ tự, phim 30 fps, khung lặp mốc. **Mã 3.23.716 đã đạt cả 6**.
+* Nhóm nhiễu: OCR hụt lần đọc / khung lẻ / hai khung liền, tụt tin cậy, hộp cao hết vùng chữ, hộp rung ± 3 px, hộp chữ
+  cảnh thêm vào, đọc sai một chữ, hiện dần / mờ dần, thiếu cờ cùng điểm ảnh, lấy mẫu thưa.
+
+### Điểm yếu tìm ra và cách sửa
+1. **OCR hụt 1–2 khung giữa câu tách đôi câu khi khoảng gộp nhỏ** (0,1 s ở bước 0,04 s). Luật câu lặp vốn coi < 3 mẫu
+   trống là OCR hụt nhưng khoảng gộp chặn trước. Nay hai nhóm CÙNG chữ ở bước dày được gộp qua khoảng hở < 3 mẫu.
+2. **Hai bản đọc lẫn chữ xen kẽ** ("癞蛤蟆" → "痴蛤蟆" → "癞蛤蟆") khi thiếu cờ cùng điểm ảnh bị tách thành hai câu: nay
+   chữ quay lại bản cũ = cùng một hình, không tách.
+3. **Chọn chữ giữa hai bản đọc gần giống**: trước chỉ đếm khung × tin cậy ("痴" 20 khung thắng "癞" 15 khung). Nay bản
+   nhẹ hơn thắng khi có ≥ nửa số khung VÀ tin cậy cao hơn ≥ 0,03. Ngưỡng đặt theo ba ca thật: "癞" 0,983 / "痴" 0,942
+   (lật đúng); "拉不住" 7 khung 0,99 / "扛不住" 28 khung 0,95 (không lật — bản nháp chọn theo tin cậy từng làm hỏng câu
+   này trên bộ 3.23.690); "清清自白" 0,96 / "清清白白" 0,95 (không lật). Thử chọn bằng ngữ liệu của phim: bị loại vì bản
+   đọc sai hay tình cờ thành cụm thông dụng ("你要不", "让你这").
+4. **Một lần đọc sai MỘT chữ, tin cậy thấp** (câu ≥ 3 chữ, < 0,97 và thấp hơn bên kia ≥ 0,02) không còn bị tách thành
+   câu riêng (mốc đầu từng trễ 0,5 s); bước gộp câu cũng ghép cặp câu liền nhau như vậy. Câu thật liền nhau khác một chữ
+   của phim mẫu ("我去哪" / "你去哪", "这一拳替我爹" / "…娘") đều tin cậy ≥ 0,995 nên không bị đụng.
+5. **Hộp chữ cảnh dính vào câu**: hộp ít chữ hơn nằm CHỒNG trong bề ngang hộp câu bị bỏ (ba bộ dữ liệu thô thật không
+   có ca hai hộp phụ đề chồng nhau); hộp câu tự nó đúng tâm (≤ 0,12 cỡ chữ — đo thật: 99,9 % hộp câu lệch ≤ 9,5 px)
+   mà cả dòng lệch thì chỉ giữ hộp câu — kể cả hộp cảnh tin cậy cao (trước đây chỉ bỏ hộp < 0,6; test 3.23.710 đổi theo).
+   Phụ đề bị khoanh hai hộp (có dấu cách) không hộp nào tự đúng tâm → giữ nguyên.
+
+### Số đo — bộ thử sức (lượt 714, đáp án v4; 716 → 717)
+| Kịch bản | Khớp chữ | Câu thừa | Lệch mốc > 0,1 s |
+|---|---|---|---|
+| 6 kịch bản bất biến | 3662 = 3662 | 0 | 0 = 0 |
+| Hụt 3 % khung lẻ | 3661 → **3662** | 0 | 7 → **0** |
+| Hụt 2 khung liền ở 1 % vị trí | 3662 | 0 | 19 → **0** |
+| Hụt 3 % lần đọc | 3659 = 3659 | 0 | 26 → **15** |
+| Thêm 1–2 hộp nhiễu cảnh vào 5 % lần đọc | 3652 → **3662** | 3 = 3 | 9 → **1** |
+| Đổi một chữ ở 3 % lần đọc | 3645 = 3645 | 0 | 7 → **1** |
+| Thiếu cờ cùng điểm ảnh | 3660 → **3661** | 0 | 5 → **4** |
+| Tụt tin cậy 5 % lần đọc | 3660 → **3661** | 0 | 1 = 1 |
+| Lấy mẫu thưa 1/3 | 3656 → **3657** | 0 | 25 → **22** |
+| Hộp cao hết vùng chữ / rung / hiện dần / thưa 1/2 | không đổi | 0 | không đổi |
+
+* Còn lại (ghi thẳng): 3 câu thừa do hộp nhiễu đứng MỘT MÌNH giữa khung trống — không có dấu hiệu nào tách được khỏi câu
+  một chữ thật; hụt cả lần đọc (đến 12 khung liền) vẫn lệch mốc vì giống câu lặp thật.
+
+### Số đo — phát lại dữ liệu thật (716 → 717): không hồi quy
+* Lượt 714 (cấu hình ghi trong seraw), 713 / 711 / 710 / 708 / 690 × mặc định / giống máy chủ dự án: **giống hệt**
+  3.23.716 (chỉ một mốc lệch 1 ms do làm tròn). 3 bộ dữ liệu thô khác (36 tệp × 2 bước): 0 khác biệt.
+
+### Bộ test chạy đủ, không bỏ qua
+* `tools/fetch_vendor_binaries.py`: GitHub chặn API và trang phát hành → lấy libmpv từ kho gương SourceForge chính thức
+  (đọc RSS, ưu tiên bản x86_64 thường). Đã tải đủ libmpv + ffmpeg (bản LGPL) vào `vendor/`; `vendor/` nay bị bỏ qua hẳn
+  trong git (gói tải về còn header, thư viện liên kết ~300 MB).
+* `zhconv` vào dependency dev (test phồn/giản của bộ đo trần OCR).
+* `test data/fullscreen_autoroi/01–03.seraw.json`: OCR toàn khung tập 01–03 của phim mẫu (bước 0,15 s, 949–1528 khung) cho
+  các test tự dò vùng phụ đề. Hai bộ phim lớn gốc không còn → dùng tập 02, 03; ca "mega-cluster" (dữ liệu 豪门Z外 không
+  còn) tái tạo bằng box thật tập 01 + chữ cảnh dày đặc tổng hợp (đã kiểm: tắt tinh chỉnh dải thì cụm cao 100 % khung,
+  bật thì 11 %).
+* Xoá 37 test lỗi thời bị tắt vĩnh viễn (kiểm API nội bộ đã thay ở bản Omega / v3.3; hành vi mới có test riêng).
+* Quy tắc "bộ test chạy đủ, 0 bỏ qua" và các bước chuẩn bị môi trường ghi vào `CLAUDE.md`.
+
+### Kiểm thử
+* Toàn bộ: **8763 đạt, 0 bỏ qua, 0 lỗi** (bản trước: 8725 đạt, 58 bỏ qua), `compileall` sạch.
+* `test_builder_stress_v323717.py` (17 test, 12 đỏ trên mã 3.23.716), `test_fetch_vendor_v323717.py` (4 test, đỏ trên
+  công cụ cũ).
+## [3.23.716] — 🧹 Hết câu rác từ chữ dọc trong cảnh; khung cùng điểm ảnh đọc rỗng, OCR hụt rồi đọc lại yếu, khung ranh giới về đúng câu
+
+Dữ liệu vào: SRT + seraw của lượt chạy thật bằng bản 3.23.714 trên phim nối 86 tập. Đây là tệp seraw đầu tiên tự ghi
+cấu hình dựng (`meta.run.builder`: khoảng gộp 0,1 s, thời lượng tối thiểu 0,09 s, tin cậy tối thiểu 0,4, dung sai căn
+giữa 0,08, dung sai gom dòng 15 px, không đệm) và kết quả (`meta.result`): phát lại bằng mã 3.23.714 với đúng cấu hình
+đó ra **giống hệt** SRT của lượt chạy (0 khác biệt trên 3660 câu).
+
+### Kết quả lượt chạy 3.23.714 so với đáp án
+* Chữ: 3659 câu khớp; sót "是", "你" 4666 s, "那" 5535 s (3.23.715 đã cứu cả ba), 2 câu "诶" (giới hạn mô hình).
+* **Thừa câu rác 1229 "肃疏C气"** (42:27,000–42:27,400).
+* Mốc: "切" cuối −0,12 s; sau khi 3.23.715 cứu "是" thì câu này cuối −0,24 s.
+
+### Gốc lỗi 1 — câu rác "肃疏C气" (câu 1229)
+* Cảnh 2546,80–2547,36 s có 6–7 hộp chữ DỌC cao hết vùng chữ, trải khắp bề ngang ("M向H图|肃疏|C气|肖|流气气|下").
+  Bước kiểm căn lề xét cả dòng (mọi hộp chồng dọc nhau) → "dòng" rộng 650 px có tâm đúng giữa → hợp lệ. Sau đó bộ lọc
+  lệch dọc bỏ bớt hộp, còn "肃疏|C气" ở mép trái (tâm x ≈ 99 so với 360) mà không bước nào kiểm lại.
+* Sửa ba lớp, mỗi lớp có số đo riêng:
+  1. **Kiểm căn lề lại** cho khung vừa bị bộ lọc lệch dọc bớt hộp; khung chỉ còn chữ lệch tâm bị loại (ghi nhận là
+     khung loại mềm).
+  2. **Hộp ≥ 2 chữ toàn chữ Hán phải rộng ≥ 0,5 lần cỡ chữ cho mỗi chữ** (`MIN_CJK_RUN_CHAR_WIDTH_RATIO`). Đo trên 5 bộ
+     dữ liệu thô (≈ 104 000 hộp câu thật mỗi bộ): nhỏ nhất 0,61 ("一晚上"), bách phân vị 0,1 % là 0,74–0,83; chữ dọc
+     trong cảnh ("肃疏" 59 × 136 px → 0,44) dưới 0,5 ở 70 / 89 mẫu rác.
+  3. **Một dòng căn giữa không có khe trống > 3 lần chiều cao hộp giữa hai hộp kề nhau** (`MAX_INNER_GAP_HEIGHTS`). Đo
+     thật: khe lớn nhất giữa hai hộp của cùng một câu là 0,15 lần cỡ chữ; "C气" mép trái + "下" mép phải cách 473 px.
+
+### Gốc lỗi 2 — "是" kết thúc sớm 0,24 s
+* 12 khung hộp cao hết vùng chữ, rồi 6 khung CÙNG điểm ảnh đọc lại ra rỗng. Bước gộp lần đọc chỉ lấp khung rỗng bằng
+  lần đọc "đúng cỡ phụ đề" nên bỏ qua hộp phình. Nay hộp phình được đưa về dải phụ đề TRƯỚC bước gộp lần đọc.
+
+### Gốc lỗi 3 — "切" kết thúc sớm 0,12 s
+* 17 khung, OCR hụt 2 khung, rồi đọc lại "切" ở một khung yếu (tin cậy 0,57, hộp cao hết vùng chữ, bị lọc). Bước nới
+  biên chỉ nhìn 1,5 bước sau khung cuối. Nay khung bị lọc đọc ra ĐÚNG NGUYÊN VĂN câu, cách khung cuối dưới 3 mẫu trống
+  (ngưỡng "OCR hụt" của luật câu lặp), được dùng làm mốc cuối. Từ 3 mẫu trống trở lên thì không (test chặn).
+
+### Gốc lỗi 4 — khung ranh giới bị gán nhầm câu (có trên mọi bộ dữ liệu cũ)
+* Hai câu liền nhau có chung chữ ("历史至强雷劫" → "四灵天雷劫", "哎呀师叔" → "师叔"): Viterbi đôi khi gán khung cuối của
+  câu trước (đọc đúng nguyên văn, tin cậy 0,99) vào nhóm câu sau → hai mốc cùng lệch một khung. Ảnh thật tập 1 xác nhận
+  khung 16,80 s vẫn là "历史至强雷劫". `_return_boundary_frames_to_their_line` trả khung sát ranh giới có chữ trùng
+  nguyên văn câu kề bên về câu đó; không bao giờ dời hết khung của một nhóm.
+* **Đáp án v4**: sửa ranh giới này (16,80 → 16,84 s) — đáp án v3 sai theo ứng dụng ở đúng chỗ đó.
+
+### Số đo (đáp án v4, 3664 câu; phát lại 715 → 716)
+| Bộ dữ liệu thô × cấu hình | Khớp chữ | Câu thừa | Lệch mốc > 0,1 s | Lệch > 0,03 s |
+|---|---|---|---|---|
+| Lượt 714, cấu hình ghi trong seraw (SRT thật: 3659, thừa 1, 1, 11) | 3662 → 3662 | **1 → 0** | **2 → 0** | **2 → 0** |
+| Lượt 713, mặc định / giống máy chủ dự án | 3661 (không đổi) | 0 | 0 → 0 | 3 → 1 |
+| Lượt 711/712, mặc định / giống máy chủ | 3658 (không đổi) | 0 | 0 → 0 | 1 → 1 |
+| Lượt 710, mặc định / giống máy chủ | 3662 / 3661 (không đổi) | 0 | 5 → 5 / 4 → 4 | 8 → 6 / 7 → 5 |
+| Lượt 708, mặc định / giống máy chủ | 3648 (không đổi) | 0 | 1 → 1 / 3 → 3 | 8 → 2 / 9 → 3 |
+| Lượt 690, mặc định / giống máy chủ | 3656 (không đổi) | 0 | 4 → 4 / 6 → 6 | 10 → 8 / 12 → 10 |
+
+* Lượt 714 sau sửa chỉ còn sót 2 câu "诶" (mô hình OCR không đọc được chữ này); không còn mốc nào lệch quá một khung.
+* 3 bộ dữ liệu thô khác (36 tệp × 2 bước): 1 tệp đổi, đúng ranh giới "历史至强雷劫" / "四灵天雷劫" nói trên.
+* Trích xuất thật 12 tập vùng rộng + 8 tập vùng hẹp: SRT **giống hệt** 3.23.715 (0 khác biệt ở cả 20 tập).
+
+### Ghi chú
+* Cấu hình "giống máy chủ dự án" dùng ở các bản trước (dò ngược) chưa trùng hẳn cấu hình thật: còn khác thời lượng tối
+  thiểu (0,09 s), tin cậy tối thiểu (0,4), dung sai gom dòng (15 px), dung sai căn giữa (0,08 chứ không phải 0,05). Từ
+  bản này phát lại dữ liệu mới đọc thẳng `meta.run.builder`.
+
+### Kiểm thử
+* Toàn bộ: **8725 đạt, 58 bỏ qua** (thiếu binary Windows / vendor), `compileall` sạch.
+* `test_builder_robustness_v323716.py`: 7 test (6 test đỏ trên mã 3.23.715, 1 test chặn hồi quy) — cảnh chữ dọc không
+  ra câu, khung cùng điểm ảnh đọc rỗng sau hộp phình, đọc lại yếu sau 2 khung hụt, không kéo mốc qua 4 khung trống,
+  khung ranh giới về câu trước / câu sau, nhóm sạch và nhóm suy biến không bị đụng.
+
+## [3.23.715] — 🧱 Khâu dựng bền với hộp chữ phình toàn lượt, bước lấy mẫu thật, mảnh OCR hụt và khung nhiễu sát biên
+
+Dữ liệu vào: SRT + seraw của lượt chạy thật bằng bản 3.23.713 trên phim nối 86 tập (bước cấu hình 0,03 s, vùng chữ
+0,774,720×136, tiền xử lý chỉ còn tăng tương phản, khoảng gộp 0,1 s).
+
+### Kết quả lượt chạy 3.23.713 so với đáp án
+* Chữ: **3658 câu khớp**, sót 5 câu ("喜", "是", "好", "你" 4666 s, "诶"). Mốc: 6 câu lệch > 0,1 s ("啊" 845 s cuối
+  −4,24 s, "你" 1379 s, "切", "你" 3269 s, "你" 5834 s, "天驹山").
+* Phát lại seraw bằng mã 713 + cấu hình "giống máy chủ dự án" ra ĐÚNG kết quả này → cấu hình dò ngược ở 3.23.714 đúng.
+* Vì sao kém lượt 712: tiền xử lý không viền / không phóng to làm câu một chữ bị khoanh hộp cao hết vùng chữ
+  (0–136 px, dải phụ đề thật 65–133 px) ở MỌI khung → `tighten_inflated_boxes` (cần một khung gọn làm mẫu) bó tay,
+  bộ lọc lệch dọc xoá cả câu.
+
+### Thay đổi ở khâu dựng
+1. **Hộp phình toàn lượt → dải phụ đề của phim** (`measure_text_band`, `snap_inflated_boxes_to_band`). Dải đo từ
+   trung vị các khung một hộp ≥ 3 chữ, tin cậy ≥ 0,9 (cần ≥ 50 mẫu). Hộp chỉ được đưa về dải khi: một hộp duy nhất,
+   chữ Hán, tin cậy đủ, cao > 1,25× cỡ chữ, tâm lệch ≤ 0,15× cỡ chữ, rộng đúng số chữ (−0,5…+1,0 chữ), trùm dải.
+   Nhiễu cảnh đo thật (lệch tâm ≥ 40 px, rộng dư ≥ 1,2 chữ, không phải chữ Hán) không bị đụng. Cứu "是", "你".
+2. **Bước lấy mẫu thật** (`measure_sample_step`). Cấu hình 0,03 s nhưng phim 25 fps chỉ có khung mỗi 0,04 s: luật
+   "câu lặp" chia khoảng hở cho 0,03 nên 2 khung hụt bị đếm thành 3 khung trống. Nay đo trung vị khoảng cách khung
+   (≥ 20 khoảng); lớn hơn cấu hình > 15 % thì dựng bằng bước đo được.
+3. **Ghép mảnh OCR hụt** (`post_merge_duplicates`). Mảnh cùng chữ, hiện < 0,30 s, cách câu chính < 3 khung trống
+   (tính từ khung có chữ cuối cùng) được ghép thay vì bị xoá như "khung chớp"; mốc cuối lấy theo khung có chữ thật
+   cuối cùng, không theo mốc đã đệm. Sửa "切", "你" kết thúc sớm.
+4. **Không nới mốc câu bằng khung nhiễu** (`extend_group_timing_from_soft_drops`). Khung bị loại mềm mà chữ không
+   chung ký tự nào với câu ("N", "V", "11!", "J0") không còn kéo mốc đầu / cuối.
+5. **Khung bị bộ lọc lệch dọc loại hẳn được tính là loại mềm** → khung đầu đọc méo nhưng chung chữ với câu ("敬哼"
+   cho "哼") vẫn mở đầu câu.
+
+### Đáp án v3 (3664 câu)
+Soi ảnh thật (dải khung căn theo mốc seraw) 20 mốc lệch một khung: **17 mốc là đáp án v2 sai**, đã sửa; thêm câu
+"诶" 5529,80–5530,16 s đáp án từng bỏ sót (mô hình OCR không đọc được chữ này).
+
+### Số đo (đáp án v3; phát lại 714 → 715)
+| Bộ dữ liệu thô × cấu hình | Khớp chữ | Lệch mốc > 0,1 s | Lệch > 0,03 s |
+|---|---|---|---|
+| Lượt 713, mặc định | **3659 → 3661** | 1 → 0 | **9 → 1** |
+| Lượt 713, giống máy chủ dự án | **3659 → 3661** | 2 → 0 | **13 → 1** |
+| Lượt 711/712, mặc định / giống máy chủ | 3658 (không đổi) | 0 → 0 | 12 → 3 / 14 → 3 |
+| Lượt 710, mặc định / giống máy chủ | 3662 / 3661 (không đổi) | 5 → 5 / 4 → 4 | 14 → 6 / 13 → 5 |
+| Lượt 708, mặc định / giống máy chủ | 3648 (không đổi) | 1 → 1 / 3 → 3 | 17 → 6 / 18 → 7 |
+| Lượt 690, mặc định / giống máy chủ | 3656 (không đổi) | 5 → 4 / 9 → 6 | 21 → 8 / 25 → 10 |
+
+* Lượt 713 còn lại: 2 câu "诶" (giới hạn mô hình), "一天呐" ra "天呐" chỉ khi phát lại (lượt chạy thật đọc đúng nhờ
+  vòng soát), "啊" 2887,44 s lệch đầu một khung chưa phân xử được bằng ảnh.
+* 3 bộ dữ liệu thô khác (36 tệp × 2 bước): 7 tệp-bước đổi, toàn mốc ± một mẫu. Đối chiếu đáp án tập: "这都修仙了"
+  đầu 21,92 → 21,96 (đáp án 21,96), "只待飞升" cuối 52,02 → 51,90 (đáp án 51,88). Bộ bước 0,12 s trọn phim: 10 câu
+  đổi — 3 mốc đầu thôi bám khung nhiễu ("J0", "GC"), 6 mốc cuối lùi một mẫu, "看着我懊恼痛哭" hụt một khung không còn
+  bị tách đôi (đáp án: một câu).
+* Trích xuất thật 12 tập vùng rộng + 8 tập vùng hẹp: SRT **giống hệt** 3.23.714 (0 khác biệt ở cả 20 tập).
+
+### Điểm còn yếu (ghi thẳng)
+* Bộ 690, khoảng gộp 0,1 s: câu "喂" 2614 s bị OCR hụt 4 khung giữa chừng nay ra hai câu "喂" liền nhau (bản trước
+  xoá nửa sau nên câu kết thúc sớm). 4 khung hở giống hệt câu lặp thật, không tách được nếu thiếu bằng chứng điểm ảnh;
+  cấu hình mặc định ra đúng một câu.
+* Cặp câu lặp thật "散了吧" (7 khung + hở 4 khung) ở khoảng gộp mặc định 0,2 s chỉ được giữ riêng nhờ khoảng cách vừa
+  nhỉnh hơn ngưỡng; hành vi này không đổi ở bản này.
+
+### Kiểm thử
+* `test_builder_robustness_v323715.py`: 10 test (8 test đỏ trên mã 3.23.714, 2 test chặn hồi quy) — dải phụ đề, đưa
+  hộp về dải, nhiễu không bị đụng, câu toàn hộp phình, bước đo được, mẫu khung thật của "你" và "切", câu lặp thật có
+  nhiễu ở giữa vẫn hai câu, biên không bám khung nhiễu, biên bám khung đọc méo.
+* Toàn bộ: **8718 đạt, 58 bỏ qua** (thiếu binary Windows / vendor), `compileall` sạch.
+
+## [3.23.714] — 🧾 Tệp seraw tự mô tả lượt chạy; hộp chữ phình không còn cắt mốc câu; khâu dựng dùng đúng bước của lượt chạy
+
+Dữ liệu vào: SRT + seraw của lượt chạy thật bằng bản 3.23.712 trên phim nối 86 tập (208 752 khung, bước 0,03 s).
+
+### Kết quả lượt chạy 3.23.712 so với đáp án
+* Chữ: **3661 / 3663 câu khớp**. Còn "腌攒" (3.23.713 đã phân xử đúng khi trích xuất thật) và "诶" (giới hạn mô hình).
+* Mốc thời gian: soi ảnh thật từng câu lệch > 0,1 s. **8 câu là đáp án sai, ứng dụng đúng** ("喂", "去那站着", "是",
+  "好", "这第二次", "你" 5772 s, "呦", "哟") → lập đáp án v2. Sau đó còn 3 câu lệch thật: "喜" (cuối −0,16 s),
+  "你" 5834 s (đầu +0,20 s), "天驹山" (cuối −0,28 s).
+
+### Gốc lỗi 1 — tệp debug không ghi cấu hình lượt chạy
+* Phát lại seraw bằng cấu hình mặc định KHÔNG ra 3 câu lệch trên. Đã loại bằng số đo: làm tròn mốc / độ tin cậy,
+  cờ nối khung, hash seed, căn lề vùng chữ, dải ranh giới, hậu xử lý ở trình sửa. Dò cấu hình dựng mới ra: máy chạy
+  thật đặt khoảng gộp ≈ 0,1 s (mặc định 0,20) và dung sai căn giữa nhỏ hơn 0,10 — seraw không ghi nên không biết.
+* **seraw nay ghi `meta.run`** (ghi ngay khi OCR xong, kể cả lượt bị huỷ): mã lượt chạy, phiên bản ứng dụng, Python,
+  hệ điều hành, bản đóng gói hay mã nguồn, phiên bản thư viện, lớp bộ giải mã + engine OCR; tên / cỡ / mtime / kích
+  thước / fps / codec của video; vùng chữ kèm căn lề và hướng; toàn bộ cấu hình lấy mẫu, OCR, **dựng phụ đề**; tuỳ
+  chọn lượt chạy; thống kê khung. Khoá API và mọi trường bí mật bị che.
+* **seraw ghi thêm `meta.result`** sau khi dựng: từng câu (mốc, chữ, số khung, cờ nghi) và nhật ký vòng soát (câu
+  nào đọc lại, kết quả: xác nhận / đổi / giữ). Phát lại nay đối chiếu được chính xác với lượt chạy thật.
+* Debug dịch thêm `settings_at_export` (mục dịch, ngữ cảnh video, NLP; khoá bị che). Debug TTS thêm dòng phiên bản.
+* Tệp seraw cũ vẫn đọc được (hai trường mới vắng → `None`).
+
+### Gốc lỗi 2 — hộp chữ phình làm đứt câu khi khoảng gộp nhỏ
+* Ở vài khung, bộ khoanh chữ trả hộp cao / rộng gấp > 1,25 lần hộp của chính chữ đó ở khung kề (99–149 px so với
+  ≈ 73 px). Tâm hộp lệch → khung bị coi là câu khác; khoảng gộp 0,2 s che được, 0,1 s thì không.
+* `tighten_inflated_boxes`: trong một chuỗi khung liền nhau (cách ≤ 0,25 s), mỗi khung đúng một hộp, cùng chữ, độ tin
+  cậy đủ cao, khung có hộp phình > 1,25× nhận hộp gọn nhất của chuỗi. Chạy sau bước gộp bản đọc, không phụ thuộc cài đặt.
+
+### Gốc lỗi 3 — khâu dựng lấy bước lấy mẫu từ Cài đặt thay vì bước của lượt chạy
+* Lượt gọi không qua giao diện (đo A/B nhiều bước, công cụ) dựng bằng bước 0,12 s của Cài đặt trong khi lượt chạy
+  dùng bước khác → kết quả thật khác phát lại (tập 02 "师叔" bị gộp, tập 73 mốc cuối "天驹山"). `_builder_for` nay tạo
+  bộ dựng với đúng bước của yêu cầu. Giao diện không bị ảnh hưởng (tạo use case theo từng lượt).
+
+### Số đo (đáp án v2, 3663 câu)
+| Bộ dữ liệu thô × cấu hình | Khớp chữ 713 → 714 | Lệch mốc > 0,1 s | Lệch > 0,03 s | Câu đổi |
+|---|---|---|---|---|
+| Lượt 711/712, mặc định | 3658 → 3658 | 0 → 0 | 30 → 29 | 1 ("哼") |
+| Lượt 711/712, giống máy chủ dự án | 3658 → 3658 | **2 → 0** | 34 → 31 | 3 ("喜", "哼", "天驹山") |
+| Lượt 710, mặc định / giống máy chủ | 3662 / 3661 (không đổi) | 5 → 5 / 4 → 4 | 30 → 29 / 29 → 28 | 1 ("美") |
+| Lượt 708, mặc định / giống máy chủ | 3648 (không đổi) | 2 → 1 / 4 → 3 | 29 → 26 / 30 → 27 | 3 / 4 |
+| Lượt 690, mặc định / giống máy chủ | 3656 (không đổi) | 6 → 5 / 10 → 9 | 14 → 13 / 18 → 17 | 1 / 2 |
+
+* Mọi câu đổi đều tiến về đáp án; không câu nào đổi chữ, không câu nào xấu đi. (Phát lại không có vòng soát nên số
+  khớp chữ thấp hơn lượt chạy thật.)
+* 3 bộ dữ liệu thô khác (36 tệp, 2 bước lấy mẫu): **0 khác biệt** so với 3.23.713.
+* Trích xuất thật có vòng soát: 12 tập vùng chữ rộng **554 / 554**, 8 tập vùng hẹp **375 / 375**, 0 câu lệch mốc lớn;
+  20 / 20 tệp seraw có đủ `run` + `result`; mốc lượt chạy thật trùng phát lại.
+* Chưa xác nhận: "你" 5834 s (đầu +0,20 s ở lượt chạy thật) — hộp ở đó phình nên nhiều khả năng đã được sửa, nhưng
+  cấu hình dò ngược chưa tái hiện được đúng câu này; cần lượt chạy 3.23.714 (seraw tự ghi cấu hình) để chốt.
+
+### Test
+* `test_run_provenance_v323714.py` (11): thu gọn hộp phình theo chiều cao / chiều rộng, không lan qua chữ khác hay
+  khoảng trống; câu trọn vẹn với khoảng gộp 0,1 s (thất bại trên mã cũ); che bí mật; nội dung `run` / `result`; đầu
+  vào hỏng không làm hỏng lượt chạy; đọc tệp cũ; bộ dựng dùng bước của lượt chạy; cài đặt trong debug dịch.
+* Cài `pedalboard` vào môi trường test: 3 tệp test trước bị bỏ qua nay chạy đạt.
+* Toàn bộ: **8705 đạt, 0 lỗi**; `compileall` sạch.
+
+## [3.23.713] — 🗳️ Hai bản đọc tranh chấp được phân xử bằng đọc lại nhiều khung; đo thật tiền xử lý ảnh
+
+Mục tiêu: xử lý nốt các câu còn lệch đáp án sau 3.23.712 trên lượt chạy vùng chữ rộng (model small, làm nét + tăng
+tương phản) và chứng minh phần còn lại là giới hạn của mô hình OCR.
+
+### Đo tiền xử lý ảnh (915 khung thật có đáp án, vùng chữ 0,774,720,136, model small)
+| Cấu hình | Khung đọc đúng | "一" đầu câu đọc được |
+|---|---|---|
+| Ảnh gốc (không tiền xử lý) | **909** | 34 / 35 |
+| Viền trắng 8 px | 902 | — |
+| Viền + làm nét | 903 | — |
+| Viền + tăng tương phản 1,2 | 897 | 28 / 35 |
+| Cấu hình lượt chạy 3.23.711 (viền + nét + tương phản) | 896 | — |
+| Viền 16 px / unclip 2,0 / box 0,4 | 904 / 901 / 899 | — |
+
+* Ảnh gốc đọc đúng nhiều nhất; tăng tương phản làm rơi "一" đầu câu ở 7 / 35 khung. Gợi ý trong giao diện
+  (`tip_preprocess_recommended`) ghi rõ số đo này. Mặc định của ứng dụng không đổi.
+* Bỏ phiếu nhiều khung bằng cấu hình ảnh gốc phân xử đúng mọi câu tranh chấp của lượt chạy: "腌臜" 12 / 17 khung,
+  "癞" 15 / 16, "吗" 12 / 12, "狠" 17 / 24, "白日" 16 / 16, "清清白白" 20 / 21.
+
+### Phân xử hai bản đọc tranh chấp (vòng soát câu nghi)
+* Câu có hai bản đọc cùng số chữ trên CÙNG điểm ảnh nay mang ghi chú riêng `reads_disagree` (trước dùng chung
+  `restored_char`), hiện trong bộ lọc "Nghi ngờ OCR" với lý do "hai bản đọc khác nhau".
+* Vòng soát đọc lại 12 khung trải đều trong câu bằng ảnh gốc rồi bỏ phiếu (`accept_disputed_reread`): chỉ nhận bản
+  đọc khác câu hiện tại ≤ 2 chữ, cùng số chữ, có ≥ 3 phiếu, ≥ 50 % số khung đọc được và hơn bản nhì ≥ 2 phiếu. Bản
+  đọc lại trùng câu hiện tại → gỡ cờ. Khi người dùng đã chọn ảnh gốc, vòng soát vẫn chạy cho riêng loại câu này.
+* **Lỗi phát hiện khi chạy thật tập 47:** "做这等腌攒之事" đọc 3 lần rồi "腌臜" 1 lần — đổi MỘT chiều nên không được
+  gộp (đúng, để giữ "任务一" → "任务二") nhưng cũng không được gắn cờ → câu sai lọt. Nay chuỗi một chiều trên cùng
+  điểm ảnh vẫn không gộp nhưng **gắn cờ cả hai bản** để vòng soát phân xử. Trên phim nối 86 tập: 23 / 3662 câu mang cờ.
+
+### Chứng minh giới hạn mô hình
+* "诶" (5660 s): bộ khoanh chữ chỉ thấy ở ngưỡng 0,1, bộ nhận dạng trả rỗng với cả model small lẫn medium → giới hạn
+  của mô hình OCR.
+* Quét các chuỗi khung có chữ trắng mà OCR không đọc được: 2007 chuỗi ≥ 0,3 s, chỉ **1** là phụ đề thật (chính câu
+  "诶") — không còn câu nào bị bỏ sót do ứng dụng.
+
+### Số đo
+* Trích xuất thật có vòng soát, 12 tập vùng chữ rộng (cấu hình lượt chạy 3.23.711): **554 / 554 câu khớp**
+  (3.23.712: 553, sai "腌攒"); vòng soát xác nhận 7 câu tranh chấp, sửa "千什么去了" → "干什么去了" và "腌攒" → "腌臜".
+* Trích xuất thật 8 tập vùng chữ hẹp: **375 / 375** (vòng soát thêm "一" cho "一天呐", "一百道雷劫一起劈下来").
+* Phát lại 4 bộ dữ liệu thô trọn phim (không OCR lại, không vòng soát): 3658 / 3662 / 3656 / 3648 câu khớp — SRT
+  trùng từng byte với 3.23.712; 3 bộ dữ liệu thô khác (681, 619, 680): 0 khác biệt.
+* Test mới `test_disputed_reread_v323713.py` (13 ca: bỏ phiếu, bản đọc rác, bằng chứng yếu, lý do nghi ngờ, chuỗi
+  giao diện, cờ riêng, chuỗi một chiều — thất bại trên mã cũ). Toàn bộ test: 8693 đạt, 61 bỏ qua, 0 lỗi; `compileall` sạch.
+
+## [3.23.712] — 📐 Hình học hộp chữ: hết rác "000" lệch tâm, hết đọc lẫn chữ trên cùng một hình, hết mất câu vì hộp phình
+
+Đối chiếu lượt chạy thật của chủ dự án bằng bản 3.23.711 (phim nối 86 tập; vùng chữ rộng cả khung 720 px, model
+small; 3663 câu đáp án): **3656 câu khớp**, 5 sai, 2 sót, 1 rác (dòng 3315 "000"), 1 câu thừa, 2 câu lệch mốc.
+
+### Vì sao dòng 3315 "000" còn
+* Luật của 3.23.710 loại câu không chữ Hán có hộp thấp hơn 0,70 lần chữ phụ đề (khi đó "000" cao 39 / 61 px = 0,64).
+  Lượt chạy này dùng vùng chữ và model khác nên hộp của nó cao 54 / 68 px = **0,79 lần → lọt**. Luật một chiều (chỉ
+  cỡ chữ) không đủ.
+* Đo hình học 3648 câu của lượt chạy: câu ĐÚNG lệch tâm nhiều nhất 0,34 lần chiều cao chữ ("来人"), phân vị 99,9 %
+  là 0,12 lần; "000" lệch **0,84 lần** (57 px). `drop_small_non_han_events` thêm luật **lệch tâm > 0,50 lần chiều cao
+  chữ** cho câu không chữ Hán của phim phụ đề căn giữa (vẫn không áp cho phim song ngữ).
+
+### Đọc lẫn chữ trên cùng một hình (bằng chứng điểm ảnh)
+* "这不是癞蛤蟆吗" ↔ "痴", "下山探风吗" ↔ "鸣", "把你狠狠踩在脚下" ↔ "狼", "做这等腌臜之事" ↔ "攒": các lần đọc lại của
+  CÙNG điểm ảnh xen kẽ hai chữ — bản 3.23.711 chỉ gộp các cặp có trong bảng chữ dễ lẫn nên để lọt (4 câu sai, 1 câu
+  thừa). Nay trong một chuỗi cùng điểm ảnh, hai bản đọc cùng số chữ khác ≤ 2 vị trí và **xen kẽ nhau (A → B → A)** là
+  một câu; chọn theo ngữ liệu của phim → độ tin cậy cao nhất khi chênh ≥ 0,02 ("吗" 1,00 / "鸣" 0,96) → số khung.
+  Chuỗi một chiều A → B (có thể là hai câu thật khác một chữ, vd "任务一" → "任务二") vẫn để nguyên.
+
+### Rơi "一" giữa câu
+* "其实我一直都在" (2119 s): 8 khung đọc đủ, 20 khung đọc thành hai hộp "其实我" + "直都在". Hai bản cùng tâm nên luật
+  "đúng tâm" của 3.23.711 không phân xử được và bản 6 chữ thắng theo số khung. Thêm **độ khớp bề rộng với số chữ**
+  (bước chữ đo từ phim, 55,3 px): hai hộp trải đúng 7 chữ nhưng chỉ đọc ra 6 → bản đủ chữ thắng.
+
+### Hộp chữ phình
+* "打" (3087 s) đọc đúng 13 khung nhưng 10 khung có hộp cao 143 px thay vì 80 (dính nền sáng) → bị bộ lọc hình dạng
+  loại → **mất câu**; "不" kết thúc sớm 0,44 s, "爽" bắt đầu trễ 0,48 s cùng lý do. Trong chuỗi cùng điểm ảnh, khung
+  cùng chữ mà hộp cao hơn 1,25 lần hộp gọn nhất nhận hộp gọn.
+
+### Chống nhân rác
+* Rà từng khung bị sửa (838 khung trên lượt chạy này): rác tin cậy cao đọc được một lần ("à", "4", "R"… ở góc khung)
+  từng được lấp sang các khung rỗng cùng chuỗi. Nay lần đọc rỗng / hỏng chỉ nhận chữ của lần đọc có hộp nằm **đúng
+  chỗ, đúng cỡ phụ đề** (tâm lệch ≤ 0,5 lần chiều cao chữ, cao 0,6–1,5 lần).
+
+### Số đo
+* Phát lại trên đúng dữ liệu OCR thô của lượt chạy 3.23.711 (không OCR lại): khớp **3656 → 3658**, rác 1 → 0, câu
+  thừa 1 → 0, sót "打" được khôi phục, câu lệch mốc 2 → 0. Bốn câu chưa khớp trong bản phát lại: ba câu thiếu "一"
+  đầu câu (đã gắn cờ; lúc trích xuất thật vòng tự soát đọc lại và sửa — đúng như trong SRT của chủ dự án) và
+  "腌臜" → "腌攒" (giới hạn mô hình, nay là MỘT câu có cờ nghi ngờ thay vì hai câu).
+* **Trích xuất thật** (CPU, bước 0,03 s) trên 8 tập chứa mọi câu lỗi của lượt chạy này (tập 15, 19, 22, 24, 47, 53,
+  67, 77 — 352 câu đáp án): **351 khớp, 0 sót, 0 thừa, 0 gộp**; câu còn lại là "腌臜" → "腌攒". Một câu "lệch mốc" duy
+  nhất ("喂", 2614 s) đã kiểm trên khung hình: lõi chữ còn trên màn hình tới 2615,08 s — ứng dụng đúng, đáp án ghi sớm.
+* Không hồi quy: dữ liệu thô 3.23.710 giữ 3662 khớp, 3.23.708 giữ 3648, 3.23.690 giữ 3656; 18 bộ dữ liệu thô khác × 2
+  bước lấy mẫu (9851 câu) không đổi câu nào.
+* Toàn bộ test: 8680 đạt, 61 bỏ qua (thiếu tệp mẫu / binary native), 0 lỗi; `compileall` sạch.
+
+### Giới hạn còn lại (do mô hình OCR)
+* "诶" (5660 s) không khoanh được; "臜" (chữ hiếm) bị đọc thành "攒" ở 25/36 khung với độ tin cậy cao hơn.
+
+### Test
+`test_read_fusion_v323712.py` (9): "一" giữa câu theo bề rộng, ba cặp đọc xen kẽ thật, chuỗi một chiều không gộp, hộp
+phình, rác tin cậy cao không bị nhân ra, số đo của phim, "000" lệch tâm bị loại còn "OK" đúng tâm / "来人" / chữ Hán
+lệch xa được giữ.
+
+## [3.23.711] — 🧩 Gộp các lần đọc của cùng một câu: hết tách câu vì "一" / 白–自, hết cắt mốc vì lần đọc rỗng
+
+Đối chiếu lượt chạy thật của chủ dự án bằng bản 3.23.710 (phim nối 86 tập, 3663 câu đáp án): **3660 câu khớp**
+(bản 3.23.708: 3651), không còn rác, không còn câu gộp. Ba câu lệch và năm câu lệch mốc còn lại có chung một gốc.
+
+### Gốc lỗi — mỗi lần đọc khác đi bị coi là một câu khác
+Từ 3.23.710 mỗi câu được OCR vài lần (khung xác nhận + đọc lại định kỳ). Các lần đọc của CÙNG một hình không phải
+lúc nào cũng giống nhau, và khâu dựng xử lý từng lần đọc như một câu:
+* "一晚上" (743 s) đọc lần lượt "一晚上" / "晚上" / "一晚上" → ra **ba câu**;
+* "你还想白日宣淫不成" (6052 s) đọc "白" 14 khung rồi "自" 22 khung → ra **hai câu**; "清清白白" đọc xen kẽ
+  白/自/白/自 (độ tin cậy của bản sai còn cao hơn: 0,96 so với 0,95);
+* lần đọc lại trả **rỗng** dù chữ còn trên màn hình → "你" (1379 s: đọc "你", rỗng, "你") mất hẳn; "你" (6137 s) kết
+  thúc sớm 0,68 s; "哎" sớm 0,36 s; "啊" bắt đầu trễ 0,52 s.
+
+### Sửa
+* **Bằng chứng điểm ảnh** — `FrameDeduper.continues_text` → `SampledFrame.continues_text` →
+  `OcrFrameResult.continues_previous` (ghi vào dữ liệu thô, khoá `k`): bộ lọc khung xét "chữ có đổi không" TRƯỚC
+  lịch đọc lại, nên biết lần đọc lại nào là của cùng một hình. `read_fusion.fuse_same_pixel_reads`: trong một chuỗi
+  khung cùng điểm ảnh, lần đọc rỗng hoặc tin cậy < 0,80 nhận chữ của lần đọc tốt, lần đọc thiếu "一" nhận bản đủ.
+  Chuỗi có các bản đọc tin cậy cao khác nhau kiểu khác thì để nguyên.
+* **Hình học hộp chữ cho chữ "一"** (chỉ phụ đề ngang căn giữa) — hai đoạn liền nhau (không khung trống xen giữa) chỉ hơn kém chữ "一" là một
+  câu; bản đúng là bản có hộp chữ **nằm đúng tâm phụ đề** của phim (lấy khung đúng tâm nhất của mỗi bản): rơi "一"
+  làm hộp lệch nửa chữ ("晚上" lệch 26 px, "一晚上" 0 px), còn đọc THỪA "一" do dính vật trong cảnh làm hộp phình một
+  bên (tập 08: 2/32 khung "一小小教训你们一下吧", lệch 18 px — giữ bản không có "一").
+* **Cặp chữ dễ lẫn hình** (白–自, 干–千, 己–已, 未–末… `CONFUSABLE_PAIRS`) — hai đoạn liền nhau cùng số chữ chỉ khác
+  nhau ở các cặp này là một câu. Độ tin cậy không phân xử được, nên chọn theo **ngữ liệu của chính phim**: cụm chữ
+  dài nhất quanh chỗ khác nhau mà một câu khác cũng có ("白日宣淫" thắng "想自"), rồi số câu khác có cặp chữ liền kề
+  ("清白"), rồi số khung. Câu được chọn mang cờ "Nghi ngờ OCR" để soát.
+* Chữ đổi đúng vào khung tới lịch đọc lại nay được ghi là "chữ đổi" (trước đây ghi là đọc định kỳ, không hẹn khung
+  xác nhận cho câu mới).
+
+### Số đo
+* Phát lại trên đúng dữ liệu OCR thô của lượt chạy 3.23.710 (không OCR lại): khớp **3660 → 3662**, câu thừa 3 → 0;
+  chỉ còn sót "诶". Bốn câu lệch mốc cần cờ điểm ảnh nên chỉ sửa được khi trích xuất lại.
+* Dữ liệu thô bản 3.23.708 và 3.23.690: giữ nguyên 3648 và 3656 câu khớp. 18 bộ dữ liệu thô khác × 2 bước lấy mẫu
+  (9851 câu): đổi đúng một câu, "他到底要千什么" → "他到底要干什么" (đúng).
+* Các phép thay chữ dễ lẫn trên ba bộ dữ liệu trọn phim: 白日宣淫, 清清白白, 明白了吧, 干什么 ×3, 白搭 — đều ra chữ đúng.
+* **Trích xuất thật** (CPU, bước 0,03 s) trên 17 tập chứa mọi câu lỗi của hai lượt chạy 708 và 710 (762 câu đáp
+  án): 761 khớp, 0 sai / gộp / thừa, sót "诶"; lượt đó lộ thêm ca "啊" 1,00 → "国sd" 0,51 → "啊" 1,00 trên cùng điểm
+  ảnh (mất 0,9 s đầu câu) → lần đọc tin cậy < 0,80 được coi như lần đọc hỏng. Chạy lại 6 tập (04, 09, 18, 42, 61,
+  77 — 330 câu) bằng mã cuối: **330/330 khớp, 0 câu lệch mốc quá 0,2 s đầu / 0,3 s cuối**; dựng lại 17 tập từ dữ
+  liệu thô có cờ điểm ảnh: 0 câu lệch mốc.
+* Toàn bộ test: 8672 đạt, 61 bỏ qua (thiếu tệp mẫu / binary native), 0 lỗi; `compileall` sạch.
+
+### Giới hạn còn lại (do mô hình OCR)
+* "诶" (5660 s): mô hình phát hiện chữ không khoanh được ở mọi cấu hình đã thử.
+* Cặp chữ dễ lẫn mà phim không có câu nào khác làm chứng thì chọn theo số khung và gắn cờ để soát tay.
+
+### Lưu ý khi nâng cấp
+* Dữ liệu OCR thô cũ không có cờ điểm ảnh: dựng lại vẫn được hưởng hai luật "一" và cặp chữ dễ lẫn; phần lấp lần đọc
+  rỗng cần trích xuất lại bằng bản này.
+
+### Test
+`test_read_fusion_v323711.py` (15): ba lần đọc "你"/rỗng/"你", chuỗi bị khung trống cắt, rác tin cậy thấp không bị
+nhân ra, 白/自 theo ngữ liệu phim, đọc xen kẽ, "一" thừa (tập 08) và "一" thật thiểu số, hai câu thường liền nhau
+không bị đụng, dựng trọn vẹn ra một câu. `test_gate_continues_v323711.py` (4): cờ cùng điểm ảnh của bộ lọc khung,
+chữ đổi trúng lịch đọc lại, cờ còn nguyên qua tệp dữ liệu thô.
+
+## [3.23.710] — 🔎 Dựng phụ đề từ OCR: hết sót câu một chữ, hết rác "000", toạ độ hộp chữ về đúng ảnh gốc
+
+Đối chiếu lượt chạy thật của chủ dự án (phim nối 86 tập, bản 3.23.708, 3663 câu đáp án đã kiểm bằng ảnh thật):
+3651 câu khớp, **3 sai, 7 sót, 2 gộp, 1 rác** (dòng 3308 "000"). Lần theo từng câu tới tận khung hình và tìm ra ba gốc lỗi.
+
+### Gốc lỗi 1 — mỗi câu chỉ được OCR ở khung ĐẦU TIÊN (có từ 3.23.697)
+* Bộ lọc khung chữ trắng so "lõi sáng" nên câu đứng yên chỉ đi OCR đúng một lần, lúc chữ vừa hiện; mọi khung sau chép
+  lại kết quả đó. Khung đầu đọc hỏng (chữ đang hiện dần) thì **cả câu mất**, và việc bỏ phiếu qua nhiều khung không
+  còn bằng chứng nào. Bản 3.23.690 sót 2 câu một chữ, bản 3.23.708 sót 7; bốn câu "是", "你", "哎", "好" có mọi khung
+  rỗng dù dữ liệu bản 3.23.690 đọc được với độ tin cậy 1,00. Tái hiện trên CPU ở tập 74 (mất "好").
+* Sửa (`frame_dedupe.py`): sau mỗi lần chữ đổi, OCR thêm **một khung xác nhận** sau 0,08 s; khi chữ còn hiện thì đọc
+  lại định kỳ mỗi 0,40 s. Tỉ lệ khung đi OCR (7 tập, bước 0,03 s): 17,9 % → 23,5 %.
+
+### Gốc lỗi 2 — toạ độ hộp chữ bị co khi tiền xử lý có "thêm viền" (có từ khi có tuỳ chọn viền, mặc định BẬT)
+* `PaddleOcrAdapter._prepare_image` tính tỉ lệ thu-phóng bằng (chiều cao **đã cộng 2 viền**) / (chiều cao gốc): vùng chữ
+  cao 136 px, viền 8 px cho tỉ lệ 1,118 dù ảnh không hề phóng → mọi hộp chữ trả về bị co 0,895 lần. Đo trên phim mẫu:
+  tâm phụ đề thật là 360 px (325 px trong vùng chữ), dữ liệu thô ghi 290 px.
+* Hệ quả: bộ lọc căn giữa so với tâm vùng chữ (322 px) thấy mọi câu "lệch 32 px". Câu dài còn trong dung sai; câu một
+  chữ tin cậy thấp (dung sai 26 px) bị **loại oan** — "哼" (0,55, 11 khung) ở 968 s; câu "哦" hộp méo ở 4045 s bị bỏ
+  nên câu trước nó kéo dài đè lên. Khung chữ vẽ đè trên video và vùng chữ tự dò cũng lệch theo.
+* Sửa: tỉ lệ tính trên phần ảnh, không gồm viền (đường GPU `_reverse_vram_geometry` vốn đã đúng). Điểm dừng OCR dở
+  dang của bản cũ không chạy tiếp được (`CHECKPOINT_VERSION = 2`) để không trộn hai hệ toạ độ trong một lượt.
+* Chống tái diễn ở tầng dựng (`measure_subtitle_center`): phép kiểm căn giữa và bộ khôi phục ký tự dùng **tâm phụ đề
+  đo từ chính phim** (≥ 200 hộp ≥ 3 chữ tin cậy ≥ 0,90, 90 % nằm trong nửa chiều cao chữ quanh tâm) thay cho tâm vùng
+  chữ — vùng chữ vẽ tay lệch, hay dữ liệu thô của bản cũ (toạ độ co), đều dựng lại đúng mà không phải OCR lại.
+
+### Gốc lỗi 3 — rác tin cậy cao và hộp rìa
+* "000" (dòng 3308): 6 khung, tin cậy 0,98 — không bộ lọc nào dựa trên độ tin cậy bắt được. Hộp của nó cao 39 px trong
+  khi chữ phụ đề cao 61 px (0,64 lần; câu chữ Hán thấp nhất phim là 0,72 lần). `drop_small_non_han_events`: bỏ câu
+  **không có chữ Hán** mà chữ nhỏ hơn 0,70 lần cỡ chữ phụ đề; không áp cho phim song ngữ (câu không chữ Hán > 2 %).
+* "元婴大圆满小川": hộp vật trong cảnh "小川" (0,49) đứng bên phải câu thật. `_strip_weak_edge_boxes`: bỏ hộp RÌA tin cậy
+  < 0,60 khi phần còn lại đúng tâm phụ đề còn cả dòng thì lệch quá nửa chiều cao chữ.
+* Câu một chữ Hán đứng đúng chỗ phụ đề (đúng tâm, đúng cỡ chữ, ≥ 5 khung) được giữ từ độ tin cậy 0,50.
+* Vòng tự soát nhận thêm ca thiếu **hai** chữ "一" ở hai chỗ khác nhau ("百道雷劫起劈下来" → "一百道雷劫一起劈下来");
+  "一一" liền nhau vẫn bị bỏ.
+
+### Video ngắn cũng được tự soát
+* Vòng tự soát (3.23.708) cần mỗi số chữ có ≥ 5 câu để ước lượng cỡ chữ → một tập ~30 câu không bao giờ gắn được cờ,
+  câu thiếu "一" đầu câu không được đọc lại (tập 77 "眼就察觉到了吗", tập 42 "百道雷劫一起劈下来"). Nay video từ 15 câu
+  đo được và ≥ 4 cỡ số chữ khớp đường thẳng bằng Theil–Sen (trung vị độ dốc mọi cặp câu). Trên 12 tập (470 câu): gắn
+  cờ đúng 2 câu, cả 2 là câu sai thật, 0 cờ oan; phim dài giữ nguyên cách khớp cũ.
+
+### Số đo
+* Phát lại trên đúng dữ liệu OCR thô của lượt chạy 3.23.708 (không OCR lại): khớp **3644 → 3648**, gộp 2 → 0, rác
+  1 → 0, sót 6 → 5; 10 câu "sai" còn lại đều thiếu chữ "一" và đã mang cờ nghi ngờ (lúc trích xuất thật vòng tự soát
+  đọc lại và sửa). Dữ liệu bản 3.23.690: giữ nguyên 3656 khớp.
+* 18 bộ dữ liệu thô khác × 2 bước lấy mẫu (9851 câu): kết quả dựng **không đổi một câu nào**.
+* **Trích xuất thật** (CPU, cùng cấu hình tiền xử lý của chủ dự án, bước 0,03 s) trên 12 tập chứa mọi câu lỗi của
+  lượt chạy 3.23.708 (tập 06, 12, 24, 25, 36, 37, 42, 55, 57, 59, 74, 77 — 471 câu đáp án): **470 khớp, 0 sai, 0 gộp,
+  0 thừa, 1 sót** ("诶"). Các câu "是", "你", "哎", "好", "哼" ×2, "哦", "元婴大圆满", "一百雷劫太重了",
+  "一百道雷劫一起劈下来", "一眼就察觉到了吗" đều ra đúng.
+* Toàn bộ test: 8652 đạt, 61 bỏ qua (thiếu tệp mẫu / binary native), 0 lỗi; `compileall` sạch.
+
+### Giới hạn còn lại (do mô hình OCR)
+* "诶" (một chữ, 5660 s): mô hình phát hiện chữ không khoanh được ở bất kỳ cấu hình nào đã thử.
+* Chữ "一" đầu câu: nét ngang mảnh hay bị mô hình phát hiện bỏ ngoài hộp. Ứng dụng tự gắn cờ bằng hình học rồi đọc lại
+  trên ảnh gốc; câu nào đọc lại vẫn không ra "一" thì giữ nguyên chữ và **giữ cờ "Nghi ngờ OCR"** để soát tay.
+
+### Lưu ý khi nâng cấp
+* Trích xuất mới chậm hơn một chút ở khâu OCR (thêm ~1/3 số khung đi OCR) — đổi lấy việc mỗi câu có vài lần đọc độc lập.
+* Dữ liệu OCR thô cũ vẫn dựng lại được (tâm đo từ phim); muốn khung chữ vẽ đè đúng vị trí thì trích xuất lại.
+
+### Test
+`test_frame_gate_confirm_v323710.py` (4), `test_polygon_scale_back_v323710.py` (5; trên mã cũ lệch 20–34 px),
+`test_ocr_build_v323710.py` (18): tâm đo từ phim, câu "哼" thật, hộp rìa "小川", "000", phim song ngữ, phụ đề dọc, hai chữ
+"一". Cập nhật kỳ vọng lịch OCR ở `test_frame_dedupe_v323644.py`, `test_white_core_gate_v323697.py`.
+
+## [3.23.709] — 🪟 Hết cửa sổ cmd chớp lên sau khi mở ứng dụng
+
+### Nguyên nhân (đã ghi vết khởi động thật)
+* Quét AST toàn bộ mã ứng dụng: **0** lời gọi tiến trình con thiếu cờ ẩn cửa sổ; bản đóng gói đã đặt `console=False`.
+* Ghi vết mọi tiến trình con và mọi cửa sổ được tạo trong 12 giây đầu: chỉ có **một** cửa sổ Qt (cửa sổ chính), và
+  khoảng 3 giây sau khi nó hiện thì việc nạp nền PaddleOCR làm chính thư viện `paddle` chạy lệnh dò `nvcc` và `ccache`
+  (`paddle/utils/cpp_extension/extension_utils.py`, `subprocess.check_output([which_cmd, ...])` — trên Windows là
+  `where nvcc`, `where ccache`) **không ẩn cửa sổ**. Ứng dụng GUI không có console nên Windows mở một cửa sổ cmd cho
+  mỗi lệnh rồi đóng ngay.
+
+### Sửa
+* `hidden_process.install_hidden_console_default()`, gọi ở dòng đầu của `main()` trước mọi import thư viện: đặt
+  `CREATE_NO_WINDOW` làm mặc định cho **mọi** tiến trình con của tiến trình ứng dụng (bọc `subprocess.Popen.__init__`,
+  nơi `run` / `check_output` / `os.popen` / asyncio đều đi qua; `os.system` đổi sang `subprocess.call`). Lời gọi tự
+  chọn `creationflags` hoặc `startupinfo` được giữ nguyên.
+* Ba worker chạy tiến trình riêng (Edge TTS, VieNeu GPU, WhisperX) có cùng lớp chắn ở đầu `main()`: worker không có
+  console, nên lệnh con của chúng (ffmpeg, lệnh dò của torch…) cũng từng có thể bật cửa sổ.
+
+### Giới hạn
+* Môi trường kiểm thử là Linux nên **chưa nhìn thấy trực tiếp** trên Windows; kết luận dựa trên ghi vết lời gọi và mã
+  của `paddle`. Nếu sau bản này vẫn còn một cửa sổ nhỏ chớp lên, đó là nguồn khác (ghi vết chỉ thấy một cửa sổ Qt lúc
+  khởi động) — cần ảnh chụp hoặc mô tả thời điểm để tìm tiếp.
+
+### Test
+`test_hidden_console_default_v323709.py` (7 test): chỉ thêm cờ khi nơi gọi không tự chọn; lời gọi kiểu `paddle` được
+ẩn khi giả lập Windows; không đụng gì ngoài Windows; `main.py` cài trước các import nặng; cả ba worker đều gọi lớp chắn.
+
+## [3.23.708] — 🔁 Vòng tự soát OCR: tự tìm câu đọc thiếu / thừa chữ bằng hình học hộp chữ rồi OCR lại đúng các câu đó
+
+Phát triển từ ý tưởng "tự cải thiện nhắm vào mẫu model làm sai" (OXR): ứng dụng tự tìm câu OCR nhiều khả năng đọc sai,
+đọc lại riêng các câu đó bằng cấu hình khác, và chỉ nhận kết quả khi nó giải thích đúng dấu hiệu.
+
+### Đo trước khi làm
+* PP-OCRv6 trả độ tin cậy ~1,0 cả cho câu đọc sót chữ, nên không dùng độ tin cậy để tìm được. Tín hiệu dùng được là
+  **hình học**: phụ đề một cỡ chữ, căn giữa, nên bề rộng hộp chữ tuyến tính theo số chữ và tâm hộp trùng tâm phụ đề.
+* Lượt chạy thật phim nối 86 tập (3455 câu một dòng toàn chữ Hán, đáp án đã kiểm bằng ảnh): bề rộng ≈ 49,8 × số chữ
+  + 17,4 px.
+  | | Lệch bề rộng (tính theo chữ) | Lệch tâm (tính theo chữ) |
+  |---|---|---|
+  | Câu ĐÚNG, lệch nhiều nhất | +0,52 / −0,63 | 0,34 |
+  | "其实我直都在", "是你师伯唯的弟子" (sót "一" ở giữa) | +1,18, +1,09 | ~0 |
+  | "成功解除余一部分" (thừa "余") | −0,98 | ~0 |
+  | "个万年炼气的人", "任务" (sót "一" ở mép) | ~0 | +0,46, −0,49 |
+* Với ngưỡng +0,75 / −0,80 chữ và lệch tâm 0,40 chữ: **bắt đủ 5 câu sai còn lại, không gắn nhầm câu đúng nào**. Ở bước
+  lấy mẫu 0,12 s bắt 10 câu, cả 10 đều sai thật. Trên dữ liệu không tiền xử lý: 12 tập không gắn cờ câu nào; bản phim
+  trọn bộ gắn 1/3660 câu (gắn nhầm — vòng đọc lại bên dưới không đổi câu đó).
+
+### Thay đổi
+1. **Bộ dò hình học** (`subtitle_pipeline/geometry_check.py`, chạy trong khâu dựng phụ đề): ước lượng cỡ chữ và tâm phụ
+   đề từ chính phim đó (cần ≥ 30 câu), rồi gắn `ocr_notes` `missing_char` / `extra_char`. Phụ đề không căn giữa thì bỏ
+   phép kiểm lệch tâm; phụ đề dọc thì bỏ qua.
+2. **Vòng tự OCR lại** (`ExtractSubtitlesUseCase._verify_suspect_lines`, cuối lượt trích xuất): với mỗi câu bị gắn cờ,
+   giải mã 5 khung trong khoảng câu đó và OCR lại bằng **ảnh gốc, tắt mọi tiền xử lý**. Chỉ thay chữ khi:
+   * `missing_char`: bản đọc lại = chữ cũ thêm đúng **một** chữ Hán;
+   * `extra_char`: bản đọc lại = chữ cũ bớt đúng một chữ Hán;
+   * ít nhất 2 khung đồng thuận và đó là bản nhiều nhất.
+
+   Mọi trường hợp khác (đọc lại vẫn như cũ, đổi chữ khác, câu khác) giữ nguyên câu và giữ cờ. Câu được sửa mang cờ
+   "chữ được khôi phục" để vẫn hiện trong danh sách soát. Cấu hình vốn đã không tiền xử lý thì không có "ý kiến thứ
+   hai" nên vòng này không chạy. Bước này hỏng (lỗi giải mã/OCR) thì giữ nguyên kết quả đã dựng.
+3. **Trang Chỉnh sửa → bộ lọc "Nghi ngờ OCR"** có thêm hai lý do: "nghi thiếu một chữ (hộp chữ rộng/lệch)" và "nghi
+   thừa một chữ (hộp chữ hẹp)" — F8 nhảy tới như các lý do khác.
+
+### Kiểm chứng bằng trích xuất thật (OCR chạy thật, cấu hình tiền xử lý của chủ dự án, bước 0,12 s)
+| Tập | Câu bị gắn cờ | Sau vòng tự soát |
+|---|---|---|
+| 14 | 个万年炼气的人 | **一个万年炼气的人** |
+| 15 | 其实我直都在 | **其实我一直都在** |
+| 26 | 是你师伯唯的弟子 | **是你师伯唯一的弟子** |
+| 02 | 任务 | **任务一** |
+
+Mỗi tập chỉ đọc lại đúng 1 câu (4 khung), thêm khoảng 1–2 giây. Tập 02 so đáp án riêng: 143/144 câu đúng.
+Đây chính là 4 câu "không khung nào đọc ra 一" mà bản 3.23.707 không cứu được.
+
+### Giới hạn
+* Vòng tự soát cần video (chạy trong lượt trích xuất); dựng lại phụ đề từ tệp OCR thô thì chỉ gắn cờ, không tự sửa.
+* Chưa kiểm trên GPU / NVDEC của chủ dự án và chưa chạy trọn phim 86 tập (môi trường này chỉ có CPU).
+* Hai câu một chữ ("我", "诶") OCR không phát hiện được vẫn chưa có cách bắt.
+
+### Rà cập nhật thư viện (11/11/2026)
+| Thư viện | Bản ứng dụng dùng | Bản mới nhất | Kết luận |
+|---|---|---|---|
+| PaddleOCR | 3.7.0 (PP-OCRv6) | 3.7.0 | Đã mới nhất. |
+| paddlex | 3.7.2 | 3.7.2 | Đã mới nhất. |
+| google-genai | 2.31 (`>=2.29,<3`) | 3.1.0 | **Giữ `<3`.** Bản 3.0.0 (06/11) đổi API mặc định sang `v1` (bí danh kiểu `gemini-flash-latest` chỉ có ở `v1beta`) và thay `httpx` bằng `httpx2`. Đã ghi lý do vào requirements. |
+| vieneu (SDK) | `>=3.8.3` | 3.8.4 | Tự nhận 3.8.4. So mã: chỉ thêm khoá đa luồng cho GPU và siết nạp mã từ xa, không đổi chất lượng giọng. |
+| edge-tts, PySide6 | 7.3.1, 6.12.0 | như cũ | Đã mới nhất. |
+* **Gemini:** model mới `gemini-4-argon`, `gemini-4-carbon` (đầu ra tối đa 32 768 token) và `gemini-omni-1.2-flash`.
+  Gói miễn phí không có hạn mức cho Gemini 4 (gọi thử: 429) nên chưa đo được; `gemini-3.5-flash-lite` vẫn là lựa chọn
+  của ứng dụng. Trang changelog `ai.google.dev` không truy cập được từ môi trường này (bị chặn mạng).
+* **Cookbook:** 25 commit gần nhất chủ yếu sửa liên kết / chính tả, thêm hướng dẫn Gemini 4 và Omni 1.2; không có
+  thay đổi về thinking, cache, TTS hay structured output cần áp dụng.
+
+### Tìm hiểu jasna (github.com/Kruk2/jasna)
+* Công cụ khôi phục vùng mosaic trong video (dò bằng RF-DETR, khôi phục bằng BasicVSR++ / mô hình khuếch tán), mã AGPL.
+  Chức năng không liên quan tới trích phụ đề, dịch hay lồng tiếng.
+* Kỹ thuật của họ mà ứng dụng **đã có**: giải mã / mã hoá bằng GPU (NVDEC / NVENC), sao chép âm thanh không mã hoá
+  lại, tạm dừng / tiếp tục việc dài.
+* Ý tưởng có thể dùng sau, **chưa làm**: (1) chuẩn bị model tối ưu cho đúng GPU ở lần chạy đầu rồi lưu lại (ứng dụng
+  có tuỳ chọn TensorRT nhưng chưa đo lợi ích trên RTX 3070 Ti); (2) theo dõi một vùng qua nhiều khung và xử lý theo
+  clip — tương ứng với việc bỏ phiếu chữ theo từng câu mà ứng dụng đang làm.
+
+### Test
+`test_geometry_verify_v323708.py` (20 test): các độ lệch thật bị gắn cờ; câu đúng lệch nhiều nhất không bị gắn; phim
+quá ít câu / phụ đề không căn giữa thì không kết luận; luật nhận bản đọc lại (3 ca sửa thật, 10 ca phải từ chối); vòng
+tự soát chỉ đọc lại câu bị gắn cờ, tắt tiền xử lý, giữ nguyên khi không xác nhận được, không chạy khi cấu hình đã là
+ảnh gốc.
+
+## [3.23.707] — 🔎 Dựng phụ đề từ OCR: khôi phục chữ bị rơi ở một phần khung (3651 → 3656 / 3663 câu đúng)
+
+### Đo trước khi sửa (dữ liệu thật của chủ dự án)
+* Phát lại thuật toán dựng phụ đề trên tệp OCR thô lượt chạy thật (phim nối 86 tập, 208 752 khung, bước 0,03 s,
+  PP-OCRv6 small, có bật 4 bước tiền xử lý ảnh), chấm theo đáp án 3663 câu đã kiểm bằng ảnh.
+* Bản 3.23.706: **3651 câu đúng**, 10 sai chữ, 2 sót. Xem dữ liệu thô từng khung của 12 câu đó:
+  | Nhóm | Số câu | Dữ liệu thô |
+  |---|---|---|
+  | Mất "一"/"三" nhưng **một phần khung vẫn đọc đúng** | 4 | "一天都拦不住" 11/45 khung, "一百雷劫太重了" 7/35, "三百道雷劫" 12/28, "一群小可爱" 9/31 |
+  | "一" bị đọc thành dấu gạch | 1 | "-天呐" 8 khung, "天呐" 17 khung |
+  | Mất "一", **không khung nào** đọc ra | 4 | "任务一", "一个万年炼气的人", "其实我一直都在", "是你师伯唯一的弟子" |
+  | Thừa chữ, gần hoà phiếu | 1 | "成功解除余一部分" 14 khung, "成功解除一部分" 13 khung |
+  | Câu một chữ, OCR không phát hiện | 2 | "我", "诶": mọi khung đều trống |
+* **Gốc lỗi của nhóm đầu:** các khung đọc xen kẽ ("天都拦不住" 12 khung, "一天都拦不住" 7, "天都拦不住" 22,
+  "一天都拦不住" 4) bị bộ gom tách thành bốn group thuần nhất. Mỗi group tự bầu nên bộ khôi phục chữ sẵn có không bao
+  giờ thấy bản có "一"; sau đó pass gộp chọn theo số đông.
+
+### Thay đổi (`event_filters.merge_adjacent_duplicates`)
+1. **Khôi phục chữ qua mọi group đã gộp** (`_restore_across_merged`): sau khi gộp xong, chạy lại bộ khôi phục chữ
+   với bằng chứng của tất cả group con. Dùng đúng ngưỡng sẵn có, không đặt luật mới: "一" cần 1 khung tin cậy cao;
+   chữ khác cần ≥ 2 khung và ≥ 20 % số khung.
+2. **"一" bị đọc thành gạch ngang** (`_restore_dash_as_yi`): chỉ sửa khi cả hai dạng cùng có mặt trong một câu — đa số
+   khung không có gạch, và ≥ 3 khung (≥ 15 %) có gạch liền trước chữ Hán. Phim dùng gạch đầu dòng hội thoại ("-你好")
+   thì mọi khung đều có gạch nên không bị đụng. Trên cả 208 752 khung chỉ có 3 câu mang gạch kiểu này, cả 3 đều là "一".
+
+### Kết quả
+| Dữ liệu | 3.23.706 | 3.23.707 |
+|---|---|---|
+| Phim 86 tập, bước 0,03 s (3663 câu) | 3651 đúng | **3656 đúng** |
+| Cùng dữ liệu, bước 0,06 s | 3650 | **3655** |
+| Cùng dữ liệu, bước 0,12 s | 3639 | 3639 |
+| Tập 1–5 có đáp án riêng (429 câu), bước 0,04 / 0,12 s | 428 / 426 | 428 / 426 |
+| 26 bộ OCR thô khác (8 995 câu, hai bước lấy mẫu) | — | giống hệt từng câu |
+
+Không câu nào từ đúng thành sai. 7 câu còn lại: 4 câu không có khung nào đọc ra "一" (do tiền xử lý ảnh — xem khuyến
+nghị ở 3.23.701/704), 2 câu một chữ OCR không phát hiện, 1 câu gần hoà phiếu.
+
+### Đã thử và bỏ
+* Chặn tách câu khi chữ dao động A-B-A với lần quay lại ngắn: không sửa được câu nào trên dữ liệu thật nên gỡ khỏi bản.
+* Khôi phục chữ ngay trong vòng gộp: làm đổi chữ dùng để so với group kế tiếp ("一天呐" so với "天呐" thành hai câu) —
+  chuyển xuống sau khi gộp xong.
+
+### Tìm hiểu OXR (github.com/SoMarkAI/OXR)
+* OXR-1.0 là mô hình **đọc tài liệu** (PDF, ảnh tài liệu → Markdown/JSON kèm bố cục: bảng, công thức, con dấu…),
+  khoảng 1,3 tỷ tham số, chạy qua vLLM. Yêu cầu nêu trong README: Linux, driver tương thích CUDA 13.0, Python 3.12,
+  **tối thiểu 24 GB VRAM** (khuyến nghị ≥ 48 GB).
+* **Không áp dụng trực tiếp được:** máy đích là Windows 11 + RTX 3070 Ti (8 GB VRAM); bài toán của ứng dụng là một
+  dòng chữ trong vùng phụ đề trên hàng trăm nghìn khung, không phải phân tích bố cục trang. README không nói gì về
+  ảnh cảnh hay phụ đề video, và giấy phép là bản tuỳ biến riêng.
+* **Ý tưởng dùng được:** vòng "tự cải thiện nhắm vào mẫu model làm sai" của họ tương ứng với việc ứng dụng tự OCR lại
+  riêng các câu có dấu hiệu nghi ngờ. Bản này chưa làm; 6 câu còn sai vì OCR không đọc ra chữ là ứng viên cho hướng đó.
+
+### Test
+`test_merge_char_restore_v323707.py` (12 test): bốn chuỗi khung chép từ dữ liệu thô (đỏ trên mã cũ); không có bằng
+chứng thì không bịa; hai câu thật đứng yên lâu vẫn tách; chữ khác "一" cần ≥ 20 %; gạch đầu dòng hội thoại không bị
+đổi.
+
+## [3.23.706] — 🧪 Vòng A/B dịch với 3.5-flash-lite: lượt rút gọn không còn làm hỏng câu; model dự phòng sập không làm chết lượt dịch
+
+### Cách làm
+* Bộ 361 câu tập 40–49 (chưa dùng khi tinh chỉnh), gemini-3.5-flash-lite, dịch sát nghĩa + phong cách + lượt khớp
+  giọng đọc. Đọc đối chiếu từng dòng bản 3.23.702 với câu gốc để tìm lỗi có hệ thống, rồi phát lại (không gọi API) các
+  bộ kiểm mới trên 7 lượt chạy đã lưu (175 câu đã được rút gọn) trước khi chạy thật.
+* Đo trước khi code đã loại hai ý tưởng:
+  * **"Sau dấu phẩy thì viết thường"**: thử trên 3664 dòng thật, sửa nhầm dòng của người nói khác ("Ấy, đợi đã," →
+    "Sao thế?") và tên riêng ("Cực Quang").
+  * **Nhận diện từ ghép bằng thống kê** trên chính bản dịch: với 361 câu, bỏ sót cả hai ca hỏng thật và chặn nhầm việc
+    bỏ lượng từ ("hai trăm đạo lôi kiếp" → "hai trăm lôi kiếp").
+* **Prompt phân tích:** đọc lại kết quả phân tích của bộ này (bảng nhân vật, quy tắc xưng hô từng cặp, thuật ngữ) không
+  thấy lỗi nào để lập biến thể, nên không đổi. So sánh mức suy nghĩ của khâu phân tích đã làm ở 3.23.702.
+
+### Lỗi tìm được và cách sửa (ràng buộc bằng mã, kèm một dòng nhắc trong prompt rút gọn)
+1. **Lượt rút gọn cắt đôi từ xưng hô hai tiếng.** "nể mặt ngươi là đệ tử của sư tỷ" → "Nể tình ngươi là đệ sư tỷ";
+   "xin hãy tìm cho đồ nhi" → "Tìm nơi cho đồ"; "Diệp Nhiên là đồ nhi của ta" → "Diệp Nhiên là đồ tôi". Bộ kiểm cũ
+   cho qua vì mọi từ còn lại đều có trong câu cũ.
+   * Sửa: `_breaks_title_compound` + danh sách 46 từ xưng hô / danh xưng Hán-Việt (`TITLE_COMPOUNDS`). Giữ trọn hoặc bỏ
+     cả từ thì được; giữ một nửa thì loại câu rút gọn, dùng lại câu cũ.
+   * Phát lại trên 7 lượt: bắt đúng 3 ca, không chặn nhầm ca nào.
+2. **Lượt rút gọn bỏ từ điều kiện "nếu".** "Nếu như con không chống đỡ nổi nữa," → "Con không chống nổi nữa,";
+   "nếu ngươi không chịu nổi" → "Không chịu nổi". 9/175 câu rút gọn mắc lỗi này, đều là đổi nghĩa.
+   * Sửa: "nếu", "dù", "tuy" có trong câu cũ thì phải còn trong câu mới.
+3. **Dòng nối tiếp bị viết hoa giữa câu** (15/361 dòng ở bản 3.23.702): bản dịch thô "Đã vậy," + "ta là sư bác đây"
+   thành "Ta là sư bác đây,"; "mà đã tăng lên năm mươi đạo…" thành "Đã tăng năm mươi lôi kiếp.".
+   * Sửa ở lượt rút gọn (`_keep_leading_case`) và ở cuối chuỗi dịch (`restore_continuation_case`): chỉ trả lại chữ
+     thường khi **chính bản dịch thô của dòng đó viết thường**, dòng trước chưa kết câu và từ đầu không phải tên riêng.
+4. **Model dự phòng sập thì cả lượt dịch chết** (gặp thật khi chạy A/B, 10/11/2026): 3.5-flash-lite quá tải thoáng
+   qua → lời gọi chuyển sang 3.1-flash-lite đúng lúc 3.1 trả 503 ở cả 3 key → chờ 11 phút trên 3.1 rồi báo lỗi, dù
+   3.5 đã trả lời bình thường (HTTP 200) từ lâu.
+   * Sửa: model dự phòng cũng quá tải và không còn dự phòng nào khác thì **quay về model chính một lần** mỗi lời gọi.
+   * Lượt chạy thật sau khi sửa: tình huống này lặp lại 1 lần, lời gọi quay về 3.5 và dịch xong.
+
+### Số đo — lượt chạy thật 361 câu (cùng bảng phân tích)
+| | 3.23.702 | 3.23.706 |
+|---|---|---|
+| Dòng nối tiếp bị viết hoa giữa câu | 15 | **0** |
+| Câu rút gọn cắt đôi từ xưng hô | 2 | **0** |
+| Dòng TTS cần > 1,5× / > 1,8× | 33 / 8 | 34 / 11 |
+| Câu rút gọn được nhận | 19/25 | 26/32 |
+
+Độ khớp TTS giữ nguyên (chênh 1–3 dòng nằm trong dao động giữa hai lượt chạy). Lượt 3.23.706 chạy trước khi thêm bộ
+kiểm "nếu": 1 câu của nó (dòng 137) thuộc loại nay bị loại.
+
+### Test
+* `test_shorten_guards_v323706.py` (12 test): ca thật cắt đôi từ xưng hô; giữ/bỏ trọn thì nhận; bỏ "nếu" thì loại;
+  giữ chữ thường đầu dòng nối tiếp; tên riêng đầu câu giữ hoa; không có bằng chứng thì không đổi.
+* `test_failover_overloaded_fallback_v323706.py` (2 test): dự phòng sập thì quay về model chính (đỏ trên mã cũ); cả
+  hai sập thì vẫn báo lỗi và không qua lại vô hạn.
+
+## [3.23.705] — 🧩 Lồng tiếng: đọc liền cụm câu (gộp mảnh câu cùng người nói mà giọng đọc không kịp)
+
+### Đo trước khi làm (lượt chạy thật của chủ dự án: 3664 dòng, VieNeu, bản dịch 3.23.690)
+* Theo mô hình nhịp đọc VieNeu (0,235 + 0,247 s/tiếng), 717 dòng cần đọc nhanh hơn 1,5×. Phần lớn là **mảnh của
+  một câu** bị phụ đề gốc cắt thành các dòng liền nhau: "Mới lần hai" chỉ có 0,36 s, ngay sau là "mà đã giáng năm
+  mươi đạo cùng lúc sao?". Câu gốc đã quá nhanh so với khung nên dịch ngắn hơn cũng không cứu được.
+* Hai phương án đã mô phỏng trên dữ liệu đó:
+  | Phương án | Dòng > 1,5× | > 1,8× | > 2,2× |
+  |---|---|---|---|
+  | Hiện tại | 717 | 308 | 98 |
+  | Giữ đọc từng dòng, chia lại thời gian trong cụm (dời ≤ 0,35 s) | 573 | 176 | 45 (thêm 82 dòng mới vượt 1,5×) |
+  | **Đọc liền cụm câu (bản này)** | **369** | **138** | **41** |
+* Rà tĩnh toàn bộ mã (ruff nhóm luật bắt bug, mypy): các cảnh báo đã xem đều là báo động giả, không có bug mới.
+
+### Thay đổi
+* Trang **Lồng tiếng** có nút mới **"🧩 Đọc liền cụm câu (N)"**, đặt cạnh nút Rút gọn. N là số cụm sẽ gộp.
+  * Chỉ gộp khi **cùng người nói** (theo yêu cầu của chủ dự án), các dòng sát nhau (khe ≤ 0,12 s), dòng trước chưa
+    kết câu, và trong cụm có dòng cần đọc nhanh hơn 1,5×.
+  * Chọn cụm **nhỏ nhất** đưa tốc độ về ≤ 1,5×. Không đạt thì chỉ gộp khi tốc độ cần giảm ≥ 15 %.
+  * Giới hạn mỗi cụm: 4 dòng, 26 tiếng, 7 giây. Trên dữ liệu thật: 329 cụm, trong đó 292 cụm 2 dòng.
+  * Dòng đã đọc kịp thì không bị đụng tới.
+* Bấm nút mới gộp; ứng dụng không tự gộp. Cả lượt gộp là **một bước Hoàn tác**.
+* Dùng lại đúng cơ chế "Gộp dòng" sẵn có, nên chạy như nhau với VieNeu, Edge và Gemini TTS. Đã có kết quả TTS thì
+  các dòng gộp được tổng hợp lại như khi gộp tay.
+* Phụ đề xuất ra theo dòng đã gộp.
+* Hàm thuần `plan_fragment_merges` (`tts_fit.py`): 10 ms cho 3664 dòng. Gộp 300 cụm trên 1200 dòng mất 0,4 s.
+
+### Giới hạn
+* Số đo trên là **mô phỏng theo mô hình nhịp đọc**, chưa chạy VieNeu thật trên GPU. Cần chủ dự án nghe thử.
+* Khi chưa nạp phân vai (một giọng đọc cho cả phim), mọi dòng được coi là cùng người nói.
+
+### Test
+`test_fragment_merge_v323705.py` (12 test): ca thật tập 40; khác người nói không gộp; câu đã kết / có khe không gộp;
+dòng ổn không đụng; gộp không lợi thì bỏ; giới hạn cụm và không chồng nhau; đầu vào rỗng; một bước hoàn tác và vị trí
+sau gộp; phim lớn gộp nhanh; nút trên trang.
+
+## [3.23.704] — 🎛️ Tiền xử lý OCR: chỉ gợi ý cài đặt tốt nhất, người dùng toàn quyền
+
+Theo quyết định của chủ dự án: **không** tự tắt 4 bước tiền xử lý trong cấu hình đã lưu, chỉ gợi ý.
+
+* Thẻ **Cài đặt → Tiền xử lý** có thêm nút **"Dùng cài đặt gợi ý (tắt 4 bước dưới)"**.
+  * Nút bỏ chọn 4 bước: Phóng chữ nhỏ, Viền, Làm nét, Tăng tương phản.
+  * Nút **chưa lưu**: người dùng xem lại rồi bấm Lưu, hoặc Huỷ thay đổi để giữ như cũ.
+  * Nút chỉ bấm được khi còn bước nào đang bật.
+* Mỗi ô trong 4 ô có chú thích "Gợi ý: TẮT với phụ đề chữ trắng viền đen". Ghi chú số đo v3.23.701 vẫn giữ: 598 câu
+  đúng khi dùng ảnh gốc, so với 594 khi bật các bước; nét "一"/"三" chỉ còn 2/10 so với 10/10.
+* Mặc định cho cài đặt mới vẫn là tắt cả 4 bước (như trước). Cấu hình đã lưu không bị đụng tới.
+* **Test:** `test_preprocess_recommendation_v323704.py` (3 test) kiểm:
+  * mở trang không đổi cấu hình;
+  * bấm nút chỉ đổi ô trên màn hình, chưa lưu;
+  * vẫn bật lại được từng bước;
+  * nút tắt khi đã đúng gợi ý;
+  * đủ chuỗi vi/en.
+
+## [3.23.703] — 🛠️ Sửa lỗi build "không tìm thấy paddlepaddle-gpu 3.3.1" + nút bật/tắt tự rút gọn khớp giọng đọc
+
+### Lỗi build: `No matching distribution found for paddlepaddle-gpu==3.3.1 (from versions: 2.6.0, 2.6.1, 2.6.2)`
+* **Nguyên nhân gốc (đã kiểm ngày 10/11/2026):** trang chỉ mục `paddlepaddle.org.cn/packages/stable/cu129/` trả
+  **502 / ngắt kết nối**. Khi một kho chỉ mục lỗi, pip **không báo lỗi kho** mà lặng lẽ bỏ qua nó, chỉ còn thấy
+  PyPI. PyPI chỉ có `paddlepaddle-gpu` 2.6.x, nên pip báo "không có bản 3.3.1". Mã build không sai; kho Paddle sập.
+* **Kho lưu trữ gốc của file wheel vẫn chạy:** `paddle-whl.bj.bcebos.com/stable/cu129/paddlepaddle-gpu/` trả HTTP 200,
+  có `paddlepaddle_gpu-3.3.1-cp313-cp313-win_amd64.whl` (809 978 141 byte) và bản cp312. Đây là nơi trang chỉ mục trỏ tới.
+  `pip install --dry-run` (win_amd64, Python 3.13) với file đó + `--index-url https://pypi.org/simple` phân giải đủ mọi
+  phụ thuộc.
+* **Sửa:**
+  1. `build_windows.bat`: cài qua kho chỉ mục thất bại thì **tự tải thẳng file wheel** từ kho gốc. Mã Python `cpXY` lấy
+     từ chính `build_env`. Hỏng cả hai đường thì mới dừng, kèm thông báo rõ.
+  2. Trình tải lõi Paddle trong ứng dụng (bản build nhỏ, tải lúc chạy): dùng cùng cách dự phòng
+     (`paddle_direct_wheel_url`, `build_paddle_install_command(direct_wheel=True)`).
+  3. `tools/check_batch_syntax.py`: thêm luật bắt `)` chưa thoát trong `echo` bên trong khối `if`/`for`. Dấu `)` này
+     đóng khối sớm, biến phần sau thành lệnh rác. Bản nháp đầu của bản sửa này mắc đúng lỗi đó; luật mới đã bắt được.
+* **Test:** `test_paddle_wheel_fallback_v323703.py` (4 test) kiểm URL wheel, lệnh dự phòng, nội dung build script, và
+  việc bộ kiểm batch bắt được echo hỏng.
+
+### Nút bật/tắt "Khớp giọng đọc" (trang Dịch)
+* Lượt tự rút gọn của v3.23.702 làm thời gian dịch tăng khoảng 50 %. Trước bản này lượt đó luôn chạy; nay có ô
+  **"Khớp giọng đọc: Tự rút gọn dòng dài hơn khung lồng tiếng"**.
+  * Mặc định **bật**.
+  * Lưu trong cài đặt (`translation.fit_for_speech`), áp dụng từ lượt dịch kế tiếp, cả khi dịch lại dòng chọn.
+  * Tắt khi chỉ cần phụ đề, không lồng tiếng.
+* Bật/tắt không làm hỏng bộ nhớ đệm giai đoạn: lượt rút gọn chạy SAU các giai đoạn và không nằm trong khoá đệm.
+* **Test:** `test_fit_for_speech_toggle_v323703.py` (3 test) kiểm:
+  * mặc định bật;
+  * ô lưu vào cài đặt, giá trị tới được `TranslateSubtitlesRequest` và giữ trạng thái khi mở lại trang;
+  * đủ chuỗi vi/en.
+
+## [3.23.702] — 🗣️ Dịch khớp giọng đọc: ngân sách theo nhịp VieNeu, 3.5-flash-lite được suy nghĩ thật, rút gọn có kiểm
+
+### Đo trên dữ liệu thật trước khi sửa
+* **Tệp debug lượt chạy thật của chủ dự án** (3664 dòng, 3.5-flash-lite): 500 dòng (13,6 %) TTS phải đọc nhanh > 1,5×,
+  250 dòng ≥ 1,8×. Với ngưỡng 1,5×, mỗi dòng vượt chỉ thừa trung bình 1,8 tiếng (từ đệm "cái", "đã", "những"…).
+* **Ngân sách độ dài cũ sai đơn vị và sai engine.** Ngân sách tính theo nhịp nhanh nhất của Gemini TTS ở 1,9× rồi
+  quy ra ký tự; với VieNeu, câu "đạt ngân sách" vẫn phải đọc ~2×. Prompt còn dặn "cứ vượt, phần mềm sẽ tự nén giọng".
+* **3.5-flash-lite chỉ suy nghĩ ở mức "high".** Gọi thẳng API: minimal/low/medium = **0 token suy nghĩ**, "high" ≈ 2000.
+  Ứng dụng gửi "low" cho các giai đoạn dịch và "medium" cho phân tích, tức model chưa từng suy nghĩ.
+* **Cache:** gói miễn phí chặn cache tường minh (giới hạn 0). Cache ngầm chạy với 3.1-flash-lite (trúng 24 549/27 459
+  token) nhưng **không chạy với 3.5-flash-lite**, kể cả 3 yêu cầu giống hệt nhau. Không có gì để tối ưu ở phía ứng dụng.
+
+### A/B — 361 câu tập 40–49 (chưa dùng khi tinh chỉnh), 3.5-flash-lite, dịch sát nghĩa + phong cách
+| Cấu hình | Dòng cần > 1,5× | > 1,8× | Ghi chú nghĩa (đọc đối chiếu từng dòng) |
+|---|---|---|---|
+| 3.23.701 | 65 | 25 | — |
+| Ngân sách mới, không suy nghĩ | 45 | 8 | đảo nghĩa "不客气了" → "nương tay nhé", mất "大罪", mất phủ định |
+| + nới ngân sách khâu dịch sát nghĩa | 33 | 5 | vẫn đảo nghĩa / mất ý như trên |
+| + dịch sát nghĩa suy nghĩ "high" | **28** | **4** | hết các lỗi đảo nghĩa, giữ tên / xưng hô bề trên |
+| Bản giao, chạy từ đầu (11/22 yêu cầu bị đẩy sang 3.1 vì 503) | 33 | 8 | không lỗi đảo nghĩa; tên đúng 26/26 |
+
+**Phân tích "medium" so với "high"** (3.5-flash-lite, cùng 361 câu):
+* "medium" ra chữ vô nghĩa ("gọi 'mươi'", "thế điểu") và sai vai (sư thúc bị ghi "sư muội").
+* "high" lập đủ quy tắc xưng hô từng cặp, lại xong nhanh hơn (25 s so với 75 s, do ít phải thử lại).
+
+### Thay đổi
+1. **Ngân sách độ dài `max_words` (số tiếng)** thay `max_chars`, tính theo nhịp đọc VieNeu đo thật (0,235 + 0,247 s/tiếng).
+   * Khâu dịch sát nghĩa ≤ 1,8× (ưu tiên đủ nghĩa), các khâu sau ≤ 1,5×.
+   * Prompt: được vượt chỉ khi bắt buộc để giữ nghĩa, và vượt ít nhất có thể.
+   * Ngôn ngữ đích khác tiếng Việt giữ `max_chars` như cũ.
+2. **Lượt "khớp giọng đọc" sau khi dịch** (mặc định bật):
+   * Dòng còn dài hơn ngân sách > 1 tiếng được AI rút gọn riêng.
+   * Câu mới phải qua bộ kiểm, hỏng thì giữ câu cũ; câu rút gọn giữ dấu kết câu.
+   * Lỗi API hay hết hạn mức ở bước này không làm hỏng bản dịch đã xong; lô lỗi giữ lại kết quả các lô trước.
+   * Bỏ qua khi chỉ dịch lại vài dòng rời và khi đích không phải tiếng Việt.
+3. **Bộ kiểm rút gọn chặt hơn** (áp cả cho nút rút gọn ở trang Lồng tiếng). Loại câu:
+   * đổi số từ phủ định;
+   * đổi kiểu câu (hỏi ↔ khẳng định);
+   * thêm đại từ xưng hô mới;
+   * mất tên riêng.
+   * Đây là bốn ca thật bộ kiểm cũ cho qua: "không qua nổi" → "qua nổi", "Không lẽ…" → "…à?", "đồ nhi của ta" → "đồ
+     tôi", bỏ "Thiên Thanh".
+4. **Mức suy nghĩ cho model chỉ suy nghĩ ở "high"** (3.5-flash-lite):
+   * khâu dịch sát nghĩa và các lời gọi phân tích tự dùng "high" khi người dùng chọn "low" / "medium";
+   * người dùng tắt suy nghĩ thì giữ nguyên;
+   * lượt rút gọn cũng dùng "high" với model này.
+   * Đổi lại, thời gian dịch tăng ~50 % (248 → 374 s cho 361 câu).
+5. **Sửa tên đọc nhầm âm họ** (tên 2 chữ):
+   * Ca thật: phân tích ghi `叶然 (Lâm Nhiên)`, "Lâm" là âm của 林, tên nam chính sai 24/24 dòng.
+   * Bảng âm họ cho chữ nhiều âm (叶 → Diệp, 曾 → Tăng…). Không đụng danh xưng thân tộc hay địa danh.
+   * Đối chiếu 494 bảng nhân vật đã lưu: chỉ sửa đúng ca này.
+
+### Rà độc lập (agent) — đã sửa trước khi giao
+* Hết hạn mức ở bước khớp giọng đọc làm hỏng cả lượt dịch.
+* Luật âm họ đổi nhầm "长兄 (Đại Huynh)" và "长安".
+* Ngân sách sai khi dịch lại vài dòng rời.
+* Câu rút gọn mất dấu kết câu.
+* Chữ hoa đầu câu thứ hai bị coi là tên riêng.
+* "vi_VN" và "models/…" không được nhận ra.
+
+### Kiểm chứng
+* Test mới: `test_speech_fit_translation_v323702.py` (16; 8 test của các lỗi rà độc lập đều thất bại trên mã trước khi sửa).
+* Cập nhật 4 test cũ theo payload `max_words`.
+* Toàn bộ test: 8548 passed, 61 skipped, 0 lỗi (3.23.701: 8525). `compileall` sạch.
+
+## [3.23.701] — 🔍 Đáp án OCR tự quét MỌI khung hình + đối chiếu ảnh thật; tìm ra gốc lỗi mất nét "一"; sửa 2 lỗi dựng phụ đề
+
+### Đáp án mới, kiểm bằng ảnh thật (3663 câu)
+* Tự quét toàn bộ 208 752 khung của 86 tập theo hai bước, **độc lập với ứng dụng**:
+  1. Băm mặt nạ "chữ trắng viền tối" để tách từng đoạn phụ đề, mốc thời gian theo PTS.
+  2. OCR dải chữ của mỗi đoạn bằng model **server** PP-OCRv5.
+* Kết quả: 3667 câu. So ba nguồn (bộ tự quét, bản 3664 câu của chủ dự án, đáp án cũ 3659 câu); mọi chỗ lệch đều được
+  xem trực tiếp trên ảnh cắt từ video.
+* Bản 3664 câu của chủ dự án:
+  * sai 1 chữ: 清清自白 → **清清白白**;
+  * thiếu 2 câu: **我** (1098 s), **诶** (5660,8 s);
+  * tách thừa 3 câu: "不", "嗯", "别" hiện **liên tục** trên phim, OCR sót vài khung nên bị tách đôi.
+* Đáp án cũ 3659 câu sai nhiều hơn: thiếu "不", "嗯", "别" và câu cuối, gộp sai "我让你不出手 / 你就不出手啊" và
+  "救我 / 救救我".
+* → **3663 câu.** Chỉ đúng một câu thoại nằm ngoài vị trí thường lệ: câu cuối phim, đặt cao hơn.
+
+### Gốc lỗi mất nét "一"/"三" (8 câu): tiền xử lý ảnh trong Cài đặt
+* Tệp OCR thô của lượt chạy thật cho thấy các bước đang bật: làm nét, tăng tương phản ×1,2, viền 8 px, phóng chữ nhỏ.
+  Mặc định của ứng dụng là TẮT cả bốn bước.
+* Tái hiện trên khung thật, cùng model v6 small và cùng ROI:
+  * bật cả bốn bước: **2/10** câu đúng;
+  * ảnh gốc: **10/10**.
+* Đo rộng trên 611 câu rải đều 86 tập, mỗi câu một khung:
+
+  | Cấu hình | Câu đúng |
+  |---|---|
+  | Ảnh gốc | **598** |
+  | Chỉ làm nét / chỉ tương phản | 597 |
+  | Chỉ viền / chỉ phóng to | 596 (phóng to chậm gấp 8,5 lần) |
+  | Bật cả bốn bước | 594 |
+
+* Trang Cài đặt → Tiền xử lý nay hiện khuyến nghị TẮT, kèm số đo. Cài đặt đã lưu của người dùng **không** bị tự đổi.
+
+### Sửa trong mã (mỗi lỗi có test thất bại trên mã 3.23.700)
+1. **Phụ đề đúng giữa bị loại vì hộp vật thể nằm cùng dòng.**
+   * Ca thật: "二" (hoa văn) và "叶然" chồng nhau 56 % theo chiều dọc, nên bị gom thành dòng "二叶然" lệch tâm 83 px →
+     mất câu.
+   * Nay khi cả dòng lệch tâm, giữ dãy hộp liền nhau hợp lệ có nhiều chữ nhất. Bổ sung này chỉ cứu thêm hộp, không loại
+     thêm hộp nào.
+2. **Câu đặt lệch vị trí bị bộ lọc vị trí dọc toàn phim loại.**
+   * Ca thật: "我真的是冤枉的" đọc đúng ở 65 khung, tin cậy 1,0, nhưng 65 khung ít hơn 1 % số hộp của cả phim.
+   * Nay cứu khi đủ mọi điều kiện:
+     * cùng chữ hiện liên tục ≥ 0,5 s;
+     * tin cậy ≥ 0,9;
+     * ≥ 2 chữ Hán;
+     * hộp ngang, cao 0,7–1,4 lần cỡ chữ phụ đề;
+     * trong các khung đó không có phụ đề nào khác.
+3. **Bảng chữ phồn → giản** tăng từ 313 lên 2922 chữ, lấy từ dữ liệu OpenCC: chỉ chữ phồn một-một, đã loại các chữ đa
+   nghĩa như 乾/於/徵/覆/藉. Bảng cũ thiếu cả 遙, 蕭. Không chữ nào của bảng xuất hiện trong 3663 câu đáp án giản thể.
+   Bảng vẫn dùng cơ chế "chỉ đổi khi phồn thể là thiểu số".
+
+### Số đo
+Dựng lại từ OCR thô của lượt chạy thật, chấm theo đáp án mới:
+
+| Mã | Câu đúng |
+|---|---|
+| 3.23.700 | 3649/3663 |
+| **3.23.701** | **3651/3663** |
+
+* Bộ 86 tập của chúng tôi ra y hệt từng byte, không hồi quy.
+* Nếu tắt tiền xử lý, 8 câu mất "一" sẽ đọc đúng: ước tính **≈ 3659/3663**.
+* Còn lại: "我" và "诶" (model không đọc ra cả trên ảnh gốc), cùng 1 chữ chèn thừa ("成功解除余一部分").
+
+### Kiểm chứng
+* Test mới: `test_ocr_reference_fixes_v323701.py` (7).
+* Toàn bộ test: 8525 passed, 61 skipped, 0 lỗi (3.23.700: 8517). `compileall` sạch.
+
+## [3.23.700] — 🔑 Đổi nhà cung cấp AI không còn lẫn model / tick video; ô key chính không làm mất key
+
+Ba điểm còn lại từ lượt rà API key Gemini ↔ nhà cung cấp tuỳ chỉnh (3.23.698). Mỗi lỗi có test thất bại trên mã 3.23.699.
+
+1. **Ô key Gemini chính (Cài đặt) làm mất key.**
+   * Thao tác gây lỗi: xoá trống ô, bấm Enter (key 2 lên làm key chính), rồi bấm ra chỗ khác → mất LUÔN key 2.
+   * Nguyên nhân: lúc ô đang được chọn thì ô không được nạp lại, nên lần "sửa xong" thứ hai lại xoá "key đầu danh sách
+     hiện tại".
+   * Nay ô chỉ thay đúng key nó đang hiển thị. Chữ trong ô không đổi thì không làm gì.
+2. **Đổi nhà cung cấp mà ô chọn model vẫn giữ tên model của bên cũ.**
+   * Chuyển sang tuỳ chỉnh vẫn gửi `gemini-…` (đa số nhà cung cấp trả 404).
+   * Quay lại Gemini vẫn gửi `gpt-4o-mini`… cho Gemini.
+   * Nay model đã chọn được nhớ RIÊNG cho từng nhà cung cấp, kể cả sau khi khởi động lại. Phạm vi gồm 4 giai đoạn dịch,
+     model phân tích, model dự phòng và model tự kiểm tra.
+   * Đổi qua lại sẽ khôi phục đúng lựa chọn trước đó của mỗi bên. Lần đầu dùng nhà cung cấp tuỳ chỉnh thì ô vẫn giữ
+     như cũ cho tới khi anh chọn.
+3. **Ô "Đính video ngữ cảnh" bị tự bỏ tick khi chuyển sang tuỳ chỉnh, nhưng không bật lại khi quay về Gemini.**
+   * Nay được bật lại nếu video của phim vẫn còn.
+   * Nạp phim mới thì không mang tick của phim cũ sang.
+
+### Kiểm chứng
+* Test mới: `test_provider_switch_v323700.py` (7).
+* Toàn bộ test: 8517 passed, 61 skipped, 0 lỗi (3.23.699: 8510). `compileall` sạch.
+
+## [3.23.699] — 🎯 Dựng phụ đề chính xác hơn trên dữ liệu OCR thật của chủ dự án (4 lỗi)
+
+### Cách đo
+* Dựng lại phụ đề từ OCR thô của lượt trích xuất thật trên máy chủ dự án: phim nối 86 tập, GPU, bước 0,03 s,
+  208 752 khung.
+* Phim nối của chủ dự án lệch dần so với bản của chúng tôi (0 → −0,68 s). Đã bù độ lệch này trước khi chấm theo đáp án
+  3659 câu.
+* Tệp SRT và tệp OCR thô gửi kèm không cùng một lượt chạy (vd 1952 s: 35/35 khung OCR thô thiếu chữ 一, còn SRT có). Vì
+  vậy chỉ so mã với mã trên cùng một tệp OCR thô.
+
+| Mã | Câu khớp đáp án | Câu thừa |
+|---|---|---|
+| 3.23.690 (bản chủ dự án đang chạy) | 3643 | 1 |
+| 3.23.698 | 3644 | 1 |
+| **3.23.699** | **3646** | **0** |
+
+* Bộ 86 tập dựng từ OCR của chúng tôi (bước 0,12 s) ra **y hệt từng byte** so với trước (3652/3659): không hồi quy.
+* Mười một câu còn sai đều do model OCR không đọc ra chữ, không do khâu dựng phụ đề. Chủ yếu là nét "一" mảnh bị bỏ
+  (vd 35/35 khung đọc "个万年炼气的人"), và một câu chỉ có chữ "我" không khung nào đọc được.
+
+### Các lỗi đã sửa (mỗi lỗi có test thất bại trên mã 3.23.698)
+1. **Gộp hai đoạn trùng chọn sai chữ.**
+   * Ca thật: "十不存一" (7 khung), rồi "十不存" (8), rồi "十不存一" (14) → ra "十不存", dù "十不存一" chiếm 21/29 khung.
+   * Nguyên nhân: mỗi lần gộp, mã cũ so điểm của CẢ đoạn đã gộp với đoạn mới.
+   * Nay cộng điểm riêng cho từng cách đọc qua mọi lần gộp và chọn cách đọc nhiều điểm nhất.
+2. **Chữ lặp do OCR đọc thừa được giữ.**
+   * Ca thật: "别闹" chiếm đa số khung, 1–2 khung đọc "别别闹" → ra "别别闹".
+   * Nguyên nhân: khi hai bản chỉ chênh một chữ, mã cũ luôn giữ bản dài.
+   * Nay nếu chữ thừa chỉ là lặp lại chữ đứng cạnh, chọn bản nhiều khung hơn. Bản dài do bản ngắn đọc SÓT chữ
+     ("师叔" / "小师叔") vẫn được giữ như cũ.
+3. **Từ láy AABB đọc nhầm chữ trông giống.**
+   * Ca thật: "清清白白" bị đọc "清清自白" ở 33/45 khung, nên bầu chọn giữa các khung không cứu được.
+   * Nay sửa theo bảng một chiều 自→白, 曰→日, 入→人, ở cả chữ thứ ba lẫn thứ tư.
+   * Cặp mơ hồ được giữ nguyên: 千千万万 / 干干净净 đều đúng; 己/已, 未/末 không láy.
+   * Chạy trên 3659 câu đáp án: 0 câu bị đổi.
+4. **Câu rác "色6%".**
+   * Một khung có hoa văn cho ra khoảng 20 hộp chữ vụn, ghép thành câu "色6%" (độ tin cậy 0,60).
+   * Nay bỏ những câu có dưới 2 chữ Hán, có chữ Latin, số hoặc ký hiệu, và độ tin cậy dưới 0,7.
+   * Chỉ áp cho phim mà ít nhất 80 % câu có chữ Hán; phim phụ đề Latin không bị đụng tới.
+   * Trên cả hai bộ dữ liệu mẫu, luật chỉ bắt đúng câu này.
+
+### Kiểm chứng
+* Test mới: `test_merge_text_choice_v323699.py` (7), `test_reduplication_lookalike_v323699.py` (13).
+* Toàn bộ test: 8510 passed, 61 skipped, 0 lỗi (3.23.698: 8490). `compileall` sạch.
+* Dọn 3 import thừa (ruff F401) ở `dependency_doctor`, `edge_tts_adapter`, `speaker_review_dialog`.
+
+## [3.23.698] — 🔑 Rà quản lý API key Gemini ↔ nhà cung cấp tuỳ chỉnh (7 lỗi) + huỷ được tự dò vùng + dự đoán độ dài đọc VieNeu theo dữ liệu thật
+
+### Rà soát API key (lượt rà độc lập + kiểm lại; mỗi lỗi có test thất bại trên mã 3.23.697)
+Phần cốt lõi vẫn đúng:
+* key tuỳ chỉnh không bao giờ tới Google, key Gemini không bao giờ tới địa chỉ tuỳ chỉnh;
+* đổi nhà cung cấp có hiệu lực ngay;
+* log và tệp debug không chứa key.
+
+Lỗi nằm ở các mép:
+1. **Dán "key1, key2" vào ô key chính** (hoặc cấu hình cũ lưu danh sách phẩy) → lưu thành MỘT key.
+   * Tóm tắt ghi "1 key".
+   * Kiểm phát âm gửi nguyên chuỗi đó nên báo key không hợp lệ.
+   * Bảng hạn mức luôn hiện 0.
+   * Nay tách theo cả dấu phẩy, khi đọc lẫn khi ghi.
+2. **Nhà cung cấp tuỳ chỉnh hiện 🟢 "sẵn sàng" dù mọi thao tác đều từ chối.** Ví dụ địa chỉ thiếu `https://`, key dính ký
+   tự vô hình, cổng sai. Đèn trạng thái nay dùng đúng phép kiểm của bộ dịch.
+3. **"TTS lại dòng chọn" / kiểm phát âm dùng key của lượt tổng hợp trước.**
+   * Thêm key mới sau khi mọi key cạn hạn mức thì vẫn báo "hết hạn mức trên cả N key".
+   * Key đã gỡ (vd lộ key) vẫn được dùng.
+   * Nay adapter Gemini TTS nhận key hiện tại trước mỗi lần TTS lại, và giữ đánh dấu "hết hạn mức" của key còn lại.
+4. **Model dự phòng chọn lúc dùng nhà cung cấp tuỳ chỉnh lọt sang Gemini.** Ví dụ `gpt-4o-mini`: khi Gemini quá tải
+   hoặc hết hạn mức, bộ dịch gửi `gpt-4o-mini` cho Gemini (404). Nay lựa chọn chỉ áp cho nhà cung cấp đang dùng; Gemini
+   chỉ nhận tên `gemini-*`, tên khác thì tự động chọn.
+5. **Nhà cung cấp tuỳ chỉnh lặng lẽ không chuyển model dự phòng** sau khi khởi động lại / đổi key / bật tắt qua lại, tới
+   khi bấm "Tải danh sách model". Nay:
+   * danh sách model chỉ bị quên khi đổi ĐỊA CHỈ;
+   * model người dùng tự chọn làm dự phòng được coi là có sẵn.
+6. **Đổi nhà cung cấp trong lúc "Tải danh sách model"** → danh sách của nhà cung cấp cũ đổ vào mọi ô chọn. Nay bỏ kết
+   quả đến muộn.
+7. **"Tải danh sách model" Gemini chỉ thử key đầu.** Key đầu hỏng thì báo lỗi dù các key khác tốt. Nay thử lần lượt mọi
+   key.
+* Thông báo "bộ dịch chưa sẵn sàng" nay theo nhà cung cấp đang dùng (trước luôn nói "API Key Gemini… google-genai").
+  "Dịch cả bộ" vẫn dừng đúng.
+
+### Huỷ được tự dò vùng phụ đề (việc còn từ 3.23.696)
+* **Trước đây:** nút Huỷ bật trong lúc dò (trang đang bận) nhưng không có tác dụng. Lượt dò đầy đủ (~5 phút trên CPU,
+  tập 3: 335 s) chạy hết rồi mới trả quyền; hàng loạt bị huỷ cũng phải chờ.
+* **Nay:** hàm báo tiến độ của bộ dò (gọi ~mỗi 1 % khung) dừng lượt dò ngay khi bấm Huỷ, cho cả dò thường và phim bộ.
+  * Kết quả xong đúng lúc bấm Huỷ không được áp.
+  * Vùng đang chọn giữ nguyên, kèm thông báo.
+
+### Lồng tiếng: dự đoán độ dài đọc theo dữ liệu thật (mục D4 của kế hoạch)
+* **Dữ liệu:** lượt lồng tiếng thật cả phim 86 tập của chủ dự án (VieNeu, 14 giọng, 3664 dòng). 6,8 % dòng phải đọc
+  > 1,8× (vượt ngưỡng 5 % kế hoạch đặt ra để hành động).
+* **Gốc:** mô hình thời lượng đọc tự nhiên (đo 141 dòng một giọng) ngắn hơn thực tế **19 %**, theo giọng 0,89–1,38 lần —
+  "Kim Thanh" chậm nhất.
+* **Cách sửa:** khớp lại trên 3664 dòng: `0,235 + 0,247 × số âm tiết` (σ 0,23 s), thay `0,312 + 0,177`.
+* **Kết quả:**
+  * Dự đoán trước khi tổng hợp: bắt **168/251** dòng thật phải nén ≥ 1,8×, thay vì 66/251 (F1 0,40 → 0,62).
+  * Quy đổi số giây lấn sang số âm tiết cần bớt không còn thiếu.
+  * Sau khi tổng hợp, nút rút gọn vẫn dùng tốc độ đo thật.
+
+### Đối chiếu dữ liệu thật của chủ dự án (lượt trích xuất 3.23.690, GPU, bước 0,03 s)
+* So thẳng với đáp án 3659 dòng ra 3006 khớp, 492 "gộp". Nguyên nhân là **phim nối của hai bên khác nhau 0,74 s**
+  (8350,925 s so với 8351,663 s): mốc lệch tăng đều từ 0 tới −0,68 s ở cuối phim, ổn định trong từng đoạn (độ lệch chuẩn
+  ≤ 0,08 s). Đây không phải lỗi mốc thời gian của ứng dụng.
+* Bù độ lệch đó: **3656/3659 dòng đúng**. Còn lại:
+  * 1 dòng OCR "清清自白" (đúng: "清清白白");
+  * 1 câu một chữ "我" 0,36 s bị thiếu;
+  * 1 câu ngoài phạm vi đáp án;
+  * 1 lỗi của chính đáp án ("千什么" → "干什么", đã sửa đáp án).
+
+### Kiểm thử
+* `tests/unit/presentation/test_ai_keys_review_v323698.py` (12 ca), `tests/unit/presentation/test_roi_detection_cancel_v323698.py`
+  (5 ca), `tests/unit/infrastructure/test_tts_fit_refit_v323698.py` (4 ca). Mọi ca lỗi đều thất bại trên mã 3.23.697.
+* `test_shorten_for_speech_v323629` cập nhật theo mô hình mới (ghi rõ số đo).
+* `compileall` sạch. Toàn bộ test: 8490 passed, 61 skipped.
+
+## [3.23.697] — ⚡ Trích xuất nhanh hơn ~1/3: bỏ OCR lại câu đứng yên khi nền sáng chuyển động
+
+### Đo trước khi sửa
+* Tập 17 (69,7 s, CPU, bước 0,12 s, lọc chữ trắng bật như mặc định): 310/581 khung đi OCR. Trong 310 khung đó:
+  * 180 khung (58 %) đọc ra ĐÚNG chữ của lần OCR trước (152 khung chỉ cách 0,12 s);
+  * 87 khung đọc ra rỗng;
+  * chỉ 43 khung có chữ mới.
+* Gốc: bộ lọc coi mọi điểm ảnh sáng > 200 là chữ, nên nền sáng chuyển động (trời, áo trắng, đèn…) làm mặt nạ "đổi" dù
+  câu phụ đề đứng yên.
+* Gần như toàn bộ thời gian trích xuất là suy luận OCR. Giải mã/đổi màu chỉ ~0,6 ms/khung, nên bớt khung OCR là cách tăng
+  tốc thật.
+
+### Thay đổi (`infrastructure/video/frame_dedupe.py`, dùng chung bộ giải mã CPU và NVDEC)
+* Khi cả hai khung có **lõi sáng ≥ 240** (chữ phụ đề trắng luôn có lõi, nền sáng thường chỉ 200–239), bộ lọc so "chữ đã
+  đổi chưa" trên lõi đó.
+* Ứng dụng tự nhận **phim phụ đề trắng** khi, sau 30 khung có chữ, ≥ 50 % khung có lõi. Ở loại phim này, khung có chữ mà
+  không có lõi (thường chỉ là nền sáng, đôi khi một câu xám lẻ) được OCR ở đầu đoạn rồi tối đa mỗi 1 s; giữa chừng chép
+  kết quả lần OCR đó. Câu xám vẫn được đọc.
+* **Phim phụ đề xám** (không có lõi) giữ nguyên luật cũ. Đặt "Ngưỡng độ sáng chữ" ≥ 240 trong Cài đặt thì tắt hẳn chế độ
+  lõi. Khung trống vẫn xét bằng ngưỡng cũ (200), nên không bao giờ coi chữ xám là khung trống.
+
+### Kiểm chứng
+* Chọn luật bằng mô phỏng không OCR lại: OCR thô từng khung tập 1–5 + ảnh vùng phụ đề thật → dựng phụ đề → chấm 429 dòng
+  đáp án.
+
+  | Luật | Khung đi OCR | Khớp đúng |
+  |---|---|---|
+  | OCR mọi khung | 100 % | 426/429 |
+  | Luật cũ | 56,8 % | 426/429 |
+  | **Luật mới** | **26,1 %** | **426/429** |
+  | Ngưỡng 240 thẳng (đã loại: mất chữ phim xám) | 16 % | 426/429 |
+  | Ảnh làm tối 15 % (giả phim phụ đề xám), luật mới | — | y hệt luật cũ trên cùng ảnh |
+
+  Mô phỏng dùng đúng lớp `FrameDeduper` mới: ra 2067 khung OCR, khớp bản mô phỏng.
+* Tập 6–12 (không dùng khi chọn luật): khung đi OCR 4451 → 2184 (−51 %), 409/409 câu như cũ. Chỉ 2 câu có mốc đầu lệch
+  một khung mẫu, cả hai do khung chuyển tiếp: một khung OCR ra chữ rác "台", một khung OCR đọc sót. Bước tinh chỉnh mốc
+  theo dải ranh giới (3.23.680) đặt lại mốc này trong trích xuất thật.
+* Trích xuất thật tập 17, cùng máy, mỗi bên 2 lượt: **54,6 / 56,8 s → 37,3 / 37,4 s (−33 %)**, OCR 310 → 193 khung, tệp
+  SRT giống hệt từng dòng.
+* `tests/unit/infrastructure/test_white_core_gate_v323697.py` (5 ca):
+  * nền sáng chuyển động mà chữ đứng yên → OCR 1 lần thay vì 10/10 như mã cũ;
+  * chữ đổi vẫn bắt được;
+  * phụ đề xám giữ luật cũ;
+  * khung không lõi OCR tối đa mỗi 1 s;
+  * ngưỡng ≥ 240 tắt chế độ lõi.
+* Toàn bộ test: 8465 passed, 61 skipped.
+
+## [3.23.696] — 🔎 Rà lỗi các bản 3.23.683–695: sửa chữ làm hỏng tên riêng, xoá nhầm câu thật, dịch có video dừng sớm khi còn model dự phòng
+
+Một lượt rà độc lập (chỉ đọc mã) cộng tự kiểm lại. Mỗi lỗi dưới đây đều có test thất bại trên mã 3.23.695.
+
+### Lỗi đã sửa
+* **Sửa chữ "dính liền" (3.23.684) đổi cả tên nhân vật.**
+  * Ca hỏng: "沈清漪" → "沈涟漪", "婉漪姑娘" → "涟漪姑娘", "麒儿快走" → "麒麟快走", "琥儿" → "琥珀", "玫姐" → "玫瑰". Gốc: 漪/麒/琥/玫
+    được ghi là chữ chỉ có trong một từ, nhưng thực tế hay gặp trong tên người.
+  * Ca mất chữ: "他很尴了" (OCR cắt mất 尬) → "他很尴尬", mất 了.
+  * Cách sửa: bỏ 4 từ đó khỏi bảng; không bao giờ thay ~50 chữ rất thường gặp (了的是我你他…). Vẫn sửa đúng "凯觎"
+    → "觊觎", "忐志" → "忐忑".
+  * Kiểm chứng: chạy trên cả 3659 dòng đáp án 86 tập: 0 dòng bị đổi, ở cả bản cũ lẫn bản mới.
+* **Bộ lọc chữ trôi (3.23.685) xoá nhầm câu thật khi hộp OCR phình một phía.**
+  * Ca hỏng: "哦" có hộp 68 px ở mọi khung, riêng một khung cuối phình 209 px (dính vật sáng bên cạnh) → bị coi là trôi và
+    bị xoá, ở cả 3, 4 và 6 khung. Gốc: đo theo TÂM hộp bằng đường thẳng khớp; 3 điểm (a, a, a+d) luôn lệch chỉ 0,24·d,
+    dưới ngưỡng 0,5·d.
+  * Cách sửa: đo riêng HAI MÉP hộp. Chỉ coi là trôi khi cả hai mép trôi cùng chiều, và trôi đều qua ít nhất 2 bước khung
+    (chiếm ≥ một nửa số bước). Vật trôi theo cảnh dời cả hộp; hộp phình chỉ dời một mép.
+* **Dịch có đính video vẫn dừng ngay khi model chính hết hạn mức ngày, dù đã bật model dự phòng.**
+  * Gốc: 3.23.690 cho bộ dịch tự chuyển sang dự phòng, nhưng bước kiểm tra trước (trước khi nén/tải video) vẫn báo "Tất
+    cả API key đã hết quota ngày…" rồi dừng.
+  * Cách sửa: nay hỏi bộ dịch model dự phòng nào còn hạn mức (`daily_quota_fallback`), cùng luật chọn với lúc gọi thật,
+    và chọn key theo model đó để video được tải dưới đúng key sẽ dùng. Không có dự phòng thì vẫn dừng sớm như trước.
+* **Model dự phòng được dư một lượt thử khi chuyển ngay ở bước đặt chỗ hạn mức** (lượt đếm bắt đầu từ -1; 4 lượt thay vì 3).
+* **Giọng đã lưu khớp chéo hai người khác nhau giữa các phim** (3.23.687): "师父(张三)" nhận giọng của "师父(李四)". Hai
+  tên cùng có chú thích trong ngoặc mà chú thích khác nhau nay không khớp. Một bên không chú thích vẫn khớp như cũ
+  ("叶然（师兄）" ↔ "叶然").
+
+### Điểm chưa hợp lý đã sửa
+* **ROI phim bộ bị nới dần theo logo / chữ trong cảnh** (3.23.686): mọi hộp chữ cùng độ cao trong dải đều kéo ROI rộng
+  ra, và ROI học được truyền sang tập sau. Nay chỉ nới theo hộp chồng lên bề ngang ROI (tức câu dài hơn).
+* **"Cảm xúc theo dòng" (3.23.688) vẫn đổi chữ ký cache với model TTS đời cũ** (model đó bỏ qua chỉ dẫn) → bật/tắt ô
+  này làm TTS lại cả phim vô ích. Nay chỉ gắn chỉ dẫn với model Gemini TTS 3.8+.
+* **Dải ranh giới (3.23.684) cộng cả khung trống không liền chuỗi** ("trống, có chữ, [chuỗi trống]"). Nay chỉ cộng các
+  khung trống liền với chuỗi.
+* **Đổi chữ phồn lẻ tẻ về giản (3.23.683) đổi cả chữ vẫn đúng trong văn bản giản thể**: 於 (họ Ư — "於谦"), 徵 (宫商角徵羽).
+  Nay giữ nguyên hai chữ này.
+
+### Chưa làm (ghi lại)
+* Bước tự dò vùng phụ đề (cả dò thường lẫn phim bộ) chưa huỷ giữa chừng được: lượt dò đầy đủ ~5 phút trên CPU vẫn chạy
+  hết sau khi bấm huỷ. Cần nối tín hiệu huỷ vào bộ dò — để một bản riêng.
+* Lượt rà độc lập không thấy lỗi nào ở các bản tách trang 3.23.689–695: thân hàm giống hệt, tên cấp module trỏ đúng đối
+  tượng, không có `super()`/hàm ảo Qt trong lớp trộn, logger giữ tên cũ.
+
+### Kiểm chứng không hồi quy
+* Dựng lại phụ đề cả phim 86 tập (69 594 khung OCR thô): **giống hệt từng dòng** so với 3.23.695 (3653/3659 khớp đúng,
+  6 gộp khi không có dải ranh giới — như trước). Bộ lọc chữ trôi vẫn bỏ đúng một câu "00" từ vòng đai lưng.
+* `tests/unit/application/test_review_fixes_v323696.py` (23 ca).
+* Toàn bộ test: 8460 passed, 61 skipped.
+
+## [3.23.695] — 🧱 Tách nốt trang Lồng tiếng: giao diện, engine, bảng kết quả, duyệt nhanh, cài đặt (U6 xong, không đổi hành vi)
+
+### Đã làm
+* `tts_page.py`: 2961 → 915 dòng (−69 %; tính từ trước 3.23.692 là 3558 → 915, −74 %). Phần chuyển ra:
+  * `tts_ui.py` — `TTSUiMixin` (16): dựng giao diện (lồng tiếng theo vai, nguồn, chọn engine, bảng cấu hình
+    Edge/Gemini/VieNeu, cấu hình chung, đầu ra, nút thao tác, bảng kết quả).
+  * `tts_engines.py` — `TTSEnginesMixin` (17): đổi engine, nạp giọng VieNeu ở nền, chế độ/độ chính xác VieNeu, model
+    Gemini, giọng Edge, gợi ý cài đặt.
+  * `tts_results.py` — `TTSResultsMixin` (12): điền/lọc bảng kết quả, chọn/sửa dòng, nghe thử từng câu.
+  * `tts_review.py` — `TTSReviewMixin` (8): phím tắt duyệt, đếm và nhảy tới dòng cần duyệt, chọn dòng bất thường.
+  * `tts_settings.py` — `TTSSettingsMixin` (3): lưu, khôi phục, đặt lại cài đặt.
+  * `tts_voice_loader.py` — `_VieNeuVoiceLoader` (luồng nạp giọng nền), chuyển nguyên văn.
+  * `tts_constants.py` — thêm 6 hằng số (tốc độ tối đa mặc định, ngưỡng cảnh báo lấn, danh sách engine/ngôn ngữ Edge…).
+* `tts_page` vẫn xuất lại mọi tên cũ. Khoá cài đặt (`QSettings`) và logger giữ nguyên.
+* Đối chiếu cây cú pháp bản cũ với bản mới: đủ 108 hàm, **không hàm nào khác một ký tự**.
+* Xong U6: ba trang lớn nhất (Dịch, Chỉnh sửa, Lồng tiếng) từ 3558/3206/3188 dòng còn 1108/1992/915 dòng.
+
+### Kiểm thử
+* `tests/unit/presentation/test_tts_page_split_v323695.py` (8 ca):
+  * mỗi lớp trộn đủ phương thức, không bị trang hoặc lớp trộn khác che;
+  * tên cũ, hằng số, logger giữ nguyên;
+  * mã nối lại parse được và không phương thức nào lặp.
+* `tests/unit/page_sources.py` thêm `TTS_PAGE_SOURCE`. 10 test đọc mã trang Lồng tiếng chuyển sang dùng nó, gồm cả 3 test
+  của 3.23.692 trước đây tự nối từng file.
+* 1726 test lồng tiếng / VieNeu / Edge / Gemini / bộ canh tĩnh đều qua.
+* Toàn bộ test: 8436 passed, 61 skipped.
+
+## [3.23.694] — 🧱 Tách tiếp trang Dịch: giao diện, key/hạn mức, model, phân tích, bảng kết quả, công cụ (U6, không đổi hành vi)
+
+### Đã làm
+* `translate_page.py`: 3188 → 1108 dòng (−65 %; tính từ trước 3.23.689 thì −74 %). Phần chuyển ra:
+  * `translate_ui.py` — `TranslateUiMixin` (10): dựng giao diện (nguồn, cấu hình AI, ngữ cảnh, video, giai đoạn,
+    nút thao tác, bảng kết quả).
+  * `translate_keys.py` — `TranslateKeysMixin` (5): gom/che key, trạng thái hạn mức, hộp sửa bảng hạn mức.
+  * `translate_models.py` — `TranslateModelsMixin` (15): tải danh sách model, model dự phòng, model tự kiểm tra,
+    nhà cung cấp tuỳ chỉnh.
+  * `translate_analysis.py` — `TranslateAnalysisMixin` (10): phân tích ngữ cảnh, phân tích lại, bổ sung Visual Cues,
+    hoàn thiện người nói.
+  * `translate_table.py` — `TranslateTableMixin` (9): bảng kết quả (chọn, sao chép, menu chuột phải, dịch lại/sửa dòng,
+    gửi sang Chỉnh sửa).
+  * `translate_tools.py` — `TranslateToolsMixin` (6): bộ nhớ dịch, kiểm thuật ngữ, so sánh giai đoạn, xoá bộ nhớ đệm.
+  * `translate_widgets.py` — `_StagePanel`, `replace_model_items`, `parse_quota_rows` (chuyển nguyên văn).
+  * `translate_constants.py` — thêm 10 hằng số (danh sách ngôn ngữ/model, model tinh chỉnh mặc định, khoá QSettings…).
+* `translate_page` vẫn xuất lại mọi tên cũ; khoá cài đặt (`SubtitlesExtractor`/`TranslatePage`) giữ nguyên nên không mất
+  cài đặt đã lưu. Logger giữ tên cũ.
+* Đối chiếu cây cú pháp bản cũ với bản mới: đủ 128 hàm. Chỉ một hàm (`_on_edit_quota_clicked`) bớt các tên trong lệnh
+  import đặt trong thân hàm vì đầu module đã import sẵn.
+
+### Kiểm thử
+* `tests/unit/presentation/test_translate_page_split_v323694.py` (10 ca):
+  * mỗi lớp trộn đủ phương thức, không bị trang hoặc lớp trộn khác che;
+  * tên cũ, hằng số và khoá cài đặt giữ nguyên; logger giữ nguyên;
+  * mã nối lại parse được và không phương thức nào lặp.
+* Bộ đọc mã nguồn cho test (`tests/unit/editor_page_source.py` của 3.23.693) gom thành `tests/unit/page_sources.py`, dùng
+  chung cho trang Chỉnh sửa và trang Dịch.
+* Hai test đọc mã trang Dịch (`test_numeric_under_translation_v323578`, `test_voice_roster_v323671`) đọc cả các phần tách.
+* `test_media_resolution_ui_v32529` (chống NameError khi mở hộp thoại) nay kiểm `caption_style` ở `translate_keys` và
+  `QMessageBox` ở `translate_tools`, nơi hai tên này được dùng. Lượt quét F821 toàn thư mục trang vẫn giữ.
+* 2335 test trang Dịch / phân tích / model / hạn mức / bộ canh tĩnh đều qua.
+* Toàn bộ test: 8422 passed, 61 skipped.
+
+## [3.23.693] — 🧱 Tách trang Chỉnh sửa: hộp thoại, Re-OCR, tìm/thay/gộp, xuất/xem trước ASS (U6, không đổi hành vi)
+
+### Đã làm
+* `editor_page.py` (3206 dòng) chia thành:
+  * `editor_dialogs.py` — ba lớp hộp thoại/cửa sổ phụ chuyển nguyên văn: `AdvancedReOcrDialog`, `EditorSettingsDialog`,
+    `_DetachedVideoWindow` (kèm `_fmt_mmss`).
+  * `editor_reocr.py` — `EditorReOcrMixin` (9): mở Re-OCR nâng cao / nhanh, khoá khi đang trích xuất, tiến độ, huỷ.
+  * `editor_find_replace.py` — `EditorFindReplaceMixin` (9): lọc, tìm/thay, tự sửa dòng thời gian, gộp dòng giống nhau.
+  * `editor_export.py` — `EditorExportMixin` (7): xuất phụ đề, dựng và dọn bản xem trước ASS.
+  * `editor_constants.py` — 13 hằng số dùng chung (độ trễ, ngưỡng, độ phân giải thanh trượt).
+* `editor_page` vẫn xuất lại mọi tên cũ (hộp thoại, hằng số, `_fmt_mmss`) — mã nhập từ đây không phải đổi.
+* Logger vẫn là `loguru` như trang gốc; hai phần không ghi log thì không giữ import thừa.
+* `editor_page.py`: 3206 → 1992 dòng (−38 %).
+
+### Kiểm thử
+* `tests/unit/presentation/test_editor_page_split_v323693.py` (8 ca):
+  * mỗi lớp trộn đủ phương thức, không bị trang hoặc lớp trộn khác che;
+  * `_replace_in_text_safe` vẫn là `staticmethod`;
+  * tên cũ nhập được từ `editor_page`;
+  * mã nối lại vẫn parse được và không phương thức nào lặp.
+* 13 test cũ đọc thẳng mã nguồn `editor_page.py` nay dùng `tests/unit/editor_page_source.py`: nối trang và các phần tách
+  theo đúng thứ tự file gốc, nên vẫn kiểm đúng các dòng mã đó.
+* Test vá hộp thoại Re-OCR (`test_ui_bug_sweep_v323613`) nay vá tại `editor_reocr`, nơi hộp thoại được gọi.
+* `test_accessibility_v32371` kiểm `btn_play` và `timeline_slider` ở `editor_dialogs.py`, nơi chúng nằm hiện nay.
+* 588 test trang Chỉnh sửa / Re-OCR / xuất / bộ canh tĩnh đều qua.
+* Toàn bộ test: 8405 passed, 61 skipped.
+
+## [3.23.692] — 🧱 Tách trang Lồng tiếng: lồng tiếng cả bộ, cài GPU VieNeu, xuất chi tiết (U6, không đổi hành vi)
+
+### Đã làm
+* Như trang Dịch ở 3.23.689–691, ba nhóm phương thức của `TTSPage` chuyển **nguyên văn** sang lớp trộn riêng:
+  * `tts_batch.py` — `TTSBatchMixin` (10): lồng tiếng cả bộ / dây chuyền phim bộ — hàng đợi, chạy từng tập, xử lý lỗi,
+    báo cáo cuối.
+  * `tts_gpu_install.py` — `TTSGpuInstallMixin` (9): cài gói GPU cho VieNeu, tiến độ, dò khả năng GPU chạy nền, ghi chú.
+  * `tts_export_details.py` — `TTSExportDetailsMixin` (2): xuất chi tiết từng dòng và tệp cấu hình gỡ lỗi.
+* Cách làm:
+  * vị trí phương thức lấy theo cây cú pháp (`ast`);
+  * chỉ nhập lại đúng các tên mỗi nhóm dùng; nhập trùng (nhóm vốn tự nhập trong thân hàm) đã gỡ.
+* Hằng số dùng chung (`_EDGE_ONLY_FIELDS`, `_ENGINE_EDGE/GEMINI/VIENEU`) chuyển sang `tts_constants.py`. `tts_page`
+  vẫn xuất lại tên cũ.
+* Logger giữ tên cũ.
+* `tts_page.py`: 3558 → 2961 dòng (−17 %).
+
+### Kiểm thử
+* `tests/unit/presentation/test_tts_page_split_v323692.py` (4 ca):
+  * mỗi lớp trộn đủ phương thức;
+  * không bị trang hoặc lớp trộn khác che;
+  * hằng số và logger giữ nguyên.
+* Hai test cũ đọc mã nguồn trang để kiểm (`test_vieneu_gpu_install_v323343`, `test_edge_only_settings_v32614`) nay đọc
+  cả trang lẫn phần tách — vẫn kiểm đúng các dòng mã đó.
+* 1629 test lồng tiếng / VieNeu / GPU / phim bộ / bộ canh tĩnh đều qua.
+* Toàn bộ test: 8392 passed, 61 skipped.
+
+## [3.23.691] — 🧱 Tách tiếp trang Dịch: xuất tệp và Visual Cues (U6, không đổi hành vi)
+
+### Đã làm
+* Tiếp nối 3.23.689 (phần "Dịch cả bộ"). Hai nhóm phương thức chuyển **nguyên văn** sang lớp trộn riêng:
+  * `presentation/pages/translate_export.py` — `TranslateExportMixin` (5 phương thức):
+    * xuất phụ đề SRT/ASS;
+    * xuất song ngữ;
+    * xuất chẩn đoán dịch / chẩn đoán phân tích ngữ cảnh;
+    * mở thư mục chứa tệp.
+  * `presentation/pages/translate_cues.py` — `TranslateCuesMixin` (9 phương thức):
+    * soát lại Visual Cues;
+    * bảng sửa người nói / người nghe;
+    * áp lựa chọn của người dùng (kể cả từ trang Lồng tiếng);
+    * kiểm cues hợp lệ.
+* Vị trí phương thức được tìm bằng cây cú pháp (`ast`, gồm cả decorator như `@staticmethod`), không cắt theo số dòng
+  ước lượng.
+* `_LANGUAGE_CODES` chuyển sang `translate_constants.py`; `translate_page` vẫn xuất lại đúng tên cũ.
+* Log giữ tên logger cũ.
+* `translate_page.py`: 3580 → 3188 dòng. Tính từ bản 3.23.688 đã giảm 850 dòng (−21 %).
+
+### Kiểm thử
+* `tests/unit/presentation/test_translate_page_split_v323691.py` (4 ca):
+  * mỗi lớp trộn đủ phương thức;
+  * không phương thức nào bị trang hoặc lớp trộn khác che;
+  * phương thức tĩnh vẫn tĩnh;
+  * hằng số dùng chung và logger giữ nguyên.
+* 1729 test liên quan trang Dịch / Visual Cues / xuất tệp / chẩn đoán / bộ canh tĩnh đều qua.
+* Toàn bộ test: 8384 qua, 61 bỏ qua.
+
 ## [3.23.690] — 🔁 Model chính hết hạn mức NGÀY → tự chuyển model dự phòng (lỗi tìm được khi đo D5)
 
 ### Lỗi

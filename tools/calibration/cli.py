@@ -71,9 +71,9 @@ def _collect_files(uploads_dir: Path) -> tuple[list[Path], list[Path]]:
 
 
 def _calibrate_subtitle(args: argparse.Namespace) -> None:
-    from subtitles_extractor.application.dtos.extract_subtitles_dto import (
-        SubtitleBuilderConfig,
-    )
+    import dataclasses
+
+    from subtitles_extractor.composition.builder_config import app_default_builder_config
     from subtitles_extractor.application.services.subtitle_pipeline.orchestrator import (
         SubtitleBuilder,
     )
@@ -105,7 +105,8 @@ def _calibrate_subtitle(args: argparse.Namespace) -> None:
     ]
 
     def builder_factory(kwargs: dict[str, float | int | bool]) -> SubtitleBuilder:
-        return SubtitleBuilder(SubtitleBuilderConfig(**kwargs))
+        # [v3.23.720] Tham số dò được đặt lên MẶC ĐỊNH CỦA ỨNG DỤNG, không lên mặc định DTO (lệch ứng dụng 5 trường).
+        return SubtitleBuilder(dataclasses.replace(app_default_builder_config(), **kwargs))
 
     evaluator = SubtitleBuildEvaluator(
         corpus=corpus,

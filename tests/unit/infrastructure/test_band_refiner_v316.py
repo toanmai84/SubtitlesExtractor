@@ -93,10 +93,8 @@ def _primary_band(clusters, frame_height: int) -> tuple[float, float] | None:
 
 # Bộ dataset đại diện: gồm cả ca từng gây mega-cluster (file lớn nhiều nhiễu).
 _MEGA_PRONE_DATASETS = ["01.seraw.json"]
-_LARGE_DATASETS = [
-    "Fantasy, starting to cultivate immortality at seventy years old (98 episodes).seraw.json",
-    "The Hehuan Sect begins its cultivation journey by caring for its junior brothers and their partners (80 episodes).seraw.json",
-]
+# [v3.23.717] Hai bộ phim lớn gốc không còn trong kho; dùng các tập toàn khung của phim mẫu có trong ``test data``.
+_LARGE_DATASETS = ["02.seraw.json", "03.seraw.json"]
 
 
 @pytest.mark.skipif(not _FULLSCREEN_DIR.is_dir(), reason="Thiếu thư mục test data")
@@ -154,7 +152,7 @@ class TestAsymmetricBottomPadding:
     """Text NGANG: biên dưới phải được nới nhiều hơn biên trên."""
 
     def test_horizontal_cluster_bottom_padding_exceeds_top(self) -> None:
-        seraw_path = _FULLSCREEN_DIR / "2.seraw.json"
+        seraw_path = _FULLSCREEN_DIR / "02.seraw.json"
         if not seraw_path.exists():
             pytest.skip("Thiếu dataset")
         boxes, frame_width, frame_height = _load_raw_bboxes(seraw_path)
@@ -173,7 +171,7 @@ class TestAsymmetricBottomPadding:
         assert bottom_pad > top_pad
 
     def test_user_padding_override_is_symmetric(self) -> None:
-        seraw_path = _FULLSCREEN_DIR / "2.seraw.json"
+        seraw_path = _FULLSCREEN_DIR / "02.seraw.json"
         if not seraw_path.exists():
             pytest.skip("Thiếu dataset")
         boxes, frame_width, frame_height = _load_raw_bboxes(seraw_path)

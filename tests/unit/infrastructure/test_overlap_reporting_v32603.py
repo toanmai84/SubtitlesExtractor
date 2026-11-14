@@ -80,11 +80,11 @@ def test_no_overlap_when_fits(monkeypatch, tmp_path) -> None:
 def test_ui_counts_overlap_from_results() -> None:
     # Khoá điều kiện UI đếm từ kết quả. [v3.23.601] Chỉ đếm chồng tiếng THẬT (≥1 ms):
     # "overlap_s > 0" đếm cả phần dư làm tròn sau nén (113 báo cáo so với 7 dòng thật).
-    import pathlib
 
-    source = pathlib.Path(
-        "src/subtitles_extractor/presentation/pages/tts_page.py"
-    ).read_text(encoding="utf-8")
+    # [v3.23.692/695] Trang Lồng tiếng đã tách thành nhiều module — đọc cả trang lẫn các phần tách.
+    from tests.unit.page_sources import TTS_PAGE_SOURCE
+
+    source = TTS_PAGE_SOURCE.read_text(encoding="utf-8")
     assert "r.overlap_s for r in ok if r.has_audible_overlap" in source
 
 

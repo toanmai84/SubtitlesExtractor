@@ -76,6 +76,8 @@ def main() -> int:
 
     try:
         frames, meta = _load_raw_data(Path(args.raw_data))
+        global _BASE_CONFIG
+        _BASE_CONFIG = _base_config_for(meta)
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"[LỖI] Không nạp được file dữ liệu thô: {exc}", file=sys.stderr)
         return 1
@@ -140,7 +142,7 @@ def _run_grid_search(
     best_result_str = ""
 
     for combo_idx, combo in enumerate(combinations, start=1):
-        params = dict(zip(param_names, combo))
+        params = dict(zip(param_names, combo, strict=True))
         builder_cfg = _build_config(**params)
 
         try:
@@ -173,7 +175,7 @@ def _run_grid_search(
     print("\n" + "=" * 65)
     print(f"🏆 Tốt nhất (score={best_score:.4f}):")
     print(f"   {best_result_str}")
-    print(f"\nLệnh chạy lại:")
+    print("\nLệnh chạy lại:")
     print(
         f"   python {Path(__file__).name} {args.raw_data}"
         + (f" --reference {args.reference}" if args.reference else "")
@@ -366,27 +368,35 @@ def _load_raw_data(path: Path) -> tuple[list, object]:
     return load_raw_ocr(path)
 
 
-def _build_config(
-    similarity_threshold: float = 0.75,
-    merge_gap_sec: float = 0.60,
-    min_duration_sec: float = 0.15,
-    min_confidence: float = 0.50,
-    use_viterbi: bool = False,
-    viterbi_open_penalty: float = 0.35,
-    min_text_chars: int = 2,
-    **_: object,
-) -> object:
-    from subtitles_extractor.application.dtos.extract_subtitles_dto import (
-        SubtitleBuilderConfig,
-    )
-    return SubtitleBuilderConfig(
-        similarity_threshold=similarity_threshold,
-        merge_gap_sec=merge_gap_sec,
-        min_duration_sec=min_duration_sec,
-        min_confidence=min_confidence,
-        use_viterbi=use_viterbi,
-        viterbi_open_penalty=viterbi_open_penalty,
-        min_text_chars=min_text_chars,
+#: [v3.23.720] Cấu hình nền của lượt phát lại: ``meta.run.builder`` của seraw nếu có (đúng cấu hình lượt chạy), không
+#: thì MẶC ĐỊNH CỦA ỨNG DỤNG — trước đây là mặc định DTO, lệch ứng dụng ở 5 trường (khoảng gộp 0,6 / 0,2, viterbi tắt / bật,
+#: số chữ tối thiểu 2 / 0, đệm 0,05 / 0…) nên mọi số đo phát lại là của một cấu hình ứng dụng không bao giờ chạy.
+_BASE_CONFIG: object | None = None
+
+
+def _base_config_for(meta: object) -> object:
+    import dataclasses
+
+    from subtitles_extractor.application.dtos.extract_subtitles_dto import SubtitleBuilderConfig
+    from subtitles_extractor.composition.builder_config import app_default_builder_config
+
+    recorded = ((getattr(meta, "run", None) or {}).get("builder")) or {}
+    if recorded:
+        names = {field.name for field in dataclasses.fields(SubtitleBuilderConfig)}
+        return SubtitleBuilderConfig(**{key: value for key, value in recorded.items() if key in names})
+    return app_default_builder_config(sample_step_sec=getattr(meta, "sample_step_sec", None))
+
+
+def _build_config(**overrides: object) -> object:
+    """Cấu hình nền (:data:`_BASE_CONFIG`) + các tham số dòng lệnh / lưới được truyền (``None`` = giữ nền)."""
+    import dataclasses
+
+    from subtitles_extractor.composition.builder_config import app_default_builder_config
+
+    base = _BASE_CONFIG if _BASE_CONFIG is not None else app_default_builder_config()
+    names = {field.name for field in dataclasses.fields(base)}
+    return dataclasses.replace(
+        base, **{key: value for key, value in overrides.items() if key in names and value is not None}
     )
 
 
@@ -517,26 +527,28 @@ def _parse_args() -> argparse.Namespace:
                    help="Xuất kết quả ra file SRT")
 
     p.add_argument("--sim", "--similarity-threshold", dest="similarity_threshold",
-                   type=float, default=0.75, metavar="FLOAT",
-                   help="Ngưỡng similarity để gộp frame (default: 0.75)")
+                   type=float, default=None, metavar="FLOAT",
+                   help="Ngưỡng similarity để gộp frame (mặc định: theo seraw / cài đặt ứng dụng)")
     p.add_argument("--gap", "--merge-gap", dest="merge_gap",
-                   type=float, default=0.60, metavar="SEC",
-                   help="Khoảng cách thời gian tối đa để gộp (default: 0.60s)")
+                   type=float, default=None, metavar="SEC",
+                   help="Khoảng cách thời gian tối đa để gộp (mặc định: theo seraw / cài đặt ứng dụng)")
     p.add_argument("--min-duration", dest="min_duration",
-                   type=float, default=0.15, metavar="SEC",
-                   help="Thời lượng tối thiểu (default: 0.15s)")
+                   type=float, default=None, metavar="SEC",
+                   help="Thời lượng tối thiểu (mặc định: theo seraw / cài đặt ứng dụng)")
     p.add_argument("--min-confidence", dest="min_confidence",
-                   type=float, default=0.50, metavar="FLOAT",
-                   help="Ngưỡng confidence OCR tối thiểu (default: 0.50)")
+                   type=float, default=None, metavar="FLOAT",
+                   help="Ngưỡng confidence OCR tối thiểu (mặc định: theo seraw / cài đặt ứng dụng)")
     p.add_argument("--min-text-chars", dest="min_text_chars",
-                   type=int, default=2, metavar="N",
-                   help="Số ký tự tối thiểu của câu (default: 2)")
+                   type=int, default=None, metavar="N",
+                   help="Số ký tự tối thiểu của câu (mặc định: theo seraw / cài đặt ứng dụng)")
     p.add_argument("--use-viterbi", dest="use_viterbi",
-                   action="store_true", default=False,
-                   help="Dùng thuật toán Viterbi thay vì Greedy")
+                   action="store_const", const=True, default=None,
+                   help="Bật Viterbi (mặc định: theo seraw / cài đặt ứng dụng)")
+    p.add_argument("--no-viterbi", dest="use_viterbi", action="store_const", const=False,
+                   help="Tắt Viterbi (dùng Greedy)")
     p.add_argument("--viterbi-penalty", dest="viterbi_penalty",
-                   type=float, default=0.35, metavar="FLOAT",
-                   help="Open penalty của Viterbi (default: 0.35)")
+                   type=float, default=None, metavar="FLOAT",
+                   help="Open penalty của Viterbi (mặc định: theo seraw / cài đặt ứng dụng)")
 
     p.add_argument("--grid-search", dest="grid_search",
                    action="store_true", default=False,

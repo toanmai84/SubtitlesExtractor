@@ -784,6 +784,20 @@ class SettingsPage(QWidget):
         scroll_widget, scroll_layout, scroll_area = self._create_scroll_container(self)
 
         group_basic = SectionCard(self._translator.translate("settings.sec_preprocess_basic"))
+        # [v3.23.701] Số đo thật: tiền xử lý làm OCR kém đi với phụ đề chữ trắng viền đen (mất nét "一").
+        preprocess_note = QLabel(self._translator.translate("settings.preprocess_measured_note"))
+        preprocess_note.setWordWrap(True)
+        preprocess_note.setStyleSheet(caption_style(_c.warning()))
+        group_basic.add_widget(preprocess_note)
+        # [v3.23.704] Chỉ GỢI Ý — không tự đổi cấu hình: người dùng bấm nút thì 4 ô mới tắt, rồi tự bấm Lưu.
+        self._btn_preprocess_recommended = QPushButton(
+            self._translator.translate("settings.btn_preprocess_recommended")
+        )
+        self._btn_preprocess_recommended.setToolTip(
+            self._translator.translate("settings.tip_preprocess_recommended")
+        )
+        self._btn_preprocess_recommended.clicked.connect(self._apply_recommended_preprocess)
+        group_basic.add_widget(self._btn_preprocess_recommended)
         form_basic = QFormLayout()
         group_basic.add_layout(form_basic)
 
@@ -794,6 +808,8 @@ class SettingsPage(QWidget):
         self._sp_upscale_target.setRange(32, 512); self._sp_upscale_target.setSuffix(" px")
         form_basic.addRow(self._translator.translate("settings.rl_target_height"), self._sp_upscale_target)
         self._chk_upscale.toggled.connect(self._sp_upscale_target.setEnabled)
+        self._chk_upscale.setToolTip(self._translator.translate("settings.tip_upscale"))     # [v3.23.721] số đo thật
+        self._sp_upscale_target.setToolTip(self._translator.translate("settings.tip_upscale"))
 
         self._chk_border = QCheckBox(self._translator.translate("settings.cb_black_border"))
         form_basic.addRow(self._translator.translate("settings.rl_black_border"), self._chk_border)
@@ -813,6 +829,11 @@ class SettingsPage(QWidget):
         form_basic.addRow(self._translator.translate("settings.rl_contrast_factor"), self._sp_contrast_factor)
         self._chk_contrast.toggled.connect(self._sp_contrast_factor.setEnabled)
 
+        recommended_tip = self._translator.translate("settings.tip_preprocess_off_recommended")
+        for check in self._recommended_off_preprocess_checks():
+            check.setToolTip(recommended_tip)
+            check.toggled.connect(self._refresh_preprocess_recommendation)
+        self._refresh_preprocess_recommendation()
         scroll_layout.addWidget(group_basic)
 
         group_adv = SectionCard(self._translator.translate("settings.sec_preprocess_adv"))
@@ -1116,6 +1137,27 @@ class SettingsPage(QWidget):
         if self._is_populating:
             return
         self._mark_dirty()
+
+    def _recommended_off_preprocess_checks(self) -> tuple[QCheckBox, ...]:
+        """[v3.23.704] Các bước tiền xử lý mà số đo khuyên TẮT (viền, làm nét, tương phản).
+
+        [v3.23.721] Bỏ "Phóng to" khỏi danh sách: số đo 3.23.713 đo phóng to khi nó còn vô hiệu (vùng chữ 136 px, đích
+        ≤ 272 px không bao giờ được phóng). Phóng thật ×2 là bước tốt nhất đo được → không gợi ý tắt nữa.
+        """
+        return (self._chk_border, self._chk_sharpen, self._chk_contrast)
+
+    def _refresh_preprocess_recommendation(self, *_args: object) -> None:
+        """[v3.23.704] Nút "Dùng cài đặt gợi ý" chỉ bấm được khi còn bước nào đang bật."""
+        button = getattr(self, "_btn_preprocess_recommended", None)
+        if button is None:
+            return
+        button.setEnabled(any(check.isChecked() for check in self._recommended_off_preprocess_checks()))
+
+    def _apply_recommended_preprocess(self) -> None:
+        """[v3.23.704] Tắt 4 bước theo gợi ý. Chưa lưu — người dùng xem lại rồi bấm Lưu (hoặc Huỷ thay đổi)."""
+        for check in self._recommended_off_preprocess_checks():
+            check.setChecked(False)
+        self._refresh_preprocess_recommendation()
 
     def _mark_dirty(self) -> None:
         """[v3.20.3 #4] Có thay đổi chưa lưu → mở khoá Save/Cancel."""

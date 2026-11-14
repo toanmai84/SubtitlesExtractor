@@ -197,7 +197,8 @@
     "ex_tt_bench": "Đo thử các cấu hình OCR (tắt phân loại hướng chữ, batch dò chữ, lọc khung theo chữ sáng) trên một đoạn phim ngắn bằng video + ROI + cài đặt hiện tại, rồi đề xuất cấu hình nhanh nhất mà không đổi phụ đề.",
     "ss_busy_cannot_load": "Đang trích xuất — chưa thể nạp video khác. Hãy chờ xong hoặc bấm Huỷ.",
     "ss_roi_locked_extracting": "Đang trích xuất — tự dò ROI tạm khoá tới khi chạy xong (kể cả lượt hàng loạt).",
-    "ss_reocr_running": "Đang Re-OCR ở trang Chỉnh sửa — trích xuất / tự dò ROI / đo tốc độ tạm khoá tới khi Re-OCR xong (cùng engine OCR)."
+    "ss_reocr_running": "Đang Re-OCR ở trang Chỉnh sửa — trích xuất / tự dò ROI / đo tốc độ tạm khoá tới khi Re-OCR xong (cùng engine OCR).",
+    "ss_roi_detect_cancelled": "Đã huỷ tự dò vùng phụ đề — vùng đang chọn giữ nguyên."
   },
   "editor": {
     "title": "Chỉnh sửa phụ đề",
@@ -444,6 +445,9 @@
     "ed_suspect_near_duplicate": "gần trùng câu kề",
     "ed_suspect_mixed_script": "lẫn chữ Latin/số",
     "ed_suspect_low_confidence": "tin cậy thấp",
+    "ed_suspect_missing_char": "nghi thiếu một chữ (hộp chữ rộng/lệch)",
+    "ed_suspect_reads_disagree": "hai bản đọc mâu thuẫn (lẫn chữ gần giống)",
+    "ed_suspect_extra_char": "nghi thừa một chữ (hộp chữ hẹp)",
     "ed_suspect_restored_char": "chữ được khôi phục"
   },
   "debug": {
@@ -811,7 +815,12 @@
     "co_det_follow_version": "Theo phiên bản OCR",
     "rl_det_override": "Bộ dò chữ:",
     "tip_det_override": "Dùng bộ dò chữ khác với phiên bản OCR (vd v6 small dò chữ + v6 medium nhận dạng). Bộ dò chữ nhỏ nhanh hơn rõ trên GPU; chỉ đổi khi \"Đo tốc độ OCR\" cho thấy kết quả giống hệt.",
-    "tab_ai_access": "Khoá API và AI"
+    "tab_ai_access": "Khoá API và AI",
+    "preprocess_measured_note": "Khuyến nghị TẮT các bước dưới đây. Đo trên phim 86 tập (611 câu, model v6 small): ảnh gốc đúng 598, bật cả làm nét + tương phản + viền đúng 594; riêng câu có nét ngang mảnh (\"一\", \"三\") còn 2/10 so với 10/10 — ứng dụng mất chữ \"一\" ở 8 câu. Chỉ bật khi phim có chữ quá nhỏ/mờ và đã thử thấy tốt hơn.",
+    "btn_preprocess_recommended": "Dùng cài đặt gợi ý (tắt Viền, Làm nét, Tăng tương phản)",
+    "tip_preprocess_recommended": "Bỏ chọn Viền, Làm nét và Tăng tương phản. Chưa lưu ngay:\nxem lại rồi bấm Lưu, hoặc Huỷ thay đổi để giữ như cũ. Bạn vẫn bật lại được từng bước.\n\nSố đo trên 915 khung phụ đề thật (bản 3.23.713): tắt cả 3 bước đọc đúng 909 khung;\nbật Viền + Làm nét + Tăng tương phản đọc đúng 896. Riêng Tăng tương phản làm rơi chữ “一”\nđầu câu ở 7/35 câu (tắt: 1/35). Nút không đụng tới Phóng to (xem chú thích của mục đó).",
+    "tip_upscale": "Phóng vùng chữ (bicubic) tới chiều cao mục tiêu trước khi OCR. Nên đặt gấp đôi chiều cao vùng chữ\n(vùng 136 px → 272 px). Thấp hơn chiều cao vùng chữ thì không phóng.\n\nSố đo 3.23.721 (phim 86 tập, 5 tập OCR thật, 4064 khung giữa câu): đọc đúng 98,28 % → 99,53 %,\nkhung sai / thừa chữ 70 → 19. Đổi lại OCR chậm khoảng 3 lần (đo trên CPU: 474 s → 1399 s cho 5 tập) và đọc thêm rác nền\nngoài câu (khâu dựng phụ đề đã lọc hết: 154/154 câu đúng ở cả hai cách).",
+    "tip_preprocess_off_recommended": "Gợi ý: TẮT với phụ đề chữ trắng viền đen (số đo ở ghi chú phía trên).\nBật nếu phim có chữ quá nhỏ/mờ và bạn thử thấy OCR tốt hơn."
   },
   "common": {
     "task_done_extract": "Trích xuất xong",
@@ -1038,6 +1047,9 @@
     "tr_analysis_think": "Mức Thinking phân tích:",
     "tr_address_style": "Cách gọi tên:",
     "native_address": "Xưng hô thuần Việt (anh Kiếm, chị Hồng — phim hiện đại/đời thường)",
+    "tr_fit_for_speech": "Khớp giọng đọc:",
+    "fit_for_speech": "Tự rút gọn dòng dài hơn khung lồng tiếng (thêm ~50 % thời gian dịch)",
+    "fit_for_speech_tip": "Sau khi dịch xong, dòng nào đọc không kịp trong khung thời gian của nó\n(đã tính cả khoảng lặng tới câu sau) được gửi lại model để rút gọn, giữ\nnguyên nghĩa, phủ định, câu hỏi và tên riêng. Giúp giọng lồng tiếng không\nphải đọc quá nhanh. Chỉ áp cho bản dịch tiếng Việt. Tắt khi chỉ cần phụ đề.",
     "toast_native_title": "Đã lưu cách gọi tên",
     "toast_native_on_body": "Đã đổi bảng nhân vật và bản dịch đang có sang cách gọi thuần Việt; lần phân tích/dịch sau cũng dùng cách này.",
     "toast_native_off_body": "Lần phân tích/dịch sau dùng lại cách gọi Hán-Việt (Kiếm ca, Hồng đại tẩu); bản dịch đang có giữ nguyên.",
@@ -1382,6 +1394,10 @@
     "btn_timing_tip": "Đổi mốc bắt đầu/kết thúc của MỘT dòng đang chọn (không đổi thứ tự dòng).",
     "btn_merge_lines": "🔗 Gộp dòng",
     "btn_merge_lines_tip": "Gộp các dòng LIỀN NHAU đang chọn thành một dòng (lời nối lại, mốc phủ cả hai).",
+    "btn_merge_fragments": "🧩 Đọc liền cụm câu",
+    "btn_merge_fragments_tip": "Gộp các MẢNH của một câu bị phụ đề gốc cắt thành nhiều dòng liền nhau, để giọng đọc\nliền một hơi và mảnh ngắn mượn được thời gian của mảnh dài. Chỉ gộp khi: CÙNG người nói,\ncác dòng sát nhau (khe ≤ 0,12 s), dòng trước chưa kết câu, và trong cụm có dòng phải đọc\nnhanh hơn 1,5×. Cụm tối đa 4 dòng. Số trong ngoặc là số cụm sẽ gộp. Hoàn tác được bằng\nmột lần bấm Hoàn tác; phụ đề xuất ra cũng theo dòng đã gộp.",
+    "fragments_merged": "Đã gộp {n} cụm câu để đọc liền (Hoàn tác để trả lại).",
+    "fragments_none": "Không có cụm câu nào cần gộp.",
     "btn_split_line": "✂ Tách dòng…",
     "btn_split_line_tip": "Tách dòng đang chọn thành hai tại một mốc thời gian.",
     "menu_timing": "Sửa mốc thời gian…",

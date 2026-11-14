@@ -228,7 +228,8 @@ class PyAvFrameSampler:
                     frame_index=frame_counter_idx,
                     timestamp_sec=frame_timestamp_sec,
                     image_rgb=cropped_rgb_arr,
-                    is_duplicate=False
+                    is_duplicate=False,
+                    continues_text=deduper.continues_text,
                 )
 
                 deduper.accept(cropped_rgb_arr, frame_timestamp_sec)

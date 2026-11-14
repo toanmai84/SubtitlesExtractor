@@ -546,6 +546,21 @@ class TTSLineEditsController(QObject):
         self._resynthesize_after({merged})
         return merged
 
+    def merge_fast_fragments(self, _checked: bool = False) -> int:
+        """[v3.23.705] Gộp mọi cụm mảnh câu (cùng người nói) đọc không kịp; trả số cụm đã gộp."""
+        if self._view_model.is_busy:
+            return 0
+        self._commit_edit()
+        merged = self._view_model.merge_fast_fragments()
+        if not merged:
+            self._show_status(self._tr("fragments_none"))
+            return 0
+        if self._panel.is_dubbing_enabled():
+            self._dubbing.reload_cast()
+        self._show_status(self._tr("fragments_merged").replace("{n}", str(len(merged))))
+        self._resynthesize_after(set(merged))
+        return len(merged)
+
     def split_line(self, position: int | None = None, _checked: bool = False) -> int | None:
         """Tách MỘT dòng thành hai (hộp thoại: lời từng nửa + mốc cắt); cần TTS lại cả hai."""
         if self._view_model.is_busy:
@@ -1126,6 +1141,10 @@ class TTSLineEditsController(QObject):
         self._btn_split = PushButton(self._tr("btn_split_line"))
         self._btn_split.setToolTip(self._tr("btn_split_line_tip"))
         self._btn_split.clicked.connect(lambda _checked=False: self.split_line())
+        # [v3.23.705] Đọc liền cụm câu: gộp các mảnh câu cùng người nói mà giọng đọc không kịp.
+        self._btn_merge_fragments = PushButton(self._tr("btn_merge_fragments"))
+        self._btn_merge_fragments.setToolTip(self._tr("btn_merge_fragments_tip"))
+        self._btn_merge_fragments.clicked.connect(lambda _checked=False: self.merge_fast_fragments())
         self._btn_shorten = PushButton(self._tr("btn_shorten"))
         self._btn_shorten.setToolTip(self._tr("btn_shorten_tip"))
         self._btn_shorten.clicked.connect(lambda _checked=False: self.shorten_lines())
@@ -1156,6 +1175,7 @@ class TTSLineEditsController(QObject):
             "restore_deleted": self._btn_restore_deleted, "restore_original": self._btn_restore_original,
             "history": self._btn_history, "timing": self._btn_timing, "merge": self._btn_merge,
             "split": self._btn_split, "shorten": self._btn_shorten,
+            "merge_fragments": self._btn_merge_fragments,
         }
 
     def _prepare_table(self) -> None:
@@ -1318,6 +1338,10 @@ class TTSLineEditsController(QObject):
         label = self._tr("btn_shorten")
         self._btn_shorten.setText(f"{label} ({misfits})" if misfits else label)
         self._btn_shorten.setEnabled(misfits > 0 and not busy and self._shorten is not None)
+        fragments = 0 if busy else len(self._view_model.fragment_merge_plan())
+        label = self._tr("btn_merge_fragments")
+        self._btn_merge_fragments.setText(f"{label} ({fragments})" if fragments else label)
+        self._btn_merge_fragments.setEnabled(fragments > 0 and not busy)
         self._btn_timing.setEnabled(len(positions) == 1 and not busy)
         self._btn_split.setEnabled(len(positions) == 1 and not busy)
         self._btn_merge.setEnabled(self._can_merge(positions) and not busy)

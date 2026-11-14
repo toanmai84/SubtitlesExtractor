@@ -488,8 +488,11 @@ class PaddleOcrAdapter:
             border_thickness_px=pre.border_thickness_px
         )
 
-        scale = float(working_rgb.shape[0]) / orig_height
-        border_px = int(pre.border_thickness_px) if pre.add_white_border else 0
+        # [v3.23.710] Tỉ lệ thu-phóng tính trên phần ẢNH, không gồm viền: trước đây lấy cả chiều cao đã cộng 2 viền
+        # → mọi hộp chữ trả về bị co (vùng cao 136 px, viền 8 px: co 0,895 lần), tâm câu lệch khỏi tâm vùng chữ ~35 px
+        # và bộ lọc căn giữa loại oan các câu một chữ tin cậy thấp. Đo trên phim mẫu: tâm thật 360 px, lưu thành 290+35.
+        border_px = int(pre.border_thickness_px) if pre.add_white_border and pre.border_thickness_px > 0 else 0
+        scale = max(1.0, float(working_rgb.shape[0] - 2 * border_px)) / orig_height
         image_bgr = np.ascontiguousarray(cv2.cvtColor(working_rgb, cv2.COLOR_RGB2BGR), dtype=np.uint8)
         return _PreparedImage(image_bgr=image_bgr, scale=scale, border_px=border_px)
 
@@ -696,8 +699,13 @@ class PaddleOcrAdapter:
 
     @staticmethod
     def _empty_cupy_pool() -> None:
-        try: import cupy as cp
-        except ImportError: return
+        # [v3.23.724] Bộ nạp CuPy an toàn dùng chung (không import CuPy lần hai, không ném lỗi khởi tạo).
+        try:
+            from subtitles_extractor.infrastructure.ocr.preprocessing.gpu_image_filters import cp
+        except ImportError:
+            return
+        if cp is None:
+            return
         try:
             pool = cp.get_default_memory_pool()
             if pool is not None: pool.free_all_blocks()

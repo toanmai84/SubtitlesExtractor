@@ -86,9 +86,9 @@ def test_voice_loader_class_emits_mode_with_result() -> None:
     import json
     import pathlib
 
-    source = pathlib.Path(
-        "src/subtitles_extractor/presentation/pages/tts_page.py"
-    ).read_text(encoding="utf-8")
+    from tests.unit.page_sources import TTS_PAGE_SOURCE
+
+    source = TTS_PAGE_SOURCE.read_text(encoding="utf-8")  # [v3.23.695] trang + các phần đã tách
     assert "class _VieNeuVoiceLoader(QThread)" in source
     assert "voices_loaded = Signal(str, list)" in source  # (mode, ids)
     assert "if mode != current_mode:" in source               # stale check

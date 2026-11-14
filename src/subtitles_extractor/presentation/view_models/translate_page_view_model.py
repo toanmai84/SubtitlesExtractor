@@ -301,6 +301,17 @@ class TranslatePageViewModel(QObject):
         trang gọi mỗi lần chọn dòng / gõ phím vào bảng thuật ngữ)."""
         return len(self._stage_outputs)
 
+    def _diagnostic_settings(self) -> dict[str, object]:
+        """[v3.23.714] Các nhóm cài đặt ảnh hưởng tới bản dịch — ghi kèm tệp chẩn đoán (khoá API bị che ở khâu ghi)."""
+        try:
+            snapshot = self._container.settings_service.current
+        except Exception:  # noqa: BLE001 — thiếu cài đặt không được cản việc xuất chẩn đoán
+            return {}
+        return {
+            name: section for name in ("translation", "video_context", "nlp")
+            if (section := getattr(snapshot, name, None)) is not None
+        }
+
     def export_translation_diagnostics(self, out_path: Path) -> Path:
         """Xuất gói chẩn đoán dịch (JSON) cho video hiện hành.
 
@@ -348,6 +359,7 @@ class TranslatePageViewModel(QObject):
             translated_events=self._translated_events,
             session=session,
             series_context=series_context,
+            settings=self._diagnostic_settings(),
         )
         # [v3.23.610] Token của việc chạy gần nhất (để đối chiếu token suy nghĩ, cache…).
         last_usage = getattr(self, "_last_token_usage", {}) or {}
@@ -709,6 +721,17 @@ class TranslatePageViewModel(QObject):
     def set_clip_video_to_batch(self, enabled: bool) -> None:
         """[v3.23.648] Lưu tuỳ chọn cắt video theo lô (áp dụng từ lượt dịch kế tiếp)."""
         self._container.settings_service.update(translation={"clip_video_to_batch": bool(enabled)})
+
+    def get_fit_for_speech(self) -> bool:
+        """[v3.23.703] Bật lượt khớp giọng đọc (tự rút gọn dòng dài hơn khung TTS)? Mặc định bật."""
+        try:
+            return bool(self._container.settings_service.current.translation.fit_for_speech)
+        except AttributeError:
+            return True
+
+    def set_fit_for_speech(self, enabled: bool) -> None:
+        """[v3.23.703] Lưu tuỳ chọn khớp giọng đọc (áp dụng từ lượt dịch kế tiếp)."""
+        self._container.settings_service.update(translation={"fit_for_speech": bool(enabled)})
 
     def set_native_address(self, enabled: bool) -> None:
         """[v3.23.612] Lưu tuỳ chọn xưng hô thuần Việt (cho lượt phân tích/dịch sau)."""
@@ -1190,7 +1213,7 @@ class TranslatePageViewModel(QObject):
         probe = self._container.make_subtitle_translator(api_key, retry_count)
         if not probe.is_available():
             self.error_occurred.emit(
-                "Bộ dịch chưa sẵn sàng. Kiểm tra đã cài 'google-genai' và nhập đúng API Key."
+                self._not_ready_message()
             )
             return False
 
@@ -1221,6 +1244,7 @@ class TranslatePageViewModel(QObject):
         )
         request = TranslateSubtitlesRequest(
             events=list(subset), stages=stages, context=context, contiguous=False,
+            fit_for_speech=self.get_fit_for_speech(),  # [v3.23.703]
         )
         self._retranslate_indices = valid
         self._retranslate_target_lang = context.target_lang
@@ -1386,7 +1410,7 @@ class TranslatePageViewModel(QObject):
         probe = self._container.make_subtitle_translator(api_key, retry_count)
         if not probe.is_available():
             self.error_occurred.emit(
-                "Bộ dịch chưa sẵn sàng. Kiểm tra đã cài 'google-genai' và nhập đúng API Key."
+                self._not_ready_message()
             )
             return False
 
@@ -1500,6 +1524,7 @@ class TranslatePageViewModel(QObject):
             # getattr: vài test dựng ViewModel bằng __new__ (không qua __init__).
             text_cues=bool(getattr(self, "_text_cues", False)),
             voice_source_path=getattr(self, "_voice_source_path", "") or "",
+            fit_for_speech=self.get_fit_for_speech(),  # [v3.23.703] nút bật/tắt tự rút gọn
         )
 
     def _effective_context(self, context: TranslationContext) -> TranslationContext:
@@ -1709,7 +1734,7 @@ class TranslatePageViewModel(QObject):
         use_case = self._container.make_analyze_context_use_case(api_key)
         probe = self._container.make_subtitle_translator(api_key, retry_count=3)
         if not probe.is_available():
-            self.error_occurred.emit("API Key Gemini chưa hợp lệ hoặc thiếu thư viện google-genai.")
+            self.error_occurred.emit(self._not_ready_message())
             return False
 
         from subtitles_extractor.application.use_cases.translate_subtitles import _events_to_lines_helper
@@ -1765,10 +1790,23 @@ class TranslatePageViewModel(QObject):
         """
         self._fallback_choice = (value or "").strip()
         try:
-            self._container.gemini_model_health.set_preferred_fallback(self._fallback_choice)
-            # [v3.23.666] Cùng lựa chọn cho nhà cung cấp tuỳ chỉnh (khi đang dùng).
+            # [v3.23.698] Lựa chọn chỉ áp cho nhà cung cấp ĐANG DÙNG. Trước đây luôn ghi vào bộ Gemini: chọn
+            # "gpt-4o-mini" lúc dùng nhà cung cấp tuỳ chỉnh rồi quay về Gemini → khi quá tải / hết hạn mức ngày, bộ
+            # dịch gửi "gpt-4o-mini" cho Gemini (404).
             if self.custom_provider_active():
-                self._container.custom_model_health.set_preferred_fallback(self._fallback_choice)
+                health = self._container.custom_model_health
+                health.set_preferred_fallback(self._fallback_choice)
+                if self._fallback_choice not in ("", "-"):
+                    # Model người dùng tự chọn coi như có ở nhà cung cấp: trước đây sau khi khởi động lại (chưa bấm
+                    # "Tải danh sách model") bộ chọn dự phòng không biết model nào nên lặng lẽ không chuyển.
+                    health.add_known_model(self._fallback_choice)
+            else:
+                from subtitles_extractor.infrastructure.translation.model_health import model_family
+
+                choice = self._fallback_choice
+                if choice not in ("", "-") and model_family(choice) != "gemini":
+                    choice = ""            # tên của nhà cung cấp khác → tự động chọn trong họ Gemini
+                self._container.gemini_model_health.set_preferred_fallback(choice)
         except Exception as exc:  # noqa: BLE001 — cấu hình phụ: lỗi không được làm hỏng giao diện
             logger.warning("Không áp được model dự phòng '%s': %s", value, exc)
 
@@ -1799,11 +1837,16 @@ class TranslatePageViewModel(QObject):
         config = CustomProviderConfig(base_url=base_url or "", api_key=api_key or "")
         self._container.set_custom_text_provider(config if enabled else None)
         active = self.custom_provider_active()
-        if active:
-            self._container.custom_model_health.set_preferred_fallback(
-                getattr(self, "_fallback_choice", "") or ""
-            )
+        # [v3.23.698] Áp lại lựa chọn dự phòng cho nhà cung cấp vừa có hiệu lực (cả khi quay về Gemini).
+        self.set_fallback_model(getattr(self, "_fallback_choice", "") or "")
         return active
+
+    def _not_ready_message(self) -> str:
+        """[v3.23.698] Lý do bộ dịch chưa sẵn sàng, theo nhà cung cấp ĐANG DÙNG (trước đây luôn nói về key Gemini)."""
+        if self.custom_provider_active():
+            return ("Nhà cung cấp tuỳ chỉnh chưa sẵn sàng — kiểm tra địa chỉ API (http/https) và API key trong "
+                    "Cài đặt → Khoá API và AI.")
+        return "API Key Gemini chưa hợp lệ hoặc thiếu thư viện google-genai."
 
     def custom_provider_active(self) -> bool:
         """[v3.23.666] True khi các lời gọi AI văn bản đang đi tới nhà cung cấp tuỳ chỉnh."""
@@ -1870,7 +1913,7 @@ class TranslatePageViewModel(QObject):
             return False
         probe = self._container.make_subtitle_translator(api_key, retry_count=3)
         if not probe.is_available():
-            self.error_occurred.emit("API Key Gemini chưa hợp lệ hoặc thiếu thư viện google-genai.")
+            self.error_occurred.emit(self._not_ready_message())
             return False
         from subtitles_extractor.application.use_cases.translate_subtitles import (
             _events_to_lines_helper,
@@ -2028,7 +2071,7 @@ class TranslatePageViewModel(QObject):
         probe = self._container.make_subtitle_translator(api_key, retry_count=3)
         if not probe.is_available():
             self.error_occurred.emit(
-                "API Key Gemini chưa hợp lệ hoặc thiếu thư viện google-genai."
+                self._not_ready_message()
             )
             return False
         from subtitles_extractor.application.use_cases.translate_subtitles import (
@@ -2087,7 +2130,7 @@ class TranslatePageViewModel(QObject):
             return False
         probe = self._container.make_subtitle_translator(api_key, retry_count=3)
         if not probe.is_available():
-            self.error_occurred.emit("API Key Gemini chưa hợp lệ hoặc thiếu thư viện google-genai.")
+            self.error_occurred.emit(self._not_ready_message())
             return False
         from subtitles_extractor.application.use_cases.translate_subtitles import (
             _events_to_lines_helper,

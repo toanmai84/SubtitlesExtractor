@@ -105,6 +105,7 @@ class AiAccessPanel(QWidget):
         self._store = store or shared_ai_access_store()
         self._quota_provider: Callable[[list[str]], str] | None = None
         self._loading = False
+        self._shown_main_key = ""   # [v3.23.700] key mà ô key chính đang hiển thị
         tr = self._tr
 
         root = QVBoxLayout(self)
@@ -216,6 +217,7 @@ class AiAccessPanel(QWidget):
             keys = self._store.gemini_keys()
             if not self.gemini_key_edit.hasFocus():
                 self.gemini_key_edit.setText(keys[0] if keys else "")
+                self._shown_main_key = keys[0] if keys else ""
             if not self.custom_url_edit.hasFocus():
                 self.custom_url_edit.setText(self._store.custom_url())
             if not self.custom_key_edit.hasFocus():
@@ -236,9 +238,16 @@ class AiAccessPanel(QWidget):
         if self._loading:
             return
         keys = self._store.gemini_keys()
-        main = self.gemini_key_edit.text().strip()
-        rest = keys[1:] if keys else []
-        self._store.set_gemini_keys([main, *rest] if main else rest)
+        main = split_keys(self.gemini_key_edit.text())   # [v3.23.698] dán "key1, key2" vào ô chính → hai key
+        # [v3.23.700] Thay đúng key mà ô ĐANG HIỂN THỊ, không phải "key đầu danh sách hiện tại". Ô đang có tiêu điểm thì
+        # load() không ghi đè ô: xoá trống ô + Enter (key 2 lên làm key chính) rồi bấm ra ngoài → editingFinished lần hai
+        # với ô vẫn trống từng xoá LUÔN key 2.
+        shown = self._shown_main_key
+        if main == ([shown] if shown else []):
+            return
+        rest = [k for k in keys if k != shown] if shown else keys
+        self._shown_main_key = main[0] if main else ""
+        self._store.set_gemini_keys([*main, *rest])
 
     def _on_custom_edited(self) -> None:
         if not self._loading:

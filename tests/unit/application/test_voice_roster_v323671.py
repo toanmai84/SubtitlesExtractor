@@ -193,7 +193,9 @@ def test_chi_dan_nghe_giong_chi_them_khong_doi_ten() -> None:
 def test_tuy_chon_giao_dien_co_chuoi_va_luu_cai_dat() -> None:
     import json
 
-    page = (ROOT / "presentation/pages/translate_page.py").read_text(encoding="utf-8")
+    from tests.unit.page_sources import TRANSLATE_PAGE_SOURCE
+
+    page = TRANSLATE_PAGE_SOURCE.read_text(encoding="utf-8")  # [v3.23.694] trang + các phần đã tách
     assert "translate.opt_voice_roster" in page and '"voice_roster"' in page
     for lang in ("vi", "en"):
         data = json.loads((ROOT / f"data/strings_{lang}.json").read_text(encoding="utf-8"))

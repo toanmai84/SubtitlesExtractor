@@ -167,6 +167,14 @@ def _match_free_tier_limit(model_name: str) -> RateLimit:
     return _DEFAULT_LIMIT
 
 
+def _default_limit(model_name: str) -> RateLimit:
+    """[v3.23.724] Hạn mức mặc định: theo DANH MỤC model (đúng bảng AI Studio; model chỉ trả phí không còn bị bó 5/20 của
+    bản miễn phí), model ngoài danh mục thì suy theo tên như trước."""
+    from subtitles_extractor.infrastructure.translation.gemini_model_catalog import default_limit
+
+    return default_limit(model_name) or _match_free_tier_limit(model_name)
+
+
 def _same_label(label: str, _quota_period: str) -> str:
     """Nhãn ngày đã đúng cách tính hiện hành: giữ nguyên."""
     return label
@@ -300,7 +308,7 @@ class GeminiQuotaManager:
                     except (TypeError, ValueError, OverflowError):
                         continue
                     if value > 0:
-                        base = self._limits.get(name) or _match_free_tier_limit(name)
+                        base = self._limits.get(name) or _default_limit(name)
                         self._learned_limits[name] = RateLimit(
                             rpm=base.rpm, tpm=base.tpm, rpd=value
                         )
@@ -431,7 +439,7 @@ class GeminiQuotaManager:
             current = (
                 self._learned_limits.get(key)
                 or self._limits.get(key)
-                or _match_free_tier_limit(model_name)
+                or _default_limit(model_name)
             )
             changed = current.rpd != server_rpd
             if not changed and key in self._learned_limits:
@@ -601,7 +609,7 @@ class GeminiQuotaManager:
         if explicit is not None:
             return explicit
         # [v3.23.17] Không cấu hình thủ công → suy theo tên model (free tier).
-        return self._with_learned_minute(model_name, _match_free_tier_limit(model_name))
+        return self._with_learned_minute(model_name, _default_limit(model_name))
 
     def _with_learned_minute(self, model_name: str, base: RateLimit) -> RateLimit:
         """[v3.23.639] Thay RPM/TPM của ``base`` bằng số server đã nêu (nếu có)."""

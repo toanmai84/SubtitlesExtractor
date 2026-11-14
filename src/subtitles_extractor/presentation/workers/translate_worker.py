@@ -163,6 +163,27 @@ class TranslateWorker(QThread):
                         1,
                         sum(1 for stage in request.stages if stage.kind in needed_kinds),
                     )
+                    # [v3.23.146] DỰ ĐOÁN: mọi key cạn quota ngày -> fail ngay, khỏi phí
+                    # nén+upload rồi mới 429.
+                    if not self._use_case.has_any_daily_quota(video_stage_model):
+                        # [v3.23.696] Còn model dự phòng có hạn mức thì adapter sẽ tự chuyển sang nó (3.23.690) — đừng
+                        # dừng ở đây; chọn key theo model dự phòng để video được tải dưới key sẽ thật sự dùng.
+                        fallback = getattr(self._use_case, "daily_quota_fallback", lambda _m: None)(video_stage_model)
+                        if not fallback:
+                            self.failed.emit(
+                                "Tất cả API key đã hết quota ngày cho model dịch có đính video. "
+                                f"{describe_quota_reset()} Hãy thử lại lúc đó, thêm API "
+                                "key, hoặc tắt đính video ở giai đoạn dịch."
+                            )
+                            return
+                        logger.warning(
+                            "Dịch: model '%s' đã hết hạn mức ngày ở mọi key → dùng model dự phòng '%s'.",
+                            video_stage_model, fallback,
+                        )
+                        self.progress_changed.emit(
+                            0, f"Model '{video_stage_model}' hết hạn mức ngày → dịch bằng model dự phòng '{fallback}'."
+                        )
+                        video_stage_model = fallback
                     viable_key = self._use_case.ensure_viable_key(
                         video_stage_model,
                         needed_requests=session_needed_requests,
@@ -170,15 +191,6 @@ class TranslateWorker(QThread):
                     )
                     if viable_key:
                         self._video_provider.set_active_key(viable_key)
-                    # [v3.23.146] DỰ ĐOÁN: mọi key cạn quota ngày -> fail ngay, khỏi phí
-                    # nén+upload rồi mới 429.
-                    if not self._use_case.has_any_daily_quota(video_stage_model):
-                        self.failed.emit(
-                            "Tất cả API key đã hết quota ngày cho model dịch có đính video. "
-                            f"{describe_quota_reset()} Hãy thử lại lúc đó, thêm API "
-                            "key, hoặc tắt đính video ở giai đoạn dịch."
-                        )
-                        return
                 try:
                     refs = self._video_provider.prepare_and_upload(
                         Path(self._video_path),

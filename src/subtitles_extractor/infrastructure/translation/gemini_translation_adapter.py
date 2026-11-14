@@ -1817,6 +1817,15 @@ def _shorten_system_instruction(target_lang: str) -> str:
         "'sư huynh'), không đổi nghĩa động từ (vd 'phong ấn' ≠ 'phá phong ấn'), không đổi mức độ "
         "('đương nhiên chấp nhận' ≠ 'tất nhận đi'), không đổi 'chúng ta' thành 'đôi ta'. Muốn xem ngữ "
         "cảnh thì đối chiếu 'nguon'.\n"
+        "- TUYỆT ĐỐI GIỮ: mọi từ phủ định ('không', 'chưa', 'chẳng', 'đừng'); kiểu câu (câu hỏi vẫn là câu hỏi, câu "
+        "khẳng định không thành câu hỏi); tên riêng; cách xưng hô — không thêm đại từ mới (vd đừng đổi 'ta' thành "
+        "'tôi', đừng thay tên bằng 'nó'). Câu vi phạm sẽ bị phần mềm loại bỏ.\n"
+        # [v3.23.706] Ca thật: "đệ tử của sư tỷ" → "đệ sư tỷ", "cho đồ nhi" → "cho đồ"; dòng nối tiếp bị viết hoa.
+        "- GIỮ từ mở mệnh đề điều kiện / nhượng bộ ('nếu', 'dù', 'tuy'): bỏ đi là đổi nghĩa câu.\n"
+        "- KHÔNG cắt đôi từ ghép: từ xưng hô / thuật ngữ hai tiếng ('đệ tử', 'đồ nhi', 'sư tỷ', 'lôi kiếp') giữ "
+        "TRỌN cả hai tiếng hoặc bỏ cả từ — không bao giờ giữ một nửa ('đệ', 'đồ').\n"
+        "- GIỮ kiểu chữ đầu dòng: 'ban_dich' mở bằng chữ thường (dòng nối tiếp câu trước) thì câu mới cũng mở bằng "
+        "chữ thường; giữ dấu câu cuối dòng như câu cũ.\n"
         "- Nếu KHÔNG thể rút gọn mà vẫn giữ nguyên nghĩa và từ khoá, trả lại ĐÚNG câu cũ (không ép).\n"
         "- Trả đủ MỌI id đã cho, mỗi id một câu hoàn chỉnh, một dòng, không xuống dòng.\n"
         "- 'truoc' / 'sau' chỉ để hiểu mạch hội thoại, KHÔNG viết lại chúng.\n"
@@ -2418,6 +2427,17 @@ class GeminiSubtitleTranslator:
         if self._quota_manager is None or not self._api_keys:
             return True
         return any(self._key_has_capacity(model_name, key) for key in self._api_keys)
+
+    def daily_quota_fallback(self, model_name: str) -> str | None:
+        """[v3.23.696] Model dự phòng mà lời gọi sẽ chuyển sang khi ``model_name`` hết hạn mức ngày ở mọi key.
+
+        Cùng luật chọn với lúc gọi thật (:meth:`_failover_model`): dự phòng còn hạn mức ở ít nhất một key, không đang bị
+        ngắt mạch, và người dùng chưa tắt "Model dự phòng". Worker hỏi trước để không dừng sớm khi adapter vẫn chạy tiếp được.
+        """
+        try:
+            return self._failover_model(model_name, {model_name})
+        except (AttributeError, TypeError, ValueError):
+            return None
 
     def ensure_viable_key(
         self,
@@ -3716,6 +3736,28 @@ class GeminiSubtitleTranslator:
                 return True
             return False
 
+        returned_to_primary = False
+
+        def _return_from_overloaded_fallback(raw: int) -> bool:
+            """[v3.23.706] Model DỰ PHÒNG cũng quá tải và không còn dự phòng nào khác: QUAY VỀ model chính một lần.
+
+            Ca thật 10/11/2026: 3.5-flash-lite quá tải thoáng qua → lời gọi chuyển sang 3.1-flash-lite đúng lúc
+            3.1 sập hẳn (503 ở cả 3 key) → chờ 11 phút trên 3.1 rồi bỏ cả lượt dịch, trong khi 3.5 đã chạy lại
+            sau chưa đầy một phút. Chỉ quay về MỘT lần mỗi lời gọi nên không thể qua lại vô hạn.
+            """
+            nonlocal returned_to_primary
+            if returned_to_primary or model_name == primary_model:
+                return False
+            if not self._has_any_key_capacity(primary_model):
+                return False
+            returned_to_primary = True
+            logger.warning(
+                "Model dự phòng '%s' cũng đang quá tải và không còn model dự phòng nào khác → quay lại '%s'.",
+                model_name, primary_model,
+            )
+            _switch_model(primary_model, raw)
+            return True
+
         def _refresh_video_after_key_switch() -> None:
             """[v3.23.132] Sau khi XOAY KEY, handle video (do key cũ tải lên) sẽ bị 403 →
             resolve lại bằng key hiện tại, tải lại đoạn nếu cần, rồi dựng lại contents."""
@@ -3782,6 +3824,11 @@ class GeminiSubtitleTranslator:
                             continue
                         # [v3.23.690] Mọi key đều hết theo bộ đếm → model dự phòng (nếu bật) rồi đặt chỗ lại.
                         if _leave_exhausted_fallback(raw_attempt):
+                            # [v3.23.696] Đổi model NGAY trong lượt này (chưa gửi gì): lượt này là lượt 0 của model mới.
+                            # ``_switch_model`` đặt mốc ``raw + 1`` cho lời gọi đã hỏng — ở đây làm model dự phòng
+                            # được dư một lượt thử (đếm từ -1).
+                            attempt_offset = raw_attempt
+                            attempt = 0
                             with self._state_lock:
                                 reserve_index = self._key_index
                             continue
@@ -4129,6 +4176,10 @@ class GeminiSubtitleTranslator:
                             overload_failures >= FAILOVER_AFTER_IN_CALL
                             or self._model_health.cooling_remaining(model_name) > 0
                         ) and _fail_over("quá tải kéo dài", raw_attempt):
+                            continue
+                        if overload_failures >= FAILOVER_AFTER_IN_CALL and _return_from_overloaded_fallback(
+                            raw_attempt
+                        ):
                             continue
                 # [v3.23.592] Trần tính theo key đang dùng: key đầu được thử đủ lượt, các
                 # key sau chỉ thăm dò. Chạm trần mà còn key chưa thử → chuyển key, gửi
@@ -4689,25 +4740,21 @@ class GeminiSubtitleTranslator:
             "diễn đạt đủ (do phải thêm đại từ xưng hô, hư từ, giới từ). Vì vậy TUYỆT ĐỐI "
             "KHÔNG lấy số âm tiết câu gốc làm đích: ép bằng câu gốc là "
             "điều BẤT KHẢ THI và "
-            "chỉ dẫn tới CẮT NGHĨA. Hãy lấy 'max_chars' làm mốc, không lấy câu gốc.\n"
-            "- DÙNG ĐỦ NGÂN SÁCH: 'max_chars' là NGÂN SÁCH được phép "
-            "dùng, KHÔNG phải chỉ "
-            "tiêu phải tiết kiệm. Khi bản dịch đã nằm trong ngân sách thì DỪNG rút gọn — "
-            "rút thêm nữa chỉ làm mất chi tiết mà không được lợi gì. "
-            "Một bản dịch chỉ dùng "
-            "một nửa ngân sách thường là dấu hiệu ĐÃ BỎ MẤT nội dung: hãy đọc lại và bổ "
-            "sung phần còn thiếu.\n"
-            "- GIỚI HẠN ĐỘ DÀI (max_chars): mỗi dòng có trường 'max_chars' là số ký tự "
-            "mà giọng đọc kịp phát âm trong thời lượng cảnh đó (tính từ tốc độ phát âm "
-            "THỰC ĐO của engine TTS). Hãy ĐẾM ký tự bản dịch và cố viết gọn trong giới "
-            "hạn — CHỈ bằng cách bỏ từ đệm/thừa, rút cụm vòng vo, dùng từ cô đọng hơn.\n"
-            "- NHƯNG NGHĨA LUÔN THẮNG GIỚI HẠN (TUYỆT ĐỐI): 'max_chars' là MỤC TIÊU, "
-            "KHÔNG phải mệnh lệnh được phép hy sinh nội dung. TUYỆT ĐỐI KHÔNG: bỏ thông "
-            "tin, bỏ chủ ngữ/tân ngữ làm câu tối nghĩa, bỏ từ phủ định ('không', 'chưa', "
-            "'đừng'), đảo người nói/người nghe, hay biến câu thành mảnh cụt vô nghĩa. "
-            "Nếu KHÔNG THỂ vừa giới hạn mà vẫn giữ TRỌN nghĩa, hãy GIỮ NGHĨA và chấp "
-            "nhận vượt 'max_chars' — phần mềm sẽ tự nén giọng, hoàn toàn ổn. Người xem "
-            "thà nghe giọng hơi gấp mà HIỂU ĐÚNG, còn hơn nghe rõ mà nghĩa sai.\n"
+            "chỉ dẫn tới CẮT NGHĨA. Hãy lấy 'max_words' làm mốc, không lấy câu gốc.\n"
+            # [v3.23.702] Ngân sách theo SỐ TIẾNG (trước: số ký tự) và không còn "cứ vượt, phần mềm tự nén":
+            # lượt chạy thật phim 86 tập có 500/3664 dòng TTS phải đọc nhanh > 1,5× vì câu dịch dài quá khung.
+            "- GIỚI HẠN ĐỘ DÀI (max_words): mỗi dòng có 'max_words' = số TIẾNG (từ viết rời, đếm theo dấu "
+            "cách; 'sư huynh' = 2 tiếng) mà giọng đọc kịp nói trong thời lượng cảnh đó. ĐẾM số tiếng bản dịch "
+            "và viết KHÔNG VƯỢT 'max_words' — bằng cách bỏ từ đệm/thừa ('thì', 'là', 'mà', 'đã', 'cái', "
+            "'những', 'các', 'đấy', 'rồi', 'cơ chứ'), bỏ đại từ khi ngữ cảnh đã rõ ai nói với ai, rút cụm "
+            "vòng vo, dùng từ ngắn tương đương.\n"
+            "- DÙNG ĐỦ NGÂN SÁCH: 'max_words' là mức TRẦN được phép dùng, không phải chỉ tiêu phải tiết kiệm. "
+            "Khi đã nằm trong giới hạn thì DỪNG rút gọn; dòng chỉ dùng một nửa giới hạn thường là dấu hiệu "
+            "đã BỎ MẤT nội dung.\n"
+            "- NGHĨA LUÔN THẮNG GIỚI HẠN: TUYỆT ĐỐI KHÔNG bỏ thông tin, bỏ từ phủ định ('không', 'chưa', "
+            "'đừng'), bỏ tên riêng/thuật ngữ, đảo người nói/người nghe, hay biến câu thành mảnh cụt vô nghĩa. Chỉ khi "
+            "KHÔNG THỂ giữ trọn nghĩa trong 'max_words' mới được vượt — và vượt ÍT NHẤT có thể (1-2 tiếng). "
+            "Câu vượt quá xa buộc giọng đọc phải đọc rất nhanh, nghe gấp gáp và lệch hình.\n"
             "- VÍ DỤ PHẢN DIỆN (những lỗi CẤM tuyệt đối, lấy từ ca thật):\n"
             "  * \"cháu đã nói về chú thế nào,\" → \"Chú?\" — SAI: mất sạch nghĩa.\n"
             "  * \"Không phải chú không cho cháu cơ hội.\" → \"Cho cơ hội,\" — SAI: mất "
@@ -4729,7 +4776,7 @@ class GeminiSubtitleTranslator:
             "thể suy nghĩ và làm biến mất TÔI (tân ngữ). Khi câu gốc lược chủ ngữ, hãy "
             "dùng 'speaker'/'addressee' và các dòng lân cận để khôi phục ĐÚNG vai — "
             "KHÔNG được đoán bừa rồi đảo ngược.\n"
-            "  Tuyệt đối KHÔNG trả trường 'max_chars' trong kết quả.\n"
+            "  Tuyệt đối KHÔNG trả trường 'max_words' trong kết quả.\n"
         )
 
         # [v3.23.225] Chỉ thị xử lý cờ needs_expansion — vòng TỰ SỬA giữa các giai đoạn.
@@ -4744,11 +4791,25 @@ class GeminiSubtitleTranslator:
             "  (2) Đối chiếu xem bản dịch hiện tại đã BỎ SÓT gì — thường là: tân ngữ, tên "
             "riêng, trạng ngữ nơi chốn/thời gian, từ phủ định, hoặc cả một vế câu;\n"
             "  (3) VIẾT LẠI dòng đó cho ĐỦ NỘI DUNG bản gốc, kể cả khi phải dài hơn "
-            "'max_chars' — thà dài mà đúng còn hơn ngắn mà mất nghĩa;\n"
+            "'max_words' — thà dài mà đúng còn hơn ngắn mà mất nghĩa;\n"
             "  (4) Kiểm tra HƯỚNG hành động: ai làm gì với ai, đúng như bản gốc.\n"
             "  Ví dụ: gốc '作为王建强的侄女' dịch thành 'Là cháu chú,' đã RỚT tên riêng -> "
             "phải bổ sung: 'Là cháu gái của Vương Kiến Cường,'.\n"
         )
+
+        # [v3.23.702] Ngân sách "số tiếng" chỉ cho đích tiếng Việt (nhịp VieNeu theo âm tiết); ngôn ngữ khác payload vẫn
+        # gửi 'max_chars' — viết lại phần chỉ dẫn độ dài cho khớp.
+        from subtitles_extractor.infrastructure.tts.tts_fit import is_vietnamese_target
+
+        if not is_vietnamese_target(context.target_lang):
+            concise = concise.replace(
+                "mỗi dòng có 'max_words' = số TIẾNG (từ viết rời, đếm theo dấu "
+                "cách; 'sư huynh' = 2 tiếng) mà giọng đọc kịp nói trong thời lượng cảnh đó. ĐẾM số tiếng bản dịch "
+                "và viết KHÔNG VƯỢT 'max_words'",
+                "mỗi dòng có 'max_chars' = số KÝ TỰ mà giọng đọc kịp nói trong thời lượng cảnh đó. ĐẾM số ký tự "
+                "bản dịch và viết KHÔNG VƯỢT 'max_chars'",
+            ).replace("max_words", "max_chars").replace("1-2 tiếng", "vài ký tự")
+            expansion = expansion.replace("max_words", "max_chars")
 
         # Chỉ dẫn xưng hô — tránh đoán bừa vai vế/giới tính (lỗi kinh điển khi dịch
         # phim Trung: huynh/đệ/tỷ/muội, anh/chị/em lộn xộn giữa các câu).
@@ -5767,7 +5828,7 @@ class GeminiSubtitleTranslator:
             enable_thinking=True,
             thinking_budget=-1,
             model_name=model_name,
-            thinking_level=getattr(self, "_analysis_thinking_level", "medium"),
+            thinking_level=self._analysis_level_for(model_name),
             media_resolution=getattr(self, "_analysis_media_resolution", "medium"),
         )
 
@@ -6516,7 +6577,7 @@ class GeminiSubtitleTranslator:
             0.2, _VISUAL_CUES_SCHEMA, system_instr,
             enable_thinking=True, thinking_budget=-1,
             model_name=model_name,
-            thinking_level=getattr(self, "_analysis_thinking_level", "medium"),
+            thinking_level=self._analysis_level_for(model_name),
             media_resolution=getattr(self, "_analysis_media_resolution", "medium"),
         )
         # [v3.23.475] Dùng bản HEAL: xoay key do quota (429) làm handle video của key cũ bị
@@ -6700,7 +6761,7 @@ class GeminiSubtitleTranslator:
             0.2, _TEXT_CUES_SCHEMA,
             _text_cues_system_instruction(target_lang, characters, bool(voices)),
             enable_thinking=True, thinking_budget=-1, model_name=model_name,
-            thinking_level=getattr(self, "_analysis_thinking_level", "medium"),
+            thinking_level=self._analysis_level_for(model_name),
         )
 
         def _noop_validator(_data: dict[str, Any]) -> None:
@@ -6818,7 +6879,7 @@ class GeminiSubtitleTranslator:
         config = self._build_config(
             0.2, _VOICE_ROSTER_SCHEMA, VOICE_ROSTER_SYSTEM,
             enable_thinking=True, thinking_budget=-1, model_name=model_name,
-            thinking_level=getattr(self, "_analysis_thinking_level", "medium"),
+            thinking_level=self._analysis_level_for(model_name),
         )
         logger.info("Nghe giọng bổ sung bảng nhân vật (%.0f giây âm thanh, %d dòng có nhãn giọng).",
                     seconds, len(labels))
@@ -6936,13 +6997,17 @@ class GeminiSubtitleTranslator:
         Returns:
             ``{id: câu mới}`` cho các id model trả về (use case kiểm hợp lệ từng câu).
         """
+        from subtitles_extractor.infrastructure.translation.thinking_policy import thinks_only_at_high
+
         self._ensure_available()
         if not items:
             return {}
         config = self._build_config(
             0.3, _SHORTEN_SCHEMA, _shorten_system_instruction(target_lang),
             enable_thinking=True, thinking_budget=-1, model_name=model_name,
-            thinking_level="low",
+            # [v3.23.702] 3.5-flash-lite chỉ suy nghĩ ở mức "high" (đo: low/medium = 0 token suy nghĩ, đếm sai số
+            # tiếng). Model khác giữ "low" như trước.
+            thinking_level="high" if thinks_only_at_high(model_name) else "low",
         )
         wanted_all: dict[int, str] = {}
         batches = [items[i:i + SHORTEN_BATCH_SIZE] for i in range(0, len(items), SHORTEN_BATCH_SIZE)]
@@ -6954,10 +7019,20 @@ class GeminiSubtitleTranslator:
                 "Viết lại NGẮN HƠN từng dòng trong <cac_dong_can_rut_gon> theo đúng giới hạn "
                 f"'toi_da_am_tiet' ({len(batch)} dòng, id: {[b['id'] for b in batch]}).",
             ])
-            data = self._call_gemini(
-                model_name, prompt, config, lambda _d: None, cancel_cb=cancel_cb,
-                est_tokens=max(1, len(prompt) // 4), reject_truncated=True,
-            )
+            try:
+                data = self._call_gemini(
+                    model_name, prompt, config, lambda _d: None, cancel_cb=cancel_cb,
+                    est_tokens=max(1, len(prompt) // 4), reject_truncated=True,
+                )
+            except TranslationCancelledError:
+                raise
+            except (RuntimeError, ValueError, OSError, SubtitleTranslationError) as exc:
+                # [v3.23.702] Lô sau lỗi (hết hạn mức…) không được bỏ phí các lô trước đã rút gọn xong.
+                if not wanted_all:
+                    raise
+                logger.warning("Rút gọn câu: dừng ở lô %d/%d (%s) — giữ %d câu của các lô trước.",
+                               batch_idx + 1, len(batches), exc, len(wanted_all))
+                break
             ids = {int(b["id"]) for b in batch}
             for row in (data or {}).get("lines", []) if isinstance(data, dict) else []:
                 try:
@@ -7083,6 +7158,21 @@ class GeminiSubtitleTranslator:
             return []
         if self.uses_custom_provider:
             return self._list_custom_models()
+        # [v3.23.698] Thử lần lượt MỌI key: trước đây chỉ key hiện tại — key đầu hỏng / bị cách ly thì nút "Tải danh sách
+        # model" trả rỗng dù các key khác vẫn tốt.
+        start = self._key_index
+        for offset in range(max(1, len(self._api_keys))):
+            if offset:
+                self._switch_to_key((start + offset) % len(self._api_keys))
+            models = self._list_gemini_models_once()
+            if models is not None:
+                return models
+        if self._api_keys and self._key_index != start:
+            self._switch_to_key(start)
+        return []
+
+    def _list_gemini_models_once(self) -> list[str] | None:
+        """Danh sách model bằng key hiện tại; ``None`` nếu gọi API lỗi (để thử key khác)."""
         try:
             client = self._get_client()
             result: list[str] = []
@@ -7115,7 +7205,7 @@ class GeminiSubtitleTranslator:
                 is_gemini_model = "gemini" in model_id.lower()
 
                 if supports_generate or is_gemini_model:
-                    if self._is_free_tier_text_model(model_id):
+                    if self._is_listed_text_model(model_id):
                         result.append(model_id)
                         logger.debug(
                             "Lấy model: %s | methods=%s", model_id,
@@ -7131,16 +7221,18 @@ class GeminiSubtitleTranslator:
                     )
 
             logger.info(
-                "list_available_models: tổng %d model từ API → %d model free tier được chọn.",
+                "list_available_models: tổng %d model từ API → %d model sinh văn bản (miễn phí + trả phí).",
                 all_count, len(result),
             )
             if self._model_health is not None:
                 self._model_health.set_known_models(result)
-            return sorted(result)
+            from subtitles_extractor.infrastructure.translation.gemini_model_catalog import sort_key
+
+            return sorted(dict.fromkeys(result), key=sort_key)
 
         except Exception as exc:
-            logger.warning("Không lấy được danh sách model Gemini: %s", exc)
-            return []
+            logger.warning("Không lấy được danh sách model Gemini (key …%s): %s", self._current_key_id()[-4:], exc)
+            return None
 
     def _list_custom_models(self) -> list[str]:
         """[v3.23.666] Mọi model sinh văn bản của nhà cung cấp tuỳ chỉnh (``GET /models``).
@@ -7169,6 +7261,14 @@ class GeminiSubtitleTranslator:
         if self._model_health is not None and result:
             self._model_health.set_known_models(result)
         return result
+
+    @staticmethod
+    def _is_listed_text_model(model_id: str) -> bool:
+        """[v3.23.724] Model hiện trong danh sách chọn: MỌI model Gemini sinh văn bản — miễn phí và trả phí (danh mục
+        ``gemini_model_catalog``). Trước đây chỉ giữ ``*flash*`` miễn phí → mất 2.5/3.1 Pro, Gemini 4 Argon/Carbon/Hydrogen."""
+        from subtitles_extractor.infrastructure.translation.gemini_model_catalog import is_text_out_model
+
+        return is_text_out_model(model_id)
 
     @staticmethod
     def _is_free_tier_text_model(model_id: str) -> bool:
@@ -7200,6 +7300,66 @@ class GeminiSubtitleTranslator:
     # (``timing_math.readable_char_budget``), thay cho giả định "tốc độ đọc là hằng số
     # 16 ký tự/giây" — vốn sai bản chất vì mỗi câu có chi phí cố định ~0.3s (lấy hơi,
     # đuôi âm). Xem docstring của ``readable_char_budget`` để biết bằng chứng đo đạc.
+    def _analysis_level_for(self, model_name: str) -> str:
+        """[v3.23.702] Mức suy nghĩ cho các lời gọi PHÂN TÍCH: mức người dùng chọn, trừ model chỉ suy nghĩ ở "high".
+
+        3.5-flash-lite ở "low"/"medium" trả 0 token suy nghĩ. A/B phân tích 361 câu: "medium" ra chữ vô nghĩa ("gọi
+        'mươi'", "thế điểu") và sai vai (sư thúc ghi là "sư muội"); "high" lập đủ quy tắc xưng hô từng cặp, còn
+        nhanh hơn (25 s so với 75 s do bớt thử lại). "minimal" (người dùng chủ động tắt) giữ nguyên.
+        """
+        from subtitles_extractor.infrastructure.translation.thinking_policy import thinks_only_at_high
+
+        level = getattr(self, "_analysis_thinking_level", "medium") or "medium"
+        if thinks_only_at_high(model_name) and level.lower() in ("low", "medium"):
+            return "high"
+        return level
+
+    def _word_budget(
+        self, line: TranslationLine, next_start_ms: int | None = None, ref_speed: float | None = None,
+    ) -> int:
+        """[v3.23.702] Số TIẾNG tối đa để giọng đọc (VieNeu, ≤ 1,5× nhịp tự nhiên) kịp khung; 0 nếu mốc lỗi.
+
+        Gửi model dưới dạng ``max_words``: model đếm TIẾNG (từ viết rời) tin cậy hơn đếm ký tự, và tiếng Việt đọc
+        theo âm tiết. Khung hiệu dụng tính như ``_length_hint`` (khung gốc + khe tới câu sau).
+        """
+        from subtitles_extractor.infrastructure.tts.timing_math import CHARS_PER_SYLLABLE
+        from subtitles_extractor.infrastructure.tts.tts_fit import (
+            PAINFUL_SPEED,
+            TRANSLATION_MIN_WORDS,
+            translation_word_budget,
+        )
+
+        if line.end_ms - line.start_ms <= 0:
+            return 0
+        if next_start_ms is None:
+            usable_s = (line.end_ms - line.start_ms) / 1000.0
+        else:
+            usable_s = effective_available_seconds(
+                line.start_ms / 1000.0, line.end_ms / 1000.0, next_start_ms / 1000.0,
+            )
+        ref = ref_speed if ref_speed is not None else getattr(self, "_word_budget_ref", PAINFUL_SPEED)
+        words = translation_word_budget(usable_s, ref)
+        # Tuỳ chọn "dịch theo tốc độ mắt đọc" (CPS): siết thêm, quy ký tự → tiếng như ngân sách cũ.
+        cps = getattr(self, "_reading_cps_budget", 0.0)
+        if cps > 0:
+            reading_words = int(reading_char_budget(usable_s, cps) / CHARS_PER_SYLLABLE)
+            words = max(TRANSLATION_MIN_WORDS, min(words, reading_words))
+        return words
+
+    def line_word_budgets(self, lines: list[TranslationLine]) -> dict[int, int]:
+        """[v3.23.702] ``{index: max_words}`` — đúng con số gửi cho model (khung hiệu dụng theo thứ tự thời gian)."""
+        from subtitles_extractor.infrastructure.tts.tts_fit import PAINFUL_SPEED
+
+        ordered = sorted(lines, key=lambda line: (line.start_ms, line.index))
+        next_starts: list[int | None] = [line.start_ms for line in ordered[1:]] + [None]
+        budgets: dict[int, int] = {}
+        pairs = [(line, self._word_budget(line, next_start_ms, PAINFUL_SPEED))   # bản cuối: mức chặt
+                 for line, next_start_ms in zip(ordered, next_starts, strict=True)]
+        for line, words in pairs:
+            if words:
+                budgets[line.index] = words
+        return budgets
+
     def _length_hint(self, line: TranslationLine, next_start_ms: int | None = None) -> int:
         """Số ký tự tối đa NÊN dùng để TTS đọc kịp; 0 nếu không rõ mốc thời gian.
 
@@ -7281,9 +7441,14 @@ class GeminiSubtitleTranslator:
             data["cue"] = line.scene
         if line.description:
             data["description"] = line.description
-        hint = self._length_hint(line, next_start_ms)
-        if hint:
-            data["max_chars"] = hint
+        if getattr(self, "_speech_words", True):
+            words = self._word_budget(line, next_start_ms)
+            if words:
+                data["max_words"] = words   # [v3.23.702] trước: max_chars (model đếm ký tự kém, ngân sách theo Gemini TTS)
+        else:
+            hint = self._length_hint(line, next_start_ms)
+            if hint:
+                data["max_chars"] = hint
         return data
 
     def _attach_address_rules_once(
@@ -7392,9 +7557,14 @@ class GeminiSubtitleTranslator:
             data["cue"] = line.scene
         if line.description:
             data["description"] = line.description
-        hint = self._length_hint(line, next_start_ms)
-        if hint:
-            data["max_chars"] = hint
+        if getattr(self, "_speech_words", True):
+            words = self._word_budget(line, next_start_ms)
+            if words:
+                data["max_words"] = words   # [v3.23.702]
+        else:
+            hint = self._length_hint(line, next_start_ms)
+            if hint:
+                data["max_chars"] = hint
         # [v3.23.225] Cờ TỰ SỬA: dòng bị lưới ``under_translation_guard`` nghi DỊCH THIẾU
         # ở khâu TRƯỚC. Giai đoạn này DÙ SAO CŨNG gọi API và DÙ SAO CŨNG có 'original'
         # trong payload kép -> tận dụng để BỔ SUNG phần bị rớt, không tốn thêm lượt gọi.
@@ -7766,6 +7936,27 @@ class GeminiSubtitleTranslator:
 
         is_preprocess = stage.kind is TranslationStageKind.PREPROCESS
         is_literal = stage.kind is TranslationStageKind.LITERAL
+        # [v3.23.702] Dịch sát nghĩa: ngân sách NỚI (≤ 1,8×) — A/B 361 câu: ngân sách chặt ngay ở khâu này khiến
+        # 3.5-flash-lite bỏ ý ("不客气了" → "nương tay nữa nhé", "大罪啊" → "đấy."). Khâu tinh chỉnh siết về 1,5×.
+        from subtitles_extractor.infrastructure.tts.tts_fit import PAINFUL_SPEED, PREDICTED_SPEED
+
+        self._word_budget_ref = PREDICTED_SPEED if (is_literal or is_preprocess) else PAINFUL_SPEED
+        from subtitles_extractor.infrastructure.tts.tts_fit import is_vietnamese_target
+
+        self._speech_words = is_vietnamese_target(context.target_lang)   # ngôn ngữ khác: giữ max_chars như cũ
+        # [v3.23.702] Dịch sát nghĩa bằng model chỉ suy nghĩ ở "high" (3.5-flash-lite): mức low/medium = KHÔNG suy
+        # nghĩ. A/B 361 câu: không suy nghĩ ở khâu này đảo nghĩa ("不客气了" → "nương tay nhé"), mất ý ("大罪啊" →
+        # "đấy."), bỏ tên khi gọi bề trên; bật "high" hết các lỗi đó (+50 % thời gian dịch). Người dùng TẮT suy nghĩ
+        # thì giữ nguyên.
+        from subtitles_extractor.infrastructure.translation.thinking_policy import thinks_only_at_high
+
+        if (is_literal and stage.enable_thinking and thinks_only_at_high(stage.model_name)
+                and (getattr(stage, "thinking_level", "") or "").lower() != "high"):
+            logger.info(
+                "Model '%s' chỉ suy nghĩ ở mức cao → khâu dịch sát nghĩa dùng mức 'high' (mức '%s' = không suy nghĩ).",
+                stage.model_name, getattr(stage, "thinking_level", ""),
+            )
+            stage = replace(stage, thinking_level="high")
         # [Anti-Chinese Whispers] Seed bản gốc bất biến ở giai đoạn dịch ĐẦU TIÊN
         # (khi text vẫn là ngôn ngữ gốc). Các stage sau giữ nguyên để đối chiếu.
         # [v3.23.503] Gieo NGAY TỪ PREPROCESS: trước đây bỏ qua khâu này nên ``original_text``

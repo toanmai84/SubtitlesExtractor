@@ -1218,6 +1218,23 @@ def _process_log_snapshot(source_texts: list[str]) -> dict[str, Any]:
         return {"events": [], "counts": {}, "dropped": 0}
 
 
+def _settings_snapshot(settings: Any | None) -> dict[str, Any]:
+    """Cài đặt ở dạng JSON ghi được, đã che mọi khoá trông như bí mật; lỗi → ``{}`` (không cản việc xuất)."""
+    if settings is None:
+        return {}
+    try:
+        from subtitles_extractor.application.services.run_provenance import to_jsonable
+
+        dumped = {
+            name: (section.model_dump(mode="json") if hasattr(section, "model_dump") else section)
+            for name, section in dict(settings).items()
+        }
+        snapshot = to_jsonable(dumped)
+        return snapshot if isinstance(snapshot, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def build_diagnostics_bundle(
     *,
     app_version: str,
@@ -1227,6 +1244,7 @@ def build_diagnostics_bundle(
     translated_events: Iterable[_EventLike],
     session: Any | None,
     series_context: Any | None = None,
+    settings: Any | None = None,
 ) -> dict[str, Any]:
     """Gom toàn bộ dữ liệu một lần dịch thành dict JSON-serializable.
 
@@ -1305,6 +1323,9 @@ def build_diagnostics_bundle(
         "schema_version": _SCHEMA_VERSION,
         "app_version": app_version,
         "exported_at": exported_at,
+        # [v3.23.714] Cài đặt dịch / ngữ cảnh video LÚC XUẤT (khoá API bị che): biết ngay lượt dịch dùng model, cỡ
+        # lô, mức suy nghĩ nào — trước đây tệp chỉ có phiên bản ứng dụng nên phải hỏi lại chủ dự án.
+        "settings_at_export": _settings_snapshot(settings),
         "video": {
             "path": video_path,
             "filename": PurePath(video_path).name if video_path else "",

@@ -162,12 +162,28 @@ def pixel_confirmed_blanks(track: BoundaryTrack | None, *, min_pixels: int = MIN
             blank_frames = j - i
             run = list(track.probes[lo:hi])
             # Khung bỏ qua có chữ (> ngưỡng) nằm GIỮA chuỗi thì không còn là một khoảng trống liền.
-            if all(p.text_pixels <= limit for p in run if times[i] - eps <= p.timestamp_sec <= times[j - 1] + eps):
-                blank_frames += sum(1 for p in run if p.text_pixels <= limit)
+            inner = [p for p in run if times[i] - eps <= p.timestamp_sec <= times[j - 1] + eps]
+            if all(p.text_pixels <= limit for p in inner):
+                # [v3.23.696] Khung bỏ qua kề hai đầu chỉ được cộng khi LIỀN với chuỗi trống: đi từ mép chuỗi ra ngoài,
+                # gặp khung có chữ thì dừng (trước đây "trống, có chữ, [chuỗi trống]" vẫn cộng khung trống phía ngoài).
+                before = [p for p in run if p.timestamp_sec < times[i] - eps]
+                after = [p for p in run if p.timestamp_sec > times[j - 1] + eps]
+                blank_frames += len(inner)
+                blank_frames += _leading_blank(reversed(before), limit) + _leading_blank(after, limit)
                 if blank_frames >= BLANK_MIN_FRAMES:
                     out.extend(times[i:j])
         i = j
     return out
+
+
+def _leading_blank(probes, limit: float) -> int:
+    """Số khung trống liền nhau ở đầu dãy (dừng ở khung đầu tiên có chữ)."""
+    count = 0
+    for probe in probes:
+        if probe.text_pixels > limit:
+            break
+        count += 1
+    return count
 
 
 __all__ = [

@@ -22,13 +22,15 @@ from subtitles_extractor.domain.value_objects.roi import (
     TextOrientation,
 )
 
+from tests.unit.editor_page_source import EDITOR_PAGE_SOURCE
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PRESENTATION_DIR = PROJECT_ROOT / "src" / "subtitles_extractor" / "presentation"
 WIDGETS_INIT_PATH = PRESENTATION_DIR / "widgets" / "__init__.py"
 VIDEO_CANVAS_PATH = PRESENTATION_DIR / "widgets" / "video_canvas.py"
 EXTRACT_PAGE_PATH = PRESENTATION_DIR / "pages" / "extract_page.py"
-EDITOR_PAGE_PATH = PRESENTATION_DIR / "pages" / "editor_page.py"
+EDITOR_PAGE_PATH = EDITOR_PAGE_SOURCE  # [v3.23.693] editor_page.py + các phần đã tách (U6)
 
 
 def _make_test_roi(x: int = 100, y: int = 200, w: int = 300, h: int = 50) -> Roi:

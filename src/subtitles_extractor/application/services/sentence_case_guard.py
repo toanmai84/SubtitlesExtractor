@@ -101,4 +101,67 @@ def capitalize_sentence_starts(texts: Sequence[str]) -> dict[int, str]:
     return fixed
 
 
-__all__ = ["capitalize_sentence_starts", "supports_sentence_case"]
+# ── [v3.23.706] Viết thường chữ đầu dòng NỐI TIẾP sau dấu phẩy ───────────────────────────────────────────────
+_COMMA_END_RE = re.compile(f"[,，][{_CLOSERS}]*\\s*$")
+_WORD_RE = re.compile(r"[^\W\d_]+")
+
+
+def proper_words(texts: Sequence[str]) -> frozenset[str]:
+    """Các từ (đã ``casefold``) từng viết HOA ở GIỮA câu trong ``texts`` — tên riêng, thuật ngữ riêng (hàm thuần)."""
+    found: set[str] = set()
+    for text in texts:
+        sentence_start = True
+        for token in (text or "").split():
+            word = _WORD_RE.search(token)
+            if word and not sentence_start and word.group()[:1].isupper():
+                found.add(word.group().casefold())
+            sentence_start = bool(_TERMINAL_END_RE.search(token)) or token.endswith(("\u2026", ":", "-", "\u2014"))
+    return frozenset(found)
+
+
+def restore_continuation_case(before: Sequence[str], after: Sequence[str]) -> dict[int, str]:
+    """Trả lại chữ THƯỜNG đầu dòng nối tiếp mà khâu sau lỡ viết hoa (hàm thuần).
+
+    Đo trên A/B 361 câu (3.5-flash-lite): khâu phong cách và lượt rút gọn viết hoa lại 15 dòng nối tiếp — bản dịch
+    thô "Đã vậy," + "ta là sư bác đây" thành "Ta là sư bác đây,"; "mà đã tăng lên năm mươi đạo…" thành "Đã tăng năm
+    mươi lôi kiếp." ngay sau "Mới lần thứ hai".
+
+    Chỉ sửa khi có BẰNG CHỨNG: chính dòng đó ở khâu trước mở bằng chữ thường (model đã coi là phần nối tiếp), dòng
+    trước nó (bản mới) chưa kết câu, và từ đầu không phải tên riêng. Quy tắc "sau dấu phẩy thì viết thường" đã thử
+    trên 3664 dòng thật và bị loại: sửa nhầm dòng của người nói khác và tên riêng ("Cực Quang").
+
+    Args:
+        before: Lời từng dòng ở khâu trước, theo thứ tự thời gian.
+        after: Lời từng dòng sau khâu hiện tại (cùng độ dài).
+
+    Returns:
+        ``vị trí → bản đã sửa``; rỗng nếu không có gì để sửa hoặc hai danh sách lệch độ dài.
+    """
+    if len(before) != len(after):
+        return {}
+    names = proper_words(list(before) + list(after))
+    fixed: dict[int, str] = {}
+    previous = ""
+    for position, (old, new) in enumerate(zip(before, after, strict=True)):
+        current = new or ""
+        stripped = current.lstrip()
+        if not stripped:
+            continue
+        old_first = (old or "").lstrip()[:1]
+        if previous and not _ends_sentence(previous) and old_first.isalpha() and old_first.islower():
+            tokens = stripped.split()
+            word = _FIRST_WORD_RE.match(stripped)
+            second = _WORD_RE.search(tokens[1]) if len(tokens) > 1 else None
+            if (
+                word and word.group()[:1].isupper() and not any(ch.isupper() for ch in word.group()[1:])
+                and word.group().casefold() not in names and len(word.group()[:1].lower()) == 1
+                and not (second and second.group()[:1].isupper())
+            ):
+                current = current[: len(current) - len(stripped)] + stripped[:1].lower() + stripped[1:]
+                fixed[position] = current
+        previous = current.rstrip()
+    return fixed
+
+
+__all__ = ["capitalize_sentence_starts", "proper_words", "restore_continuation_case",
+           "supports_sentence_case"]

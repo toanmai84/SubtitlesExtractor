@@ -63,7 +63,7 @@ class TestBottomBandDetection:
 def _seraw_available() -> bool:
     """Kiểm tra file seraw thật có đọc được không (chịu lỗi I/O môi trường)."""
     try:
-        return _FULLSCREEN_DIR.is_dir() and (_FULLSCREEN_DIR / "1.seraw.json").is_file()
+        return _FULLSCREEN_DIR.is_dir() and (_FULLSCREEN_DIR / "01.seraw.json").is_file()
     except OSError:
         return False
 
@@ -74,7 +74,7 @@ def _seraw_available() -> bool:
 )
 class TestRealData:
     @staticmethod
-    def _load(idx: int) -> tuple[list[RawBBox], int, int]:
+    def _load(idx: str) -> tuple[list[RawBBox], int, int]:
         try:
             doc = json.loads((_FULLSCREEN_DIR / f"{idx}.seraw.json").read_text(encoding="utf-8"))
         except OSError as io_error:  # môi trường CI có thể lỗi đọc file lớn
@@ -95,8 +95,8 @@ class TestRealData:
                 max_x = max(max_x, max(xs)); max_y = max(max_y, max(ys))
         return boxes, int((max_x // 16 + 1) * 16), int((max_y // 16 + 1) * 16)
 
-    @pytest.mark.parametrize("idx", [1, 2, 3])
-    def test_detects_dominant_bottom_subtitle(self, idx: int) -> None:
+    @pytest.mark.parametrize("idx", ["01", "02", "03"])
+    def test_detects_dominant_bottom_subtitle(self, idx: str) -> None:
         boxes, width, height = self._load(idx)
         clusters = BBoxAnalyzer(frame_width=width, frame_height=height).analyze(boxes)
         assert clusters, f"{idx}_seraw: không tách được ROI nào"

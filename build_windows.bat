@@ -134,11 +134,26 @@ REM Rieng paddlepaddle-gpu: chi goi nay moi can index Paddle (cu129).
 if "%REQFILE%"=="requirements-gpu.txt" (
     echo [INFO] Cai paddlepaddle-gpu tu kho Paddle cu129 - goi lon ~810MB, kien nhan...
     "%PYEXE%" -m pip install "paddlepaddle-gpu==3.3.1" --index-url https://www.paddlepaddle.org.cn/packages/stable/cu129/ --extra-index-url https://pypi.org/simple %PIP_CACHE_FLAG% --retries 5 --timeout 120
-    if errorlevel 1 (
-        echo [LOI] Cai paddlepaddle-gpu that bai. Kiem tra mang / thu lai.
-        exit /b 1
-    )
+    if errorlevel 1 goto :paddle_direct_wheel
 )
+goto :paddle_done
+
+REM [v3.23.703] DU PHONG: trang chi muc paddlepaddle.org.cn sap (502 / ngat ket noi) thi pip LANG LE bo qua
+REM kho Paddle, chi thay paddlepaddle-gpu 2.6.x tren PyPI va bao "No matching distribution ... 3.3.1".
+REM File wheel van tai thang duoc tu kho luu tru goc (paddle-whl.bj.bcebos.com) - cai thang file do,
+REM phu thuoc lay tu PyPI.
+:paddle_direct_wheel
+echo [CANH BAO] Kho chi muc Paddle khong phan hoi - tai thang file wheel tu kho goc paddle-whl.bj.bcebos.com...
+"%PYEXE%" -c "import sys;open(r'build_env\pytag.txt','w').write('cp%%d%%d' %% sys.version_info[:2])"
+set /p PYTAG=<build_env\pytag.txt
+echo [INFO] Phien ban Python build_env: %PYTAG%
+"%PYEXE%" -m pip install "https://paddle-whl.bj.bcebos.com/stable/cu129/paddlepaddle-gpu/paddlepaddle_gpu-3.3.1-%PYTAG%-%PYTAG%-win_amd64.whl" --index-url https://pypi.org/simple %PIP_CACHE_FLAG% --retries 5 --timeout 120
+if errorlevel 1 (
+    echo [LOI] Cai paddlepaddle-gpu that bai ca 2 duong ^(kho chi muc + file wheel truc tiep^).
+    echo       Kiem tra mang. Neu Python build_env khong phai 3.12/3.13 thi Paddle co the chua co ban cho %PYTAG%.
+    exit /b 1
+)
+:paddle_done
 
 REM --- (TUY CHON) WhisperX: nhan dang giong noi de canh thoi gian phu de -------
 REM  [v3.23.333] CAI VAO MOI TRUONG RIENG `whisperx_env`, KHONG cai chung build_env.

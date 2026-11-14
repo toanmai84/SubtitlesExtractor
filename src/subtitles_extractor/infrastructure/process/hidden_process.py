@@ -36,6 +36,50 @@ def no_window_kwargs() -> dict[str, Any]:
     return {"creationflags": _CREATE_NO_WINDOW}
 
 
+def _with_hidden_default(kwargs: dict[str, Any], flag: int) -> dict[str, Any]:
+    """Thêm cờ ẩn cửa sổ khi nơi gọi KHÔNG tự chọn cờ tạo tiến trình / ``startupinfo`` (hàm thuần)."""
+    if flag and not kwargs.get("creationflags") and kwargs.get("startupinfo") is None:
+        return {**kwargs, "creationflags": flag}
+    return kwargs
+
+
+def install_hidden_console_default() -> bool:
+    """[v3.23.709] Đặt "ẩn cửa sổ console" làm MẶC ĐỊNH cho mọi tiến trình con của tiến trình này (Windows).
+
+    Mã của ứng dụng đã ẩn cửa sổ ở mọi lời gọi, nhưng THƯ VIỆN bên thứ ba thì không: khi nạp ``paddle``, chính nó chạy
+    ``where nvcc`` và ``where ccache`` (``paddle/utils/cpp_extension/extension_utils.py``) bằng
+    ``subprocess.check_output`` trần. Ứng dụng GUI không có console nên Windows mở một cửa sổ cmd cho mỗi lệnh — người
+    dùng thấy cửa sổ đen chớp lên vài giây sau khi mở ứng dụng (lúc PaddleOCR nạp nền).
+
+    Bọc ``subprocess.Popen.__init__`` (nơi mọi ``run``/``check_output``/``os.popen``/asyncio đi qua): lời gọi không
+    tự chọn ``creationflags`` hay ``startupinfo`` được thêm ``CREATE_NO_WINDOW``; lời gọi có chọn thì giữ nguyên.
+    ``os.system`` (không đi qua ``Popen``) được đổi sang ``subprocess.call(shell=True)``.
+
+    Returns:
+        ``True`` nếu vừa cài; ``False`` khi không phải Windows hoặc đã cài rồi.
+    """
+    if sys.platform != "win32" or getattr(subprocess.Popen, "_se_hidden_console_default", False):
+        return False
+    import functools
+    import os
+
+    original_init = subprocess.Popen.__init__
+
+    @functools.wraps(original_init)
+    def hidden_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **_with_hidden_default(kwargs, _CREATE_NO_WINDOW))
+
+    subprocess.Popen.__init__ = hidden_init  # type: ignore[method-assign]
+    subprocess.Popen._se_hidden_console_default = True  # type: ignore[attr-defined]
+
+    def hidden_system(command: str) -> int:
+        # Thay os.system nguyên trạng, chỉ ẩn cửa sổ.
+        return subprocess.call(command, shell=True, **no_window_kwargs())  # noqa: S602
+
+    os.system = hidden_system
+    return True
+
+
 def run_hidden(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
     """Chạy ``subprocess.run`` mà không bật cửa sổ console.
 
@@ -137,6 +181,7 @@ def run_ffmpeg_hardened(
 
 
 __all__ = [
+    "install_hidden_console_default",
     "no_window_kwargs",
     "popen_hidden",
     "run_hidden",

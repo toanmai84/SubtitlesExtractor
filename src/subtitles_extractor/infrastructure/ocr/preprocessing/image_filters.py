@@ -19,7 +19,7 @@ _CLAHE_MAX_CACHE_PER_THREAD: int = 4
 _clahe_thread_local: threading.local = threading.local()
 
 def _get_clahe_object(clip_limit: float, tile_size: int) -> Any:
-    cache: dict[tuple[float, int], Any] = getattr(_clahe_thread_local, "cache", None)
+    cache: dict[tuple[float, int], Any] | None = getattr(_clahe_thread_local, "cache", None)
     if cache is None:
         cache = {}
         _clahe_thread_local.cache = cache
@@ -39,16 +39,30 @@ def add_border(image_rgb: np.ndarray, border: int = _DEFAULT_BORDER_PX) -> np.nd
 
 def needs_upscale(image_rgb: np.ndarray, min_height: int = _DEFAULT_MIN_HEIGHT_PX) -> bool:
     if image_rgb.ndim < 2: return False
-    return image_rgb.shape[0] < min_height
+    return bool(image_rgb.shape[0] < min_height)
+
+def upscale_size(height: int, width: int, target_height: int, max_factor: float = _MAX_UPSCALE_FACTOR) -> tuple[int, int] | None:
+    """[v3.23.721] Kích thước (rộng, cao) sau khi phóng ảnh cao ``height`` lên ``target_height``; ``None`` = không phóng.
+
+    Dùng chung cho nhánh CPU và VRAM. Trước bản này cả hai nhánh chỉ phóng khi ảnh thấp hơn MỘT NỬA đích
+    (``h < target // 2``) → vùng chữ 136 px với đích 128–272 px không bao giờ được phóng (tuỳ chọn "Phóng to ảnh"
+    bật mà không có tác dụng), còn đích 274 px nhảy vọt ×2.
+    """
+    if height <= 0 or width <= 0 or target_height <= height:
+        return None
+    scale = min(float(max_factor), target_height / height)
+    if scale <= 1.0 + 1e-6:
+        return None
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
 
 def upscale_to_min_height(image_rgb: np.ndarray, target_height: int = _DEFAULT_UPSCALE_TARGET_HEIGHT_PX) -> np.ndarray:
     if image_rgb.ndim < 2: return image_rgb
     height, width = image_rgb.shape[:2]
-    if height >= target_height or height <= 0 or width <= 0: return image_rgb
-    scale = min(_MAX_UPSCALE_FACTOR, target_height / height)
-    new_width = max(1, int(round(width * scale)))
-    interpolation = cv2.INTER_LINEAR if scale > _UPSCALE_INTERPOLATION_BREAKPOINT else cv2.INTER_CUBIC
-    return cv2.resize(image_rgb, (new_width, int(round(height * scale))), interpolation=interpolation)
+    size = upscale_size(height, width, target_height)
+    if size is None: return image_rgb
+    interpolation = cv2.INTER_LINEAR if size[1] / height > _UPSCALE_INTERPOLATION_BREAKPOINT else cv2.INTER_CUBIC
+    return cv2.resize(image_rgb, size, interpolation=interpolation)
 
 def apply_sharpen(image_rgb: np.ndarray) -> np.ndarray:
     if image_rgb.ndim < 2: return image_rgb
@@ -84,7 +98,8 @@ def median_blend_frames(frames_rgb: list[np.ndarray]) -> np.ndarray:
     valid_frames = [f for f in frames_rgb if f.shape == target_shape]
     if len(valid_frames) < 2: return frames_rgb[0].copy()
     stacked = np.stack(valid_frames, axis=0)
-    return np.median(stacked, axis=0).astype(np.uint8)
+    median: np.ndarray = np.median(stacked, axis=0).astype(np.uint8)
+    return median
 
 def temporal_denoise_bilateral(image_rgb: np.ndarray, diameter: int = 5, sigma_color: float = 50.0, sigma_space: float = 50.0) -> np.ndarray:
     if image_rgb.ndim < 2: return image_rgb
@@ -98,7 +113,7 @@ def apply_cpu_preprocessing_pipeline(
 ) -> np.ndarray:
     """[V3.27] Hợp nhất toàn bộ Pipeline Toán học (Single Source of Truth)."""
     working_rgb = image_rgb.copy()
-    if upscale_small_text and needs_upscale(working_rgb, max(upscale_target_height_px // 2, 32)):
+    if upscale_small_text:  # [v3.23.721] phóng khi ảnh thấp hơn đích (trước: thấp hơn NỬA đích → thường vô hiệu)
         working_rgb = upscale_to_min_height(working_rgb, upscale_target_height_px)
     if apply_clahe_flag:
         working_rgb = apply_clahe(working_rgb, clahe_clip_limit, clahe_tile_size)
@@ -113,5 +128,5 @@ def apply_cpu_preprocessing_pipeline(
 __all__ = [
     "add_border", "apply_adaptive_binarization", "apply_clahe", "apply_contrast_boost",
     "apply_sharpen", "median_blend_frames", "needs_upscale", "temporal_denoise_bilateral",
-    "upscale_to_min_height", "apply_cpu_preprocessing_pipeline"
+    "upscale_size", "upscale_to_min_height", "apply_cpu_preprocessing_pipeline"
 ]

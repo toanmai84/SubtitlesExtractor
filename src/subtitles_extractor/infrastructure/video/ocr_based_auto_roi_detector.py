@@ -362,6 +362,9 @@ class OcrBasedAutoRoiDetector:
             vram_border_thickness_px=vram_flags.vram_border_thickness_px if vram_flags else 8,
             vram_sharpen=vram_flags.vram_sharpen if vram_flags else False,
             vram_contrast_factor=vram_flags.vram_contrast_factor if vram_flags else 1.0,
+            vram_apply_clahe=vram_flags.vram_apply_clahe if vram_flags else False,
+            vram_clahe_clip_limit=vram_flags.vram_clahe_clip_limit if vram_flags else 3.0,
+            vram_clahe_tile_size=vram_flags.vram_clahe_tile_size if vram_flags else 8,
         )
 
         all_raw_bboxes: list[RawBBox] = []

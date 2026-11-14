@@ -23,12 +23,11 @@ from pathlib import Path
 
 import pytest
 
+from tests.unit.editor_page_source import EDITOR_PAGE_SOURCE
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-EDITOR_PAGE_PATH = (
-    PROJECT_ROOT / "src" / "subtitles_extractor" / "presentation"
-    / "pages" / "editor_page.py"
-)
+EDITOR_PAGE_PATH = EDITOR_PAGE_SOURCE  # [v3.23.693] editor_page.py + các phần đã tách (U6)
 
 
 @pytest.fixture(scope="module")
@@ -40,22 +39,6 @@ def editor_source() -> str:
 def editor_tree(editor_source: str) -> ast.Module:
     return ast.parse(editor_source)
 
-
-class TestBug1TextEditingLength:
-    """Bug 1: ``_on_text_editing`` strip HTML/N trước khi đếm length."""
-
-    @pytest.mark.skip(reason="Introspection lỗi thời: logic đã refactor sang hàm thuần strip_formatting_tags; hành vi kiểm bởi test_text_utils_v314.")
-    def test_clean_text_used_for_length(self, editor_source: str) -> None:
-        """Phải gán kết quả ``re.sub`` vào biến ``text_clean`` và dùng để đếm."""
-        # Tìm method _on_text_editing.
-        idx = editor_source.index("def _on_text_editing(self)")
-        snippet = editor_source[idx:idx + 800]
-        # Phải có biến text_clean = re.sub(...)
-        assert "text_clean = re.sub" in snippet, (
-            "Kết quả re.sub phải được gán cho biến (Bug 1 fix)"
-        )
-        # max_len phải dùng text_clean.split, không phải text gốc.
-        assert "text_clean.split" in snippet
 
 
 class TestBug2ChangeSpeedSimplified:
@@ -141,7 +124,7 @@ class TestBug15PlayCurrentLineSync:
 
     def test_loop_single_play_initialized_in_init(self, editor_source: str) -> None:
         """``_loop_single_play`` phải khởi tạo ở __init__ (rõ ràng)."""
-        idx = editor_source.index("class EditorPage(QWidget):")
+        idx = editor_source.index("class EditorPage(")  # [v3.23.693] lớp nay có thêm các mixin
         init_idx = editor_source.index("def __init__(self, container", idx)
         snippet = editor_source[init_idx:init_idx + 4000]
         assert "self._loop_single_play: bool = False" in snippet
@@ -210,18 +193,6 @@ class TestUx13AutoFixConfirm:
         # Đếm error trước khi gọi service.
         assert "error_count" in snippet
 
-
-class TestUx14StripTagsDoesNotRemoveLineBreak:
-    """UX 14: ``_on_strip_tags_clicked`` không strip ``\\N`` line breaks."""
-
-    @pytest.mark.skip(reason="Introspection lỗi thời: logic đã refactor sang hàm thuần strip_formatting_tags; hành vi kiểm bởi test_text_utils_v314.")
-    def test_pattern_only_matches_braces_block(self, editor_source: str) -> None:
-        idx = editor_source.index("def _on_strip_tags_clicked(self)")
-        snippet = editor_source[idx:idx + 1500]
-        # Pattern an toàn: chỉ match ``\{[^}]*\}`` (không match ``\N``).
-        assert r"\{[^}]*\}" in snippet
-        # InfoBar báo user biết đã strip bao nhiêu ký tự.
-        assert "InfoBar.info(" in snippet
 
 
 class TestConstantsExtracted:
