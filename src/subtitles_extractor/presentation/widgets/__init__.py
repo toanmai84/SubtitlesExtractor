@@ -17,7 +17,6 @@ signal names (``roi_changed``, ``roi_preview``, ``video_clicked``,
 from __future__ import annotations
 
 import os
-
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -52,7 +51,9 @@ def _is_mpv_available() -> bool:
         logger.warning("SUBTITLES_EXTRACTOR_NO_MPV được đặt — dùng VideoCanvas thay mpv.")
         return False
     try:
-        from subtitles_extractor.infrastructure.logging.crash_hooks import mpv_disabled_by_crash
+        from subtitles_extractor.infrastructure.logging.crash_hooks import (
+            mpv_disabled_by_crash,
+        )
 
         if mpv_disabled_by_crash():
             logger.warning(
@@ -102,7 +103,7 @@ def create_video_widget(
     mpv_options: dict | None = None,
     parent: QWidget | None = None,
     force_fallback: bool = False,
-    translator: object | None = None,
+    translator: object | None,
 ) -> MpvVideoWidget | VideoCanvas:
     """Factory — chọn ``MpvVideoWidget`` hoặc ``VideoCanvas`` tự động.
 
@@ -112,6 +113,8 @@ def create_video_widget(
         parent: Qt parent widget.
         force_fallback: ``True`` để bypass MPV và ép dùng VideoCanvas (vd
             test/debug).
+        translator: [v3.23.736] BẮT BUỘC (``container.translator``): thiếu thì ``MpvVideoWidget`` rơi về
+            ``NullTranslator`` và hiện nguyên khoá "common.video_placeholder" (trang Trích xuất / Biên tập trước đây).
 
     Returns:
         Widget có API tương thích — caller chỉ cần biết các method/signal

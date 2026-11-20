@@ -13,6 +13,7 @@ from subtitles_extractor.application.use_cases.transcribe_speech import (
 )
 from subtitles_extractor.domain.exceptions import SubtitlesExtractorError
 from subtitles_extractor.domain.ports.speech_to_text_port import TranscriptionConfig
+from subtitles_extractor.infrastructure.process.keep_awake import keeps_awake
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class TranscribeSpeechWorker(QObject):
     def request_cancel(self) -> None:
         self._is_cancelled = True
 
+    @keeps_awake("Subtitles Extractor — Nhận dạng giọng nói")  # [v3.23.747] màn hình tắt → GPU kẹt
     def run(self) -> None:
         try:
             result = self._use_case.execute(

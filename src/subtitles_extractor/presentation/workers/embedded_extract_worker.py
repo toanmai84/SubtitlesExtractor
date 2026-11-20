@@ -19,6 +19,7 @@ from subtitles_extractor.application.use_cases.extract_embedded_subtitles import
 )
 from subtitles_extractor.domain.exceptions import SubtitlesExtractorError
 from subtitles_extractor.domain.ports.embedded_subtitle_port import EmbeddedSubtitleTrack
+from subtitles_extractor.infrastructure.process.keep_awake import keeps_awake
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class ListEmbeddedTracksWorker(QObject):
         self._use_case = use_case
         self._video_path = video_path
 
+    @keeps_awake("Subtitles Extractor — Trích phụ đề nhúng")  # [v3.23.747] màn hình tắt → GPU kẹt
     def run(self) -> None:
         try:
             tracks = self._use_case.list_tracks(self._video_path)
@@ -76,6 +78,7 @@ class ExtractEmbeddedWorker(QObject):
         """Yêu cầu dừng mềm (kiểm giữa các ảnh OCR bitmap)."""
         self._is_cancelled = True
 
+    @keeps_awake("Subtitles Extractor — Trích phụ đề nhúng")  # [v3.23.747] màn hình tắt → GPU kẹt
     def run(self) -> None:
         try:
             response = self._use_case.execute(

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
+from subtitles_extractor.infrastructure.process.keep_awake import keeps_awake
 from subtitles_extractor.infrastructure.video.ffmpeg_concat_adapter import (
     VideoConcatError,
     concatenate_videos,
@@ -53,6 +54,7 @@ class ConcatVideoWorker(QObject):
         """Yêu cầu dừng (an toàn từ luồng giao diện)."""
         self._cancelled = True
 
+    @keeps_awake("Subtitles Extractor — Nối video")  # [v3.23.747] màn hình tắt → GPU kẹt
     def run(self) -> None:
         """Thực hiện nối video. Gọi trong QThread, KHÔNG gọi trực tiếp."""
         try:

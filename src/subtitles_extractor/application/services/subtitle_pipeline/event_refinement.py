@@ -19,6 +19,7 @@ import re
 from rapidfuzz import fuzz
 
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
+from subtitles_extractor.domain.value_objects.time_interval import TimeInterval
 
 #: Từ Latin viết hoa hợp lệ thường gặp trong thoại CJK — không bao giờ drop.
 _LATIN_WHITELIST: frozenset[str] = frozenset(
@@ -34,6 +35,12 @@ _CJK_DOMINANT_RATIO: float = 0.80
 
 #: Mảnh flash: ngắn hơn ngưỡng này cần thêm bằng chứng rác mới bị drop.
 _FLASH_MAX_DURATION_SEC: float = 0.18
+
+#: [v3.23.729] Câu MỘT chữ Hán ngắn hơn ngưỡng flash vẫn là phụ đề thật khi có từ chừng này khung đọc trở lên...
+_FLASH_SINGLE_MIN_FRAMES: int = 3
+#: ...và tin cậy trung bình từ mức này. Phim "[全集]" (98 phút, bước 0,04 s): 7 câu cảm thán thật hiện 3–4 khung
+#: (0,12–0,16 s: 啊, 啊, 嘿, 哼, 哎, 哎, 额; tin cậy 0,88–1,00) bị xoá; rác đã gặp đều 1–2 khung hoặc tin cậy ≤ 0,81.
+_FLASH_SINGLE_MIN_CONFIDENCE: float = 0.85
 
 #: Echo: similarity tối thiểu với event lân cận để coi mảnh flash là echo.
 _FLASH_ECHO_SIMILARITY: float = 0.66
@@ -239,6 +246,14 @@ def drop_flash_fragments(events: list[SubtitleEvent], sample_step_sec: float = 0
         cjk_chars = sum(1 for c in stripped if _is_cjk_char(c))
 
         is_single_cjk = cjk_chars <= 1 and len(stripped) <= 2
+        # [v3.23.729] Chữ Hán đọc rõ qua ≥ 3 khung là câu cảm thán hiện chớp nhoáng có thật, không phải rác chớp.
+        if (
+            is_single_cjk and cjk_chars == 1 and sample_step_sec > 0
+            and event.frame_count >= _FLASH_SINGLE_MIN_FRAMES
+            and float(event.confidence) >= _FLASH_SINGLE_MIN_CONFIDENCE
+        ):
+            kept.append(event)
+            continue
         has_digit_line = any(
             _DIGIT_ONLY_LINE_REGEX.match(line.strip())
             for line in event.text.splitlines()
@@ -302,9 +317,80 @@ def merge_progressive_events(
     return merged, absorbed
 
 
+#: [v3.23.734] Mảnh đọc thiếu chữ của câu liền kề: dài tối đa chừng này giây...
+TRUNCATED_FRAGMENT_MAX_SEC = 0.30
+#: ...và câu đầy đủ dài ít nhất chừng này lần mảnh.
+TRUNCATED_FRAGMENT_NEIGHBOR_RATIO = 1.5
+_HAN_ONLY = re.compile(r"[\u3400-\u9fff]+")
+
+
+def _absorbs(full: SubtitleEvent, fragment: SubtitleEvent, gap: float) -> bool:
+    """``fragment`` là ``full`` bị đọc thiếu đoạn đầu/đuôi, hiện sát ``full`` và ngắn hẳn."""
+    a, b = "".join(full.text.split()), "".join(fragment.text.split())
+    return (
+        bool(b) and len(a) > len(b) and _HAN_ONLY.fullmatch(a) is not None and _HAN_ONLY.fullmatch(b) is not None
+        and (a.startswith(b) or a.endswith(b))
+        and fragment.duration_sec <= TRUNCATED_FRAGMENT_MAX_SEC
+        and full.duration_sec >= TRUNCATED_FRAGMENT_NEIGHBOR_RATIO * fragment.duration_sec
+        and gap >= -1e-3
+    )
+
+
+def absorb_truncated_fragments(events: list[SubtitleEvent], sample_step_sec: float = 0.0) -> list[SubtitleEvent]:
+    """[v3.23.734] Gộp mảnh ĐỌC THIẾU chữ (≤ 0,3 s) vào câu đầy đủ liền kề.
+
+    Phim "反派" (83 tập): trên nền sáng chuyển động bộ lọc khung coi mỗi khung là "chữ đổi", OCR đọc vài khung thiếu chữ
+    cuối/đầu và khâu dựng tách thành câu riêng: "懂什么" | "懂什" (0,20 s), "走火了" | "走火" (0,24 s), "魔了" | "魔" |
+    "魔了" | "魔" (một câu "入魔了"), "小翠" | "翠" | "小翠" — ảnh từng khung cho thấy phụ đề KHÔNG đổi. Câu thật nối tiếp
+    ("你" | "你要干什么", "只当我不是你嫂嫂" | "嫂嫂") dài từ 0,56 s trở lên nên không bị đụng.
+    Mảnh chỉ được gộp khi đứng SAU câu đầy đủ hoặc KẸP GIỮA hai lần cùng câu: phụ đề hiện dần thật luôn đặt phần ngắn
+    TRƯỚC ("啊" | "这这全部啊", "这" | "这不可能" — ảnh xác nhận). Hai câu cùng chữ đứng liền nhau chỉ được nối khi một trong
+    hai vừa nuốt mảnh; câu lặp lại thật có khoảng trống giữa ("冷静" | "冷静") giữ nguyên. Khoảng hở cho phép: 1,5 bước lấy mẫu (không rõ bước → 0,05 s).
+    """
+    if len(events) < 2:
+        return events
+    max_gap = 1.5 * sample_step_sec if sample_step_sec > 0 else 0.05
+    out: list[SubtitleEvent] = []
+    absorbed: list[bool] = []
+    for event in events:
+        if out and event.start_sec - out[-1].end_sec <= max_gap:
+            previous = out[-1]
+            gap = event.start_sec - previous.end_sec
+            keep: SubtitleEvent | None = None
+            if _absorbs(previous, event, gap):                    # "懂什么" | "懂什" → câu trước kéo dài
+                keep = dataclasses.replace(
+                    previous, interval=TimeInterval(previous.start_sec, max(previous.end_sec, event.end_sec)),
+                    frame_count=previous.frame_count + event.frame_count,
+                )
+            elif (
+                len(out) >= 2 and _absorbs(event, previous, gap)
+                and "".join(out[-2].text.split()) == "".join(event.text.split())
+                and previous.start_sec - out[-2].end_sec <= max_gap
+            ):                                                    # "小翠" | "翠" | "小翠": mảnh kẹp giữa → một câu
+                keep = dataclasses.replace(
+                    out[-2], interval=TimeInterval(out[-2].start_sec, event.end_sec),
+                    frame_count=out[-2].frame_count + previous.frame_count + event.frame_count,
+                )
+                out.pop()
+                absorbed.pop()
+            elif absorbed[-1] and "".join(previous.text.split()) == "".join(event.text.split()):
+                keep = dataclasses.replace(                        # "魔了"(+"魔") | "魔了" → một câu
+                    previous, interval=TimeInterval(previous.start_sec, max(previous.end_sec, event.end_sec)),
+                    frame_count=previous.frame_count + event.frame_count,
+                )
+            if keep is not None:
+                out[-1] = keep
+                absorbed[-1] = True
+                continue
+        out.append(event)
+        absorbed.append(False)
+    return out
+
+
 def refine_final_events(events: list[SubtitleEvent], sample_step_sec: float = 0.0) -> list[SubtitleEvent]:
-    """Tinh lọc cuối: đuôi watermark → watermark Latin → rác chữ số → mảnh flash."""
-    refined = strip_latin_suffix_from_cjk_events(events)
+    """Tinh lọc cuối: mảnh đọc thiếu chữ → đuôi watermark → watermark Latin → rác chữ số → mảnh flash."""
+    refined = absorb_truncated_fragments(events, sample_step_sec)
+    refined = strip_latin_suffix_from_cjk_events(refined)
     refined = drop_pure_latin_watermark_events(refined)
     refined = drop_digit_garbage_events(refined)
     refined = drop_alnum_garbage_events(refined)

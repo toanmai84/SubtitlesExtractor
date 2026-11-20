@@ -1,5 +1,1395 @@
 # Changelog
 
+## [3.23.777] — 📝 Tệp mô tả lượt chạy ghi rõ OCR có chạy TensorRT thật không
+
+Lượt cả bộ 大乾悍刀行 ngày 20/11 (bản 3.23.776; 228 675 khung; TensorRT bật, lô engine bộ dò 8 / bộ nhận dạng 8, bộ dò
+8 ảnh/lô): OCR 1532 s — gần bằng lượt KHÔNG TensorRT bản 3.23.728 (1538 s, bộ dò 64 ảnh/lô). Tệp `seraw` chỉ ghi cài đặt
+(`use_tensorrt: true`) và `"ocr_engine": "PaddleOcrAdapter"`, không cho biết TensorRT có chạy thật hay đã lùi GPU thường
+→ không kết luận được (CLAUDE.md: "ghi rõ đường đã chạy vào log / tệp mô tả").
+
+- `environment.ocr_acceleration` trong `seraw`: `cpu` / `gpu` / `gpu (TensorRT đã bật nhưng không dùng được …)` /
+  `gpu+tensorrt_direct fp32 (bộ dò ≤8: N lô TensorRT, M lô lùi Paddle GPU; bộ nhận dạng ≤8: …)`.
+
+Chất lượng lượt này (so với lượt 3.23.736/742 cùng phim, 3622 → 3609 câu, 11 chỗ khác): sửa đúng 6 chữ (筒直→简直,
+叫器→叫嚣, 剔→别, 千旱→干旱, 一千二净→一干二净, 抢一抢→抡一抡), bỏ các mảnh rác 1–2 chữ (和上 / 上 / 王愿 / 火 / 知王 /
+知工 …), bỏ "渊侯府凝香郡主" (chú thích tên nhân vật — cần xem hình để chắc). GLM-OCR đọc lại 3609 câu: 10 câu đa số
+khác OCR, phần lớn OCR đúng (蠢货, 别, 早).
+
+Kiểm chứng: `test_ocr_acceleration_record_v323777.py` (3) + `test_run_provenance_v323714.py`; ruff sạch, mypy không thêm lỗi.
+
+## [3.23.776] — ⚙️ Cỡ lô engine TensorRT trong Cài đặt, kèm gợi ý theo VRAM
+
+Chủ dự án: "TensorRT nhận lô sao không đưa vô cài đặt để người dùng chọn và có kèm gợi ý cho người dùng". Bản 3.23.775
+đặt cứng bộ dò 16 ảnh / bộ nhận dạng 32 dòng.
+
+- Cài đặt → Phần cứng, dưới ô TensorRT: **Lô engine TensorRT — bộ dò** (1–64, mặc định 16) và **— bộ nhận dạng** (8–128,
+  mặc định 32); chỉ bấm được khi bật TensorRT; chú thích (di chuột) giải thích lớn hơn = nhanh hơn nhưng giữ nhiều VRAM,
+  đổi số → engine dựng lại một lần.
+- Dòng gợi ý theo VRAM: 4–6 GB → 8 / 16 · 8 GB → 16 / 32 · 12 GB → 32 / 64 · 16 GB+ → 64 / 128. Nút **Gợi ý theo GPU máy
+  này** đọc tổng VRAM (`nvidia-smi`), điền số và ghi rõ GPU bao nhiêu GB — CHƯA lưu, người dùng bấm Lưu mới dùng (không
+  dò được → mức card 8 GB, có báo).
+- Số đã lưu đi tới tận hồ sơ engine: bộ chuyển đổi OCR đặt cỡ lô (biến môi trường) TRƯỚC khi tự kiểm, nên tiến trình tự
+  kiểm dựng đúng cỡ đó; lô tối ưu bộ nhận dạng = số dòng ứng dụng đưa vào mỗi lô (không quá lô tối đa). Khoá kết quả tự
+  kiểm gồm cỡ lô → đổi số thì kiểm lại engine mới; dấu cache engine đổi theo hồ sơ → engine cũ tự dựng lại.
+- Đổi cỡ lô khi đang bật TensorRT → nạp lại mô hình OCR; không làm mất điểm dừng OCR (chỉ đổi tốc độ).
+- Bộ test: `tests/conftest.py` dọn biến cỡ lô sau mỗi test (không rò sang test sau).
+
+Kiểm chứng: `test_trt_batch_settings_v323776.py` (17: bảng gợi ý, kẹp giới hạn, hồ sơ bộ dò / bộ nhận dạng theo số chọn,
+khoá tự kiểm, giới hạn cài đặt, chuỗi vi/en, cả 4 chỗ dựng cấu hình OCR, bộ chuyển đổi đặt cỡ lô trước tự kiểm, nạp lại
+mô hình, điểm dừng; trang Cài đặt: tắt khi TensorRT tắt, gợi ý 12 GB → 32 / 64 chưa lưu, Lưu → đã lưu, không dò được
+VRAM); 197 + 45 test liên quan đạt; ruff không thêm lỗi, mypy không thêm lỗi.
+
+## [3.23.775] — ⚡ Engine TensorRT nhận lô lớn hơn 8 (bộ dò 16, bộ nhận dạng 32)
+
+Chủ dự án: "Dựng engine nhận lô lớn hơn 8". Log 19/11 22:17 (bản 3.23.774): TensorRT trực tiếp chạy đúng (kết quả GIỐNG
+Paddle GPU, ×1,24) nhưng engine chỉ nhận lô ≤ 8 — bộ dò 64 ảnh/lô phải chạy 8 lần, bộ nhận dạng 16 dòng/lô chạy 2 lần.
+
+- Bộ dò: hồ sơ `[1,3,32,32]` / `[16,3,288,1600]` / `[16,3,512,2048]` (lô 8 → 16, kích thước ảnh giữ nguyên).
+- Bộ nhận dạng: giữ chiều cao / rộng của PaddleX, lô tối ưu 16 (đúng lô ứng dụng đưa vào), tối đa 32
+  (`[1,3,48,160]` / `[16,3,48,320]` / `[32,3,48,3200]`). Tắt được bằng `SE_TRT_REC_PROFILE=0` (chẩn đoán).
+- Dấu hồ sơ cache engine đổi (`app_profile` 2) → engine lô 8 cũ tự xoá, dựng lại một lần (vài phút, ở tiến trình tự kiểm).
+- Log ghi VRAM mỗi engine giữ sẵn ("VRAM … MB") để chỉnh cỡ lô theo số đo thật.
+- Tự kiểm báo "thiếu VRAM" (không tạo được context — vd ứng dụng khác đang chiếm GPU) → không ghi nhớ, lần sau kiểm lại;
+  lần này chạy GPU thường.
+
+Kiểm chứng: `test_trt_bigger_batch_v323775.py` (5; 4 thất bại trên mã cũ), `test_tensorrt_det_profile_v323765.py` cập
+nhật (lô 70 dòng → 32 + 32 + 6, nối đúng thứ tự); 122 test TensorRT đạt; ruff sạch, mypy không thêm lỗi.
+
+## [3.23.774] — ⚡ TensorRT chạy TRỰC TIẾP (bỏ bộ chạy TensorRT C++ của Paddle — nguồn crash)
+
+Kết luận chẩn đoán (log 19/11 20:17 → 21:34, bản 3.23.770–3.23.773): bộ chạy `pd_op.tensorrt_engine` của Paddle 3.3.1
+(biên dịch với TensorRT 10.5) **sập (access violation) với MỌI engine** khi chạy trên TensorRT 10.9 — bộ dò, bộ nhận dạng,
+FP32/FP16, mọi hồ sơ, cùng/khác luồng. Cùng tệp `engine_*.trt` đó nạp thẳng bằng TensorRT 10.9 (Python API) thì **chạy
+được** (bộ dò 8×3×288×1600 trong 18,6 ms). Nên:
+
+- Paddle chỉ còn làm việc **chuyển mô hình → tệp engine** (bước dựng). Mô hình OCR của ứng dụng là mô hình **GPU thường**;
+  `predictor.runner` của bộ dò + bộ nhận dạng được thay bằng `DirectTrtRunner` (`trt_direct_runner.py`) chạy engine
+  bằng TensorRT trực tiếp: tensor GPU của paddle (`data_ptr`) + `set_tensor_address` + `execute_async_v3` trên luồng CUDA
+  của paddle — dữ liệu ở lại VRAM. Lô ngoài hồ sơ engine / lỗi hình dạng → chạy lô đó bằng Paddle GPU (ghi log); lỗi
+  khác 3 lần → thôi TensorRT cho mô hình đó.
+- Tự kiểm (tiến trình con) theo chuỗi mới: **dựng engine bộ dò** → **dựng engine bộ nhận dạng** (mỗi mô hình một tiến
+  trình — Paddle sập khi chuyển mô hình này không chặn mô hình kia) → **TensorRT trực tiếp**: chạy cùng ảnh mẫu bằng Paddle
+  GPU và bằng engine, đòi chữ GIỐNG hệt, cùng số hộp, điểm tin cậy lệch ≤ 0,02, hộp chữ lệch ≤ 3 px, runner thật sự chạy
+  và không lùi Paddle lô nào; ghi tốc độ (×) vào log.
+
+Rà độc lập (agent) phần mới — đã sửa hết:
+- Chỉ gắn khi mỗi mô hình có ĐÚNG một tệp engine (mạng bị tách nhiều đoạn → không gắn); kiểm `set_input_shape`, hình dạng
+  đầu ra, context `None` (thiếu VRAM), luôn `synchronize` luồng kể cả khi lỗi; dùng chung engine giữa các mô hình.
+- Dấu tệp engine (đường dẫn, cỡ, thời điểm) đã kiểm được ghi cùng kết quả đạt trong `selftest.json`; lúc gắn, tệp khác
+  dấu → không gắn (GPU thường) và xoá kết quả tự kiểm để lần sau kiểm lại.
+- Thiếu engine vì bước dựng sập, hoặc FP16 lệch nhỏ → không ghi nhớ "không chạy được".
+- Tiến trình con luôn `os._exit` sau khi báo (kể cả nhánh lỗi) — không dọn Paddle / TensorRT lúc thoát.
+- Canh "lần suy luận đầu" (chống crash) chỉ hết khi runner trực tiếp đã chạy ít nhất một lô (lô lùi Paddle chưa tính).
+
+Kiểm chứng: `test_trt_direct_runner_v323774.py` (16), `test_trt_direct_review_v323774.py` (10),
+`test_tensorrt_selftest_v323766.py` (36, chuỗi mới), `test_tensorrt_fallback_v323754.py`; ruff sạch, mypy không thêm lỗi.
+Nhánh gốc vẫn chạy được: đặt `SE_TRT_FULL_DIAG=1` để chạy lại toàn bộ chẩn đoán cũ (không ghi nhớ).
+
+## [3.23.773] — 🔬 Phép thử "engine trực tiếp" dùng bộ đệm GPU của paddle (không cần CuPy)
+
+Log 19/11 21:12 (bản 3.23.772):
+- Phép thử engine trực tiếp vẫn chưa chạy engine: trong TIẾN TRÌNH CON, CuPy không nạp được dù qua bộ nạp của ứng dụng,
+  trước paddle ("CuPy có nhưng thiếu mô-đun 'cuda.pathfinder'"); tiến trình chính vẫn dùng CuPy bình thường (NVDEC).
+  → Bộ đệm GPU bằng tensor paddle (`paddle.to_tensor(..., CUDAPlace)`, `data_ptr()`), luồng CUDA của paddle
+  (`current_stream().stream_base.cuda_stream`) giao cho `execute_async_v3` — không cần CuPy.
+- Ghi nhận: lần này tiến trình tự kiểm SẬP trong lúc CHUYỂN mô hình (`paddle/tensorrt/converter.py:641`,
+  `convert_program_to_trt` — vòng dọn tham số không dùng, sau khi engine đã ghi ra tệp), không phải lúc chạy: cache engine
+  đổi qua các phép thử chẩn đoán 3.23.770 nên Paddle chuyển lại. Cả bước chuyển lẫn bước chạy Paddle-TensorRT đều có thể sập;
+  tệp engine vẫn được ghi trước chỗ sập nên phép thử engine trực tiếp dùng được.
+- Test thêm 2.
+
+## [3.23.772] — 🔬 Phép thử "engine trực tiếp": nạp CuPy đúng thứ tự của ứng dụng
+
+Log 19/11 20:53 (bản 3.23.771): phép thử engine trực tiếp chưa tới bước chạy engine — "ModuleNotFoundError: No module
+named 'cuda.pathfinder'" khi `import cupy`. Ứng dụng nạp CuPy qua bộ nạp an toàn dùng chung (`gpu_image_filters`) lúc
+khởi động, TRƯỚC paddle (log tiến trình chính: "NVDEC GPU-First: … CuPy=True"); phép thử lại `import cupy` SAU paddle +
+chuẩn bị TensorRT — một mô-đun `cuda` khác đã nạp trước che gói `cuda` (namespace) của `cuda-pathfinder` mà CuPy 14 cần.
+- Sửa: phép thử nạp CuPy qua đúng bộ nạp của ứng dụng, TRƯỚC paddle; CuPy không dùng được → báo lý do của bộ nạp.
+- Test thêm 1 (thứ tự nạp); test phép thử engine trực tiếp chạy tiến trình con thật.
+
+## [3.23.771] — 🔬 Chẩn đoán TensorRT: chạy THẲNG engine Paddle đã dựng bằng TensorRT (không qua Paddle)
+
+Log 19/11 20:31 (bản 3.23.770) — chẩn đoán thành phần hoàn tất, KẾT LUẬN: mọi engine TensorRT Paddle chạy đều SẬP
+("access violation" ở `predictor.run()`): bộ dò, bộ nhận dạng, hồ sơ gốc PaddleX, không bản vá Int32, FP16, cùng / khác
+luồng. → Không phải bản vá nào của ứng dụng, không phải mô hình, cỡ lô hay luồng: lỗi ở lớp Paddle C++ chạy engine với
+thư viện TensorRT. Nghi vấn còn lại: Paddle 3.3.1 biên dịch với TensorRT 10.5, thư viện chạy là 10.9 (bản thấp nhất có
+gói Python cho Python 3.13).
+- Phép thử phân định: tiến trình con nạp THẲNG tệp engine Paddle đã dựng (`<mô hình>/.cache/paddle/trt/**/engine_*.trt`)
+  bằng TensorRT 10.9, chạy `execute_async_v3` với bộ đệm CuPy trên GPU (đầu vào cỡ "opt" của hồ sơ engine), đo ms/lần.
+  Chạy được → lỗi nằm ở lớp Paddle ↔ TensorRT 10.9 (hướng tiếp: ứng dụng tự chạy engine bằng TensorRT, dữ liệu ở lại VRAM);
+  sập → lỗi ở TensorRT 10.9 / driver.
+- Bỏ 6 phép thử đã có đáp án (bố cục cũ + 5 thành phần — bật lại bằng `SE_TRT_FULL_DIAG=1`): lần mở đầu ~3–4 phút thay vì
+  ~15 phút. Kiểm tĩnh mọi API TensorRT phép thử dùng trên bindings 10.9 thật (máy đám mây không có GPU để chạy).
+- Bộ test đầy đủ bản 3.23.770: 9255 đạt. Test thêm 3.
+
+## [3.23.770] — 🔬 Chẩn đoán TensorRT tự động: khoanh vùng thành phần gây sập (một lần, ghi nhớ)
+
+Log 19/11 19:14 (bản 3.23.769): tự kiểm dựng xong engine (148 s) rồi SẬP lúc chạy ("access violation" trong
+`predictor.run()`, qua `guarded_call`) — ngay cả bố cục nạp + dựng + chạy CÙNG một luồng → giả thuyết "khác luồng" KHÔNG
+phải nguyên nhân sập. Ứng dụng KHÔNG sập (lớp bảo vệ 3.23.766), chạy GPU thường. Đường TensorRT kiểu cũ (`enable_tensorrt_
+engine`, không cần gói Python `tensorrt`) không dùng được: PaddleX chỉ cho TensorRT với mô hình PIR (`inference.json`) qua
+PIR-TRT (`hpi/backend.py`), mà PP-OCRv6 chỉ có định dạng PIR. Chủ dự án chọn: "Chẩn đoán tiếp vài vòng".
+- Khi bố cục chính SẬP: tự chạy thêm 5 phép thử thành phần, mỗi phép một tiến trình con (sập không ảnh hưởng ứng dụng):
+  chỉ bộ dò; chỉ bộ nhận dạng; bộ dò với hồ sơ gốc PaddleX (không hồ sơ lô 8 của ứng dụng); bộ dò không bản vá ép Int32;
+  bộ dò FP16. Mỗi phép dùng `TextDetection` / `TextRecognition` của PaddleOCR với TensorRT, cùng luồng đã nạp paddle.
+  Log một dòng "TensorRT chẩn đoán — tóm tắt: …" (chạy được / SẬP / lỗi / treo). Ghi nhớ — không chạy lại mỗi lần mở.
+- Biến môi trường chẩn đoán (chỉ đặt trong tiến trình con): `SE_TRT_DET_PROFILE=0`, `SE_TRT_SHAPE_FIX=0`; dấu hồ sơ cache
+  engine gồm cờ ép Int32 — engine chẩn đoán không bao giờ bị ứng dụng dùng lại.
+- Kiểm trên máy đám mây (paddle CPU, chưa có TensorRT): tiến trình con phép thử chạy hết đường mã — bộ nhận dạng đọc đúng
+  "Subtitles Extractor 000 TensorRT", bộ dò ra 2 hộp chữ.
+- Bộ test đầy đủ bản 3.23.769: 9252 đạt. Test thêm 3.
+
+## [3.23.769] — 🔬 Tự kiểm TensorRT: paddle đã nạp SẴN trong tiến trình con (Windows) → chạy bố cục trên đúng luồng đó
+
+Log 19/11 18:47 (bản 3.23.768 — nhật ký con mới chỉ ra nguyên nhân): trong tiến trình con trên Windows "paddle đã nạp
+trước khi dựng: True" (trên Linux: False) → bộ chuyển đổi trong con tắt TensorRT ("paddle đã được nạp ở luồng khác") ở CẢ
+hai bố cục; cũng là gốc của lỗi "static graph mode" ở 3.23.766–767 (luồng dựng ≠ luồng nạp paddle). Tiến trình CHÍNH
+không bị (log: "Nạp paddle trên luồng paddle-tensorrt").
+- Sửa: con thấy paddle đã nạp sẵn (trên luồng chính của con — lúc đó con chỉ có luồng này) → chạy bố cục trên luồng chính:
+  "luồng Paddle riêng" = nạp + dựng + OCR cùng luồng chính; "khác luồng" (chẩn đoán) = dựng ở luồng chính, OCR ở luồng
+  khác — đúng quy tắc đã đo (chỉ luồng nạp paddle chuyển được TensorRT), đúng bố cục tiến trình chính dùng.
+- Ghi AI nạp paddle sớm (luồng + ngăn xếp gọi) vào nhật ký con, và paddle đã nạp lúc con bắt đầu hay trong bước chuẩn bị
+  — để tìm mã nạp sớm (chưa tái hiện được trên Linux).
+- Kiểm thật trên máy đám mây: tiến trình con thật, paddle nạp sẵn trên luồng chính trước mã tự kiểm (như Windows) → chạy
+  bố cục trên luồng chính, không còn "paddle đã được nạp ở luồng khác"; ghi đúng nơi nạp paddle sớm.
+- Bộ test đầy đủ bản 3.23.768: 9250 đạt. Test thêm 2 (tiến trình con thật).
+
+## [3.23.768] — 🔬 Tự kiểm TensorRT chạy ĐÚNG đường mã của ứng dụng (không còn bản dựng riêng khác tiến trình chính)
+
+Log 19/11 17:23 (bản 3.23.767): lớp bảo vệ làm đúng việc (KHÔNG sập, chạy GPU thường; paddle nạp đúng trên luồng
+`paddle-tensorrt`), nhưng tự kiểm báo CẢ HAI bố cục lỗi ở bước dựng: "load_inference_model() is only supported in static
+graph mode" — kể cả "luồng Paddle riêng" (nạp + dựng cùng luồng). Trên máy đám mây (Linux, paddle CPU), đúng tiến trình
+con đó (spawn + chuẩn bị tiến trình + nạp paddle trên luồng B) gọi `load_inference_model` trên luồng B thì CHẠY ĐƯỢC →
+không tái hiện được; `main.py` không nạp gì trước `freeze_support`; `paddle.tensorrt` không tự đổi chế độ.
+- Điểm yếu gốc của 3.23.766–767: tiến trình con TỰ dựng PaddleOCR theo cách riêng (gọi thẳng `PaddleOCR(**kwargs)`) —
+  không giống tiến trình chính (bộ chuyển đổi: dò thiết bị, thử lại tham số, giới hạn lô, luồng Paddle, chống sập…).
+  Kết quả tự kiểm vì vậy không nói chắc được tiến trình chính sẽ ra sao, và lỗi không kèm chỗ vấp.
+- Sửa: tiến trình con tạo `PaddleOcrAdapter` THẬT với `OcrEngineConfig` của người dùng, gọi `initialize()` từ một luồng
+  như luồng nạp sẵn và `infer_batch()` từ một luồng như luồng trích xuất — mọi lớp (plugin, cầu NumPy, hồ sơ engine,
+  luồng Paddle, chia lô) chạy y như tiến trình chính. Đạt ở con = tiến trình chính chạy được.
+- Lỗi → gửi về NHẬT KÝ của chính bộ chuyển đổi trong con (WARNING/INFO, gồm "TensorRT không dùng được …", "TensorRT báo
+  lỗi trước đó …", traceback chỗ Paddle vấp) + chẩn đoán: paddle đã nạp trước khi dựng chưa, luồng nạp paddle có phải
+  luồng Paddle không. Mỗi mô hình ghi "dùng engine trong cache" hay "chưa có engine — chuyển mô hình" (đường dẫn, luồng).
+- Bố cục cũ (chẩn đoán) chạy bằng `SE_TRT_LEGACY_THREADS=1` CHỈ trong tiến trình con; con không ghi dấu chống sập của
+  tiến trình chính (bố cục chẩn đoán có sập cũng không tắt TensorRT oan); con thoát bằng `os._exit` sau khi báo.
+- Kiểm thật trên máy đám mây: tiến trình con thật chạy bộ chuyển đổi thật (paddle CPU, cấu hình TensorRT): báo đúng "KHÔNG
+  dựng được bằng TensorRT" (không GPU) kèm nhật ký; bố cục mới nạp paddle trên luồng Paddle (True), bố cục cũ thì không.
+- Bộ test đầy đủ bản 3.23.767: 9249 đạt. Test thêm 1 (tiến trình con thật).
+
+## [3.23.767] — ⚡ TensorRT chạy trên MỘT luồng Paddle cố định (nguyên nhân gốc nghi vấn của "access violation")
+
+Log 19/11 16:32 (bản 3.23.766): tự kiểm ở tiến trình riêng làm đúng việc bảo vệ (ứng dụng KHÔNG sập, chạy GPU thường),
+nhưng báo lỗi ở bước dựng: "load_inference_model() is only supported in static graph mode". Tái hiện + đo bằng paddle
+thật trên máy đám mây: Paddle giữ trạng thái RIÊNG TỪNG LUỒNG — CHỈ luồng đã nạp paddle chạy được
+`paddle.static.io.load_inference_model` (bước chuyển TensorRT); luồng khác, kể cả luồng chính Python, đều lỗi, dù
+`in_dynamic_mode()` như nhau.
+- Nguyên nhân gốc nghi vấn của các lần SẬP (log 14:46, 15:46): ứng dụng nạp paddle + dựng engine TensorRT ở LUỒNG NẠP
+  SẴN (kết thúc ngay sau đó) rồi chạy OCR TensorRT ở LUỒNG TRÍCH XUẤT. GPU thường thì Paddle chịu được khác luồng — engine
+  TensorRT (C++) thì không. Bố cục kiểm của 3.23.766 "khác luồng" lại dựng ở một luồng KHÁC luồng nạp paddle → lỗi dựng.
+- Sửa: bật TensorRT → nạp paddle + tự kiểm + dựng + MỌI lần OCR TensorRT + huỷ mô hình TensorRT đều trên MỘT luồng Paddle
+  cố định (sống suốt phiên). Paddle đã nạp ở luồng khác (vd bật TensorRT giữa phiên) → phiên đó GPU thường, log nói rõ
+  cần mở lại ứng dụng. GPU thường giữ nguyên bố cục cũ.
+- Tự kiểm ở tiến trình riêng kiểm ĐÚNG bố cục mới trước ("luồng Paddle riêng": nạp + dựng + OCR một luồng); không đạt →
+  chạy thêm bố cục cũ "khác luồng" để chẩn đoán (log so sánh được hai bố cục).
+- Rà độc lập (agent) — đã sửa: mô hình TensorRT từng thật ra được huỷ ở LUỒNG GỌI (tham chiếu cuối nằm ở biến cục bộ /
+  traceback của lỗi) và VRAM trả trước khi mô hình được huỷ → nay tham chiếu duy nhất trao cho luồng Paddle, xoá khung
+  traceback trước khi huỷ ở đường lùi; luồng Paddle là luồng NỀN (`ThreadPoolExecutor` giữ tiến trình sống không hạn lúc
+  thoát → đóng cửa sổ giữa lúc tự kiểm / dựng engine thì exe chạy ngầm); ghi luồng nạp paddle trong khoá nạp, cả khi
+  PaddleOCR nạp lỗi sau paddle; test không rò mô-đun paddle giả.
+- Kiểm thật trên máy đám mây: bộ chuyển đổi thật (paddle CPU) cấu hình TensorRT — paddle nạp trên luồng `paddle-tensorrt`,
+  OCR gọi từ luồng khác đọc đúng chữ, giải phóng đúng; tiến trình con thật đạt cả hai bố cục; đo bằng mô hình giả: huỷ
+  trên luồng Paddle ở cả nạp lại, giải phóng nền, đường lùi khi lỗi; tiến trình thoát ngay dù luồng Paddle còn việc.
+- Test `test_tensorrt_selftest_v323766.py` thêm 9 (24); test 3.23.754 / 3.23.764 cập nhật theo luồng Paddle.
+
+## [3.23.766] — 🛡️ TensorRT tự kiểm ở TIẾN TRÌNH RIÊNG: lỗi sập C++ của TensorRT không còn đóng ứng dụng
+
+Log + `fault.log` 19/11 15:46 (bản 3.23.765): vẫn SẬP ("access violation" trong `predictor.run()` của bộ dò, qua
+`guarded_call`) dù lô đã chia vừa hồ sơ engine (bộ dò 8 ảnh/lô). Đọc mã C++ của Paddle
+(`paddle/fluid/framework/new_executor/instruction/tensorrt_engine_instruction.cc`): trước khi chạy, Paddle tự kiểm hình
+dạng theo hồ sơ (`RuntimeDynamicShapeCheck` → lỗi Python) → giả thuyết "lô vượt hồ sơ gây sập" của 3.23.764 SAI; vụ sập
+nằm trong `Execute`/`enqueueV3` của TensorRT — không xác định được từ xa (máy đám mây không có GPU). Sửa theo giả thuyết
+mà không kiểm được là vòng lặp "sửa – thử – sập" chủ dự án đã phản ánh → đổi cách: CÔ LẬP.
+- Trước khi tiến trình chính dùng TensorRT: tiến trình con (spawn, như PaddleOCR-VL) dựng mô hình ĐÚNG cấu hình (cùng
+  tham số, lô bộ dò của Cài đặt), dựng ở một luồng + suy luận ở luồng khác như ứng dụng, trên ảnh tổng hợp cỡ dải phụ đề
+  (1578×272, chữ trắng — bắt buộc đọc ra chữ). Con sập / treo / lỗi → tiến trình chính ghi lý do (mã thoát, traceback
+  `fault` của con, lỗi `[TensorRT]` gần nhất) rồi chạy GPU thường. Con sập kiểu "khác luồng" → thử thêm "cùng luồng" để
+  khoanh vùng nguyên nhân (ghi log). Con chạy được → tiến trình chính dùng TensorRT với engine con đã dựng (cache).
+- Nhớ kết quả trong `tensorrt_runtime/selftest.json` theo bản ứng dụng + bản TensorRT + tham số đi vào engine; chỉ ghi
+  nhớ kết quả CHẮC CHẮN (treo, thiếu VRAM, bị dừng → lần sau kiểm lại).
+- Rà độc lập (agent) — đã sửa: lỗi của chính bộ máy tự kiểm (spawn, `PeekNamedPipe` khi con đã chết) không được chặn OCR
+  → GPU thường; TensorRT chưa chuẩn bị được (bản vá / lưới an toàn hình dạng không cài được) → không chạy TensorRT "trần";
+  `faulthandler` của con bật lại sau khi nạp Paddle (Paddle cài bộ bắt SIGSEGV đè lên — tệp fault từng rỗng; kiểm: sập
+  thật sau `import paddle` nay ghi đủ traceback); treo → không chạy thêm biến thể chẩn đoán (trước: tới 2 × 25 phút);
+  tiến trình treo bị `kill`; con tự thoát khi tiến trình chính chết; khoá kết quả bỏ ngưỡng / số luồng (đổi chúng không
+  kiểm lại), giữ nhiều mục (bộ OCR phụ đề nhúng không đè); kiểm đúng `use_textline_orientation`; mỗi mô hình TensorRT
+  dựng mới đều có dấu chống sập lần suy luận đầu (trước: chỉ mô hình đầu của phiên).
+- Kiểm thật trên máy đám mây: tiến trình con THẬT (chuẩn bị tiến trình, nạp paddle, PaddleOCR CPU, lô 4 ảnh) đọc đúng 4
+  dòng ở cả hai kiểu luồng; sập bộ nhớ thật (`ctypes.string_at(0)`) ở con → tiến trình chính sống, báo "SẬP (mã thoát
+  tín hiệu 11)" kèm traceback. Trên Windows mã sẽ là `0xc0000005`.
+- Còn lại (chưa làm): bước tự kiểm lần đầu mỗi bản (vài phút khi phải dựng engine) chỉ báo trong log, chưa có thanh tiến
+  độ / nút huỷ trên giao diện.
+- Test `test_tensorrt_selftest_v323766.py` (15, gồm tiến trình con thật + sập thật); test 3.23.754 cập nhật.
+
+## [3.23.765] — ⚡ Engine TensorRT bộ dò cho lô 8 + cache engine theo hồ sơ + lưới an toàn hình dạng
+
+Chủ dự án (19/11): "Sao không dựng lại engine bộ dò cho lô lớn hơn". 3.23.764 ép bộ dò chạy 1 ảnh/lô vì engine dựng theo
+hồ sơ `inference.yml` (`[1,3,4000,4000]` — lô 1).
+- Ảnh vào bộ dò của ứng dụng là DẢI phụ đề — seraw phim 大乾悍刀行: ROI 720×118, phóng cao 256 px + viền 8 → ~1600×288
+  (bội số 32). Hồ sơ mới cho bộ dò (`*_det`): min `[1,3,32,32]`, opt `[8,3,288,1600]`, max `[8,3,512,2048]`. Lô 8 (không
+  64): TensorRT cấp sẵn bộ nhớ cho hình dạng LỚN NHẤT (lô × cao × rộng) — 64 ảnh cỡ này dễ vượt 8 GB VRAM khi chạy cùng
+  bộ nhận dạng + NVDEC. Chưa đo được trên GPU (máy đám mây không có GPU) — chỉnh theo log VRAM thật.
+- Cache engine (`<mô hình>/.cache/paddle/trt`): PaddleX chỉ kiểm tệp có tồn tại → đổi hồ sơ, hay đổi FP16↔FP32, từng dùng
+  lại engine CŨ (đúng kiểu lô lớn vào engine lô 1 → sập). Nay cache gắn dấu hồ sơ + chế độ + cấu hình; khác → xoá, dựng lại
+  (lần chạy đầu sau khi cập nhật: dựng lại cả bộ dò lẫn bộ nhận dạng, vài phút).
+- Lưới an toàn ngay trước engine (mọi mô hình TensorRT của PaddleX): lô vượt lô tối đa → tự chia lô con, nối kết quả
+  đúng thứ tự (bộ dò 64 ảnh/lô của Cài đặt → 8 lần × 8; bộ nhận dạng giữ hồ sơ gốc lô 8); kích thước ngoài hồ sơ (vd phim
+  1920 rộng phóng cao 256 → rộng > 2048) → lỗi Python → chuỗi lùi 3.23.763 dựng lại GPU thường — không còn đưa dữ liệu sai
+  vào C++ rồi sập.
+- Test `test_tensorrt_det_profile_v323765.py` (11) — mã cũ hỏng toàn bộ.
+
+## [3.23.764] — 🛡️ TensorRT: lô vừa engine (hết sập "access violation") + chống sập lặp lại
+
+Log + `fault.log` 19/11 14:46 (bản 3.23.763): plugin tìm thấy ("PaddleOCR chạy GPU + TensorRT (FP32)"), rồi ỨNG DỤNG
+SẬP ngay lần suy luận đầu: "Windows fatal exception: access violation" trong `predictor.run()` của bộ dò
+(`paddlex … runner.py:265`). Lỗi trong C++ — Python không bắt được, chuỗi lùi 3.23.763 không kịp chạy.
+- Nguyên nhân gốc: ứng dụng đẩy 64 ảnh/lô vào bộ dò (`det_batch_size`) và 16 dòng/lô vào bộ nhận dạng, trong khi
+  engine TensorRT dựng theo `trt_dynamic_shapes` của `inference.yml`: bộ dò lô tối đa **1** (`[1,3,4000,4000]`; log
+  13:30: đầu vào engine `Float[1,3,-1,-1]`), bộ nhận dạng tối đa **8** (`[8,3,48,3200]`). (NVIDIA: TensorRT 10.9 tương
+  thích nhị phân với 10.x trước, trừ 10.8 — lệch bản biên dịch 10.5 khó là nguyên nhân.)
+- Sửa: mô hình chạy TensorRT → lô bộ dò / bộ nhận dạng giới hạn theo lô lớn nhất của engine, đọc từ `inference.yml` của
+  CHÍNH mô hình (không đọc được: 1 / 8); log ghi cỡ lô đã dùng. GPU thường giữ lô lớn như cũ.
+- Chống sập lặp lại: ghi dấu `tensorrt_runtime/first_inference_pending.txt` (kèm số bản) trước lần suy luận TensorRT
+  đầu tiên của phiên, xoá khi chạy xong. Mở ứng dụng thấy dấu của CÙNG bản (lần trước sập giữa chừng) → tắt TensorRT, chạy
+  GPU thường, log cảnh báo; bản mới tự thử lại.
+- Rà khi chạy nhóm test: `_empty_paddle_vram` (chạy cả ở luồng dọn dẹp nền) tự `import paddle` đúng lúc nơi khác đang nạp
+  lại paddle → mô-đun nạp dở kẹt trong `sys.modules` ("partially initialized module 'paddle' … has no attribute
+  'tensor'", hỏng `test_paddle_vl_v323733` khi chạy nhóm — có từ trước, bộ đầy đủ không lộ). Nay chỉ dùng paddle đã nạp.
+- Test `test_tensorrt_batch_guard_v323764.py` (8) — mã cũ hỏng 6 (+ test dọn VRAM); test 3.23.755 cập nhật.
+
+## [3.23.763] — ⚡ TensorRT chạy engine được (plugin "nvinfer_plugin.dll") + 🛡️ lùi GPU thường cả lúc CHẠY
+
+Log 19/11 14:21 (bản 3.23.761): bản vá 3.23.761 đúng — cả bộ DÒ lẫn bộ NHẬN DẠNG dựng engine TensorRT xong, hết "TensorRT
+không dùng được". Lỗi kế tiếp ở bước CHẠY engine: mọi lô OCR "(NotFound) TensorRT is needed, but TensorRT dynamic
+library 'nvinfer_plugin.dll' is not found" (`paddle\phi\backends\dynload\tensorrt.cc:53`) → 27 khung "lỗi OCR riêng lẻ",
+cả phim KHÔNG ra phụ đề (chuỗi lùi 3.23.754 chỉ áp lúc dựng mô hình).
+- Nguyên nhân gốc: phần C++ của Paddle nạp plugin theo tên kiểu TensorRT 8 (`nvinfer_plugin.dll`); TensorRT 10 đặt
+  tên `nvinfer_plugin_10.dll`. (`nvinfer_10.dll` Paddle tìm thấy vì mô-đun `tensorrt` đã nạp nó — `LoadLibrary` theo
+  tên trả mô-đun cùng tên đã nạp.)
+- Sửa: tạo bí danh `tensorrt_libs/nvinfer_plugin.dll` (liên kết cứng — không tốn chỗ; khác ổ thì chép; tự thay khi khác
+  cỡ), NẠP SẴN nó và đưa thư mục vào `PATH`; bước dựng engine (Python, bản vá 3.23.756) dùng CÙNG tệp đó → một bản
+  plugin trong tiến trình. Chạy cả khi engine đã có trong cache (lần sau không dựng lại).
+- Chuỗi lùi lúc CHẠY (CLAUDE.md: GPU zero-copy → GPU → CPU): mô hình dựng bằng TensorRT mà lô suy luận lỗi do TensorRT
+  (thư viện / engine) → nhớ cho cả phiên, dựng lại mô hình GPU KHÔNG TensorRT, chạy lại đúng lô đó, log lỗi gốc. Lỗi
+  khác (ảnh hỏng, hết VRAM) giữ đường xử lý cũ. Log ghi "PaddleOCR chạy GPU + TensorRT (FP16/FP32)" khi dựng được.
+- Test `test_tensorrt_runtime_fallback_v323763.py` (9) — mã cũ hỏng toàn bộ; test 3.23.755 cập nhật theo tệp bí danh.
+
+## [3.23.762] — 🧪 Sửa test log TensorRT phụ thuộc thứ tự chạy
+
+Bộ test đầy đủ bản 3.23.761: 9195 đạt, 1 hỏng — `test_logger_drops_info_and_verbose` bắt cả dòng log "TensorRT ?: dùng cầu
+NumPy ↔ TensorRT…" của bước vá (mô-đun giả lập) khi chạy chung bộ. Lỗi ở test, không ở mã: test nay xoá log bắt được trước
+khi đo và chỉ xét dòng `[TensorRT]` chuyển từ bộ ghi. Mã ứng dụng không đổi so với 3.23.761.
+
+## [3.23.761] — ⚡ TensorRT: vá 2 chỗ Paddle 3.3.1 chưa khớp TensorRT 10 (kích thước Int64, tên lớp quá dài)
+
+Log 19/11 13:30 (bản 3.23.760, có lỗi gốc TensorRT nhờ bộ ghi log mới): bộ DÒ chữ đã dựng engine TensorRT xong ("Engine
+generation completed in 67.9555 seconds" — PaddleX lưu vào thư mục cache, lần sau dùng lại); bộ NHẬN DẠNG lỗi:
+`[TensorRT] ITensor::getDimensions: … 620_pd_op.stack->after_shape_tensor(…): concat input tensors 0 and 1 have
+incompatible types Int32 and Int64` → `paddle/tensorrt/impls/manipulation.py:1009 stack_converter` →
+`converter_utils.py:351 resize_to_1d` → "__len__() should return >= 0" → lùi GPU thường.
+- Nguyên nhân gốc (lỗi của Paddle): từ TensorRT 10, `add_shape` trả kích thước kiểu Int64. Paddle tạo MỌI hằng kích thước
+  kiểu Int32 (`add_1D_constant_layer` mặc định `np.int32`) và tự ghi trong `converter_utils.trt_shape`: "Many existing
+  paddle op kernels only support input shape tensor as int32 … cast back to int32" — nhưng 18 chỗ gọi `network.add_shape`
+  thẳng không qua bước ép đó (`stack`, `append_ones` dùng cho broadcast, `common.py`, `math.py`, …).
+- Sửa: `INetworkDefinition.add_shape` trả lớp ép kiểu Int32 (`add_cast`) — đúng việc `trt_shape` của Paddle làm; kích
+  thước ảnh luôn vừa Int32; `trt_shape` ép tiếp Int32 → Int32 không đổi gì.
+- Tên lớp mạng: Paddle đặt tên bằng cả biểu thức lồng nhau, vượt giới hạn 4096 ký tự của TensorRT → hàng loạt lỗi
+  "ILayer::setName … exceeds the limit" lấn mất lỗi thật trong log. Nay rút gọn (giữ đầu + mã băm + cuối, vẫn phân biệt).
+- Bộ ghi log TensorRT bỏ dòng INFO / VERBOSE dưới mức Paddle chọn (log trước: ~19 700 dòng, tệp 12,7 MB, mất phần đầu).
+- Chưa kiểm được trên Windows + GPU: còn chỗ khác chưa khớp thì vẫn lùi GPU thường và log ghi lỗi gốc + chỗ vấp.
+- Test `test_tensorrt_paddle_fixes_v323761.py` (6, gồm 1 test chạy bindings TensorRT thật) — mã cũ hỏng 4.
+
+## [3.23.760] — 🔍 TensorRT: lỗi gốc của TensorRT vào log ứng dụng (chẩn đoán "__len__() should return >= 0")
+
+Log 19/11 12:39 (bản 3.23.758): bản vá plugin + cầu NumPy ↔ TensorRT đều chạy (log: "nạp plugin nvinfer_plugin_10.dll",
+"dùng cầu NumPy ↔ TensorRT của ứng dụng"); dựng TensorRT ~24 s rồi lỗi "__len__() should return >= 0" → lùi GPU thường
+(đúng chuỗi lùi). Lỗi đó là hệ quả: một tensor mang số chiều -1 — lớp mạng phía trước dựng LỖI — nhưng lỗi gốc của
+TensorRT MẤT: Paddle tạo `trt.Logger(trt.Logger.ERROR)` (`paddle/tensorrt/converter.py:143`), bộ ghi mặc định in ra
+stderr, exe cửa sổ không có stderr. Máy đám mây không có GPU (`trt.Builder` cần CUDA) nên không dựng thử được.
+- `trt.Logger` → bộ ghi của ứng dụng (lớp con `trt.ILogger`, cùng cách tạo `Logger(mức)` + các hằng mức): lỗi TensorRT
+  ghi WARNING `[TensorRT] …` vào log, giữ 20 lỗi gần nhất; kiểm trên bindings 10.9 thật (nhận ~40 dòng của
+  `init_libnvinfer_plugins`).
+- Khi lùi GPU thường: log thêm "TensorRT báo lỗi trước đó: …" + traceback rút gọn chỗ Paddle vấp.
+- Test `test_tensorrt_logger_v323760.py` (4).
+
+## [3.23.759] — 🛡️ Soát câu bằng GLM-OCR / cầu TensorRT: khắc phục các điểm lượt rà độc lập 3.23.758 tìm ra
+
+Lượt rà độc lập (agent) bản 3.23.758: không có lỗi sập / sai dữ liệu; cầu NumPy ↔ TensorRT kiểm lại trên bindings 10.9
+thật và các chỗ gọi của Paddle (`PluginField`, `trt.Dims`, `norm.py`) đều ổn. Các điểm còn yếu, đã sửa:
+- GLM-OCR hỏng giữa một lô: trước đọc lại NGAY bằng PaddleOCR-VL trong lúc llama-server còn giữ GLM trong VRAM — VL nạp
+  lỗi vì tranh VRAM sẽ tắt VL cho cả phiên. Nay lô đó giữ bản nháp PP-OCR, lượt soát TẮT server (trả VRAM) ngay sau câu
+  đó, các câu sau mới soát bằng PaddleOCR-VL. Bộ đọc trả sai số bản đọc cũng tính là hỏng.
+- Bộ đọc thay thế chỉ áp cho ĐÚNG luồng đã gắn (lượt soát câu): Re-OCR chạy song song ở luồng khác vẫn đọc bằng VL.
+- Mỗi lô soát đọc lại mọi hộp bằng GLM-OCR (không dùng bộ đệm) → các khung của cùng câu là phiếu độc lập.
+- llama-server treo: bộ đọc dòng có thời hạn 30 s/ảnh (GPU; CPU 120 s), bỏ GLM sau 3 ảnh lỗi liên tiếp (trước 5 × 120 s =
+  10 phút giữ khoá suy luận), dừng ngay khi người dùng huỷ; lỗi mã hoá ảnh (`cv2.error`) chỉ tính là một ảnh lỗi.
+- Chỉ bật GLM-OCR khi có câu đọc lại bằng bộ đọc dòng (câu thiếu/thừa chữ đọc bằng PP-OCR) — không tải / bật server vô ích.
+- Nhật ký soát nói thật: câu bị GLM lỗi ghi `PP-OCR (bản nháp — … lỗi)`, câu sau ghi PaddleOCR-VL; dòng "PaddleOCR-VL lỗi"
+  (lỗi VL từ lượt trước trong phiên) không còn ghi khi GLM đã đọc hết.
+- Cầu TensorRT: mảng khác thứ tự byte đổi về thứ tự máy trước khi trao con trỏ; lần vá dừng giữa chừng không bọc chồng;
+  mảng giữ từ lần chuyển đồ thị lỗi được trả trước lần dựng sau.
+- Test thêm 10 (`test_glm_verify_v323758.py`, `test_tensorrt_numpy_bridge_v323758.py`).
+
+## [3.23.758] — ⚡ TensorRT: cầu NumPy ↔ TensorRT tự viết + 🔎 bước soát câu đọc bằng GLM-OCR khi chọn GLM-OCR
+
+### TensorRT: "Could not implicitly convert NumPy data type: i0" (log 19/11 11:32, bản 3.23.756)
+Bản vá plugin 3.23.756 chạy đúng (log: "nạp plugin nvinfer_plugin_10.dll"), lỗi kế tiếp làm TensorRT lùi GPU thường.
+- Nguyên nhân gốc: bindings Python của TensorRT 10.9 / 10.11 / 10.13 cho Windows cp313 (đọc chuỗi trong
+  `tensorrt.cp313-win_amd64.pyd`: `numpy.core.multiarray`, `__pybind11_internals_v4_…`) dựng bằng pybind11 đời cũ, chưa
+  biết NumPy 2 — đọc cỡ phần tử của kiểu NumPy theo bố cục NumPy 1 → ra 0 byte ("i0" = số nguyên 0 bit). Python 3.13 bắt
+  buộc NumPy 2 → đổi sang bản TensorRT 10.x khác không cứu được.
+- Kiểm trên bindings TensorRT 10.9 THẬT (Linux, NumPy 2.3.5; chỉ tải `libnvinfer` từ gói 3,1 GB): mảng float64 → "f0"
+  (cùng loại lỗi), và tệ hơn: `Weights([1, 2, 3]).numpy()` trả `[1 1 1]` (bước nhảy 0) KHÔNG báo lỗi. Paddle gọi
+  `.numpy()` khi gộp BatchNorm (`paddle/tensorrt/impls/norm.py`) → nếu chỉ né lỗi "i0", engine dựng được nhưng trọng số
+  SAI, OCR sai âm thầm.
+- Sửa (không đụng tệp Paddle / TensorRT): `tensorrt.Weights` thành lớp con dựng trọng số qua hàm dựng
+  `Weights(DataType, con trỏ, số phần tử)` (không qua pybind11 đọc kiểu NumPy), giữ sống mảng, `numpy()` trả đúng mảng
+  gốc; `add_constant` / `add_scale(_nd)` / `add_(de)convolution_nd` đổi mảng truyền thẳng vào; bộ giữ sống dọn sau mỗi
+  lần dựng engine (Paddle chuyển + dựng từng đồ thị con tuần tự). Kiểm trên bindings thật: 7 kiểu (int64/int32/float32/
+  float16/bool/int8/uint8) khứ hồi đúng, `type(w) == trt.Weights` như Paddle so.
+- Chưa kiểm được trên Windows + GPU: còn trục trặc khác thì vẫn lùi GPU thường và ghi lý do.
+
+### Bước soát câu chạy theo "Bộ đọc kiểm định" trong Cài đặt
+Chủ dự án (19/11): "Sao tôi chọn GLM-OCR soát câu mà còn thấy PaddleOCR-VL chạy" — trước đây tuỳ chọn chỉ áp cho gói
+kiểm định, bước soát câu (đọc lại câu nghi sai rồi SỬA vào phụ đề) luôn nạp PaddleOCR-VL.
+- Chọn GLM-OCR: bước soát câu đọc lại bằng GLM-OCR (đo 457 câu: 57/57 câu khó, PaddleOCR-VL 50/57) thay PaddleOCR-VL —
+  một máy chủ llama-server cho cả bước, gắn vào bộ chuyển đổi OCR làm bộ đọc dòng (cùng đường cắt hộp chữ của VL), bộ
+  đệm bản đọc xoá khi đổi bộ đọc (không trộn chữ hai mô hình), gỡ ra trước khi tắt server.
+- Đường lùi: GLM-OCR không bật được (tải / khởi động lỗi) → soát bằng PaddleOCR-VL; hỏng giữa chừng → phần còn lại (kể cả
+  lô đang đọc) bằng PaddleOCR-VL; cả hai ghi vào nhật ký soát của seraw; mỗi câu soát ghi `reader` (mô hình đã đọc lại).
+- Kiểm thật: bộ đọc dòng GLM-OCR qua llama-server b12387 + GGUF Q8_0 (máy đám mây, CPU) đọc đúng 12/12 ảnh câu khó.
+- Chú thích tuỳ chọn "Bộ đọc kiểm định" (vi/en) nói rõ áp cho cả bước soát câu.
+
+### Kiểm chứng
+- Test mới `test_glm_verify_v323758.py` (10) và `test_tensorrt_numpy_bridge_v323758.py` (8, gồm 1 test chạy bindings
+  TensorRT thật khi có `SE_TEST_TRT_DIR`) — mã cũ hỏng toàn bộ.
+- Bộ test đầy đủ bản 3.23.756: 9157 đạt, 1 hỏng — test khớp số phiên bản, do nâng số 3.23.757 lúc bộ test đang chạy
+  (không phải lỗi mã).
+
+## [3.23.757] — 🔎 Bước soát câu không còn ghi đè ngược chữ đã sửa ("别冲动" → "剔冲动")
+
+Bộ dữ liệu phim 大乾悍刀行 (lượt chạy bản 3.23.754, 19/11): bước soát câu PaddleOCR-VL ở tiến trình riêng (3.23.751)
+chạy trơn, không treo. Bảng cụm đọc nhầm 3.23.753 sửa đúng 5/6 câu; câu 2103 bị bước soát GHI ĐÈ ngược:
+`{'text': '别冲动', 'reread': ['別冲动', '剔冲动', '剔冲动'], 'new_text': '剔冲动'}`.
+
+- Nguyên nhân gốc: bản đọc lại (VL / PP-OCR) được đem so và bỏ phiếu NGUYÊN TRẠNG, không qua bước sửa chữ mà dòng gốc đã
+  đi qua (phồn → giản, bảng cụm đọc nhầm) → đúng cặp chữ dễ nhầm 别/剔 thắng phiếu và thay chữ đã sửa.
+- Sửa: `_verify_lines_loop` chuẩn hoá mọi bản đọc lại bằng `correct_hallucination_typos(normalize_traditional_to_
+  simplified(...))` trước khi so / bỏ phiếu. Câu 2103: bản đọc lại thành ['别冲动'] ×3 → giữ nguyên "别冲动".
+- Test `test_verify_normalizes_rereads_v323757.py` (3): tái hiện lỗi trên dữ liệu thật (mã cũ trả "剔冲动"), sau chuẩn hoá
+  giữ nguyên, vòng soát chuẩn hoá trước khi bỏ phiếu.
+
+## [3.23.756] — ⚡ TensorRT trên Windows: vá chỗ Paddle gọi cứng tên thư viện Linux "libnvinfer_plugin.so"
+
+Log 19/11 11:15 (bản 3.23.755, đã bấm "Tải TensorRT"): gói `tensorrt` nạp được (hết "No module named 'tensorrt'"), lỗi
+kế: "Failed to load dynlib/dll 'libnvinfer_plugin.so'" → lùi GPU thường (bước lùi 3.23.754 chạy đúng).
+
+- Nguyên nhân gốc (lỗi của Paddle): `paddle/tensorrt/converter.py` dòng 91 trong ĐÚNG gói `paddlepaddle_gpu-3.3.1-cp313-
+  cp313-win_amd64.whl` (đọc từng đoạn zip) gọi cứng `ctypes.CDLL('libnvinfer_plugin.so')` — tên thư viện của Linux — rồi
+  `initLibNvInferPlugins`. Rà toàn bộ `paddle/tensorrt/*.py`: đây là chỗ duy nhất phụ thuộc Linux.
+- Sửa: trước khi dựng mô hình TensorRT (Windows, TensorRT đã tải), thay `ctypes` CỦA RIÊNG mô-đun
+  `paddle.tensorrt.converter` bằng lớp bọc đổi `libnvinfer_plugin.so` → `models/tensorrt_runtime/tensorrt_libs/
+  nvinfer_plugin_10.dll`; mọi thứ khác chuyển nguyên `ctypes` thật. Không đụng `ctypes` toàn cục / tệp của Paddle.
+- Chưa kiểm được trên Windows + GPU: còn trục trặc khác thì vẫn lùi GPU thường và ghi lý do.
+- Test `test_tensorrt_runtime_v323755.py` thêm 3: đổi tên plugin đúng như dòng 91 của converter, phần còn lại của ctypes
+  giữ nguyên, không vá khi không phải Windows / chưa tải TensorRT, bộ chuyển đổi chuẩn bị TensorRT trước khi dựng.
+
+## [3.23.755] — ⚡ Dùng được TensorRT: nút "Tải TensorRT (OCR)" (TensorRT 10.9, ~1,6 GB, kho NVIDIA)
+
+Log 19/11 10:26 (bản 3.23.754): bật TensorRT → bước lùi mới chạy đúng (GPU không TensorRT) và ghi lý do: "No module named
+'tensorrt'". Chủ dự án: "giúp tôi có thể sử dụng TensorRT".
+
+### Nguyên nhân gốc
+PaddleX dựng mô hình TensorRT bằng `paddle.tensorrt` (Paddle 3, PIR-TRT) — cần gói Python `tensorrt` + `nvinfer_10.dll`.
+Đọc `paddle/version/__init__.py` của đúng gói cài `paddlepaddle_gpu-3.3.1-cp313-cp313-win_amd64.whl` (cu129, đọc từng đoạn
+zip — không tải cả 800 MB): `tensorrt_version = '1.0.500'` (= 10.5, định dạng lỗi), `with_pip_tensorrt = 'OFF'` → bản
+paddle KHÔNG kèm TensorRT và không tự tìm TensorRT cài qua pip.
+
+### Sửa
+- `infrastructure/ocr/tensorrt_runtime_plan.py` + `InstallTensorRtRuntimeWorker` + nút **Cài đặt → Phần cứng → TensorRT →
+  "Tải TensorRT (OCR)"** (cùng mẫu "Bật tăng tốc GPU"): `pip install --target models/tensorrt_runtime --only-binary :all:
+  --extra-index-url https://pypi.nvidia.com tensorrt-cu12-libs==10.9.0.34 tensorrt-cu12-bindings==10.9.0.34`, rồi ghi mô-đun
+  `tensorrt` (2 dòng như gói `tensorrt-cu12` của NVIDIA — gói đó chỉ có bản mã nguồn).
+- Phiên bản 10.9.0.34: bản THẤP NHẤT có gói Python 3.13 cho Windows (10.5 chỉ tới Python 3.12); mọi 10.x cùng tên
+  `nvinfer_10.dll`. Kiểm: pip tìm đúng `tensorrt_cu12_bindings-10.9.0.34-cp313-none-win_amd64.whl`; kho NVIDIA có
+  `tensorrt_cu12_libs-10.9.0.34-py2.py3-none-win_amd64.whl` (1,63 GB).
+- Bootstrap (cả tiến trình riêng của PaddleOCR-VL): TensorRT đã tải → thêm `tensorrt_libs` vào đường dẫn DLL và thư mục
+  vào `sys.path`.
+- Chưa kiểm được trên Windows + GPU (máy dựng bản không có): nếu TensorRT 10.9 không khớp bản paddle biên dịch với 10.5,
+  bước lùi 3.23.754 vẫn chạy GPU thường và ghi lý do.
+
+### Test
+- `test_tensorrt_runtime_v323755.py` (4): lệnh pip (kho NVIDIA, chỉ wheel, đúng phiên bản), mô-đun `tensorrt` tự ghi import
+  được bindings, worker ghi mô-đun sau khi pip xong, bootstrap + Cài đặt + chuỗi giao diện vi/en.
+
+## [3.23.754] — 🚀 Bật TensorRT không còn đẩy cả phim xuống CPU: lùi GPU+TensorRT → GPU → CPU, ghi rõ lý do
+
+Log + ảnh Cài đặt 19/11 10:00 (bản 3.23.752): bật "TensorRT" → "Khởi tạo OCR trên GPU thất bại — tự động lùi về CPU"
+(dựng lỗi sau 0,12 s; lần dựng trước đó cùng phiên KHÔNG TensorRT chạy GPU bình thường) → cả phim OCR trên CPU với lô 512
+ảnh, 16 luồng → CPU quá tải, ứng dụng ì / chậm. Nhật ký không ghi lý do lỗi.
+
+- Nguyên nhân gốc: chuỗi lùi bỏ qua bậc giữa — lỗi ở cấu hình GPU + TensorRT nhảy thẳng xuống CPU thay vì thử GPU không
+  TensorRT (CLAUDE.md: GPU → GPU dự phòng → CPU). Bản paddle của ứng dụng không kèm thư viện TensorRT.
+- Sửa: GPU + TensorRT lỗi → ghi lý do, chạy GPU KHÔNG TensorRT; chỉ khi GPU thường cũng lỗi mới xuống CPU (ghi lý do).
+  TensorRT đã lỗi một lần thì cả phiên không thử lại (mỗi lần dựng mô hình không tốn thêm một lần lỗi).
+- Test `test_tensorrt_fallback_v323754.py` (2, hỏng trên mã cũ): TensorRT lỗi → GPU thường (không CPU) + lần dựng sau
+  bỏ TensorRT; GPU thường cũng lỗi → CPU, lý do có trong nhật ký.
+
+## [3.23.753] — 🔤 Phim 大乾悍刀行: GLM-OCR bắt 11/12 lỗi thật — sửa 6 cụm đọc nhầm chữ giống hình
+
+Dữ liệu: lượt "Xuất dữ liệu thô OCR" bản 3.23.751 (9149 s, 3609 câu), gói kiểm định **GLM-OCR chạy thật trên GPU**
+(3609 câu / 612 s). Bước soát câu bằng PaddleOCR-VL không chạy ở lượt này (lỗi tiến trình riêng, sửa ở 3.23.752).
+
+### Đo (công cụ + xem ảnh từng câu bất đồng)
+| Chỉ tiêu | Kết quả |
+|---|---|
+| GLM-OCR đồng thuận | 3591/3609; 18 bất đồng |
+| Ứng dụng sai | 12 (GLM đúng 11): 筒直→简直, 叫器→叫嚣, 剔高兴/剔冲动→别…, 千旱→干旱, 一千二净→一干二净, 抢→抡 ×3, 三二→三二一, 宿主→恭喜宿主, 已回米乾→已回大乾 |
+| GLM sai, ứng dụng đúng | 6 (一一用上, 八八八, 去去去去, 蠢货, 别/別 phồn thể, 早/旱) → GLM chưa được tự ghi đè |
+| Thời gian | 299/299 câu đúng ±1 khung |
+
+### Sửa
+- Bảng cụm đọc nhầm (`OCR_HALLUCINATION_TYPO_MAP`): 筒直→简直, 叫器→叫嚣, 千旱→干旱, 一千二净→一干二净 (cùng lỗi ở phim
+  "[全集]"), "剔" + động từ → "别" (剔高兴, 剔冲动, 剔担心, 剔生气, 剔害怕, 剔胡说, 剔过来, 剔走). Đếm trên kết quả 6 phim:
+  các cụm SAI chỉ xuất hiện đúng chỗ đọc nhầm; "剔" đúng nghĩa (削骨剔髓, phim 86 tập) không bị đụng.
+- Phát lại bộ dựng trên dữ liệu thô phim này: đúng 6 câu đổi (813,5 / 4288,3 / 5079,3 / 5427,9 / 6849,4 / 8833,1 s), 3603
+  câu còn lại giữ nguyên.
+- Còn lại cho bước sau (cần bộ đọc thứ hai phân xử, không sửa được bằng bảng): 抢/抡 (cả hai là từ thật — VL đọc đúng "抡"
+  ở lượt 3.23.747), thiếu "一" cuối câu, chữ phụ đề đè chữ cảnh ("恭喜宿主", "大乾").
+
+### Dữ liệu test
+- `test data/dq_v3_23_751/`: seraw + gói kiểm định GLM-OCR + README kết quả xem ảnh.
+- Test `test_misread_words_v323753.py` (14): 6 cụm sai được sửa, 8 từ đúng (削骨剔髓, 剔除, 竹筒, 一千两, 千里, 机器, 简直,
+  干旱) giữ nguyên.
+
+## [3.23.752] — 🧩 Tiến trình riêng của PaddleOCR-VL: chuẩn bị đủ như tiến trình chính, lỗi không bật hộp thoại
+
+Log + ảnh 19/11 09:14 (bản 3.23.751, phim 大乾悍刀行): tiến trình con của PaddleOCR-VL chết ngay lúc nạp —
+`No module named 'chardet'` → `OcrModelLoadError`, rồi `'NoneType' object has no attribute 'write'` bật hộp thoại
+"Unhandled exception in script" trên màn hình; tiến trình chính chờ tới khi người dùng đóng hộp thoại (09:09 → 09:14)
+rồi mới lùi về PP-OCR. Phần còn lại của lượt chạy tốt: **gói kiểm định đọc bằng GLM-OCR trên GPU CUDA — 3609 câu trong
+612 s** (lần đầu GLM-OCR chạy thật trên máy chủ dự án).
+
+### Nguyên nhân gốc
+Tiến trình con (multiprocessing spawn) của exe KHÔNG chạy `main()` — `freeze_support()` tiếp quản ngay đầu `main.py` —
+nên thiếu các bước `main()` làm trước khi nạp thư viện: shim `chardet` (charset-normalizer MIT thay chardet LGPL — bản
+đóng gói không có chardet), `stdout`/`stderr` giả (exe `console=False` → `None`), trỏ kho mô hình về `models/`, ẩn cửa
+sổ console. Máy kiểm chứng có sẵn `chardet` và `stderr` nên không lộ.
+
+### Sửa
+- `composition/child_process_setup.prepare_child_process()`: đúng thứ tự `main()` — luồng chuẩn giả, ẩn console, kho mô
+  hình, shim chardet, rồi `_prepare_process_for_paddle` (lõi paddle, cuDNN, chặn torch).
+- Tiến trình con BẮT mọi lỗi (cả lúc chuẩn bị / nạp) và GỬI về tiến trình chính rồi thoát êm — không còn hộp thoại; tiến
+  trình chính nhận lý do ngay (không chờ người dùng đóng hộp thoại), ghi log và lùi về PP-OCR.
+
+### Test
+- `test_vl_process_v323751.py` thêm 3: tiến trình con trong điều kiện exe (không có chardet, stdout/stderr = None) →
+  `prepare_child_process` gắn luồng giả + `import chardet` ra shim; lỗi lúc khởi động được báo về, không ném trong tiến
+  trình con; tiến trình con thật không để ngoại lệ thoát ra. Kiểm lại PaddleOCR-VL THẬT qua tiến trình con: đọc đúng.
+
+## [3.23.751] — 🧱 PaddleOCR-VL chạy ở TIẾN TRÌNH RIÊNG: lệnh GPU kẹt không còn kéo cả ứng dụng treo
+
+### Bằng chứng (máy chủ dự án, phim 大乾悍刀行 84 tập, cùng cấu hình)
+- 5 lượt: 3 lượt bước soát câu bằng VL chạy trơn (~1 s/câu), 2 lượt (17:01 18/11; 08:14 19/11 — bản 3.23.750, máy ĐANG
+  được giữ thức, VRAM còn 5,9 GB) lần sinh chữ ĐẦU TIÊN của VL kẹt trong `_C_ops.embedding`. → kẹt NGẪU NHIÊN, không
+  phụ thuộc trạng thái nguồn (giả thuyết màn hình tắt của 3.23.747 chỉ là yếu tố đi kèm, không phải gốc).
+- Log 08:20 (đồng hồ canh treo): lưới an toàn 3.23.747 bỏ VL sau 120 s, nhưng luồng trích xuất kẹt tiếp ngay ở lần giải
+  mã NVDEC kế tiếp (`_decode_loop`) — NGỮ CẢNH CUDA của cả tiến trình đã kẹt theo lệnh GPU của VL.
+- VL (đồ thị ĐỘNG) dùng chung tiến trình với Paddle Inference (đồ thị tĩnh PIR — phải ép luồng VL "rời chế độ tĩnh"),
+  NVDEC và CuPy.
+
+### Sửa
+- `PaddleVlProcessReader` (`infrastructure/ocr/paddle_vl_process.py`): PaddleOCR-VL ở tiến trình con (multiprocessing
+  spawn — exe đã có `freeze_support()`), ngữ cảnh CUDA riêng. Tiến trình con chuẩn bị y như tiến trình chính (lõi paddle
+  tải-lúc-chạy, cuDNN của paddle, `PaddleOcrAdapter._import_paddle`: nạp trước scipy/sklearn → paddle → gỡ chặn torch).
+  Đọc quá hạn (120 s/trang GPU; lần đầu cộng thời hạn nạp) → GIẾT tiến trình con, bỏ VL cho phiên, giữ bản đọc PP-OCR;
+  tiến trình con lỗi / sập → dừng nó (trả VRAM) và báo lỗi. Trả mô hình (cuối lượt) = tắt tiến trình con.
+- Bộ chuyển đổi dùng bộ đọc tiến trình riêng trên Windows (`SE_VL_MODE=process|thread` để chọn tay).
+- Kiểm chứng với PaddleOCR-VL THẬT qua tiến trình con (CPU, máy đám mây): đọc đúng "这娘们又想耍什么花样",
+  "其实我一直都在", "一百雷劫太重了"; lần đọc sau dùng lại mô hình; trả mô hình → tiến trình con đã tắt. Lần thử đầu
+  lộ đúng cạm bẫy CLAUDE.md (sklearn nạp lần đầu khi torch bị chặn) → dùng lại trình tự nạp của tiến trình chính.
+
+### Test
+- `test_vl_process_v323751.py` (5, tiến trình con giả): đọc qua tiến trình con + trả = tắt, treo → giết + bỏ VL + lần sau
+  báo ngay, sập → báo lỗi + bật lại được, lỗi trong tiến trình con → dừng nó, chọn bộ đọc theo hệ điều hành.
+
+## [3.23.750] — 🏷️ Nhật ký ghi phiên bản ứng dụng lúc khởi động
+
+Log 19/11 07:28 (phim 大乾悍刀行): vẫn hai lỗi gói kiểm định đã sửa ở 3.23.748/749 ("không đưa được mô hình lên GPU",
+"all input arrays must have the same shape") — exe đang chạy là 3.23.747 (câu thông báo "llama-server không đưa được mô
+hình lên GPU (thiếu DLL CUDA…)" chỉ có ở mã 3.23.747; 3.23.749 dò chữ từng ảnh nên không thể ra lỗi ghép lô). Nhật ký
+không cho biết bản nào đang chạy → dòng khởi động nay ghi "Subtitles Extractor 3.23.xxx — Bootstrap GUI hoàn tất…".
+
+- Test `test_version_in_log_v323750.py`.
+
+## [3.23.749] — 🎯 Gói kiểm định PaddleOCR-VL: ảnh cắt sát + bộ dò chạy TỪNG ảnh (đệm theo lô làm rơi "一")
+
+Kiểm chứng 3.23.748 trên 97 câu hai phim (bộ kiểm định + PaddleOcrAdapter thật, CPU), đo 57 câu bất đồng / 40 câu
+ngẫu nhiên:
+
+| Cách đưa ảnh cho PaddleOCR-VL | Bộ dò | 57 câu bất đồng | 40 ngẫu nhiên |
+|---|---|---|---|
+| cắt sát + đệm theo ảnh lớn nhất lô (3.23.748) | lô 64 (như máy chủ dự án) | 46/57 | 40/40 |
+| giữ cỡ khung, che đen ngoài câu | lô 64 | 47/57 | 40/40 |
+| **cắt sát** | **từng ảnh** | **50/57** | **40/40** |
+
+Đệm làm đổi tỉ lệ thu-phóng của bộ dò → rơi nét mảnh "一" ("其实我直都在", "百雷劫太重了"), dính chữ cảnh ("我们公司高 启");
+che khung cũng rơi "一" (dò ở tỉ lệ khung không tiền xử lý). Thử riêng 2 câu này: cắt sát đúng ở cả lô 1 lẫn lô nhỏ cùng cỡ.
+
+- Lượt kiểm định PaddleOCR-VL chạy bộ dò TỪNG ảnh (`det_batch_size=1` riêng cho lượt này) trên ảnh cắt sát — đúng cấu
+  hình đã đo 50/57. Trên GPU dò từng ảnh thêm ~1–2 phút cho cả phim. GLM-OCR giữ ảnh cắt sát (không có bộ dò).
+- Đệm theo lô (3.23.748) giữ làm lưới an toàn chung; tuỳ chọn `mask_in_frame` của bộ kiểm định giữ lại (mặc định tắt).
+
+### Test
+- `test_qa_batch_shapes_v323748.py`: lượt kiểm định dò từng ảnh, bộ chứa giữ ảnh cắt sát; chế độ che khung đúng cỡ.
+
+## [3.23.748] — 🧩 Gói kiểm định hỏng trên máy GPU: ảnh khác cỡ trong lô dò 64 ảnh + GLM-OCR bị báo nhầm "không lên GPU"
+
+Log 19/11 00:30 (bản 3.23.747, phim 大乾悍刀行 84 tập): bản 3.23.747 có tác dụng — giữ máy thức ("Giữ máy thức + màn
+hình sáng…", `powercfg /requests` có DISPLAY + SYSTEM), soát 40 câu bằng PaddleOCR-VL chạy trơn ~1 s/câu (sửa
+'出去抢一抢' → '出去抡一抡'), KHÔNG còn treo. Nhưng gói kiểm định không ra (`.qa.json.gz` thiếu) vì hai lỗi:
+
+1. **GLM-OCR bị báo nhầm "không đưa được mô hình lên GPU"**: tải + cài xong (00:16:02), server lên (00:16:04) nhưng phần
+   kiểm GPU (3.23.745) tìm dòng `offloaded N/M layers to GPU` trong log — llama-server KHÔNG in dòng đó ở mức log mặc
+   định (kiểm lại trên server thật: 0 dòng). Lỗi của bản 745: kiểm theo mã nguồn mà không xác nhận log thật. Sửa: dò
+   thiết bị bằng `llama-server --list-devices` (in `CUDA0: NVIDIA GeForce RTX 3070 Ti (… MiB free)`), chạy server với
+   `--device CUDA0 -ngl 999`; không có CUDA → lỗi rõ ràng, lùi về PaddleOCR-VL. CPU: `--device none`.
+2. **Đường lùi PaddleOCR-VL lỗi "all input arrays must have the same shape"**: ảnh cắt sát từng câu (3.23.744) mỗi câu
+   một cỡ, bộ dò chữ chạy 64 ảnh mỗi lần ghép lô bằng `np.stack`. Máy kiểm chứng chạy bộ dò từng ảnh nên không lộ.
+   Tái hiện bằng bộ chuyển đổi thật: lô 1 → OK, lô 64 → đúng lỗi này. Sửa ở gốc (`pad_to_common_shape` trong
+   `PaddleOcrAdapter.infer_batch`): ảnh khác cỡ trong một lô được đệm đen cạnh phải / dưới cho bằng ảnh lớn nhất — gốc
+   toạ độ giữ nguyên, vùng đệm không có chữ. Sau sửa: lô 64 → OK.
+
+### Test
+- `test_qa_batch_shapes_v323748.py` (3): đệm đúng cạnh / màu, lô cùng cỡ giữ nguyên, bộ chuyển đổi đệm trước bước dò.
+- `test_glm_ocr_qa_v323745.py`: dò CUDA từ `--list-devices`, không có CUDA → lỗi rõ, dòng lệnh `--device`; tích hợp
+  với llama-server thật (`--device none`) đạt.
+
+## [3.23.747] — 🔋 Nguyên nhân gốc treo PaddleOCR-VL: Windows tắt màn hình → GPU kẹt. Giữ máy thức + VL có thời hạn
+
+### Bằng chứng (máy chủ dự án, 18/11)
+- Log 23:11 (bản 3.23.746): đồng hồ canh treo ghi ngăn xếp — luồng trích xuất đứng trong `_C_ops.embedding`
+  (`greedy_search` đầu tiên của PaddleOCR-VL); "VRAM trống 5.9/8.0 GB" → KHÔNG phải thiếu VRAM.
+- Event Viewer: **23:04:17 Kernel-Power 566** (Windows tắt màn hình vì không dùng — phiên trước 289 s, `MonitorReason 31`)
+  → 23:04:31 VL sinh chữ lần đầu, treo (GPU 3 %) → **23:12:26 nvlddmkm 153** (lỗi trình điều khiển GPU khi tiến trình
+  treo bị đóng). Ba lần nvlddmkm 153 tối đó (21:40, 22:30, 23:12) đều đi sau một lần 566. Phim 86 tập (cùng trình tự)
+  chạy tốt khi người dùng ngồi máy.
+- Kết luận: màn hình tắt → GPU hạ trạng thái nguồn → lệnh CUDA đang chờ không bao giờ xong.
+
+### Sửa
+- **Giữ máy thức + màn hình sáng trong lúc chạy việc dài** (`infrastructure/process/keep_awake.py`): yêu cầu nguồn Windows
+  (`PowerCreateRequest` + SystemRequired + DisplayRequired, hiện trong `powercfg /requests` kèm lý do), lùi về
+  `SetThreadExecutionState`; đếm tham chiếu khi nhiều việc chồng nhau; xong việc trả lại. Gắn vào `run()` của các luồng:
+  trích xuất (cả hàng loạt), OCR lại, đo tốc độ OCR, phụ đề nhúng, nhận dạng giọng nói, dịch, lồng tiếng / lồng lại,
+  xuất video, nối video.
+- **PaddleOCR-VL chạy trên luồng riêng có thời hạn** (`PaddleVlLineReader`): nạp 3600 s (lần đầu còn tải ~2 GB), đọc
+  120 s mỗi trang ≤ 8 dòng trên GPU (bình thường < 5 s); quá hạn → `VlReadTimeoutError` + ngăn xếp luồng VL vào nhật ký,
+  bộ chuyển đổi tắt VL cho phiên và giữ bản đọc PP-OCR → không bao giờ treo hàng giờ nữa (lưới an toàn nếu GPU kẹt vì
+  lý do khác). Luồng `paddle-vl` là daemon — kẹt trong lệnh GPU cũng không chặn ứng dụng thoát.
+- Tự rà lại (sửa luôn): gọi API Windows bằng ctypes mà không khai báo `argtypes` → HANDLE 64 bit bị truyền như số nguyên
+  32 bit, cắt cụt — có ở Job Object của `glm_ocr_runtime` (3.23.745, gắn llama-server thất bại âm thầm); khai báo đủ cho
+  cả Job Object lẫn yêu cầu nguồn.
+
+### Test
+- `test_keep_awake_v323747.py` (6): giữ trong lúc chạy và trả sau, việc chồng nhau dùng chung một yêu cầu, trả cả khi
+  lỗi, API lỗi không phá việc, không làm gì ngoài Windows, mọi luồng chạy việc dài đều được gắn.
+- `test_vl_hang_timeout_v323747.py` (4, hỏng trên mã cũ): luồng VL riêng, treo → hết hạn + ngăn xếp + lần sau báo ngay,
+  nạp có thời hạn riêng, bộ chuyển đổi lùi về PP-OCR. Cập nhật test 3.23.739: thiết bị gán trên luồng VL.
+
+## [3.23.746] — 🩺 Treo sau "Nạp bộ đọc dòng PaddleOCR-VL" (phim 大乾悍刀行): đồng hồ canh treo + trả VRAM trước bước VL
+
+Log 18/11 21:34 (phim 84 tập, 9149 s, 228 675 khung): "Xuất dữ liệu thô OCR" đã lưu xong `.seraw.json.gz` (16:58) và
+video ROI (17:00), dựng phụ đề xong, vào bước "Soát 40 câu nghi ngờ" → mở bộ giải mã, nạp PaddleOCR-VL (17:01:04) rồi
+im lặng hơn 4 giờ. Ảnh Trình quản lý tác vụ: GPU 3 %, VRAM 7,6/8,0 GB. Cùng trình tự trên phim 86 tập (lượt 3.23.741)
+chạy tiếp ngay < 1 s. Treo nằm ở lần sinh chữ ĐẦU TIÊN của VL (khung đã giải mã xong, mô hình đã nạp xong) khi VRAM gần
+đầy; nhật ký không đủ để chỉ ra luồng nào kẹt ở hàm nào → bản này thu bằng chứng + bỏ yếu tố VRAM đầy:
+
+- **Đồng hồ canh treo** (`application/services/stall_watchdog.py`): mọi lượt trích xuất chạy dưới đồng hồ canh; không có
+  tiến độ ≥ 3 phút → ghi NGĂN XẾP MỌI LUỒNG Python vào nhật ký (WARNING), lặp lại sau 10 phút, tối đa 3 lần mỗi lần kẹt.
+  Lấy ngăn xếp bằng `sys._current_frames()` dưới GIL (an toàn trên Windows, khác `faulthandler` đọc không giữ GIL).
+- **Trả VRAM trước bước VL**: trước bước soát câu và trước gói kiểm định, `PaddleOcrAdapter.trim_gpu_memory()` trả bộ
+  nhớ đệm Paddle + CuPy mà bước OCR để lại (giữ mô hình chính) và ghi "VRAM trống X/Y GB" vào nhật ký.
+
+Nguyên nhân gốc CHƯA khẳng định — lần chạy tới (treo lại hay không) sẽ có ngăn xếp + số VRAM để kết luận.
+
+### Test
+- Toàn bộ test 9105 đạt (1 bỏ qua: tích hợp llama-server thật). `test_stall_watchdog_v323746.py` (7): ghi ngăn xếp sau im lặng, có ngăn xếp của luồng đang kẹt, nhịp sống từ bộ báo
+  tiến độ, giới hạn số lần ghi, lượt trích xuất chạy dưới đồng hồ canh, trả VRAM + ghi nhật ký trước bước VL, giữ mô hình.
+
+## [3.23.745] — 🧠 Bộ đọc kiểm định GLM-OCR (tải khi dùng, llama.cpp tiến trình riêng): câu bất đồng 57/57
+
+Chủ dự án (18/11): đồng ý dùng GLM-OCR làm bộ đọc kiểm định với điều kiện exe không nặng thêm — chỉ tải khi dùng.
+
+### Vì sao GLM-OCR
+Đo 6 bộ đọc trên 457 câu hai phim (57 câu bất đồng đã xem ảnh + 400 câu ngẫu nhiên; gói `TestData_qabench_v3_23_743`):
+GLM-OCR 57/57 + 397/400, HunyuanOCR-1.5 56/57 + 394/400, Qwen3.5-2B 55/57 + 397/400, PaddleOCR-VL 50/57 + 398/400.
+Bản GGUF Q8_0 chạy bằng llama.cpp: 57/57 + 158/159 — giữ nguyên chất lượng bản gốc.
+
+### Tính năng
+- Cài đặt → OCR → **Bộ đọc kiểm định**: PaddleOCR-VL (mặc định, như cũ) / GLM-OCR (`ocr.qa_reader`).
+- Chọn GLM-OCR: lần đầu "Xuất dữ liệu thô OCR" (có gói kiểm định) tự tải ≈ 1,9 GB về `<dữ liệu>/models/glm_ocr/` (thanh
+  tiến độ, huỷ được): llama.cpp **b12387** (đúng commit đã đo) bản Windows CUDA 12.4 + DLL CUDA từ GitHub; GGUF
+  `GLM-OCR-Q8_0` + `mmproj` từ Hugging Face (ghim phiên bản, kiểm SHA-256). Exe KHÔNG nặng thêm (chỉ thư viện chuẩn).
+- `llama-server` chạy TIẾN TRÌNH RIÊNG (không PyTorch, không đụng Paddle), chỉ nghe 127.0.0.1, GPU qua `-ngl 999` khi
+  lượt chạy GPU; nạp mô hình một lần, đọc ảnh cắt sát từng câu (cùng cách cắt của 3.23.744), xong lượt thì tắt → trả VRAM.
+  Trước khi bật, trả VRAM của PaddleOCR-VL (soát câu).
+- Đường lùi: tải / giải nén / server không lên / mô hình không lên được GPU khi chọn GPU / 5 ảnh liên tiếp đọc lỗi →
+  ghi log lý do, đọc lại bằng PaddleOCR-VL như cũ. Huỷ → dừng, không lùi. Gói kiểm định ghi bộ đọc thật ở `model`.
+
+### Kiểm chứng
+- `llama-server` dựng từ đúng mã nguồn b12387 trên máy đám mây (CPU): đường chạy thật của ứng dụng (bộ cài + server +
+  bộ kiểm định + ảnh cắt sát) trên 97 câu hai phim: **57/57 câu bất đồng, 40/40 câu ngẫu nhiên** (PaddleOCR-VL cắt sát
+  50/57, 40/40); ≈ 1 s/câu trên CPU 4 nhân.
+- Lượt rà độc lập tìm 11 vấn đề, đã sửa trước khi giao: cài dở (gói DLL CUDA hỏng) bị coi là đã cài → giờ kiểm từng gói
+  theo danh sách tệp bắt buộc và tải lại phần thiếu; server mồ côi khi khởi động lỗi lạ / ứng dụng bị giết (Job Object
+  "đóng là giết" trên Windows); gọi 127.0.0.1 qua proxy hệ thống; âm thầm chạy CPU khi chọn GPU (đọc log "offloaded N/M
+  layers to GPU"); một ảnh lỗi làm hỏng cả lượt; VRAM PaddleOCR-VL chưa trả; tệp tải dở / zip lỗi để lại; tên tệp lạ
+  trong zip; máy không phải Windows tải 1,9 GB rồi mới báo lỗi.
+- **Hạn chế còn lại**: hai gói llama.cpp từ GitHub chưa ghim được mã băm (máy dựng bản không tải được trang phát hành)
+  — kiểm bằng danh sách tệp bắt buộc; mô hình GGUF có ghim SHA-256. Phần chạy Windows + GPU CUDA chỉ kiểm được bằng test
+  giả lập — lần chạy thật đầu tiên là trên máy chủ dự án.
+
+### Test
+- `test_glm_ocr_qa_v323745.py` (18; toàn bộ test 9097 đạt, 1 bỏ qua là test tích hợp cần llama-server thật — đã chạy riêng, đạt): tải thật qua máy chủ HTTP cục bộ (mã băm sai, huỷ, gói thiếu tệp, cài dở rồi tải
+  tiếp đúng phần thiếu), dòng lệnh server, đọc log GPU, ảnh lỗi lẻ / server hỏng, server luôn được tắt, lượt trích xuất
+  chọn GLM-OCR (GPU) / lùi về PaddleOCR-VL / huỷ không lùi / trả VRAM trước, Cài đặt; tích hợp với `llama-server` +
+  GGUF THẬT khi có `SE_TEST_LLAMA_SERVER` + `SE_TEST_GLM_GGUF_DIR`.
+
+## [3.23.744] — 🔍 Gói kiểm định đọc ẢNH CẮT SÁT hộp phụ đề: câu bất đồng do chữ cảnh 1/57 → 50/57 đúng
+
+Chủ dự án (18/11): "cho PaddleOCR-VL kiểm định đọc ảnh cắt sát hộp phụ đề".
+
+### Nguyên nhân gốc
+Gói kiểm định đưa CẢ KHUNG video vùng ROI cho bộ chuyển đổi; bộ chuyển đổi chạy bộ dò chữ PP-OCR trên ảnh đó rồi cho VL
+đọc TỪNG hộp dò được và nối lại → chữ trong cảnh lọt vào bản đọc kiểm định ("喝酒去WARMHOME", "那不就是一个报表吗BOR",
+"封印" / "送给南宫梦" thay câu phụ đề). 57 câu "bất đồng" của hai phim (phim 86 tập + 豪门Z外) phần lớn là do vậy.
+
+### Sửa
+- `VlQualityAuditor.audit(..., frames=)`: lượt trích xuất truyền kết quả OCR thô (hộp chữ theo toạ độ ROI); mỗi mốc đọc
+  lại lấy khung OCR gần nhất (≤ 0,25 s) và cắt sát câu phụ đề (`subtitle_crop_rect`): hộp neo = hộp có chữ Hán trùng câu
+  nhiều nhất; thêm hộp cùng dòng hoặc dòng trên / dưới cao bằng và CĂN GIỮA cùng trục (phụ đề hai dòng; chữ cảnh "封印"
+  ngay trên dòng "修为封印" lệch trục 162 px bị loại); lề 0,25 × chiều cao dòng + 4 px. Không có hộp → cả khung như cũ.
+- `strip_scene_latin`: câu phụ đề không có chữ Latin / số thì bỏ chữ Latin / số lạc vào bản đọc lại — chữ cảnh liền sát
+  dòng phụ đề bị chính bộ dò gộp chung một hộp ("林娇娇这女人eet dream", "201717上签字"), cắt ảnh không tách được. Bản đọc
+  gốc ghi ở trường `raw`.
+- `phim.qa.json.gz`: thêm `"input": "subtitle_box_crop"` và `box` mỗi câu (khung cắt ở mốc giữa, toạ độ video ROI).
+
+### Kiểm chứng (bộ kiểm định thật + PaddleOcrAdapter thật trên CPU, seraw + video ROI thật của hai phim; toàn bộ test 9079 đạt)
+| Nhóm câu | Gói cũ (cả khung) | Gói mới |
+|---|---|---|
+| 57 câu bất đồng (đáp án đã xem ảnh) | 1/57 | **50/57** |
+| 40 câu ngẫu nhiên | 40/40 | 40/40 |
+
+291/291 ảnh được cắt sát. 7 câu còn lại là lỗi đọc của chính PaddleOCR-VL (咋→作, 阉→闻, 霄→雪, 耍→要, 依→侬, rơi 一,
+thêm 你) — giới hạn của mô hình, khớp phép đo riêng trên ảnh cắt (50/57). So sánh 6 bộ đọc trên 457 câu (gói
+`TestData_qabench_v3_23_743.zip`): GLM-OCR 57/57 + 397/400, HunyuanOCR-1.5 56/57 + 394/400, Qwen3.5-2B 55/57 + 397/400,
+PaddleOCR-VL 50/57 + 398/400 → ứng viên thay thế cho vị trí kiểm định là GLM-OCR (đang đo bản GGUF chạy bằng llama.cpp).
+
+### Test
+- `test_quality_audit_crop_v323744.py` (hỏng trên mã cũ): chọn hộp phụ đề, loại chữ cảnh (cả khi trùng chữ câu, cả khi
+  ngay trên dòng — hộp thật câu 151 phim 86 tập), phụ đề hai dòng, bộ kiểm định đưa đúng ảnh cắt cho bộ nhận dạng, lượt
+  trích xuất truyền kết quả OCR thô, bỏ Latin / số lạc.
+
+## [3.23.743] — 📏 Đo chất lượng phim 豪门Z外 (PaddleOCR-VL chạy thật): 100 % đúng — sửa thước đo báo nhầm
+
+Dữ liệu: lượt "Xuất dữ liệu thô OCR" bản 3.23.742 phim 豪门Z外 (5600 s, 2131 câu); gói kiểm định đọc bằng
+PaddleOCR-VL-1.6-0.9B THẬT (`vl_error` rỗng — lượt 3.23.740 trước đó VL lỗi, đọc bằng PP-OCR).
+
+### Kết quả (công cụ + xem ảnh mọi điểm nghi)
+| Chỉ tiêu | Kết quả |
+|---|---|
+| Nội dung | **2131/2131 đúng**. VL đồng thuận 2103; 28 bất đồng xem ảnh đều VL sai: dính chữ cảnh (WARMHARBOR, BOR, SIEUOK OUTS, RMHA, số năm), 秦可依→秦可侬, 耍→要, 裁→栽, 羞→差, 哎呦→唦呦, rơi 大 / 一 / 不, thêm 你 |
+| Câu sót | **0** (mức bộ dò 0; mức điểm ảnh: 1 ứng viên 1567,7 s = mặt đồng hồ số 7/6/5, không phải phụ đề) |
+| Câu thừa | **0** (VL thấy chữ ở mọi câu) |
+| Thời gian | **300/300 đúng ±1 khung** đầu câu; cuối câu 298/300 theo công cụ — 2 câu còn lại xem ảnh: chữ còn nguyên qua lúc chuyển cảnh, ứng dụng đúng |
+| SRT anh gửi | trùng khớp 2131/2131 câu với seraw; kết quả dựng trùng hệt lượt 3.23.740 |
+| Tốc độ | cắt ROI 165 s (GPU zero-copy, hevc_nvenc), VL kiểm định 1249 s cho 2131 câu |
+
+Phim này không lộ lỗi nào của ứng dụng. VL lại một lần nữa nhiễu hơn bộ đọc chính (28/28 bất đồng là VL sai) → giữ nguyên
+nguyên tắc VL chỉ là tín hiệu "cần xem", không tự ghi đè.
+
+### Sửa thước đo `tools/quality_report.py` (báo nhầm → tốn công xem ảnh)
+- **Ngưỡng sót mức điểm ảnh**: trước lấy phân vị 10 % theo KHUNG (gồm khung chữ đang mờ dần) → phim này ngưỡng ~0,0002,
+  50/50 ứng viên là cảnh không có chữ, trong khi câu một chữ thật yếu nhất 0,0044. Nay: ½ mức nét chữ của câu yếu nhất
+  (phân vị 1 % trung vị theo CÂU) → 50 → 1 ứng viên (豪门Z外); phim 86 tập vẫn bắt được câu "诶" sót thật (5660 s).
+- **Đo thời gian**: IoU mặt nạ → độ phủ nét chữ mẫu ≥ 60 %. Nền sáng đổi sau chữ làm phần hợp tăng gấp đôi ("门没关":
+  2746 → 5088 điểm, IoU 0,97 → 0,51) dù chữ còn nguyên → báo nhầm mốc cuối lệch 7,6 khung. Báo cáo ghi thêm
+  `pixel_threshold` và danh sách câu lệch (`timing.outliers`) để xem ảnh thẳng.
+- Phim 86 tập đo lại: thời gian 297/297 đúng ±1 khung cả đầu lẫn cuối.
+
+### Dữ liệu test
+- `test data/hmzw_v3_23_742/`: seraw, gói kiểm định VL thật, 2 đoạn video ROI, README kết quả.
+- Test `test_quality_report_tool_v323743.py` (hỏng trên công cụ 3.23.742: 2 đoạn sót giả; độ đúng mốc cuối 0,5).
+
+## [3.23.742] — 📏 Giai đoạn 0 kế hoạch 4.0: thước đo chất lượng trên phim thật — sửa câu sót "诶" và "腌攒"
+
+Dữ liệu: lượt "Xuất dữ liệu thô OCR" bản 3.23.741 phim nối 86 tập "天骄女友退婚…" (8351 s, 3663 câu) — lượt đầu tiên
+PaddleOCR-VL chạy THẬT trên GPU (log: "Đã đọc lại 3663 câu bằng PaddleOCR-VL-1.6-0.9B").
+
+### Thước đo (công cụ mới `tools/quality_report.py` + xem ảnh mọi điểm nghi)
+| Chỉ tiêu | Kết quả | Cách đo |
+|---|---|---|
+| Nội dung | 3662/3663 đúng → 3663/3663 sau bản này | VL đọc lại 3 khung mỗi câu: 3634 đồng thuận; 29 bất đồng xem ảnh: ứng dụng đúng 28 (VL sai: 灵力→灵活, 凌霄→凌雪, 阉→闹, 师姐→姐姐, rơi 一, dính chữ cảnh 封印 / 送给南宫梦, ký hiệu 〈〉《》), sai 1 |
+| Câu sót | 1 → 0 | mức bộ dò: 107 428/107 428 khung có hộp chữ dạng phụ đề đều thuộc câu; mức điểm ảnh (quét video ROI 0,2 s, nét chữ trắng viền tối): 1 câu "诶" |
+| Câu thừa | 0 | VL thấy chữ ở mọi câu; điểm ảnh: 1 câu ít nét — phụ đề thật đặt cao |
+| Thời gian | 298/298 đúng ±1 khung | mặt nạ nét chữ khung giữa câu, IoU ≥ 0,5: đầu đúng khung; cuối = lúc chữ tắt |
+| Tốc độ (RTX 3070 Ti) | OCR 1597 s (5,2×), VL kiểm định 1765 s (4,7×), cắt ROI 60 s, tổng 3502 s | log |
+
+- VL đọc cả dòng nên NHIỄU hơn PP-OCR (28/29 bất đồng là VL sai) → không được tự ghi đè; chỉ làm tín hiệu "cần xem".
+- **Đính chính kế hoạch 4.0**: "bước lấy mẫu thật 0,040 s (cấu hình 0,030 s)" KHÔNG phải hụt khung — phim 25 fps, bước
+  cấu hình nhỏ hơn khoảng cách khung nên đã đọc ĐỦ từng khung.
+
+### Sửa
+- **"诶" bị sót** (5660,32–5660,88 s): bộ dò thấy hộp; PP-OCRv6 không có "诶" trong bảng chữ; bộ cứu chữ PP-OCRv5 đọc "埃"
+  (→ "诶") 0,334 < ngưỡng 0,6. Đo cả phim (8351 khung mẫu, 455 lần cứu chữ): "埃" ra đúng 1 lần ở chỗ "诶" thật, KHÔNG lần nào
+  trên vật trong cảnh (rác cảnh ra 福 / 中 / số / Latin) → `RESCUE_MAPPED_MIN_CONFIDENCE` = 0,3; hộp được cứu mang tin cậy
+  tối thiểu 0,6 (bộ dựng không bỏ câu một chữ). Chạy lại OCR trên khung thật: `[('诶', 0.6)]` (trước: rỗng).
+- **"做这等腌攒之事"** → "腌臜" (ảnh; cùng lỗi phim "[全集]" "你和他的那些腌攒事"): bảng `OCR_HALLUCINATION_TYPO_MAP` thêm
+  "腌攒" → "腌臜" (không khai báo "腌" luôn đi với "臜" được — có 腌制 / 腌菜). Phát lại 6 lượt: chỉ 2 câu này đổi.
+
+### Dữ liệu test
+- `test data/tj_v3_23_741/`: seraw, gói kiểm định VL, 4 đoạn video ROI, README kết quả đo.
+- Test: `test_misread_words_v323742.py`, `test_rescue_threshold_v323742.py` (gồm bộ dựng giữ câu "诶" được cứu),
+  `test_quality_report_tool_v323742.py` (công cụ chạy trên dữ liệu thật: 3663 câu, 3634 đồng thuận, 29 bất đồng).
+
+## [3.23.741] — 📦 Bản exe thiếu metadata Jinja2 / safetensors → PaddleOCR-VL lỗi `ImmutableSandboxedEnvironment`
+
+Log 18/11 09:12 (bản 3.23.740): bản sửa chế độ tĩnh PIR có tác dụng ("Luồng đọc PaddleOCR-VL đang ở chế độ tĩnh (PIR) —
+chuyển về chế độ động cho luồng này"; hết `Place(undefined:0)`), VL đi tiếp và vấp lỗi kế:
+`name 'ImmutableSandboxedEnvironment' is not defined`.
+
+- Nguyên nhân: PaddleX không thử `import` mà hỏi METADATA gói cài đặt (`is_dep_available("Jinja2")` →
+  `importlib.metadata`). Bản exe chỉ chép metadata các gói trong `_METADATA_PACKAGES` (`SubtitlesExtractor.spec`) —
+  không có Jinja2 → PaddleX bỏ qua `from jinja2.sandbox import ImmutableSandboxedEnvironment` → NameError khi dựng mẫu
+  hội thoại của bộ tách từ VL. Dò mọi điểm PaddleX hỏi metadata trên đường chạy VL: kế tiếp sẽ là
+  `require_deps("safetensors")` khi đọc trọng số mô hình (không có trong danh sách); `regex` không cần (VL chạy được khi
+  không cài).
+- Sửa: `.spec` chép metadata `Jinja2`, `safetensors` (đệ quy: cả MarkupSafe) và gom mô-đun `jinja2`, `markupsafe`,
+  `safetensors`; thêm `Jinja2>=3.1`, `safetensors>=0.4` vào requirements / pyproject.
+- **Kiểm chứng bằng mô phỏng đúng điều kiện bản exe** (`importlib.metadata` chỉ thấy gói `.spec` chép metadata + phụ
+  thuộc đệ quy), chạy TRỌN đường PaddleOCR-VL thật trên khung video ROI phim "合欢宗" (1394,3 s): `.spec` cũ → đúng
+  `NameError: name 'ImmutableSandboxedEnvironment' is not defined`; `.spec` mới → VL đọc **"玄昊师兄"** (đúng — PP-OCR
+  hay đọc "玄吴").
+- Test `test_bundle_vl_metadata_v323741.py` (2 test; tiến trình con mô phỏng metadata bản exe — `.spec` cũ: JINJA False,
+  SAFETENSORS False).
+
+## [3.23.740] — 🩹 PaddleOCR-VL chạy được thật trên máy GPU (nguyên nhân thật: luồng ở chế độ tĩnh PIR)
+
+Log 18/11 07:05 (bản 3.23.739): hết văng sau "Xuất dữ liệu thô OCR" (biện pháp trả mô hình phụ có tác dụng), gói kiểm
+định đã ghi đúng bộ đọc thật ("PP-OCR — PaddleOCR-VL lỗi") — nhưng VL VẪN lỗi `Place(undefined:0)`.
+
+- **Đính chính 3.23.739**: "nơi chạy mong đợi" của Paddle là biến TOÀN CỤC, `set_device` không thiếu. Nguyên nhân thật:
+  `_current_expected_place()` trả `core.Place()` (= `Place(undefined:0)`) khi luồng ở chế độ TĨNH PIR. Chế độ động là
+  tracer RIÊNG từng luồng, chép từ biến toàn cục lúc luồng được tạo — chỉ cần ở đâu đó trong tiến trình (luồng chính)
+  từng đặt tracer về `None` (tác dụng của `paddle.enable_static()` / khối guard tĩnh) là mọi luồng tạo sau ở chế độ tĩnh.
+- **Tái hiện bằng Paddle thật** (máy đám mây): đặt tracer toàn cục về `None` → luồng mới gọi
+  `paddle.amp.is_bfloat16_supported()` lỗi đúng chữ `Invoked with: Place(undefined:0)`.
+- Sửa: `_bind_thread_device` — luồng đọc VL không ở chế độ động thì `paddle.disable_static()` cho riêng luồng đó (luồng
+  khác giữ nguyên chế độ — đo được), rồi `set_device`.
+- Test `test_vl_static_thread_v323740.py` (Paddle thật, mọi bước trong luồng phụ, khôi phục trạng thái sau test): mã cũ
+  lỗi đúng `Place(undefined:0)`, mã mới qua.
+
+## [3.23.739] — 🩹 PaddleOCR-VL không chạy ở mọi phiên trên máy GPU; văng sau "Xuất dữ liệu thô OCR"
+
+Dữ liệu: `fault_20261118_054846.log` (`0xe24c4a02` LuaJIT + `access violation`) + nhật ký ứng dụng 08–18/11.
+
+### 1. PaddleOCR-VL lỗi ở MỌI phiên (17/11 19:19, 23:05; 18/11 05:28, 05:54)
+- `PaddleOCR-VL không chạy được (is_bfloat16_supported(): incompatible function arguments … Place(undefined:0))` →
+  ứng dụng âm thầm lùi về PP-OCR "cho phiên này".
+- Nguyên nhân: PaddleX gọi `paddle.amp.is_bfloat16_supported()` KHÔNG truyền thiết bị → Paddle dùng "nơi chạy mong đợi"
+  của LUỒNG HIỆN TẠI, chỉ có ở luồng đã `paddle.set_device`. Lượt trích xuất chạy trong luồng nền → bản Paddle GPU trả
+  `undefined`. (Máy đám mây dùng Paddle CPU: luồng mới mặc định CPU nên không lộ — kiểm thử VL ở đây đều qua.)
+- Sửa: `PaddleVlLineReader.read` gán thiết bị cho luồng đang đọc trước khi nạp / dự đoán.
+- **Dữ liệu không còn mang nhãn sai**: bộ chuyển đổi ghi lý do (`vl_error`); gói kiểm định ghi bộ đọc THẬT
+  (`… (PP-OCR — PaddleOCR-VL lỗi)` + `vl_error`) thay vì "PaddleOCR-VL"; nhật ký soát câu thêm dòng lỗi VL.
+- **Đính chính 3.23.736**: phiên phim "合欢宗" (17/11 19:19) VL KHÔNG chạy — "VL đọc mất bộ 口 (吩咐 → 分咐)", "VL ra chữ
+  phồn thể (接下來)" thật ra là PP-OCR đọc lại. Hai bản sửa của 3.23.736 (quy phồn → giản, ngữ liệu phim giữ bản đang
+  có) vẫn đúng vì áp cho mọi bản đọc lại. Kiểm thật VL trên máy đám mây (CPU) vẫn là VL thật: 17/17 câu đúng.
+
+### 2. Văng ~2 s sau khi mở trang Chỉnh sửa, cuối "Xuất dữ liệu thô OCR" (18/11 05:48)
+- Nhật ký: lượt kiểm định xong 05:48:44 (đọc lại 2131 câu × 3 khung trên GPU, 152 s), mpv trang Chỉnh sửa khởi tạo
+  05:48:46, văng ngay sau. Mọi script Lua của mpv đã tắt đủ ("bản libmpv không có: —") — dòng LuaJIT là ngoại lệ đã
+  được xử lý (bộ ghi lỗi Windows ghi cả ngoại lệ đã bắt); lỗi thật là `access violation` không có vết Python (mã C).
+- Lượt chạy nhỏ (59 câu, 05:54) mở mpv bình thường → không tái hiện ổn định; máy đám mây không có Windows/GPU/libmpv.
+- Biện pháp: `release_auxiliary_models` — cuối MỖI lượt, ngay trong luồng nền: trả mô hình phụ (PaddleOCR-VL, bộ cứu
+  chữ PP-OCRv5), dọn rác, trả VRAM Paddle/CuPy trước khi giao diện mở mpv (mô hình chính giữ nguyên). Chặn hai nguyên
+  nhân khả dĩ: VRAM/bộ nhớ còn bị chiếm khi mpv cấp bộ giải mã; đối tượng Paddle bị bộ thu rác dọn muộn trên luồng giao
+  diện. Còn văng → cần tên mô-đun lỗi trong Event Viewer.
+
+### Test
+- `test_vl_thread_device_v323739.py` (4 test: thiết bị theo luồng với Paddle giả có "nơi chạy" theo luồng như bản GPU,
+  nhãn bộ đọc thật trong gói kiểm định, trả mô hình phụ giữ mô hình chính, gọi cuối lượt).
+
+## [3.23.738] — ⚙️ Rà soát toàn bộ cài đặt: mọi cài đặt có tác dụng thật; hằng số cần chỉnh đưa ra Cài đặt
+
+Yêu cầu chủ dự án (17/11/2026): mọi cài đặt phải có tác dụng khi điều chỉnh, không để cho có; đưa hằng số cần thiết ra
+Cài đặt.
+
+### Cách rà
+- **Đo tác dụng** (126 trường): đổi từng cài đặt, so thứ ứng dụng thật sự dùng — yêu cầu trích xuất, cấu hình bộ dựng /
+  OCR / MPV / dò ROI, bộ đọc metadata, bộ dịch, bộ ngữ cảnh video. 27 trường không làm đổi các thứ đó → lần theo từng
+  trường tới nơi dùng (lúc khởi động, khi mở trang / tải video, cờ chuyển đổi phiên bản).
+- **Trang Cài đặt**: cả 107 ô đều được nạp và được lưu. **Trang Lồng tiếng**: cả 54 ô đều được dùng khi chạy (không chỉ
+  lưu). **QSettings**: 86 khoá — các khoá "chỉ đọc" đều là chuyển đổi dữ liệu bản cũ.
+- **Tham số bộ dựng** (17): phát lại phim thật với giá trị cực đoan + dữ liệu dựng riêng cho từng tham số. Ngưỡng tương
+  đồng / Viterbi có tác dụng thật nhưng chỉ ở phim khó ("反派" 25 phút đầu: 2–11 câu khác; phim dễ: 0 — các khâu gộp lần
+  đọc / tách khối ổn định đã xử lý trước). "Thời lượng tối đa" chỉ chặn khi ứng dụng TỰ kéo dài dòng (đúng chú thích);
+  "Số ký tự tối thiểu" chỉ áp cho chữ Latin (chữ Hán luôn 1) — nhãn cũ "Bỏ text ngắn ≤" gây hiểu sai → sửa nhãn + chú thích.
+
+### Sửa
+- **"Định dạng đầu ra" không chỗ nào đọc** → nay là định dạng mặc định của hộp thoại Xuất tệp ở trang Chỉnh sửa (tên gợi
+  ý `.original.ass` + bộ lọc chọn sẵn). Tệp nội bộ `.original.srt` của các khâu hàng loạt giữ SRT (chuỗi cả bộ nhận ra
+  tập đã trích qua tệp đó).
+- Tắt "Hiện dạng sóng" lúc đang chạy để sót thanh phóng dọc dạng sóng → ẩn cả hai.
+- Đổi ngôn ngữ giao diện không báo gì (giao diện dựng một lần lúc khởi động) → báo cần khởi động lại.
+- **Soát câu nghi ngờ: > 200 câu thì BỎ soát cả lượt** (hằng `_MAX_VERIFY_SUSPECTS`; phim "反派" ≈ 191 câu — sát ngưỡng)
+  → `prioritize_suspects`: soát câu đáng ngờ nhất trước (cờ hình học / hai bản đọc, rồi tin cậy thấp nhất) tới giới hạn.
+
+### Hằng số đưa ra Cài đặt
+| Cài đặt | Mặc định | Trước |
+|---|---|---|
+| OCR → Số câu soát tối đa mỗi lượt (`ocr.verify_max_lines`) | 400 (10–5000) | hằng 200, vượt thì bỏ soát |
+| OCR → Soát bằng VL câu tin cậy dưới (`ocr.vl_low_confidence`) | 0,90 (0,5–1,0) | hằng 0,90 |
+| Nâng cao → Chất lượng video vùng ROI (`advanced.roi_clip_quality`) | 24 (16–34, thang CRF) | hằng 24 |
+
+### Chặn tái phát
+- `test_settings_effect_v323738.py` (9 test), gồm bộ chặn "cài đặt chết": mỗi trường phải được đọc ở một tệp có chạm
+  nhóm cài đặt của nó (mã cũ: bắt đúng `post_process.output_format`).
+
+## [3.23.737] — 🧪 Gói kiểm định chất lượng: mọi câu đọc lại bằng PaddleOCR-VL trên GPU + tiếng phim
+
+Mục tiêu (chủ dự án, 17/11/2026): chạy ứng dụng trên máy có GPU là ra đủ dữ liệu để đối chiếu phụ đề với hardsub, không
+phải dò mắt từng dòng; gửi dữ liệu để sửa ứng dụng tới khi phụ đề trích xuất khớp 100 % chữ trên phim.
+
+- "Xuất dữ liệu thô OCR" → hộp thoại "Xuất kèm video vùng ROI và gói kiểm định?" → **Có** (mặc định) nay xuất thêm:
+  - `<tên>.qa.json.gz` (`VlQualityAuditor`): MỌI câu đã dựng được PaddleOCR-VL đọc lại ở 3 khung (20/50/80 % thời
+    lượng) trên ẢNH GỐC lấy từ video vùng ROI — không giải mã lại phim gốc cho từng câu (lượt soát câu nghi ngờ mở và
+    tua bộ giải mã mỗi câu: quá chậm cho cả nghìn câu). Chạy bằng thiết bị của lượt (GPU khi chọn GPU).
+  - `<tên>.audio.opus` (`FfmpegAudioExporter`): tiếng phim mono 16 kHz Opus 24 kbps (≈ 10 MB/giờ; không có libopus →
+    AAC `.m4a`): nguồn thứ ba không phụ thuộc OCR (câu sót / thừa, chữ giống hình khác âm 昊/吴).
+  - Hỏng ở bước nào cũng chỉ mất phần phụ đó; dữ liệu thô và phụ đề đã xong. Engine không nhận cấu hình theo lượt → bỏ
+    qua (không ghi gói đọc bằng mô hình mặc định).
+- Kiểm thật trên phim "合欢宗" (video ROI của lượt 3.23.735, VL chạy CPU trên máy đám mây, 17 câu quanh các điểm đã kiểm
+  bằng ảnh): VL đọc đúng **17/17**, kể cả mọi chỗ PP-OCR và lượt soát đều sai — "玄吴师兄" → **玄昊**师兄 (3/3 khung),
+  "那玄吴…" → **玄昊** (3/3), "谨遵师兄分咐" → **吩咐** (3/3), "接下來" → **接下来** (3/3), "阵" 0,997. Tức gói này
+  không chỉ để đo mà đủ tin cậy làm căn cứ sửa (vd thống nhất tên riêng cả phim) ở các bản sau.
+- Test `test_quality_audit_v323737.py` (11 test: mốc đọc lại, thứ tự hộp, đọc lại đúng khung từ video ROI thật, huỷ,
+  engine không nhận cấu hình, tách tiếng mono 16 kHz / phim không tiếng, nối vào lượt trích xuất với VL + ảnh gốc +
+  GPU của lượt, hộp thoại).
+
+## [3.23.736] — 🔤 Hết "common.video_placeholder"; phim "合欢宗" (80 tập): lượt soát VL không đổi sai chữ, chữ đơn đọc xen kẽ
+
+### 1. Giao diện hiện nguyên tên khoá chuỗi "common.video_placeholder" (khung video trang Trích xuất)
+- Khoá CÓ trong `strings_vi.json`/`strings_en.json`. Nguyên nhân: `create_video_widget` nhận `translator` tuỳ chọn; trang
+  **Trích xuất** và **Biên tập** gọi không truyền → `MpvVideoWidget` dùng `NullTranslator` (trả nguyên khoá). Bộ test
+  chạy máy không libmpv nên chỉ dựng `VideoCanvas` (không chữ) → lỗi không bao giờ lộ.
+- Sửa: `translator` thành tham số BẮT BUỘC của `create_video_widget` (quên truyền → hỏng ngay ở test); hai trang truyền
+  `container.translator`.
+- Mở rộng: quét tĩnh 1436 khoá chữ cố định trong mã — đều có ở cả hai tệp chuỗi; dò mọi lớp rơi về `NullTranslator`:
+  thêm một chỗ cùng lỗi — `OcrBasedAutoRoiDetector.detect()` mở hộp thoại duyệt ROI không truyền bộ dịch (nay container
+  truyền).
+- Test `test_raw_i18n_keys_v323736.py`: dựng cửa sổ chính với MPV "có mặt", duyệt MỌI widget của MỌI trang (nhãn, nút,
+  gợi ý, chữ mờ, tab, mục hộp chọn) — không chữ nào được là tên khoá (mã cũ: bắt đúng "common.video_placeholder").
+
+### 2. Phim "合欢宗从照顾师弟道侣开始修仙" (80 tập, lượt 3.23.735)
+Dữ liệu: seraw lượt 17/11 (4278 câu, nhật ký soát 73 câu). Không có bản người dùng sửa; `.original.srt` gửi kèm KHÔNG
+phải kết quả của seraw này (khớp `meta.result` 4154/4281 câu, có "y"/"M" không có trong seraw); `.srt` thứ hai là lượt
+cũ bản 3.6.4 (tháng 6). So với lượt cũ: lượt mới đúng hơn hẳn (竟/竞, 请/清, 来/未, 内/肉, 符/待…; bỏ câu rác "不" lá
+tre; bắt thêm "究竟是谁", "来来来来来" — kiểm bằng ảnh). Đoạn quảng cáo 480×854 (39 %): bộ đọc khung GPU chạy bình
+thường, chỉ ra mảnh rác tin cậy thấp, đều bị lọc — không câu nào.
+
+- **Lượt soát câu bằng PaddleOCR-VL đổi SAI 2/3 câu nó đổi** (kiểm bằng ảnh):
+  - "谨遵师兄吩咐" → "分咐": VL đọc mất bộ 口 cả 3 lần. Bảng chữ dễ lẫn không có cặp 吩/分 nên ngữ liệu phim không được
+    xét. Nay (`corpus_prefers_current`): bản đọc lại khác đúng MỘT chữ mà cụm quanh chỗ khác của bản đang có có ở câu
+    KHÁC ("你要是没什么吩咐的话"), còn cụm mới không câu nào có → giữ. Áp cho cả hai đường (tin cậy thấp, hai bản đọc).
+  - "接下来" → "接下來": VL ra chữ PHỒN THỂ. Đường "hai bản đọc" đã quy giản thể, đường "tin cậy thấp" thì chưa → nay quy.
+  - Sửa thật vẫn nhận: "霍" → "嚯", "腌攒" → "腌臜", "竞" → "竟".
+- **Chữ đơn đọc xen kẽ A | B | A** (`relabel_single_char_sandwiches`): "阵" 37:24 đọc 阵 0,48 s | 降 0,40 s | 阵 0,72 s
+  (tin cậy ≈ 0,6) → trước chỉ giữ 0,72 s cuối; nay một câu 2244,02–2245,62. Liền khung, cùng chỗ, đoạn giữa ≤ 0,6 s;
+  tổng quát hoá luật "亨/哼" (3.23.734) không cần bảng cặp chữ. Quét cả phim: mẫu nhiều chữ đều đã gộp đúng sẵn.
+- Phát lại 5 lượt cũ: "反派" 6600 → 6598 ("你|尔|你" 150:51 → một câu — ảnh: một chữ "你" liền; "哼|停|哼" 113:22 kéo
+  đủ 0,8 s); "[全集]", "大乾悍刀行", "豪门Z外", phim nối 86 tập: không đổi.
+
+### Chưa sửa được
+- Tên nhân vật "玄昊" (ảnh xác nhận) bị PP-OCR đọc "玄吴" 19 / "玄昊" 10 lần trên cả phim, VL cũng lưỡng lự → 15 câu
+  "玄吴", 10 câu "玄昊". Đa số phiếu sai, không có căn cứ chọn đúng mà không đọc lại bằng mô hình khác.
+- Phụ đề hai dòng ở 37:24: dòng trên bị mép trên ROI (y = 872) cắt — chỉ ≈ 10 chỗ trên cả phim.
+
+### Dữ liệu test
+- `test data/hh_v3_23_735/`: seraw (2,2 MB) + 5 đoạn video ROI + README. Test `test_hh_builder_v323736.py` (11 test).
+
+## [3.23.735] — 🎞️ Cắt video vùng ROI treo ở 39 %: video đổi kích thước khung giữa chừng + ffmpeg kẹt vì không ai đọc stderr
+
+Phim "合欢宗从照顾师弟道侣开始修仙" (80 tập nối, H.264 720×1280, 2 giờ 49 phút): lượt "Xuất dữ liệu thô OCR" xong OCR rồi
+đứng im ở "Đang cắt video vùng ROI… 39 %", không lỗi, không log.
+
+### Nguyên nhân (đo trên video thật)
+- Đoạn 3979,70–3992,75 s (39,3 %) là quảng cáo chèn (mã QR "更多短剧扫码免费观看") mã hoá **480×854 / 30 fps** giữa phim
+  720×1280 / 25 fps (SPS mới trong luồng; dò khung khoá cả phim: chỉ một chỗ này). Vùng cắt cố định theo 720×1280
+  (`h264_cuvid -crop` ở đường GPU zero-copy, bộ lọc `crop` ở đường khác) vượt khung → ffmpeg lỗi liên tục
+  (đường CPU: "Invalid too big or non positive size", dừng).
+- `FfmpegRoiClipExporter._run` mở ffmpeg với `stderr=PIPE` nhưng KHÔNG đọc stderr và không canh "ffmpeg ngừng tiến
+  triển": lỗi in đầy ống (Windows ≈ 4 KB) → ffmpeg đứng chờ ghi, ứng dụng đứng chờ dòng tiến độ → treo vĩnh viễn.
+  Tái hiện: tiến trình ghi 2 MB ra stderr → mã cũ sau 20 s vẫn chưa trả về. (Các chỗ khác chạy ffmpeg — nối video,
+  xuất video, WhisperX — đã đọc stderr ở luồng riêng; chỉ bộ cắt ROI bị sót.)
+
+### Sửa
+- `_run`: đọc stderr liên tục ở luồng riêng (giữ 40 dòng cuối cho log); mốc `out_time` đứng yên quá
+  `STALL_TIMEOUT_SEC` = 90 s → huỷ ffmpeg, ghi log kèm stderr, thử cách kế; nút Huỷ được kiểm mỗi giây kể cả khi ffmpeg
+  im lặng (trước chỉ kiểm khi có dòng tiến độ).
+- `detect_size_changes`: dò mốc đổi kích thước bằng TÁCH GÓI (SPS H.264/HEVC khác SPS trước ở khung khoá → giải mã đúng
+  một khung đọc cỡ thật) — cả phim 2 giờ 49 phút: **2,3 s** (giải mã khung khoá: 37 s).
+- Có đổi kích thước → bỏ GPU zero-copy (cắt trong bộ giải mã cố định toạ độ), chạy GPU hybrid (NVDEC + NVENC) và ghi lý do
+  vào log; đường lọc (hybrid, CPU) luôn `scale` về kích thước gốc trước `crop` (bộ lọc `scale` tự bỏ qua khi khung đã
+  đúng cỡ — video thường không đổi gì). Tệp mô tả `.roi.json` thêm `size_changes`.
+- Kiểm chứng trên video thật (150 s quanh chỗ đổi, đường CPU): xuất đủ 3814/3814 khung, cùng cỡ 720×120, khung quảng cáo
+  được đưa về đúng tỉ lệ (kiểm bằng ảnh).
+
+### Chưa kiểm được
+- Bộ đọc khung GPU (PyNvVideoCodec) cho OCR tách khung NV12 theo kích thước đầu luồng — 13 s khung 480×854 có thể bị
+  đọc méo (OCR trên máy chủ dự án đã chạy qua đoạn này không dừng; đoạn là quảng cáo, không phụ đề). Máy đám mây không có
+  GPU: cần seraw của lượt này để kiểm các câu trong 3979–3993 s.
+
+### Quyết định sản phẩm (17/11/2026)
+- Cùng câu lặp lại sau khoảng trống ngắn có thật ("冷静" | "冷静", "师姐" | "师姐", "闭嘴" | "闭嘴") → **giữ hai câu** như
+  phim (đúng hành vi hiện tại; thêm test khoá trên bản phát lại thật).
+
+### Dữ liệu test
+- `test data/hh_v3_23_734/size_change.mp4`: 22 s chép luồng nguyên gốc quanh chỗ đổi cỡ (3,8 MB) + README.
+- Test `test_roi_clip_hang_v323735.py` (8 test: stderr ngập, treo, huỷ khi im lặng, thang lệnh, dò cỡ, xuất video đổi cỡ,
+  đoạn phim thật); `test_fp_builder_v323734.py` thêm 3 ca lặp lại câu.
+
+## [3.23.734] — 🧩 Phim "反派" (83 tập): gộp mảnh đọc thiếu chữ, bỏ hình khối / khối chữ trong cảnh, sửa "哼"/"亨", soát câu đúng công cụ
+
+Dữ liệu: lượt "xuất dữ liệu thô OCR" bản 3.23.729 (3 giờ 18 phút, model small, 6619 câu) + bản chủ dự án sửa (6534 câu).
+Tệp `.original.srt` gửi kèm KHÔNG phải kết quả của seraw này (khớp `meta.result` 6326/6619; bản phát lại khớp 6600/6619)
+→ mốc so sánh là bản phát lại. Đối chiếu từng điểm khác với ảnh cắt từ video ROI:
+
+| Khác biệt (bản sửa so với ứng dụng) | Kết luận |
+|---|---|
+| 44 câu bị xoá | phần lớn là phụ đề thật ("哦", "以后", "但", "这"…); rác thật: 6 × "V", 1 câu cuộn sách |
+| 39 chỗ gộp | 10 là lỗi thật của ứng dụng (mảnh đọc thiếu chữ); còn lại là câu thật khác nhau ("我的腿"/"我的命") hoặc lặp lại có khoảng trống ("冷静"/"冷静") |
+| 47 chỗ lệch thời gian | ảnh xác nhận thời gian của ứng dụng đúng ("是" hiện tới 442,38 s; "让他学学烧火" từ 265,41 s) |
+| 2 câu bản sửa thêm | "哼" (127:05) — lỗi thật; "老" (186:44) — bộ dò không thấy chữ trên nền rối, chưa sửa |
+
+### 1. Mảnh đọc thiếu chữ (`absorb_truncated_fragments`, `_fuse_chain`)
+- Trên nền sáng chuyển động, bộ lọc khung coi mỗi khung là "chữ đổi"; OCR đọc vài khung thiếu chữ và khâu dựng tách thành câu
+  riêng: "懂什么" | "懂什", "走火了" | "走火", "小翠" | "翠" | "小翠", "白练了" | "白练" | "白练了", "云瑶" | "瑶" | …,
+  "魔了" | "魔" | "魔了" | "魔" — ảnh: phụ đề không đổi.
+- Gộp mảnh ≤ 0,3 s là đầu/đuôi của câu liền kề, CHỈ khi mảnh đứng SAU câu đầy đủ hoặc KẸP GIỮA hai lần cùng câu. Phụ đề
+  hiện dần thật luôn đặt phần ngắn TRƯỚC ("啊" | "这这全部啊", "这" | "这不可能", "这" | "这不关我的事" — ảnh xác nhận;
+  bản thử đầu gộp nhầm 3 ca này nên đã thu hẹp luật). Hai câu cùng chữ có khoảng trống thật ("冷静" | "冷静") giữ nguyên.
+- Cùng điểm ảnh (chuỗi cờ `k`) mà một bản đọc thiếu nguyên đoạn đầu/đuôi ("您可以看" / "您可以看一下") → bản đầy đủ
+  (trước: bước gộp lần đọc bỏ cả chuỗi vì "khác kiểu").
+
+### 2. Hình khối / khối chữ trong cảnh
+- `drop_tall_non_han_events`: cổ áo chữ V trắng → "V" (6 câu; hộp cao 1,83–1,95 lần cỡ chữ). Trên 5 lượt thật (19 600 câu),
+  mọi câu không chữ Hán còn lại đều là các "V" này.
+- `drop_scene_text_block_events`: cuộn sách thư pháp nền SÁNG (bộ lọc chữ tối không bắt) → "得失言辞犀子集尤精兵法…": ≥ 2 hộp
+  mỗi khung, hộp nào cũng cao ≥ 1,6 lần cỡ chữ, ở ≥ 60 % khung. Trên 5 lượt: chỉ bắt đúng câu này + 14 câu cuộn sách mực tối
+  của phim "大乾悍刀行" (vốn chỉ bị lọc ở bước OCR — nay lọc cả ở bước dựng).
+
+### 3. "哼" đọc xen kẽ "亨" (`fix_lone_interjections`)
+- 127:05: "哼" hiện 0,8 s, OCR đọc xen kẽ "亨" 0,51–0,73 / "哼" 0,50–0,72 → tách hai câu ngắn, mỗi câu tin cậy dưới ngưỡng câu
+  một chữ → MẤT câu. Hộp chỉ có một chữ "亨"/"霍"/"厄" → "哼"/"嚯"/"呃" (dạng không bộ 口 đứng một mình không phải lời
+  thoại). Thử trước cách thêm cặp chữ dễ lẫn: chọn sai thành "亨" ở câu một chữ → bỏ.
+- Kết quả: lấy lại "哼" 127:05; "哼" | "亨" và "哼" | "哼" (ảnh: một câu liền) thành một câu; "霍" → "嚯" (2 + 1 chỗ).
+
+### 4. Lượt soát câu: đúng công cụ cho từng loại cờ
+- Nhật ký soát trong seraw: lượt soát kiểu cũ (cùng mô hình, ảnh gốc) đổi SAI 3/5 câu "hai bản đọc" ("你丢点东西" → "尔…",
+  "怎么" → "怎公", "嚣张" → "器张"); PaddleOCR-VL đọc đúng cả 3 (kiểm trên khung thật).
+- Nhưng VL đọc TRONG hộp bộ dò nên cũng thiếu chữ đầu ở câu nghi thiếu chữ ("个德行", "知死舌"), trong khi PP-OCR ảnh gốc
+  sửa đúng 7/7 → câu nghi thiếu/thừa chữ: PP-OCR ảnh gốc (như trước 3.23.733); hai bản đọc / tin cậy thấp: VL.
+
+### Kiểm chứng (phát lại bộ dựng)
+| Lượt | 3.23.733 | 3.23.734 | Khác |
+|---|---|---|---|
+| "反派" | 6622 | 6600 | −6 "V", −1 cuộn sách, 10 gộp mảnh đọc thiếu, +1 "哼", 3 sửa chữ (霍→嚯, 我长这→我长这么师) |
+| "大乾悍刀行" | 3635 | 3622 | −14 câu cuộn sách mực tối (lọc ở bước dựng) |
+| "[全集]" | 3590 | 3590 | "霍" → "嚯" (65:59, đúng theo ảnh 3.23.729) |
+| "豪门Z外" | 2131 | 2131 | không đổi |
+| Phim nối 86 tập | 3663 | 3663 | không đổi |
+
+### Chưa sửa
+- "可惜" | "可惜了": mảnh đọc thiếu đứng TRƯỚC câu đầy đủ — cùng dạng với phụ đề hiện dần thật nên chưa gộp.
+- "老" (186:44): chữ mờ trên nền hoa văn sáng, bộ dò chữ không thấy.
+- Câu lặp lại sau khoảng trống ngắn ("冷静" | "冷静", "师姐" | "师姐"): gộp hay giữ là quyết định sản phẩm.
+
+### Bộ test: `__import__` giả rò sang test khác (lỗi chập chờn test pedalboard — nguyên nhân gốc)
+- Bộ test toàn phần (14/11 và lần đầu của bản này) hỏng `test_pedalboard_stretch_preserves_rms` với
+  `ImportError: No module named 'pedalboard'` — đúng chuỗi của bản `__import__` giả trong `test_overlap_pedalboard_v32597`,
+  dù `sys.modules` có pedalboard thật; test pedalboard thật chạy sau vẫn qua (rò tạm thời).
+- Nguyên nhân: `__feature_import__` của PySide6/shiboken6 (thay `builtins.__import__` khi nạp Qt) tạm đặt
+  `builtins.__import__ = __lazy_import__` trong lúc import rồi ghi lại bản nó đã lưu — không an toàn đa luồng. Luồng nền
+  (vd. `test_release_during_batch_is_deferred` chạy OCR trong luồng) import đúng lúc test thay/khôi phục `__import__` giả
+  → ghi lại bản GIẢ sau khi monkeypatch đã hoàn tác. Đo thật: 2000 vòng thay/khôi phục, một luồng nền import → còn bản giả;
+  dò vết bộ test `tests/unit/infrastructure`: `__import__` bị để lại là `__lazy_import__` sau đúng test có luồng OCR.
+- Sửa: 4 test giả lập thiếu pedalboard / google-genai chuyển sang `monkeypatch.setitem(sys.modules, …, None)` (không chạm
+  `__import__`); `tests/conftest.py` thêm chốt chặn — mỗi test bắt đầu/kết thúc với `builtins.__import__` thật, rò ở đâu
+  thì khôi phục, ghi tên test và cảnh báo. Test `test_import_leak_guard_v323734.py` (4 test; 3 hỏng trên mã cũ).
+- Ứng dụng không bị ảnh hưởng: `__lazy_import__` chuyển tiếp đúng tới import gốc, và ứng dụng không thay `__import__`.
+
+### Dữ liệu test
+- `test data/fp_v3_23_729/`: seraw, bản sửa, 9 đoạn video ROI (5,6 MB). Test `test_fp_builder_v323734.py` (14 test).
+
+## [3.23.733] — 🧠 Tích hợp PaddleOCR-VL-1.6: soát câu nghi ngờ và tuỳ chọn chạy chính
+
+Chủ dự án yêu cầu (17/11/2026) sau đợt đánh giá mô hình OCR (bộ đo 148 dòng phụ đề thật của 3 phim, 15 ca khó kiểm bằng
+mắt — xem `bo_do_ocr_20261117.zip`): PaddleOCR-VL-1.6 đọc đúng nhất (146/148, CER 0,26 %; PP-OCRv6 small 143/148, 0,66 %),
+chạy trên Paddle sẵn có (không cần torch), Apache-2.0.
+
+### 1. Hai cách dùng
+- **Soát câu nghi ngờ** (Cài đặt → OCR: "Soát câu nghi ngờ bằng PaddleOCR-VL-1.6", mặc định BẬT): cuối lượt trích xuất,
+  các câu có hai bản đọc / nghi thiếu-thừa chữ, và THÊM câu chữ Hán tin cậy < 0,90, được đọc lại 3 khung bằng VL (trước:
+  5–12 khung bằng chính mô hình cũ trên ảnh gốc — từng chọn sai "握龊", "注人"). Câu tin cậy thấp nhận bản VL khi ≥ 2/3
+  lần đọc cùng ra một bản toàn chữ Hán, hơn kém ≤ 1 chữ (`accept_vl_reread`). Ảnh vốn không tiền xử lý vẫn được soát
+  (VL là ý kiến thứ hai thật sự).
+- **Chạy chính** (Cài đặt → Phiên bản OCR: "PaddleOCR-VL-1.6"): bộ dò PP-OCRv6 small tìm hộp + đọc nháp, VL đọc lại hộp.
+
+### 2. Thiết kế (`infrastructure/ocr/paddle_vl_reader.py`, `PaddleOcrAdapter._vl_reread`)
+- PaddleX chạy trực tiếp chỉ nhận lô 1 ảnh với mô hình này (lô nhiều ảnh cần máy chủ vLLM). Vì VL là mô hình đọc TÀI LIỆU,
+  ta **xếp 8 dòng chồng thành một trang** và đọc một lần: nhanh gấp 2,8 lần (CPU 3,6 so với 9,9 s/dòng), đúng 145/148;
+  số dòng đọc ra không khớp → đọc lại từng dòng. 16 dòng/trang không nhanh hơn mà sai thêm "涵" → "洹".
+- VL (mô hình tài liệu) đôi khi bọc chữ bằng LaTeX khi xếp trang (`注入\(\underline{\text{灵力}}\)`, 5/148 dòng) →
+  `clean_vl_text` gỡ định dạng, giữ chữ.
+- Chỉ đọc lại hộp PP-OCR đã nhận ra chữ: đo lần đầu, VL đọc cả hộp vật trong cảnh mà PP-OCR bỏ ("品但", "福没事吧").
+  Hộp chữ ngoài bảng chữ ("诶") vẫn do bước cứu chữ 3.23.732 lo và được giữ nguyên.
+- **Bộ đệm** bản đọc VL theo (chữ nháp tin cậy ≥ 0,90, vị trí hộp): khung đọc lại theo lịch / xác nhận của cùng câu (phần
+  lớn số khung OCR) dùng lại kết quả, không gọi VL.
+- VL không trả độ tin cậy: trùng bản nháp → ≥ 0,97; khác → 0,90.
+- Mô hình nạp khi cần lần đầu (tải 1,8 GB), **cùng thiết bị với OCR chính (GPU khi chọn GPU)**. Đổi qua lại VL ↔ bộ nháp
+  không nạp lại pipeline. VL lỗi (thiếu thư viện / mô hình / VRAM) → ghi log, giữ bản PP-OCR, tắt VL cho phiên — đã thử
+  thật: thiếu sentencepiece → lượt OCR vẫn chạy với PP-OCR.
+- Đóng gói: thêm `sentencepiece`, `einops` (requirements, pyproject, spec — gom gói + metadata).
+
+### 3. Kiểm chứng — trọn đường chạy của bộ chuyển đổi (dò + đọc) trên 148 khung ROI thật, CPU
+| Chế độ | Đúng dòng | CER | Ca khó | s/khung |
+|---|---|---|---|---|
+| PP-OCRv6 small | 142/148 | 0,79 % | 9/15 | 0,62 |
+| **PaddleOCR-VL-1.6** | **148/148** | **0,00 %** | **15/15** | 4,25 |
+
+VL sửa: 霍 → 嚯, 腌攒 → 腌臜, 注人 → 注入, 別 → 别, 三二 → 三二一, 八八 → 八八八. Tốc độ GPU chưa đo được (máy đám mây không
+có GPU) — một bài đo ngoài trên RTX 3060 cho thấy VL chậm hơn PP-OCR ~8 lần, dùng ~3,6 GB VRAM.
+
+### 4. Test
+- `test_paddle_vl_v323733.py` (21 test, bộ đọc VL giả lập — không cần tải mô hình).
+- Toàn bộ test: **8984 đạt, 0 hỏng, 0 bỏ qua** (23 phút 27 giây).
+
+## [3.23.732] — 🗣️ Đọc được chữ cảm thán "诶" (không có trong bảng chữ của mọi mô hình PaddleOCR)
+
+Chủ dự án giao tự chọn giải pháp tốt nhất (17/11/2026).
+
+### Gốc lỗi (đo thật)
+- Đã kiểm tệp `inference.yml` của PP-OCRv6 small, PP-OCRv6 medium, PP-OCRv5 mobile, PP-OCRv5 server: **không bộ nhận dạng
+  nào có chữ "诶"** trong bảng chữ (chỉ có dạng khác "欸", nhưng không mô hình nào đọc hình "诶" ra "欸"). Đổi mô hình
+  không giải quyết được.
+- Phim "[全集]" có 3 câu "诶" (54:05, 54:17, 74:50): bộ DÒ chữ v6 vẫn thấy hộp chữ, nhưng nhận dạng v6 small ra chuỗi rỗng
+  (hộp bị lọc khỏi kết quả, câu mất hẳn) hoặc "误" 0,37–0,51.
+- Bộ nhận dạng PP-OCRv5 mobile đọc chính hộp đó thành "埃" — chữ gần hình nhất có trong bảng chữ.
+
+### Giải pháp (`infrastructure/ocr/unreadable_rescue.py` + `PaddleOcrAdapter._rescue_unreadable`)
+1. Ứng viên: hộp bộ dò thấy (`dt_polys`) mà nhận dạng không giữ (đọc rỗng / dưới ngưỡng), và hộp MỘT chữ Hán đọc dưới 0,6.
+2. Đọc lại ứng viên bằng **PP-OCRv5 mobile rec** — nạp khi cần lần đầu, **cùng thiết bị với OCR chính** (GPU khi lượt chạy
+  GPU), đọc theo lô; mỗi hộp đọc trên CẢ ảnh đã tiền xử lý lẫn ảnh gốc (6 khung "诶": mỗi cách cứu 4/6, hợp lại 5/6).
+3. Chỉ nhận khi bản đọc lại thuộc bảng quy đổi `"埃" → "诶"` với tin cậy ≥ 0,6. "埃" đứng một mình thành cả hộp chữ không
+  phải lời thoại (chỉ có trong 埃及, 尘埃…) nên không đổi nhầm câu thật.
+- Chỉ áp cho OCR tiếng Trung; lỗi nạp / chạy bộ nhận dạng phụ → ghi log, tắt bước cứu, lượt OCR vẫn chạy bình thường.
+- Chi phí: chỉ hộp hiếm (không đọc được / một chữ đọc yếu) được đọc lại; 1500 khung ngẫu nhiên của 3 phim: không khung nào
+  bị cứu nhầm.
+
+### Kiểm chứng
+- OCR lại (kèm bước cứu) mọi khung trong 3 đoạn "诶" của phim "[全集]" rồi dựng lại phụ đề: **cả 3 câu "诶" lên SRT**
+  (3245,245–3245,685 trước là "误"; 3256,925–3257,485 và 4490,009–4490,289 trước bị mất). Mảnh rác một khung trong cùng đoạn
+  ("99", "Y", "86") vẫn bị bộ dựng loại.
+- Khung đối chứng ("啊" 1,00, "但" 0,99, "别" 0,52, "霍" 0,70) không đổi.
+- Test `test_unreadable_rescue_v323732.py` (9 test, bộ nhận dạng phụ giả lập — chạy được không cần tải mô hình).
+
+### Toàn bộ test
+- **8961 đạt, 0 hỏng, 0 bỏ qua** (20 phút 39 giây).
+
+## [3.23.731] — 🔗 Phim "豪门Z外": watermark dính chớp nhoáng không còn phá bước gộp lần đọc; cắt đuôi chữ Latin trong cảnh
+
+Dữ liệu: lượt "xuất dữ liệu thô OCR" bản 3.23.729 (1080×1920, 93 phút, model small, GPU zero-copy, 2132 câu). Đánh giá
+độc lập như 3.23.730 (hình học từng câu, câu tin cậy thấp / không chữ Hán, đoạn có chữ không câu nào phủ, tỉ lệ điểm sáng
+từng câu trên video ROI). Phim khá sạch: không sót câu, không câu chữ tối (câu tối nhất 0,098), câu tin cậy thấp nhất
+"强" 0,59 là phụ đề thật. Hai lỗi:
+
+### 1. Câu bị tách đôi và rơi chữ "一" vì watermark dính chớp nhoáng (16:42)
+- Một câu "给我揉一揉兴许我就好了" hiện 2,8 s trên CÙNG điểm ảnh, nhưng SRT ra "给我揉揉兴许我就好了" (0,5 s) + câu đúng.
+- Gốc: chuỗi khung có ba bản đọc — "给我揉揉…" (12 khung, chữ "一" không được dò), "给我揉一揉…" (35) và
+  "给我揉一揉…好了ENC" (20 khung: watermark mờ "ENCIA…" ở mép trái lọt vào). Bản thứ ba "khác kiểu" nên bước gộp lần
+  đọc (`_fuse_chain`) bỏ cả chuỗi, không phân xử được bản thiếu "一".
+- Sửa: so các bản đọc trong chuỗi theo phần chữ Hán (bỏ chữ Latin / số dính kèm); bản thắng ghi lại theo dạng đọc được
+  NHIỀU nhất của nó — chữ Latin dính chớp nhoáng bị bỏ, chữ Latin thật đọc ổn định ("我们去KTV") vẫn giữ.
+
+### 2. Chữ Latin trong cảnh dính đuôi câu (48:32)
+- Chữ in "Sweet dream" trên áo → "林娇娇这女人eet dream" (chữ thường — luật cắt watermark VIẾT HOA không bắt).
+- Sửa (`strip_offcenter_latin_tail`): cắt đuôi Latin khi hộp chữ của câu lệch tâm phụ đề > 0,5 lần cỡ chữ VỀ PHÍA đuôi
+  (câu này lệch 0,94). Phụ đề hardsub căn giữa nên câu thật có chữ Latin ("我买了iPhone") không bị cắt.
+
+### Kiểm chứng (phát lại bộ dựng)
+| Lượt | Trước (3.23.730) | Sau | Khác |
+|---|---|---|---|
+| "豪门Z外" | 2132 | 2131 | gộp lại câu bị tách; cắt "eet dream" |
+| "大乾悍刀行" | 3635 | 3635 | chỉ lệch mốc 2 câu rác cuộn giấy (đã bị lọc chữ tối ở bước OCR) |
+| "[全集]" | 3590 | 3590 | không đổi |
+| Phim nối 86 tập | 3663 | 3663 | không đổi |
+
+### Dữ liệu test giữ lại
+- `test data/hmzw_v3_23_729/`: seraw, SRT ứng dụng, 3 đoạn video ROI 3 s (1,5 MB). Test `test_chain_latin_noise_v323731.py`
+  (5 test, có phát lại cả lượt).
+
+### Toàn bộ test
+- **8951 đạt, 0 hỏng, 0 bỏ qua** (20 phút 38 giây).
+
+## [3.23.730] — 🖌️ Phim "大乾悍刀行" (84 tập): bỏ chữ mực trong cảnh dù OCR đọc chắc tay, bỏ hoa văn chữ to, sửa kana đọc nhầm
+
+Dữ liệu: lượt "xuất dữ liệu thô OCR" bản 3.23.728 trên máy chủ dự án (model small, GPU zero-copy, 2 giờ 32 phút, 3635
+câu). Không có bản sửa tay; đánh giá độc lập bằng từng khung OCR + video vùng ROI (đặc trưng hình học từng câu, tỉ lệ
+điểm sáng trong hộp chữ đo trên video, câu tin cậy thấp, câu không chữ Hán, đoạn có chữ mà không câu nào phủ).
+
+### 1. Chữ mực đen trong cảnh lên 26 câu rác
+- 94:03–94:57: người cầm cuộn giấy viết thư pháp (chữ mực đen trên nền giấy vàng). OCR đọc từng chữ to (tin cậy 0,90–1,00)
+  → 25 câu rác ("皇上王爷", "王愿", "火海", "知工", "可不"…). 20:22: chữ trên thánh chỉ → "渊侯府凝香郡主".
+- Gốc: bộ lọc chữ tối 3.23.727 chỉ bỏ hộp tối có tin cậy < 0,90 (để giữ khung đầu câu hiện dần).
+- Đo tỉ lệ điểm sáng (độ chói ≥ 200) trong hộp chữ, trên ảnh đã qua đúng tiền xử lý của ứng dụng:
+  - 26 câu rác: **0,0000** ở mọi khung;
+  - câu thật tối nhất: 0,033 ("一" nét mảnh); khung ĐẦU tối nhất của câu thật trên 2 phim có video đầy đủ
+    (7196 câu): 0,036 — chưa câu thật nào có khung đầu không điểm sáng.
+- Sửa (`drop_dark_boxes`): hộp có tỉ lệ sáng < **0,005** bị bỏ BẤT KỂ tin cậy; luật cũ (< 0,03 và tin cậy < 0,90) giữ nguyên.
+- Mô phỏng trên cả phim (áp luật lên mọi hộp — 1322 hộp bị bỏ — rồi dựng lại): bỏ đúng 26 câu rác, không mất câu thật nào.
+  Test cũ `test_confident_dark_read_is_kept` dựng hộp tỉ lệ sáng 0 làm "chữ đang hiện dần" — sửa thành hộp còn ít điểm
+  sáng (0,029) như số đo thật.
+
+### 2. Hoa văn chữ to cả hai chiều ("心福", 97:20)
+- Hoa văn thêu trên áo đỏ: hộp cao 1,89 và rộng 2,05 lần cỡ chữ mỗi chữ, tin cậy 0,74 (có điểm sáng — chỉ thêu màu kem).
+- Sửa (`drop_oversized_glyph_events`): bỏ câu tin cậy < 0,80 mà hộp chữ cao ≥ 1,6 VÀ rộng mỗi chữ ≥ 1,8 lần cỡ chữ.
+  10 847 câu thật của 3 phim: hộp phình chỉ phình MỘT chiều ("但" cao 1,85 / rộng 1,37; "哎" rộng 2,30 / cao 1,01).
+
+### 3. Kana đọc nhầm từ chữ Hán
+- Seraw có 238 lần OCR trả kana (ー 93, ニ 74, ハ 27, カ 22…); SRT có "三ニー" (phụ đề "三 二一"), "ハ八八" ("八八八"),
+  "三二ー"; lượt soát câu còn đổi "八刀" → "ハ刀" và ra "防弾衣" (chữ Nhật của 弹).
+- Sửa (`unify_minority_kana`, `kana_to_han`): phim tiếng Trung (dòng có hiragana ≤ 2 % số dòng chữ Hán) thì kana trông
+  giống chữ Hán trong dòng CÓ chữ Hán được quy về chữ Hán (ニ→二, ー→一, ハ→八, カ→力, エ→工, ロ→口, タ→夕, ト→卜,
+  弾→弹). Lượt soát "hai bản đọc" cũng quy kana của bản đọc lại. Phim tiếng Nhật không bị đụng.
+
+### Kiểm chứng (phát lại bộ dựng)
+| Lượt | Trước (3.23.729) | Sau | Khác |
+|---|---|---|---|
+| "大乾悍刀行" (seraw thật) | 3636 | 3635 | −"心福"; 3 câu kana → chữ Hán |
+| "大乾悍刀行" (mô phỏng lọc chữ tối lúc OCR) | 3636 | 3609 | −26 câu chữ mực, −"心福" |
+| "[全集]" | 3590 | 3590 | không đổi |
+| Phim nối 86 tập | 3663 | 3663 | không đổi |
+
+### Còn lại (chưa sửa)
+- "三 二一" (150:06–150:08) hiện liền 2,2 s nhưng bị tách "三二一" + "三二": hai lần đọc đầu tin cậy 0,72–0,75 (do lẫn kana)
+  dưới ngưỡng tin 0,80 của bước gộp lần đọc cùng điểm ảnh, giữa chuỗi có 0,8 s đọc rỗng. Một ca lẻ — chưa đủ căn cứ đổi
+  ngưỡng chung.
+
+### Dữ liệu test giữ lại
+- `test data/dqhdx_v3_23_728/`: seraw, SRT ứng dụng, 8 đoạn video ROI 3 s (3 MB). Test `test_dark_scene_text_v323730.py`
+  (14 test, có khung thật cắt từ video ROI và phát lại cả lượt).
+- Công cụ cắt đoạn: sửa lỗi không cộng mốc đầu video ROI (0,046 s) vào tệp mô tả đoạn cắt.
+
+### Toàn bộ test
+- **8946 đạt, 0 hỏng, 0 bỏ qua** (19 phút 40 giây).
+
+## [3.23.729] — 🧹 Đối chiếu lượt "[全集]" (98 phút): giữ câu cảm thán chớp nhoáng, bỏ logo bị mép ROI cắt, sửa lượt soát câu đổi sai chữ
+
+Dữ liệu: lượt "xuất dữ liệu thô OCR" bản 3.23.728 trên máy chủ dự án (model small, GPU zero-copy) + bản phụ đề chủ dự án
+sửa. Đối chiếu từng điểm khác nhau với **từng khung OCR trong seraw và ảnh cắt từ video ROI**:
+
+| Loại khác biệt (bản sửa so với ứng dụng) | Số chỗ | Kiểm bằng ảnh |
+|---|---|---|
+| Câu bản sửa xoá | 17 | 16 là phụ đề thật (啊, 来来来, 但, 别, 其一, 诶, 嚯, 呃…); chỉ **"一男王" là rác** (logo tựa phim) |
+| Câu bản sửa thêm | 3 | "啊" 3839,7 s: ứng dụng **xoá nhầm**; hai câu "埃" (thật ra là "诶"): **OCR đọc rỗng** |
+| Câu bản sửa gộp | 3 | cả 3 là hai câu khác nhau trên ảnh (入了我青云宗的门 / 便是我青云宗的人…) — ứng dụng đúng |
+| Thời gian bản sửa cắt ngắn | 12 | chữ hiện suốt khoảng ứng dụng ghi — ứng dụng đúng |
+| Khác chữ | 262 | bản sửa phần lớn là chữ phồn / đọc nhầm của công cụ khác (於, 吳, 干年, 人/入…) — không dùng làm đáp án |
+
+Quét độc lập thêm (khung có hộp đúng dải phụ đề, tin cậy ≥ 0,85, không câu nào phủ) tìm ra đủ **7 câu một chữ bị xoá**.
+
+### 1. Câu cảm thán hiện 3–4 khung bị xoá (`drop_flash_fragments`)
+- Gốc: câu MỘT chữ Hán ngắn hơn 0,18 s bị coi là rác chớp (giả định cũ "phụ đề thật ngắn nhất ~0,21 s"). Phim này có 7 câu
+  thật chỉ hiện 0,12–0,16 s: 啊 (3839,7), 啊 (3951,8), 嘿 (4002,4), 哼 (4211,5), 哎 (4235,3), 哎 (4260,6), 额 (5607,5);
+  tin cậy 0,88–1,00, 3–4 khung (ảnh kiểm từng câu).
+- Sửa: giữ câu một chữ khi có **≥ 3 khung đọc và tin cậy trung bình ≥ 0,85** (cần biết bước lấy mẫu). Rác cũ trong test
+  (1–2 khung, hoặc tin cậy 0,68–0,81) vẫn bị bỏ.
+
+### 2. Logo tựa phim "一男王" lọt thành câu
+- Hộp chữ −3…40 px trong ROI cao 106 px, dải phụ đề 20–74 px: bị mép trên ROI cắt, chỉ chồng 0,36 dải, cao 0,79 dải.
+- Sửa (`drop_clipped_offband_events`): bỏ câu có hộp **bị mép ROI cắt + chồng dải < 0,5 + cao < 0,85 dải**. Câu thật sát
+  mép "我真的是冤枉的" (cuối phim 86 tập, cao 0,96 dải) và phụ đề bị ROI cắt đáy vẫn giữ.
+
+### 3. Lượt soát "hai bản đọc" đổi sai chữ
+- Lượt chạy thật đổi 3 câu thì 2 câu SAI: "以人炼丹的龌龊之辈" → "握龊" (9 khung đọc lại), "注入灵力" → "注人灵力" (8 khung).
+  Đọc lại dùng cùng mô hình nên mang cùng thiên lệch.
+- Sửa (`arbitrate_disputed_verdict`): bản thắng phiếu đi qua luật chữ dính liền (握龊 → 龌龊); nếu chỉ khác bản đang có ở cặp
+  chữ dễ lẫn hình (人/入, 干/千…) mà ngữ liệu chính phim nghiêng hẳn về bản đang có ("注入" có ở 2 câu khác) thì giữ bản
+  đang có. "腌攒" → "腌臜" vẫn được sửa như trước.
+
+### 4. Hộp thoại "Xuất dữ liệu thô OCR": ước lượng dung lượng video
+- Lượt thật: 197,1 MB cho 98,7 phút (hevc_nvenc) ≈ 2 MB/phút — hộp thoại ghi "khoảng 1,3 MB" (số đo x265 CPU). Nay ghi
+  "khoảng 1,5–2 MB mỗi phút".
+
+### Kiểm chứng (phát lại bộ dựng trên seraw thật)
+| Lượt | Trước | Sau | Khác |
+|---|---|---|---|
+| "[全集]" (3.23.728) | 3584 câu | 3590 | +7 câu cảm thán thật, −1 logo "一男王"; 3583 câu còn lại khít từng mili-giây |
+| Phim nối 86 tập (3.23.726) | 3663 | 3663 | không đổi câu nào |
+
+### Chưa sửa — cần chủ dự án quyết
+- **"诶" không có trong bảng chữ** của PP-OCRv6 small và PP-OCRv5 mobile (đã kiểm tệp `inference.yml`). Bộ dò v6 vẫn thấy
+  hộp chữ nhưng nhận dạng v6 small ra RỖNG (hoặc "误" 0,37). Đo trên 5 khung "诶" thật: nhận dạng **PP-OCRv5 mobile** cho
+  "埃" 0,77–0,99 ở cả 3 chỗ, nhưng kém hơn v6 ở chữ khác ("但" 0,25).
+
+### Dữ liệu test giữ lại
+- `test data/quanji_v3_23_728/`: seraw, hai bản SRT, 16 đoạn video ROI 3 s quanh từng điểm đã kiểm (3,4 MB; kèm tệp mô tả
+  để `RoiClipReader` dùng thẳng mốc seraw). Video ROI đầy đủ 197 MB vượt giới hạn 100 MB/tệp của GitHub nên không kèm.
+- Test `test_quanji_builder_v323729.py` (12 test, có phát lại cả lượt thật).
+
+### Toàn bộ test
+- **8932 đạt, 0 hỏng, 0 bỏ qua** (20 phút 47 giây). Lần chạy trước đó có 1 test hỏng ngẫu nhiên:
+  `test_pedalboard_returns_none_when_missing` (giả lập "chưa cài pedalboard" nhưng hàm vẫn chạy pedalboard thật). Chạy
+  riêng, chạy cùng các nhóm test đứng trước nó (4 cách ghép, 7077 test) và chạy lại cả bộ đều đạt — chưa tái hiện được,
+  không liên quan bản sửa này (không đụng mã TTS).
+
+## [3.23.728] — 🎞️ "Xuất dữ liệu thô OCR": nén `.seraw.json.gz` như lượt thường + video vùng ROI (thay ảnh JPG), cắt bằng GPU zero-copy
+
+Chủ dự án yêu cầu (16/11/2026):
+- dữ liệu thô xuất ở trang Trích xuất phải nén như lượt trích xuất thường (hai thứ bản chất như nhau, đồng bộ để dễ gỡ lỗi);
+- trang Gỡ lỗi OCR phải mở được;
+- xuất kèm **video cắt đúng vùng ROI**, nhỏ, gửi đi phân tích được, thay cho ảnh JPG đang quá nặng;
+- ghi nhớ: chọn GPU thì mọi việc dùng được GPU phải chạy CUDA, zero-copy.
+
+### 1. Dữ liệu thô luôn nén
+- Nút "Xuất dữ liệu thô OCR" trước đây gợi ý `phim.seraw.json` (không nén); lượt trích xuất thường ghi `phim.seraw.json.gz`.
+- Nay luôn ghi `.seraw.json.gz` (`compressed_raw_path`). Chọn `phim.seraw.json`, `phim.json` hay `phim` đều thành
+  `phim.seraw.json.gz`; nhiều ROI vẫn đặt `_roi<n>` như cũ.
+- Trang Gỡ lỗi OCR vốn đọc được `.gz`. Test kiểm tệp ghi ra đúng là gzip.
+
+### 2. Video vùng ROI thay cho ảnh JPG
+- Ảnh JPG cũ ghi HAI ảnh cho mỗi khung có chữ. Phim nối 86 tập có khoảng 120 nghìn khung như vậy → hàng trăm nghìn tệp,
+  nhiều GB.
+- Nay ghi `phim.roi.mp4`: cắt đúng vùng ROI, **đủ mọi khung** (`-fps_mode passthrough`), không tiếng, khung khoá mỗi 2 s
+  để tua nhanh. Kèm `phim.roi.json` ghi vùng cắt thật, mốc đầu phim nguồn, bộ mã hoá và cách đã chạy.
+- **Chất lượng / dung lượng** đo trên tập 24 (64 s, ROI 720×136), x265:
+
+  | Mức nén | Dung lượng | PSNR độ chói so với khung gốc | Lệch số điểm sáng ≥ 200 |
+  |---|---|---|---|
+  | CRF 22 | 2,10 MB | 42,0 dB | 4 |
+  | **CRF 26 (chọn)** | **1,40 MB** | **39,5 dB** | 10 |
+  | CRF 30 | 0,93 MB | 37,2 dB | 19 |
+
+  - Ở CRF 26 chữ rõ nét, đủ để OCR lại và đo lại bộ lọc chữ sáng khi gỡ lỗi.
+  - Ước tính phim nối 86 tập khoảng 180 MB, tức khoảng 1,3 MB mỗi phút phim; nhỏ hơn ảnh JPG hàng chục lần.
+- **Thang chạy theo nguyên tắc GPU:**
+  1. `gpu_zero_copy`: NVDEC giải mã và cắt ROI ngay trong bộ giải mã (`<codec>_cuvid -crop`,
+     `-hwaccel_output_format cuda`), khung ở nguyên trên VRAM rồi vào thẳng NVENC (`hevc_nvenc`).
+  2. `gpu_hybrid`: NVDEC giải mã, cắt trên CPU, NVENC mã hoá.
+  3. `cpu`: `libx265`, hoặc `libx264` nếu bản ffmpeg không có x265.
+  - Chọn GPU khi lượt OCR chạy GPU. Bộ mã hoá được thử thật qua `video_encoder_selector` dùng chung.
+  - Chạy ngay sau khi ghi seraw (OCR đã xong, GPU rảnh), có báo tiến độ và cho huỷ.
+  - Lỗi xuất video không làm hỏng lượt trích xuất.
+- Hộp thoại hỏi "Xuất kèm video vùng ROI?", mặc định **Có**. Thông báo hoàn tất ghi tên và dung lượng các tệp cần gửi.
+
+### 3. Trang Gỡ lỗi OCR
+- Mở `phim.seraw.json.gz`: nếu có `phim.roi.mp4` + `.roi.json` cạnh đó thì đọc khung từ video theo mốc của từng khung OCR
+  (`RoiClipReader`). Bộ đọc giữ tệp mở, đọc tiếp khi đi tới, chỉ tua khi nhảy xa.
+- Khung được cắt về ĐÚNG ROI (bù phần làm chẵn), đưa thẳng ảnh vào hai khung xem; khung "output" tự vẽ hộp chữ như với ảnh
+  JPG cũ.
+- Thư mục ảnh `_ocr_images` của các lần xuất cũ vẫn được dùng nếu có.
+
+### 4. Ghi nhớ
+- CLAUDE.md thêm "Nguyên tắc GPU" (mọi việc dùng được GPU chạy CUDA, zero-copy, có đường lùi) và "Dữ liệu tham chiếu không
+  được mất".
+
+### Kiểm chứng
+- `test_roi_clip_export_v323728.py` (17 ca):
+  - tên tệp luôn nén;
+  - vùng cắt chẵn phủ trọn ROI, kể cả sát mép;
+  - thang lệnh GPU: lệnh zero-copy không có bộ lọc CPU nào, chuỗi `-crop` đúng;
+  - **chạy thật ffmpeg** trên video 720×1280 có mốc đầu 1 s: đọc lại từng khung từ clip đúng mốc thật, sai lệch điểm ảnh
+    trung bình dưới 6/255 so với khung gốc;
+  - máy không có GPU vẫn lùi về CPU;
+  - huỷ thì xoá tệp dở;
+  - thiếu ffmpeg / video hỏng không làm hỏng lượt chạy.
+- `test_debug_roi_clip_v323728.py` (4 ca):
+  - use case gọi bộ xuất đúng tệp, chọn GPU theo thiết bị OCR, lỗi không phá lượt chạy;
+  - trang Gỡ lỗi mở bộ seraw nén + clip, hiện khung đúng kích thước ROI, chuyển khung được.
+- Viết test bắt được một lỗi của chính bản nháp: tệp mô tả bị đặt tên `phim.roi.mp4.roi.json`. Đã sửa trước khi giao.
+- Nhánh GPU zero-copy chưa chạy được trên máy phát triển (máy ảo không có GPU). Lệnh đã kiểm bằng test, và có đường lùi
+  hybrid / CPU.
+- Toàn bộ test: **8920 đạt, 0 lỗi, 0 bỏ qua** (20 phút 53 giây).
+  - Lượt chạy đầu bắt được một lỗi của chính bản nháp: khi bỏ hàm ghi ảnh JPG, dòng `@staticmethod` của `_save_raw_ocr_payload` ngay sau nó bị xoá theo, nên 20 test trích xuất đỏ ('got multiple values for argument ocr_results'), tức mọi lượt có ghi dữ liệu thô sẽ hỏng.
+  - Đã khôi phục và rà lại diff: mọi dòng bị xoá còn lại đều thuộc hàm ghi ảnh cũ.
+
+## [3.23.727] — 🌸 Lọc chữ sáng ở mức hộp chữ: vật màu trong cảnh không còn bị đọc thành phụ đề ("福" = bông hoa)
+
+Chủ dự án gửi lượt chạy thật 14/11/2026 bằng bản 3.23.726: phim nối 86 tập, NVDEC, tiền xử lý bật đủ (phóng to, viền,
+làm nét, tương phản 1,2), **model OCR medium**.
+
+### 1. Đánh giá lượt chạy
+- OCR mất 1782 s, so với 1479 s ở model small (lượt 725), tức chậm hơn khoảng 20%.
+- 3663 câu, trung vị độ tin cậy 0,9999. SRT trùng khít `meta.result`; phát lại seraw bằng mã 3.23.726 trùng khít 3663/3663.
+- 11 chỗ mà lượt 690 hoặc 725 từng sai hay lệch nhau đều **đúng**, gồm "我" 1098 s, "清清白白", "哼" 1756 s, "腌臜",
+  "一鞋板的货色", "干什么".
+- Model medium hay đọc "瑶" thành phồn thể "瑤" (tin cậy 0,57–0,8); bộ dựng đã đổi về giản thể nên SRT đúng.
+- **Kiểm bằng ảnh thật** 10 tập (24, 28, 37, 70–76) tại 5 câu một chữ lệch tâm và các câu nghi ngờ:
+  - "我" (tập 24), "哎" (tập 28), "好" (tập 37 và 74), "全了", "天青" (tập 74) đều là phụ đề thật. Độ lệch tâm 31–34 px là
+    do hộp OCR phình ra bám vào bàn tay / vạt áo sáng phía sau, chữ vẫn nằm đúng tâm.
+  - **"福" lúc 7172,16 s là lỗi:** ở tập 72 giây 114,6 không có phụ đề; OCR đọc **bông hoa lục bình hồng tím** thành "福"
+    (tin cậy 0,73) và câu này lên SRT.
+
+### 2. Gốc lỗi
+- Bộ lọc "Lọc chữ sáng" (`white_text_gate`) chỉ xét **cả khung**: khử khung trùng và nhận khung trống. Khung này có sương mù
+  trắng ở phía trên nên vẫn được OCR, và không bước nào kiểm hộp chữ có thật sự là chữ sáng không.
+- Đo tỉ lệ điểm ảnh có độ chói ≥ 200 bên trong từng hộp chữ, trên **đúng ảnh OCR thấy** (đã phóng to, làm nét, tăng tương
+  phản), cho 759 hộp ở 10 tập:
+  - 483 hộp thuộc phụ đề thật: thấp nhất **0,134**, 1% thấp nhất 0,238, trung vị 0,548;
+  - hộp "福": **0,0005**.
+  - Mốc tập ↔ phim nối căn bằng tương quan "có câu SRT" / "dải phụ đề sáng"; hai tập căn yếu (74, 76) được chỉnh theo mốc kiểm
+    bằng mắt. Mỗi hộp lấy giá trị lớn nhất trong ±0,2 s để chịu được sai lệch căn vài khung.
+
+### 3. Sửa
+- `application/services/bright_text_check.py`: khi bật "Lọc chữ sáng", **bỏ hộp chữ** có tỉ lệ điểm sáng (≥ ngưỡng độ
+  chói trong Cài đặt) dưới **3%** và độ tin cậy dưới **0,90**.
+  - Ngưỡng 3% thấp hơn hộp phụ đề thật tối nhất 4,5 lần.
+  - Điều kiện độ tin cậy giữ lại khung đầu của câu hiện dần mà OCR đọc chắc tay.
+- `ExtractSubtitlesUseCase._drop_dark_boxes`:
+  - chạy ngay sau OCR, **trước** khi đổi toạ độ VRAM về khung gốc, nên hộp và ảnh OCR đã đọc cùng một hệ toạ độ ở cả nhánh
+    CPU lẫn NVDEC;
+  - viền trắng thêm trên VRAM được loại khỏi phép đếm;
+  - áp cho cả lượt chính, nhánh thử lại từng khung và vòng soát đọc lại.
+- Tắt "Lọc chữ sáng" thì hành vi như cũ.
+- Dọn khoảng trắng thừa có sẵn trong `extract_subtitles.py` (ruff W291/W293).
+
+### 4. Kiểm chứng
+- **Trên 10 tập có video:** luật mới bỏ 18 lần đọc. 17 trong số đó là rác bộ dựng vốn đã loại ("D", "www", "E3", "S", "M",
+  "2", "N", "R", "顺", "水", "之", toàn chữ trong cảnh), 1 là "福". **Không hộp phụ đề thật nào bị bỏ.**
+- **Phát lại cả phim** (cấu hình `meta.run.builder`) với các hộp đó bị bỏ: 3663 → 3662 câu, **chỉ mất đúng câu "福"**,
+  không thêm câu nào, 3662 câu còn lại trùng khít.
+- Test `test_bright_box_filter_v323727.py` (7 ca):
+  - bông hoa bị bỏ;
+  - phụ đề trắng tin cậy thấp được giữ;
+  - hộp tối tin cậy cao được giữ;
+  - khung lẫn phụ đề thật và bông hoa: chỉ bỏ bông hoa;
+  - viền trắng không bị tính;
+  - đầu vào hỏng không làm gì;
+  - use case chỉ lọc khi bật "Lọc chữ sáng".
+- Toàn bộ test: **8896 đạt, 0 lỗi, 0 bỏ qua** (21 phút 38 giây).
+  - Lần chạy đầu trong môi trường mới: 1 lỗi, 5 bỏ qua, vì thiếu `edge-tts`, `vieneu`, `pedalboard` và video mẫu `ui_assets/tap01_30s.mp4`.
+  - Đã cài bù các gói; video mẫu 30 s cắt lại từ tập 24 (cùng định dạng 720×1280 HEVC).
+
 ## [3.23.726] — 🎯 Dữ liệu thật lượt NVDEC đầu tiên: bỏ phiếu theo LẦN ĐỌC OCR, không theo số khung chép (sửa "腌攒", "亨")
 
 Chủ dự án gửi dữ liệu lượt chạy thật 14/11/2026 bằng bản 3.23.725 (phim nối 86 tập): `tron_bo.original.srt`,

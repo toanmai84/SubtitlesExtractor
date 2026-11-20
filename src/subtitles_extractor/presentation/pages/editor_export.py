@@ -6,6 +6,7 @@ Tách nguyên văn khỏi ``editor_page.py`` (U6). Lớp trộn chỉ chứa ph�
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 from PySide6.QtCore import QTimer
@@ -22,8 +23,30 @@ from subtitles_extractor.presentation.utils.ass_preview_builder import (
 )
 
 
+def export_dialog_defaults(
+    video_path: Path | None, fmt: SubtitleFormat, filters: str,
+) -> tuple[Path | None, str]:
+    """[v3.23.738] Tên tệp gợi ý + bộ lọc chọn sẵn của hộp thoại Xuất tệp theo Cài đặt "Định dạng đầu ra" (hàm thuần).
+
+    Trước đây cài đặt này không chỗ nào đọc: hộp thoại luôn gợi ý ``.original.srt``.
+    """
+    from subtitles_extractor.domain.value_objects.output_naming import (
+        SubtitleFormat as NamingFormat,
+    )
+    from subtitles_extractor.domain.value_objects.output_naming import (
+        extracted_subtitle_path,
+    )
+
+    # Hai enum SubtitleFormat cùng giá trị ("srt"/"ass") ở hai mô-đun: quy về enum của output_naming.
+    suggested = extracted_subtitle_path(video_path, NamingFormat(fmt.value)) if video_path else None
+    selected = next((item for item in filters.split(";;") if f"*.{fmt.value}" in item), filters.split(";;")[0])
+    return suggested, selected
+
+
 class EditorExportMixin:
     """Xuất phụ đề và dựng bản xem trước ASS cho trình phát của trang Chỉnh sửa."""
+
+    _container: Any  # [v3.23.738] cài đặt "Định dạng đầu ra" (trang Chỉnh sửa gán)
 
     def _on_export_clicked(self) -> None:
         # [v3.23.374] Log ở đầu để phân biệt "nút bị disable" (không có log) với "handler
@@ -52,21 +75,22 @@ class EditorExportMixin:
             )
 
     def _do_export_clicked(self) -> None:
-        default_dir = ""
-        if self._current_video_path:
-            # Quy ước an toàn: phụ đề gốc từ Biên tập đặt là <tên>.original.srt
-            # để không ghi đè bản dịch (.translate.) hay bản TTS (.tts.).
-            from subtitles_extractor.domain.value_objects.output_naming import (
-                extracted_subtitle_path,
-            )
-
-            default_dir = str(extracted_subtitle_path(self._current_video_path))
+        # Quy ước an toàn: phụ đề gốc từ Biên tập đặt là <tên>.original.<định dạng> để không ghi đè bản dịch
+        # (.translate.) hay bản TTS (.tts.). [v3.23.738] Định dạng mặc định theo Cài đặt "Định dạng đầu ra".
+        filters = self._translator.translate("editor.dialog_filter_export")
+        try:
+            preferred = SubtitleFormat(self._container.settings_service.current.post_process.output_format)
+        except (AttributeError, ValueError):
+            preferred = SubtitleFormat.SRT
+        suggested, selected_filter = export_dialog_defaults(self._current_video_path, preferred, filters)
+        default_dir = str(suggested) if suggested else ""
         self._prepare_for_file_dialog()
         path_str, _ = QFileDialog.getSaveFileName(
             self,
             self._translator.translate("editor.dialog_export"),
             default_dir,
-            self._translator.translate("editor.dialog_filter_export"),
+            filters,
+            selected_filter,
             options=self._FILE_DIALOG_OPTIONS,
         )
         if not path_str:

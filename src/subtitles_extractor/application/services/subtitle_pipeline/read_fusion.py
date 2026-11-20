@@ -26,14 +26,18 @@ from __future__ import annotations
 import dataclasses
 import re
 from collections.abc import Sequence
+from typing import Any
 
-from subtitles_extractor.domain.entities.ocr_frame_result import OcrFrameResult, OcrTextBox
+from subtitles_extractor.domain.entities.ocr_frame_result import (
+    OcrFrameResult,
+    OcrTextBox,
+)
 
 __all__ = [
-    "CONFUSABLE_PAIRS", "FILL_MIN_CONFIDENCE", "fresh_read_flags", "fuse_same_pixel_reads", "measure_char_pitch", "measure_text_height",
+    "CONFUSABLE_PAIRS", "FILL_MIN_CONFIDENCE", "SANDWICH_MAX_MIDDLE_SEC", "relabel_single_char_sandwiches", "fresh_read_flags", "fuse_same_pixel_reads", "measure_char_pitch", "measure_text_height",
     "tighten_inflated_boxes",
     "snap_inflated_boxes_to_band",
-    "measure_text_band", "unify_confusable_variants",
+    "measure_text_band", "unify_confusable_variants", "fix_lone_interjections", "LONE_INTERJECTION_FIXES",
 ]
 
 #: Lần đọc từ mức tin cậy này mới được tin; lần đọc rỗng / dưới mức nhận chữ của nó (rác không bị nhân ra cả chuỗi).
@@ -277,16 +281,45 @@ def _pick_substitution(
     return right if right_count > left_count else left
 
 
+_LATIN_NOISE_RE = re.compile(r"[A-Za-z0-9\s]+")
+_HAN_RE = re.compile(r"[\u3400-\u9fff]")
+
+
+def _chain_key(text: str) -> str:
+    """[v3.23.731] Khoá so sánh các lần đọc trong một chuỗi cùng điểm ảnh: bỏ chữ Latin / số dính kèm câu chữ Hán.
+
+    Phim "豪门Z外" (16:42): watermark mờ "ENCIA…" ở mép trái làm 20 khung đọc "给我揉一揉兴许我就好了ENC" — bản đọc thứ
+    ba "khác kiểu" khiến bước gộp bỏ cả chuỗi, câu bị tách và nửa giây đầu mất chữ "一".
+    """
+    if not _HAN_RE.search(text):
+        return text
+    stripped = _LATIN_NOISE_RE.sub("", text)
+    return stripped if _HAN_RE.search(stripped) else text
+
+
+def _edge_truncated(longer: str, shorter: str) -> bool:
+    """[v3.23.734] ``shorter`` là ``longer`` bị cắt mất đoạn đầu hoặc đuôi (cả hai toàn chữ Hán, ngắn hơn ít nhất 1 chữ)."""
+    return (
+        bool(shorter) and len(longer) > len(shorter) and _HAN_ONLY_RE.fullmatch(longer) is not None
+        and _HAN_ONLY_RE.fullmatch(shorter) is not None and (longer.startswith(shorter) or longer.endswith(shorter))
+    )
+
+
+_HAN_ONLY_RE = re.compile(r"[\u3400-\u9fff]+")
+
+
 def _fuse_chain(
     frames: list[OcrFrameResult], start: int, end: int, center_x: float | None, char_pitch: float | None,
     text_height: float | None, corpus: Sequence[str], conflicts: set[str],
 ) -> int:
     by_text: dict[str, list[OcrFrameResult]] = {}
+    raw_reads: dict[str, dict[str, tuple[int, int]]] = {}   # [v3.23.731] khoá → {bản đọc gốc: (số lần đọc, số khung)}
     reads: dict[str, int] = {}         # [v3.23.726] số LẦN ĐỌC thật của mỗi bản (không tính khung chép)
     runs: list[str] = []               # dãy bản đọc tin cậy theo thời gian, đã nén các khung liền nhau cùng chữ
     fresh = fresh_read_flags(frames[start:end])
     for offset, frame in enumerate(frames[start:end]):
-        text = _frame_text(frame)
+        raw = _frame_text(frame)
+        text = _chain_key(raw)
         if text and _frame_confidence(frame) >= FILL_MIN_CONFIDENCE and (not runs or runs[-1] != text):
             runs.append(text)
         # Lần đọc rỗng hoặc tin cậy thấp là lần đọc HỎNG của cùng hình (tập 04: "啊" 1,00 → "国sd" 0,51 → "啊" 1,00
@@ -294,6 +327,9 @@ def _fuse_chain(
         if text and _frame_confidence(frame) >= FILL_MIN_CONFIDENCE:
             by_text.setdefault(text, []).append(frame)
             reads[text] = reads.get(text, 0) + int(fresh[offset])
+            variants = raw_reads.setdefault(text, {})
+            got_reads, got_frames = variants.get(raw, (0, 0))
+            variants[raw] = (got_reads + int(fresh[offset]), got_frames + 1)
     if not by_text:
         return _unify_weak_alternation(frames, start, end, fresh, center_x, text_height, corpus, conflicts)
     ordered = sorted(by_text, key=lambda text: (reads[text], len(by_text[text])), reverse=True)
@@ -320,9 +356,16 @@ def _fuse_chain(
         elif center_x is not None and _only_yi_inserted(text, winner):
             if _pick_yi_variant(by_text[text], by_text[winner], center_x, char_pitch):
                 winner = text
+        elif _edge_truncated(winner, text) or _edge_truncated(text, winner):
+            # [v3.23.734] CÙNG điểm ảnh mà một bản đọc thiếu nguyên đoạn đầu/đuôi ("你修为跌落" / "你修为跌落一事",
+            # "您可以看" / "您可以看一下" — phim "反派"): màn hình không đổi nên không thể là phụ đề hiện dần → bản đầy đủ.
+            winner = winner if len(winner) > len(text) else text
         else:
             return 0                   # bản đọc khác nhau kiểu khác / không biết tâm: không đủ chắc để gộp ở mức khung
-    candidates = by_text[winner]
+    # [v3.23.731] Bản đọc gốc của bản thắng: dạng đọc được nhiều nhất (chữ Latin dính chớp nhoáng bị bỏ; chữ Latin thật
+    # đọc ổn định như "KTV" vẫn là đa số nên được giữ).
+    dominant = max(raw_reads[winner].items(), key=lambda item: item[1])[0]
+    candidates = [frame for frame in by_text[winner] if _frame_text(frame) == dominant]
     top_confidence = max(map(_frame_confidence, candidates))
     # Hộp GỌN nhất trong các lần đọc tin cậy cao nhất của bản thắng: hộp phình là hộp dính thêm nền sáng.
     best = min(
@@ -340,7 +383,7 @@ def _fuse_chain(
         frame = frames[index]
         strong = bool(_frame_text(frame)) and _frame_confidence(frame) >= FILL_MIN_CONFIDENCE
         if (
-            strong and _frame_text(frame) == winner
+            strong and _frame_text(frame) == dominant
             and (best_height <= 0 or _box_height(frame) <= INFLATED_BOX_RATIO * best_height)
         ):
             continue
@@ -613,6 +656,112 @@ def _pick_confusable(left: str, right: str, left_frames: int, right_frames: int,
     if left_evidence != right_evidence:
         return left if left_evidence > right_evidence else right
     return right if right_frames > left_frames else left
+
+
+def corpus_keeps_current(current: str, candidate: str, corpus: Sequence[str]) -> bool:
+    """[v3.23.729] ``current`` và ``candidate`` chỉ khác nhau ở cặp chữ dễ lẫn hình, và ngữ liệu của phim nghiêng hẳn về
+    ``current`` (:func:`_context_evidence`) — hoà thì ``False`` (không đủ căn cứ để giữ bản cũ)."""
+    if not _confusable_only(current, candidate):
+        return False
+    return _context_evidence(current, candidate, corpus) > _context_evidence(candidate, current, corpus)
+
+
+def corpus_prefers_current(current: str, candidate: str, corpus: Sequence[str]) -> bool:
+    """[v3.23.736] Bản đọc lại chỉ khác ``current`` đúng MỘT chữ, mà cụm chữ quanh chỗ khác nhau của ``current`` có ở câu
+    KHÁC trong phim còn của ``candidate`` thì không → giữ ``current`` (không cần cặp chữ nằm trong bảng dễ lẫn hình).
+
+    Phim "合欢宗…": PaddleOCR-VL đọc "谨遵师兄吩咐" thành "分咐" cả 3 lần (mất bộ 口) — "吩咐" có ở "你要是没什么吩咐的话",
+    "分咐" không câu nào có. Sửa thật ("腌攒" → "腌臜", "霍" → "嚯") không bị chặn: bản cũ không có bằng chứng hơn.
+    """
+    if len(current) != len(candidate) or _substitution_count(current, candidate) != 1:
+        return False
+    keep_longest, keep_pairs = _context_evidence(current, candidate, corpus)
+    new_longest, new_pairs = _context_evidence(candidate, current, corpus)
+    return keep_longest >= 2 and new_longest < 2 and new_pairs == 0 and keep_pairs > 0
+
+
+#: [v3.23.734] Chữ cảm thán bị đọc MẤT bộ 口 khi đứng MỘT MÌNH thành cả hộp chữ — dạng không bộ 口 đứng một mình không
+#: phải lời thoại ("亨" chỉ có trong 亨通/亨利, "霍" trong 霍然/họ Hoắc, "厄" trong 厄运).
+LONE_INTERJECTION_FIXES: dict[str, str] = {"亨": "哼", "霍": "嚯", "厄": "呃"}
+
+
+def fix_lone_interjections(frames: Sequence[OcrFrameResult]) -> tuple[list[OcrFrameResult], int]:
+    """[v3.23.734] Hộp chữ chỉ có MỘT chữ "亨" / "霍" / "厄" → "哼" / "嚯" / "呃" (trả ``(khung, số hộp đổi)``).
+
+    Phim "反派" (127:05): "哼" hiện 0,8 s nhưng OCR đọc xen kẽ "亨" 0,51–0,73 / "哼" 0,50–0,72 → khâu dựng tách hai câu
+    ngắn, mỗi câu tin cậy dưới ngưỡng câu một chữ nên cả hai bị bỏ. Phim "[全集]": "嚯" đọc thành "霍" 0,87.
+    """
+    out: list[OcrFrameResult] = []
+    changed = 0
+    for frame in frames:
+        boxes = frame.text_boxes
+        if any((box.text or "").strip() in LONE_INTERJECTION_FIXES for box in boxes):
+            fixed_boxes = []
+            for box in boxes:
+                target = LONE_INTERJECTION_FIXES.get((box.text or "").strip())
+                if target is not None:
+                    box = dataclasses.replace(box, text=target)
+                    changed += 1
+                fixed_boxes.append(box)
+            frame = dataclasses.replace(frame, text_boxes=fixed_boxes)
+        out.append(frame)
+    return out, changed
+
+
+#: [v3.23.736] Đoạn giữa của mẫu chữ đơn A | B | A dài tối đa chừng này giây mới coi là đọc nhầm (câu thật ≥ 0,8 s).
+SANDWICH_MAX_MIDDLE_SEC = 0.6
+
+
+def _single_char_read(frame: OcrFrameResult) -> tuple[str, float, float] | None:
+    """``(chữ, tâm x, rộng hộp)`` khi khung có đúng MỘT hộp chữ gồm MỘT chữ Hán; khác → ``None``."""
+    if len(frame.text_boxes) != 1:
+        return None
+    box = frame.text_boxes[0]
+    text = (box.text or "").strip()
+    if len(text) != 1 or not ("\u4e00" <= text <= "\u9fff") or not box.polygon:
+        return None
+    xs = [float(x) for x, _y in box.polygon]
+    return text, (min(xs) + max(xs)) / 2, max(xs) - min(xs)
+
+
+def relabel_single_char_sandwiches(frames: Sequence[OcrFrameResult]) -> tuple[list[OcrFrameResult], int]:
+    """[v3.23.736] Chữ đơn đọc xen kẽ A | B | A liền khung, cùng chỗ, đoạn B ngắn → B là A (trả ``(khung, số khung đổi)``).
+
+    Phim "合欢宗…" (37:24): "阵" hiện 1,6 s, OCR đọc "阵" 0,48 s | "降" 0,40 s | "阵" 0,72 s (tin cậy ≈ 0,6) → khâu dựng tách
+    ba mảnh, hai mảnh đầu dưới ngưỡng câu một chữ bị bỏ → câu chỉ còn 0,72 s cuối. Cùng dạng "哼" | "亨" (phim "反派"),
+    nay không cần bảng cặp chữ. Câu chữ đơn thật nối nhau luôn có khoảng trống, hoặc dài ≥ 0,8 s, hoặc hai đầu khác chữ.
+    """
+    out = list(frames)
+    runs: list[list[Any]] = []                  # [chữ, chỉ số đầu, chỉ số cuối, tâm x, rộng]
+    for index, frame in enumerate(out):
+        read = _single_char_read(frame)
+        if read is None:
+            runs.append([None, index, index, 0.0, 0.0])
+            continue
+        text, center, width = read
+        last = runs[-1] if runs else None
+        if last is not None and last[0] == text and last[2] == index - 1 and abs(last[3] - center) <= max(width, 1.0):
+            last[2] = index
+        else:
+            runs.append([text, index, index, center, width])
+    changed = 0
+    for left, middle, right in zip(runs, runs[1:], runs[2:], strict=False):
+        if left[0] is None or middle[0] is None or left[0] != right[0] or middle[0] == left[0]:
+            continue
+        if middle[1] != left[2] + 1 or right[1] != middle[2] + 1:
+            continue
+        reach = max(left[4], middle[4], right[4], 1.0)
+        if abs(middle[3] - left[3]) > reach or abs(middle[3] - right[3]) > reach:
+            continue
+        if out[middle[2]].timestamp_sec - out[middle[1]].timestamp_sec > SANDWICH_MAX_MIDDLE_SEC:
+            continue
+        for index in range(middle[1], middle[2] + 1):
+            frame = out[index]
+            box = dataclasses.replace(frame.text_boxes[0], text=left[0])
+            out[index] = dataclasses.replace(frame, text_boxes=[box])
+            changed += 1
+        middle[0] = left[0]
+    return out, changed
 
 
 def unify_confusable_variants(

@@ -16,61 +16,119 @@ import time
 from pathlib import Path
 
 from loguru import logger
-from subtitles_extractor.presentation.qt_compat import is_valid
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, QItemSelection, QItemSelectionModel, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QItemSelection,
+    QItemSelectionModel,
+    QObject,
+    QPoint,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
-    QDragEnterEvent, QDropEvent, QKeyEvent, QShowEvent, QHideEvent,
+    QDragEnterEvent,
+    QDropEvent,
+    QHideEvent,
+    QKeyEvent,
+    QShowEvent,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFileDialog,
-    QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-    QListWidget, QMenu, QMessageBox, QStackedLayout, QTableView, QVBoxLayout, QWidget,
-)
-from subtitles_extractor.presentation.fluent_compat import (
-    CaptionLabel, ComboBox, DoubleSpinBox, FluentIcon, InfoBar,
-    InfoBarPosition, LineEdit, PrimaryPushButton, ProgressBar, PushButton, Slider, StrongBodyLabel, TextEdit, ToolButton,
+    QAbstractItemView,
+    QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QListWidget,
+    QMenu,
+    QMessageBox,
+    QStackedLayout,
+    QTableView,
+    QVBoxLayout,
+    QWidget,
 )
 
 from subtitles_extractor.application.services.subtitle_editor_service import EditorState
 from subtitles_extractor.composition.container import ApplicationContainer
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
-from subtitles_extractor.presentation.view_models.editor_page_view_model import EditorPageViewModel
-from subtitles_extractor.presentation.widgets import create_video_widget
-from subtitles_extractor.presentation.theme import colors as _c
-from subtitles_extractor.presentation.theme import metrics as _m
-from subtitles_extractor.presentation.theme.styles import mono_label_style
-from subtitles_extractor.presentation.utils.accessibility import set_accessible_name
-from subtitles_extractor.presentation.widgets.audio_waveform_widget import AudioWaveformWidget
-from subtitles_extractor.presentation.widgets.editor_widgets import CpsGauge, SubtitleTagHighlighter, TimeSpinBox
-from subtitles_extractor.presentation.widgets.mpv_video_widget import MpvVideoWidget as RoiMpvVideoWidget  # noqa: F401
-from subtitles_extractor.presentation.widgets.subtitle_table_model import (
-    COL_DUR, COL_END, COL_GAP, COL_INDEX, COL_SCORE, COL_START, COL_TEXT, COL_WARN,
-    SubtitleFilterProxyModel, SubtitleTableModel,
+from subtitles_extractor.presentation.fluent_compat import (
+    CaptionLabel,
+    ComboBox,
+    DoubleSpinBox,
+    FluentIcon,
+    InfoBar,
+    InfoBarPosition,
+    LineEdit,
+    PrimaryPushButton,
+    ProgressBar,
+    PushButton,
+    Slider,
+    StrongBodyLabel,
+    TextEdit,
+    ToolButton,
 )
-
 from subtitles_extractor.presentation.pages.editor_constants import (  # noqa: F401 — giữ tên cũ trong editor_page
-    _MAX_LINE_CHARS,
-    _DEBOUNCED_SEEK_MS,
-    _PREVIEW_DEBOUNCE_MS,
-    _FILTER_DEBOUNCE_MS,
-    _SYNC_HIGHLIGHT_MS,
-    _AUTOSAVE_INTERVAL_MS,
     _AUTO_SCROLL_PAUSE_AFTER_USER_SEC,
-    _MIN_PLAYBACK_SPEED,
-    _MAX_PLAYBACK_SPEED,
-    _SLIDER_RESOLUTION,
+    _AUTOSAVE_INTERVAL_MS,
+    _DEBOUNCED_SEEK_MS,
+    _FILTER_DEBOUNCE_MS,
     _LOW_CONFIDENCE_THRESHOLD,
+    _MAX_LINE_CHARS,
+    _MAX_PLAYBACK_SPEED,
+    _MIN_PLAYBACK_SPEED,
+    _PREVIEW_DEBOUNCE_MS,
+    _SLIDER_RESOLUTION,
+    _SYNC_HIGHLIGHT_MS,
     _TOO_FAST_CPS_THRESHOLD,
     _TOO_SHORT_DURATION_SEC,
 )
-from subtitles_extractor.presentation.pages.editor_export import EditorExportMixin
-from subtitles_extractor.presentation.pages.editor_find_replace import EditorFindReplaceMixin
-from subtitles_extractor.presentation.pages.editor_reocr import EditorReOcrMixin
 from subtitles_extractor.presentation.pages.editor_dialogs import (  # noqa: F401 — giữ tên cũ trong editor_page
     AdvancedReOcrDialog,
     EditorSettingsDialog,
     _DetachedVideoWindow,
     _fmt_mmss,
+)
+from subtitles_extractor.presentation.pages.editor_export import EditorExportMixin
+from subtitles_extractor.presentation.pages.editor_find_replace import (
+    EditorFindReplaceMixin,
+)
+from subtitles_extractor.presentation.pages.editor_reocr import EditorReOcrMixin
+from subtitles_extractor.presentation.qt_compat import is_valid
+from subtitles_extractor.presentation.theme import colors as _c
+from subtitles_extractor.presentation.theme import metrics as _m
+from subtitles_extractor.presentation.theme.styles import mono_label_style
+from subtitles_extractor.presentation.utils.accessibility import set_accessible_name
+from subtitles_extractor.presentation.view_models.editor_page_view_model import (
+    EditorPageViewModel,
+)
+from subtitles_extractor.presentation.widgets import create_video_widget
+from subtitles_extractor.presentation.widgets.audio_waveform_widget import (
+    AudioWaveformWidget,
+)
+from subtitles_extractor.presentation.widgets.editor_widgets import (
+    CpsGauge,
+    SubtitleTagHighlighter,
+    TimeSpinBox,
+)
+from subtitles_extractor.presentation.widgets.mpv_video_widget import (
+    MpvVideoWidget as RoiMpvVideoWidget,  # noqa: F401
+)
+from subtitles_extractor.presentation.widgets.subtitle_table_model import (
+    COL_DUR,
+    COL_END,
+    COL_GAP,
+    COL_INDEX,
+    COL_SCORE,
+    COL_START,
+    COL_TEXT,
+    COL_WARN,
+    SubtitleFilterProxyModel,
+    SubtitleTableModel,
 )
 
 # [v3.23.111] Bảng phím tắt trình chỉnh sửa — gom nhóm để người dùng dễ khám phá.
@@ -541,7 +599,9 @@ class EditorPage(EditorReOcrMixin, EditorFindReplaceMixin, EditorExportMixin, QW
         self._table.setColumnWidth(COL_SCORE, 50); self._table.setColumnWidth(COL_WARN, 40)
         self._table.setColumnWidth(COL_GAP, 60)
 
-        from subtitles_extractor.presentation.widgets.rich_text_delegate import RichTextSubtitleDelegate
+        from subtitles_extractor.presentation.widgets.rich_text_delegate import (
+            RichTextSubtitleDelegate,
+        )
         self._text_delegate = RichTextSubtitleDelegate(text_column=COL_TEXT, parent=self)
         self._table.setItemDelegateForColumn(COL_TEXT, self._text_delegate)
 
@@ -616,7 +676,9 @@ class EditorPage(EditorReOcrMixin, EditorFindReplaceMixin, EditorExportMixin, QW
         self._video_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._video_placeholder.setStyleSheet(f"background-color: {_c.mono_bg()}; color: {_c.on_surface_muted()}; font-size: {_m.FONT_SIZE_BODY}px; border-radius: 4px;")
 
-        self._video_widget = create_video_widget(mpv_options=self._container.build_mpv_player_kwargs(), parent=self)
+        self._video_widget = create_video_widget(  # [v3.23.736] truyền bộ dịch (trước hiện khoá thô)
+            mpv_options=self._container.build_mpv_player_kwargs(), parent=self, translator=self._translator,
+        )
         self._video_widget.enable_roi_drawing(False)
 
         self._video_widget.position_changed.connect(self._on_canvas_position_changed)
@@ -1686,6 +1748,8 @@ class EditorPage(EditorReOcrMixin, EditorFindReplaceMixin, EditorExportMixin, QW
 
     def apply_ui_settings(self, font_size: int, show_waveform: bool, show_ocr_overlay: bool) -> None:
         self._waveform_widget.setVisible(show_waveform)
+        # [v3.23.738] Thanh phóng dọc đi cùng dạng sóng (lúc khởi động đã ẩn cả hai; tắt lúc đang chạy thì sót thanh này).
+        self._waveform_y_zoom.setVisible(show_waveform)
 
     def _on_waveform_seek(self, timestamp_sec: float) -> None:
         self._break_loop_if_outside(timestamp_sec)

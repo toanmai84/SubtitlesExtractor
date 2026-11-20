@@ -24,6 +24,7 @@ from subtitles_extractor.application.dtos.reocr_dto import (
 )
 from subtitles_extractor.application.use_cases.reocr import ReOcrUseCase
 from subtitles_extractor.domain.exceptions import SubtitlesExtractorError
+from subtitles_extractor.infrastructure.process.keep_awake import keeps_awake
 from subtitles_extractor.presentation.workers.qt_progress_reporter import (
     QtProgressReporter,
 )
@@ -53,6 +54,7 @@ class ReOcrWorker(QObject):
         self._request = request
         self._reporter = reporter
 
+    @keeps_awake("Subtitles Extractor — OCR lại phụ đề")  # [v3.23.747] màn hình tắt → GPU kẹt
     def run(self) -> None:
         """Slot kết nối với ``QThread.started`` — chạy trên thread mới."""
         try:

@@ -42,7 +42,8 @@ CHECKPOINT_VERSION = 2   # [v3.23.710] toạ độ hộp chữ đổi hệ quy c
 #: Hậu tố tệp điểm dừng, nối vào đường dẫn cache OCR thô.
 CHECKPOINT_SUFFIX = ".ckpt"
 #: Tham số KHÔNG làm đổi kết quả OCR (chỉ đổi tốc độ) → không vào vân tay.
-_SPEED_ONLY_OCR_FIELDS = ("batch_size", "parallel_workers", "enable_mkldnn", "use_tensorrt")
+_SPEED_ONLY_OCR_FIELDS = ("batch_size", "parallel_workers", "enable_mkldnn", "use_tensorrt",
+                          "trt_det_batch", "trt_rec_batch")                   # [v3.23.776] chỉ đổi tốc độ
 
 
 def checkpoint_path_for(raw_ocr_path: Path) -> Path:

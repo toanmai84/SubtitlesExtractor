@@ -10,16 +10,17 @@ TỐI ƯU ĐỘT PHÁ (V3.13 - OOM Fast-Fail & Stability):
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import gc
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -36,6 +37,10 @@ from subtitles_extractor.application.services.run_provenance import (
     collect_run_info,
     new_run_id,
     summarize_result,
+)
+from subtitles_extractor.application.services.stall_watchdog import (
+    StallWatchdog,
+    WatchedReporter,
 )
 from subtitles_extractor.application.services.subtitle_builder import (
     SubtitleBuilder,
@@ -61,6 +66,13 @@ from subtitles_extractor.domain.ports.progress_reporter_port import (
     NullProgressReporter,
     ProgressReporterPort,
 )
+from subtitles_extractor.domain.ports.quality_audit_port import (
+    AudioExporterPort,
+    GlmAuditorFactory,
+    GlmLineReaderFactory,
+    QualityAuditPort,
+)
+from subtitles_extractor.domain.ports.roi_clip_exporter_port import RoiClipExporterPort
 from subtitles_extractor.domain.ports.subtitle_exporter_port import (
     SubtitleExporterPort,
 )
@@ -68,6 +80,11 @@ from subtitles_extractor.domain.ports.video_metadata_reader_port import (
     VideoMetadataReaderPort,
 )
 from subtitles_extractor.domain.value_objects.boundary_track import BoundaryTrack
+from subtitles_extractor.domain.value_objects.ocr_model_names import (
+    GLM_OCR_QA_MODEL,
+    QA_READER_GLM_OCR,
+    QA_READER_PADDLE_VL,
+)
 from subtitles_extractor.domain.value_objects.roi import Roi
 
 if TYPE_CHECKING:
@@ -147,6 +164,16 @@ class _NoCancelReporter:
 
     def __getattr__(self, name: str):
         return getattr(self._inner, name)
+
+
+def _roi_clip_path(raw_ocr_path: Path) -> Path:
+    """[v3.23.728] ``phim.seraw.json.gz`` → ``phim.roi.mp4`` (cùng thư mục)."""
+    name = raw_ocr_path.name
+    for suffix in (".seraw.json.gz", ".seraw.json", ".json.gz", ".json", ".gz"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return raw_ocr_path.with_name(f"{name}.roi.mp4")
 
 
 def _needs_ocr(frame: SampledFrame) -> bool:
@@ -252,6 +279,33 @@ _VERIFY_FRAMES_PER_LINE = 5
 #: [v3.23.713] Câu có hai bản đọc mâu thuẫn: đọc lại nhiều khung hơn để bỏ phiếu.
 _VERIFY_FRAMES_DISPUTED = 12
 _MAX_VERIFY_SUSPECTS = 200
+#: [v3.23.733] Soát bằng PaddleOCR-VL: VL chậm nhưng đọc đúng hơn hẳn → ít khung mỗi câu.
+_VERIFY_FRAMES_VL = 3
+
+
+def prioritize_suspects(
+    suspects: list[tuple[int, str]], events: Sequence[object], limit: int,
+) -> list[tuple[int, str]]:
+    """[v3.23.738] Tối đa ``limit`` câu cần soát, câu đáng ngờ nhất trước (hàm thuần); giữ thứ tự câu khi trả về.
+
+    Trước đây vượt hằng 200 câu thì BỎ soát cả lượt (phim "反派" ≈ 191 câu — sát ngưỡng; phim dài hơn mất hẳn lượt soát).
+    Ưu tiên: cờ hình học / hai bản đọc (có dấu hiệu cụ thể), rồi câu tin cậy thấp nhất.
+    """
+    if len(suspects) <= limit:
+        return list(suspects)
+    from subtitles_extractor.application.services.subtitle_pipeline.geometry_check import (
+        OCR_NOTE_LOW_CONFIDENCE,
+    )
+
+    def rank(item: tuple[int, str]) -> tuple[int, float, int]:
+        position, note = item
+        return (1 if note == OCR_NOTE_LOW_CONFIDENCE else 0,
+                float(getattr(events[position], "confidence", 1.0)), position)
+
+    kept = sorted(sorted(suspects, key=rank)[:max(0, limit)])
+    logger.warning("Có %d câu nghi ngờ, vượt giới hạn soát %d (Cài đặt) — soát %d câu đáng ngờ nhất.",
+                   len(suspects), limit, len(kept))
+    return kept
 
 
 def clear_reocr_frame_cache() -> None:
@@ -299,19 +353,40 @@ class ExtractSubtitlesUseCase:
         ocr_engine: OcrEnginePort,
         builder: SubtitleBuilder,
         exporters: dict[str, SubtitleExporterPort],
+        roi_clip_exporter: RoiClipExporterPort | None = None,
+        quality_auditor: QualityAuditPort | None = None,
+        audio_exporter: AudioExporterPort | None = None,
+        glm_auditor_factory: GlmAuditorFactory | None = None,
+        glm_line_reader_factory: GlmLineReaderFactory | None = None,
     ) -> None:
         self._load_metadata_use_case = LoadVideoMetadataUseCase(metadata_reader)
         self._frame_sampler_port = frame_sampler
         self._ocr_engine_port = ocr_engine
         self._subtitle_builder = builder
         self._subtitle_exporters = exporters
+        self._roi_clip_exporter = roi_clip_exporter
+        self._quality_auditor = quality_auditor
+        self._audio_exporter = audio_exporter
+        # [v3.23.745] Bộ kiểm định đọc bằng GLM-OCR (tải khi dùng, llama-server tiến trình riêng) — Cài đặt "Bộ đọc kiểm định".
+        self._glm_auditor_factory = glm_auditor_factory
+        # [v3.23.758] Bước soát câu đọc lại bằng GLM-OCR khi "Bộ đọc kiểm định" = GLM-OCR (lỗi → PaddleOCR-VL).
+        self._glm_line_reader_factory = glm_line_reader_factory
 
     def execute(
         self,
         request: ExtractSubtitlesRequest,
         progress: ProgressReporterPort | None = None,
     ) -> ExtractSubtitlesResponse:
-        progress_reporter = progress or NullProgressReporter()
+        # [v3.23.746] Đồng hồ canh treo: lượt không có tiến độ ≥ 3 phút → ghi ngăn xếp mọi luồng vào nhật ký (log
+        # 18/11 21:34 treo 4 giờ sau khi nạp PaddleOCR-VL mà không có manh mối luồng nào kẹt ở đâu).
+        with StallWatchdog() as watchdog:
+            return self._execute(request, WatchedReporter(progress or NullProgressReporter(), watchdog))
+
+    def _execute(
+        self,
+        request: ExtractSubtitlesRequest,
+        progress_reporter: ProgressReporterPort,
+    ) -> ExtractSubtitlesResponse:
         subtitle_exporter: SubtitleExporterPort | None = None
 
         if not request.skip_export:
@@ -395,6 +470,8 @@ class ExtractSubtitlesUseCase:
             )
             if raw_ocr_file_path is not None and checkpoint is not None:
                 checkpoint.discard()   # [v3.23.632] kết quả đầy đủ đã nằm trong cache → hết cần điểm dừng
+            if raw_ocr_file_path is not None and request.export_roi_clip:
+                self._export_roi_clip(request, video_metadata, raw_ocr_file_path, progress_reporter)
 
         build_started = time.perf_counter()
         built_subtitle_events = (
@@ -422,6 +499,13 @@ class ExtractSubtitlesUseCase:
                     built_subtitle_events, verify_log, build_elapsed_sec=time.perf_counter() - build_started,
                 ),
             )
+        if (
+            raw_ocr_file_path is not None and request.export_roi_clip and request.export_qa_data
+            and not progress_reporter.is_cancelled()
+        ):
+            self._export_qa_data(request, built_subtitle_events, raw_ocr_file_path, progress_reporter,
+                                 frames=ocr_frame_results)
+        self._release_auxiliary_models()
         final_output_path = request.output_path
 
         if not request.skip_export and subtitle_exporter is not None:
@@ -466,12 +550,19 @@ class ExtractSubtitlesUseCase:
         from subtitles_extractor.application.services.subtitle_pipeline.geometry_check import (
             OCR_NOTE_DISPUTED,
             OCR_NOTE_EXTRA_CHAR,
+            OCR_NOTE_LOW_CONFIDENCE,
             OCR_NOTE_MISSING_CHAR,
-            OCR_NOTE_REOCR_FIXED,
-            accept_disputed_reread,
-            accept_reocr_text,
+            VL_LOW_CONFIDENCE,
         )
         from subtitles_extractor.domain.ports.ocr_engine_port import PreprocessConfig
+        from subtitles_extractor.domain.value_objects.ocr_model_names import (
+            PADDLE_VL_DRAFT_RECOGNITION_MODEL,
+            PADDLE_VL_RECOGNITION_MODEL,
+            is_vl_recognizer,
+        )
+
+        # [v3.23.733] Soát bằng PaddleOCR-VL (Cài đặt) — hoặc lượt chạy chính đã dùng VL: đọc lại bằng VL.
+        use_vl = bool(getattr(request, "verify_with_vl", False)) or is_vl_recognizer(request.ocr.recognition_model_name)
 
         # [v3.23.713] Thêm câu có hai bản đọc mâu thuẫn (lẫn chữ gần giống trên cùng một hình): đọc lại NHIỀU khung
         # bằng ảnh gốc rồi bỏ phiếu. Cờ hình học đứng trước để một câu mang cả hai cờ được soát thiếu/thừa chữ trước.
@@ -481,8 +572,21 @@ class ExtractSubtitlesUseCase:
             for position, event in enumerate(events)
             if any(note in flags for note in (getattr(event, "ocr_notes", ()) or ()))
         ]
-        if not suspects or len(suspects) > _MAX_VERIFY_SUSPECTS:
+        if use_vl:
+            # [v3.23.733] Câu chữ Hán đọc không chắc ("霍" 0,87 thay vì "嚯") cũng được VL đọc lại.
+            flagged = {position for position, _note in suspects}
+            suspects += [
+                (position, OCR_NOTE_LOW_CONFIDENCE) for position, event in enumerate(events)
+                if position not in flagged
+                and float(getattr(event, "confidence", 1.0)) < float(getattr(request, "vl_low_confidence", VL_LOW_CONFIDENCE))
+                and any("\u4e00" <= ch <= "\u9fff" for ch in str(event.text or ""))
+            ]
+            suspects.sort()
+        if not suspects:
             return 0
+        suspects = prioritize_suspects(
+            suspects, events, int(getattr(request, "verify_max_lines", _MAX_VERIFY_SUSPECTS) or _MAX_VERIFY_SUSPECTS),
+        )
         raw_preprocess = PreprocessConfig(
             upscale_small_text=False, add_white_border=False, apply_sharpen=False,
             apply_contrast_boost=False, apply_clahe=False,
@@ -499,17 +603,117 @@ class ExtractSubtitlesUseCase:
             sampling.vram_upscale_small_text or sampling.vram_add_border or sampling.vram_sharpen
             or abs(float(sampling.vram_contrast_factor) - 1.0) > 1e-6 or sampling.vram_apply_clahe
         )
+        geometry_notes = (OCR_NOTE_MISSING_CHAR, OCR_NOTE_EXTRA_CHAR)
         if already_raw:
             # Ảnh vốn đã không tiền xử lý: đọc lại câu thiếu/thừa chữ không cho "ý kiến thứ hai"; câu có hai bản đọc mâu
-            # thuẫn thì vẫn được lợi từ việc bỏ phiếu trên nhiều khung hơn.
-            suspects = [item for item in suspects if item[1] == OCR_NOTE_DISPUTED]
+            # thuẫn (và câu tin cậy thấp — soát bằng VL) thì vẫn được lợi.
+            suspects = [item for item in suspects if item[1] not in geometry_notes]
             if not suspects:
                 return 0
         duration = float(metadata.duration_sec or 0.0)
         if duration <= 0.0:
             return 0
-        raw_ocr = dataclasses.replace(request.ocr, preprocess=raw_preprocess)
+        # [v3.23.734] Câu nghi thiếu/thừa chữ: đọc lại ẢNH GỐC bằng PP-OCR như cũ — chữ thiếu thường nằm NGOÀI hộp bộ dò
+        # tìm được ("个德行" thiếu "一"), mà VL chỉ đọc trong hộp đó (đo phim "反派": VL ra "个德行", "知死舌"; PP-OCR ảnh gốc
+        # sửa đúng 7/7 câu). Câu hai bản đọc / tin cậy thấp: VL (cùng lượt thật: cách cũ đổi SAI 3/5 câu "你丢"→"尔丢",
+        # "怎么"→"怎公", "嚣张"→"器张"; VL đọc đúng cả 3).
+        raw_ocr_ppocr = dataclasses.replace(request.ocr, preprocess=raw_preprocess)
+        if is_vl_recognizer(raw_ocr_ppocr.recognition_model_name):
+            raw_ocr_ppocr = dataclasses.replace(raw_ocr_ppocr, recognition_model_name=PADDLE_VL_DRAFT_RECOGNITION_MODEL)
+        raw_ocr_vl = dataclasses.replace(raw_ocr_ppocr, recognition_model_name=PADDLE_VL_RECOGNITION_MODEL)
+        self._trim_gpu_memory("trước bước soát câu")
+        with contextlib.ExitStack() as stack:
+            reader_name = PADDLE_VL_RECOGNITION_MODEL
+            # [v3.23.759] Chỉ bật GLM-OCR khi có câu đọc lại bằng bộ đọc dòng (câu thiếu/thừa chữ đọc bằng PP-OCR).
+            if use_vl and any(note not in geometry_notes for _position, note in suspects):
+                reader_name = self._open_glm_line_reader(request, reporter, stack, log) or reader_name
+                logger.info("Soát %d câu nghi ngờ (hai bản đọc / tin cậy thấp bằng %s).", len(suspects), reader_name)
+            engine = getattr(self, "_ocr_engine_port", None)
+            glm_error: str | None = None
+            try:
+                return self._verify_lines_loop(
+                    suspects, events, request, metadata, reporter, log, use_vl, geometry_notes, raw_ocr_vl,
+                    raw_ocr_ppocr, sampling, duration, reader_name=reader_name, release_reader=stack.close,
+                )
+            finally:
+                if reader_name != PADDLE_VL_RECOGNITION_MODEL:
+                    glm_error = getattr(engine, "line_reader_error", None)
+                if glm_error and log is not None:
+                    log.append({"error": f"{reader_name} lỗi giữa chừng, phần còn lại soát bằng PaddleOCR-VL: {glm_error}"})
+                vl_error = getattr(engine, "vl_error", None)
+                if use_vl and vl_error and (reader_name == PADDLE_VL_RECOGNITION_MODEL or glm_error) and log is not None:
+                    # [v3.23.739] Nhật ký soát phải nói thật: VL lỗi thì các câu "soát bằng VL" thật ra đọc bằng PP-OCR.
+                    log.append({"error": f"PaddleOCR-VL lỗi, các câu soát bằng VL đã đọc bằng PP-OCR: {vl_error}"})
+
+    def _open_glm_line_reader(
+        self, request: ExtractSubtitlesRequest, reporter: ProgressReporterPort, stack: contextlib.ExitStack,
+        log: list[dict[str, Any]] | None,
+    ) -> str | None:
+        """[v3.23.758] Người dùng chọn "Bộ đọc kiểm định: GLM-OCR" → bước soát câu cũng đọc lại bằng GLM-OCR (đo 457 câu:
+        57/57 câu khó, PaddleOCR-VL 50/57) thay PaddleOCR-VL — một mô hình đọc lại cho cả lượt, không nạp thêm VL. Trả
+        tên bộ đọc đã gắn vào bộ chuyển đổi OCR (gỡ ra khi ``stack`` đóng), ``None`` = soát bằng PaddleOCR-VL như cũ."""
+        from subtitles_extractor.domain.value_objects.device_kind import DeviceKind
+
+        if getattr(request, "qa_reader", QA_READER_PADDLE_VL) != QA_READER_GLM_OCR or self._glm_line_reader_factory is None:
+            return None
+        set_reader = getattr(getattr(self, "_ocr_engine_port", None), "set_line_reader", None)
+        if not callable(set_reader):
+            return None
+        use_gpu = getattr(request.ocr, "device", None) == DeviceKind.GPU
+
+        def on_download(message: str, fraction: float) -> bool:
+            reporter.report(96, 100, f"{message}… {fraction:.0%}")
+            return not reporter.is_cancelled()
+
+        # Trả VRAM của PaddleOCR-VL (nếu lượt chính đã nạp) trước khi llama-server nạp GLM-OCR lên GPU.
+        self._release_auxiliary_models()
+        try:
+            reporter.report(96, 100, "Đang chuẩn bị GLM-OCR cho bước soát câu…")
+            reader = stack.enter_context(self._glm_line_reader_factory(
+                use_gpu=use_gpu, progress=on_download, cancelled=reporter.is_cancelled,
+            ))
+        except Exception as exc:  # noqa: BLE001 — GLM-OCR không bật được: soát bằng PaddleOCR-VL như cũ
+            logger.warning("GLM-OCR không bật được cho bước soát câu — soát bằng PaddleOCR-VL: %s", exc)
+            if log is not None:
+                log.append({"error": f"GLM-OCR không bật được, soát câu bằng PaddleOCR-VL: {exc}"[:400]})
+            return None
+        set_reader(reader)
+        stack.callback(set_reader, None)                     # gỡ trước khi tắt server (ExitStack chạy ngược thứ tự)
+        name = str(getattr(reader, "model_name", GLM_OCR_QA_MODEL))
+        logger.info("Bước soát câu đọc lại bằng %s (%s).", name, "GPU CUDA" if use_gpu else "CPU")
+        return name
+
+    def _verify_lines_loop(  # noqa: PLR0913 — tách nguyên văn vòng soát để ghi nhật ký lỗi VL ở một chỗ
+        self, suspects: list[tuple[int, str]], events: list[Any], request: ExtractSubtitlesRequest,
+        metadata: VideoMetadata, reporter: ProgressReporterPort, log: list[dict[str, Any]] | None, use_vl: bool,
+        geometry_notes: tuple[str, ...],
+        raw_ocr_vl: Any, raw_ocr_ppocr: Any, sampling: Any, duration: float, *, reader_name: str | None = None,
+        release_reader: Callable[[], None] | None = None,
+    ) -> int:
+        """Vòng đọc lại từng câu nghi ngờ (tách khỏi :meth:`_verify_suspect_lines`)."""
+        from subtitles_extractor.application.services.subtitle_pipeline.geometry_check import (
+            OCR_NOTE_DISPUTED,
+            OCR_NOTE_EXTRA_CHAR,
+            OCR_NOTE_LOW_CONFIDENCE,
+            OCR_NOTE_MISSING_CHAR,
+            OCR_NOTE_REOCR_FIXED,
+            accept_disputed_reread,
+            accept_reocr_text,
+            accept_vl_reread,
+            arbitrate_disputed_verdict,
+        )
+        from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
+            correct_hallucination_typos,
+            normalize_traditional_to_simplified,
+        )
+        from subtitles_extractor.domain.value_objects.ocr_model_names import (
+            PADDLE_VL_RECOGNITION_MODEL as _VL_NAME,
+        )
+
+        flags = (OCR_NOTE_MISSING_CHAR, OCR_NOTE_EXTRA_CHAR, OCR_NOTE_DISPUTED)
         fixed = 0
+        engine = getattr(self, "_ocr_engine_port", None)
+        line_reader = reader_name or _VL_NAME
         for done, (position, note) in enumerate(suspects, start=1):
             if reporter.is_cancelled():
                 break
@@ -520,7 +724,14 @@ class ExtractSubtitlesUseCase:
                            "text": str(event.text or ""), "flag": note, "outcome": "no_frames"}
             if log is not None:
                 log.append(entry)
-            wanted_frames = _VERIFY_FRAMES_DISPUTED if note == OCR_NOTE_DISPUTED else _VERIFY_FRAMES_PER_LINE
+            line_vl = use_vl and note not in geometry_notes
+            if line_vl:
+                entry["reader"] = line_reader                 # [v3.23.758] nhật ký ghi rõ mô hình đã đọc lại
+            raw_ocr = raw_ocr_vl if line_vl else raw_ocr_ppocr
+            wanted_frames = (
+                _VERIFY_FRAMES_VL if line_vl
+                else _VERIFY_FRAMES_DISPUTED if note == OCR_NOTE_DISPUTED else _VERIFY_FRAMES_PER_LINE
+            )
             sub_sampling = dataclasses.replace(
                 sampling,
                 sample_step_sec=max(span / wanted_frames, 0.02),
@@ -531,16 +742,23 @@ class ExtractSubtitlesUseCase:
             )
             sub_request = dataclasses.replace(
                 request, sampling=sub_sampling, ocr=raw_ocr, skip_export=True, raw_ocr_output_path=None,
-                save_debug_frames=False, export_raw_images=False, use_frame_cache=False,
+                save_debug_frames=False, export_roi_clip=False, use_frame_cache=False,
             )
             frames = [
                 frame for frame in self._frame_sampler_port.iter_frames(
                     metadata=metadata, roi=metadata.roi, config=sub_sampling,
                 ) if _needs_ocr(frame)
-            ][:wanted_frames + 2]
+            ][:wanted_frames + (0 if line_vl else 2)]
             if not frames:
                 continue
             results = self._execute_ocr_inference_on_batch(frames, None, sub_request, metadata)
+            if line_vl and line_reader != _VL_NAME and getattr(engine, "line_reader_error", None):
+                # [v3.23.759] Bộ đọc thay thế (GLM-OCR) hỏng ở câu này: câu này giữ bản nháp PP-OCR; tắt server (trả VRAM)
+                # TRƯỚC khi các câu sau nạp PaddleOCR-VL.
+                entry["reader"] = "PP-OCR (bản nháp — " + line_reader + " lỗi)"
+                line_reader = _VL_NAME
+                if release_reader is not None:
+                    release_reader()
             reread = [
                 "".join(
                     str(box.text or "")
@@ -551,8 +769,27 @@ class ExtractSubtitlesUseCase:
                 )
                 for result in results
             ]
+            # [v3.23.757] Bản đọc lại đi qua CÙNG bước sửa chữ như câu đã dựng (phồn → giản, bảng cụm đọc nhầm) trước khi
+            # so / bỏ phiếu. Phim 大乾悍刀行 (lượt 3.23.754): bảng cụm sửa đúng "剔冲动"→"别冲动", rồi VL đọc lại
+            # ['別冲动', '剔冲动', '剔冲动'] (đúng cặp chữ dễ nhầm đó) và GHI ĐÈ ngược thành "剔冲动".
+            reread = [correct_hallucination_typos(normalize_traditional_to_simplified(text)) for text in reread]
             reporter.report(96, 100, f"Đang soát lại câu nghi ngờ {done}/{len(suspects)}…")
             entry["reread"] = list(reread)
+            if note == OCR_NOTE_LOW_CONFIDENCE:
+                replacement_vl = accept_vl_reread(
+                    str(event.text or ""), reread, [str(other.text or "") for other in events],
+                )
+                if replacement_vl is None:
+                    entry["outcome"] = "kept"
+                    continue
+                logger.info("Soát câu %d: %r → %r (tin cậy thấp, %d khung %s).", position + 1, event.text,
+                            replacement_vl, len(reread), entry.get("reader", line_reader))
+                event.text = replacement_vl
+                entry["outcome"], entry["new_text"] = "changed", replacement_vl
+                if OCR_NOTE_REOCR_FIXED not in event.ocr_notes:
+                    event.ocr_notes = (*event.ocr_notes, OCR_NOTE_REOCR_FIXED)
+                fixed += 1
+                continue
             if note == OCR_NOTE_DISPUTED:
                 verdict = accept_disputed_reread(str(event.text or ""), reread)
                 if verdict is None:
@@ -566,6 +803,11 @@ class ExtractSubtitlesUseCase:
 
                 verdict = normalize_traditional_to_simplified(verdict)
                 current_key = normalize_traditional_to_simplified("".join(str(event.text or "").split()))
+                # [v3.23.729] Phiếu đọc lại cùng mô hình vẫn thiên lệch ("龌龊" → "握龊", "注入" → "注人"): chữ dính liền
+                # và ngữ liệu chính phim được xét lại trước khi đổi chữ.
+                verdict = arbitrate_disputed_verdict(
+                    current_key, verdict, [str(other.text or "") for other in events],
+                )
                 event.ocr_notes = tuple(n for n in event.ocr_notes if n != OCR_NOTE_DISPUTED)
                 if verdict == current_key:
                     logger.info("Soát câu %d %r (hai bản đọc): %d khung đọc lại xác nhận.", position + 1, event.text, len(reread))
@@ -901,9 +1143,7 @@ class ExtractSubtitlesUseCase:
                 timestamps_sec=[frame.timestamp_sec for frame in batch_queue],
             ))
 
-            if request.export_raw_images and request.raw_ocr_output_path:
-                self._save_annotated_raw_frames(batch_queue, raw_inference_results, request.raw_ocr_output_path)
-
+            raw_inference_results = self._drop_dark_boxes(raw_inference_results, batch_queue, request)
             return self._reverse_vram_geometry(raw_inference_results, batch_queue, request, metadata)
 
         except (OcrInferenceError, OcrModelLoadError) as model_error:
@@ -927,6 +1167,7 @@ class ExtractSubtitlesUseCase:
                             images_rgb=[frame.image_rgb], frame_indices=[frame.frame_index],
                             timestamps_sec=[frame.timestamp_sec],
                         ))
+                        single = self._drop_dark_boxes(single, [frame], request)
                         results.extend(self._reverse_vram_geometry(single, [frame], request, metadata))
                         consecutive_failures = 0
                     except (OcrInferenceError, OcrModelLoadError) as frame_error:
@@ -944,28 +1185,214 @@ class ExtractSubtitlesUseCase:
             logger.exception("Lỗi OOM/System khi suy luận: %s.", system_error)
             raise SubtitlesExtractorError(f"Hệ thống cạn kiệt bộ nhớ hoặc lỗi Trình xử lý: {system_error}") from system_error
 
+    def _trim_gpu_memory(self, stage: str) -> None:
+        """[v3.23.746] Trả bộ nhớ đệm VRAM bước OCR để lại (giữ mô hình) + ghi VRAM còn trống vào nhật ký."""
+        trim = getattr(getattr(self, "_ocr_engine_port", None), "trim_gpu_memory", None)
+        if not callable(trim):
+            return
+        try:
+            summary = trim()
+        except Exception as exc:  # noqa: BLE001 — dọn dẹp: không được phá lượt
+            logger.debug("Trả bộ nhớ đệm VRAM lỗi (bỏ qua): %s", exc)
+            return
+        if summary:
+            logger.info("%s %s (đã trả bộ nhớ đệm GPU của bước OCR).", stage[:1].upper() + stage[1:] + ":", summary)
+
+    def _release_auxiliary_models(self) -> None:
+        """[v3.23.739] Trả mô hình phụ + VRAM ngay trong luồng chạy lượt (trước khi giao diện mở mpv ở trang Chỉnh sửa)."""
+        release = getattr(getattr(self, "_ocr_engine_port", None), "release_auxiliary_models", None)
+        if callable(release):
+            try:
+                release()
+            except Exception as exc:  # noqa: BLE001 — dọn dẹp: không được phá kết quả lượt đã xong
+                logger.debug("Trả mô hình phụ lỗi (bỏ qua): %s", exc)
+
+    def _export_qa_data(
+        self, request: ExtractSubtitlesRequest, events: list, raw_ocr_file_path: Path, reporter: ProgressReporterPort,
+        frames: Sequence[OcrFrameResult] | None = None,
+    ) -> None:
+        """[v3.23.737] Gói kiểm định chất lượng cạnh tệp OCR thô: tiếng phim + mọi câu đọc lại bằng PaddleOCR-VL.
+
+        Đọc lại trên video vùng ROI (ảnh gốc, chưa tiền xử lý) bằng thiết bị của lượt chạy (GPU khi chọn GPU). Hỏng thì
+        chỉ mất phần phụ này: dữ liệu OCR thô và phụ đề đã xong.
+        """
+        from subtitles_extractor.domain.ports.ocr_engine_port import PreprocessConfig
+        from subtitles_extractor.domain.ports.quality_audit_port import qa_paths_for
+        from subtitles_extractor.domain.value_objects.ocr_model_names import (
+            PADDLE_VL_RECOGNITION_MODEL,
+        )
+
+        qa_path, audio_path = qa_paths_for(raw_ocr_file_path)
+        if self._audio_exporter is not None:
+            reporter.report(99, 100, "Đang tách tiếng phim cho gói kiểm định…")
+            try:
+                self._audio_exporter.export(request.video_path, audio_path)
+            except Exception as exc:  # noqa: BLE001 — phần phụ: không được phá lượt trích xuất
+                logger.warning("Tách tiếng phim lỗi: %s", exc)
+        if not events or (self._quality_auditor is None and self._glm_auditor_factory is None):
+            return
+        self._trim_gpu_memory("trước gói kiểm định")
+        clip_path = _roi_clip_path(raw_ocr_file_path)
+        sidecar_path = clip_path.with_suffix(".json")
+        if not clip_path.is_file():
+            logger.warning("Không có video vùng ROI — bỏ qua đọc lại kiểm định.")
+            return
+        if (
+            getattr(request, "qa_reader", QA_READER_PADDLE_VL) == QA_READER_GLM_OCR
+            and self._glm_auditor_factory is not None
+            and self._audit_with_glm(request, events, clip_path, sidecar_path, qa_path, reporter, frames)
+        ):
+            return
+        if self._quality_auditor is None:
+            return
+        config = dataclasses.replace(
+            request.ocr, recognition_model_name=PADDLE_VL_RECOGNITION_MODEL,
+            # [v3.23.749] Bộ dò chạy TỪNG ảnh: ảnh cắt sát mỗi câu một cỡ; dò theo lô (máy chủ dự án: 64) phải đệm theo
+            # ảnh lớn nhất lô → đổi tỉ lệ thu-phóng, rơi nét "一" / dính chữ cảnh (đo 97 câu: 50/57 → 46/57; che khung
+            # thay cắt sát: 47/57). Dò từng ảnh trên ảnh cắt sát = cấu hình đã đo 50/57.
+            det_batch_size=1,
+            preprocess=PreprocessConfig(
+                upscale_small_text=False, add_white_border=False, apply_sharpen=False,
+                apply_contrast_boost=False, apply_clahe=False,
+            ),
+        )
+
+        def on_progress(fraction: float) -> bool:
+            reporter.report(99, 100, f"Đang đọc lại mọi câu bằng PaddleOCR-VL để kiểm định… {fraction:.0%}")
+            return not reporter.is_cancelled()
+
+        try:
+            self._quality_auditor.audit(
+                events, clip_path, sidecar_path, qa_path, config=config, progress=on_progress,
+                frames=frames,          # [v3.23.744] cắt sát hộp phụ đề (bỏ chữ trong cảnh khỏi ảnh đọc lại)
+            )
+        except Exception as exc:  # noqa: BLE001 — phần phụ: không được phá lượt trích xuất
+            logger.warning("Đọc lại kiểm định lỗi: %s", exc)
+
+    def _audit_with_glm(
+        self, request: ExtractSubtitlesRequest, events: list[Any], clip_path: Path, sidecar_path: Path, qa_path: Path,
+        reporter: ProgressReporterPort, frames: Sequence[OcrFrameResult] | None,
+    ) -> bool:
+        """[v3.23.745] Gói kiểm định đọc bằng GLM-OCR. ``True`` = xong (hoặc người dùng huỷ); ``False`` = lỗi → lùi về
+        PaddleOCR-VL (ghi log lý do). Chạy GPU khi lượt chạy GPU."""
+        from subtitles_extractor.domain.ports.ocr_engine_port import OcrEngineConfig
+        from subtitles_extractor.domain.value_objects.device_kind import DeviceKind
+
+        assert self._glm_auditor_factory is not None
+        use_gpu = getattr(request.ocr, "device", None) == DeviceKind.GPU
+
+        def on_download(message: str, fraction: float) -> bool:
+            reporter.report(99, 100, f"{message}… {fraction:.0%}")
+            return not reporter.is_cancelled()
+
+        def on_progress(fraction: float) -> bool:
+            reporter.report(99, 100, f"Đang đọc lại mọi câu bằng GLM-OCR để kiểm định… {fraction:.0%}")
+            return not reporter.is_cancelled()
+
+        # Trả VRAM của PaddleOCR-VL (soát câu) trước khi llama-server nạp GLM-OCR lên GPU; lùi về VL thì nó tự nạp lại.
+        self._release_auxiliary_models()
+        try:
+            reporter.report(99, 100, "Đang chuẩn bị GLM-OCR cho gói kiểm định…")
+            with self._glm_auditor_factory(use_gpu=use_gpu, progress=on_download,
+                                           cancelled=reporter.is_cancelled) as auditor:
+                auditor.audit(
+                    events, clip_path, sidecar_path, qa_path,
+                    config=OcrEngineConfig(recognition_model_name=GLM_OCR_QA_MODEL), progress=on_progress, frames=frames,
+                )
+            logger.info("Gói kiểm định đọc bằng %s (%s).", GLM_OCR_QA_MODEL, "GPU CUDA" if use_gpu else "CPU")
+            return True
+        except Exception as exc:  # noqa: BLE001 — phần phụ: lỗi thì lùi về PaddleOCR-VL
+            if reporter.is_cancelled():
+                return True
+            logger.warning("GLM-OCR kiểm định lỗi — lùi về PaddleOCR-VL: %s", exc)
+            return False
+
+    def _export_roi_clip(
+        self, request: ExtractSubtitlesRequest, metadata: VideoMetadata, raw_ocr_file_path: Path,
+        reporter: ProgressReporterPort,
+    ) -> None:
+        """[v3.23.728] Xuất video vùng ROI cạnh tệp OCR thô (sau lượt OCR — GPU đã rảnh cho NVDEC + NVENC).
+
+        Chạy GPU khi lượt OCR chạy GPU (quy tắc: chọn GPU thì mọi việc dùng được GPU đều chạy GPU, zero-copy).
+        Hỏng thì chỉ mất phần phụ này: dữ liệu OCR thô đã ghi xong.
+        """
+        if self._roi_clip_exporter is None:
+            logger.info("Không có bộ xuất video vùng ROI — bỏ qua.")
+            return
+        from subtitles_extractor.domain.ports.ocr_engine_port import DeviceKind
+
+        prefer_gpu = getattr(request.ocr, "device", None) == DeviceKind.GPU
+        clip_path = _roi_clip_path(raw_ocr_file_path)
+        roi = effective_roi(request.roi, metadata.width, metadata.height)
+
+        def on_progress(fraction: float) -> bool:
+            reporter.report(95 + int(fraction * 4), 100, f"Đang cắt video vùng ROI để gỡ lỗi… {fraction:.0%}")
+            return not reporter.is_cancelled()
+
+        try:
+            result = self._roi_clip_exporter.export(
+                request.video_path, roi, clip_path, prefer_gpu=prefer_gpu, progress=on_progress,
+                quality=int(getattr(request, "roi_clip_quality", 24) or 24),
+            )
+        except Exception as exc:  # noqa: BLE001 — phần phụ: không được phá lượt trích xuất
+            logger.warning("Xuất video vùng ROI lỗi: %s", exc)
+            return
+        if result is None:
+            logger.warning("Không xuất được video vùng ROI cho %s.", raw_ocr_file_path.name)
+
+    @staticmethod
+    def _drop_dark_boxes(
+        results: list[OcrFrameResult], batch_queue: list[SampledFrame], request: ExtractSubtitlesRequest,
+    ) -> list[OcrFrameResult]:
+        """[v3.23.727] Lọc chữ sáng ở mức HỘP: bỏ hộp OCR tối + tin cậy thấp (vật màu trong cảnh đọc nhầm thành chữ).
+
+        Chạy TRƯỚC khi đổi toạ độ VRAM về khung gốc: lúc này hộp và ``frame.image_rgb`` (đúng ảnh OCR đã đọc — ảnh gốc
+        ở nhánh CPU, ảnh đã tiền xử lý trên VRAM ở nhánh NVDEC) cùng một hệ toạ độ. Chỉ khi bật "Lọc chữ sáng".
+        """
+        sampling = request.sampling
+        if not getattr(sampling, "white_text_gate", False):
+            return results
+        from subtitles_extractor.application.services.bright_text_check import (
+            drop_dark_boxes,
+        )
+
+        border_px = int(sampling.vram_border_thickness_px) if sampling.vram_add_border else 0
+        luma = int(getattr(sampling, "white_text_luma", 200) or 200)
+        cleaned: list[OcrFrameResult] = []
+        dropped = 0
+        for result, frame in zip(results, batch_queue, strict=True):
+            kept, count = drop_dark_boxes(result, frame.image_rgb, luma, border_px)
+            if count:
+                dropped += count
+                logger.debug(
+                    "Khung %.2f s: bỏ %d hộp chữ tối (không có điểm sáng — vật trong cảnh, không phải phụ đề).",
+                    frame.timestamp_sec, count,
+                )
+            cleaned.append(kept)
+        return cleaned
+
     def _reverse_vram_geometry(
-        self, raw_results: list[OcrFrameResult], batch_queue: list[SampledFrame], 
+        self, raw_results: list[OcrFrameResult], batch_queue: list[SampledFrame],
         request: ExtractSubtitlesRequest, metadata: VideoMetadata
     ) -> list[OcrFrameResult]:
         """Tịnh tiến ngược Hệ quy chiếu Tọa độ VRAM về lại Khung hình Gốc."""
         if not request.sampling.vram_upscale_small_text and not request.sampling.vram_add_border:
             return raw_results
-            
+
         roi = effective_roi(request.roi, metadata.width, metadata.height)  # [v3.23.655] chiều cao THẬT đã cắt
         orig_h = roi.height if roi else metadata.height
         border_px = request.sampling.vram_border_thickness_px if request.sampling.vram_add_border else 0
-        
+
         reversed_results = []
         for result, frame in zip(raw_results, batch_queue, strict=True):
             prep_h = frame.image_rgb.shape[0]
             scaled_h = prep_h - 2 * border_px
             scale = scaled_h / float(orig_h) if orig_h > 0 else 1.0
-            
+
             if abs(scale - 1.0) < 1e-4 and border_px == 0:
                 reversed_results.append(result)
                 continue
-                
+
             safe_scale = max(1e-5, scale)
             new_boxes = []
             for box in result.text_boxes:
@@ -978,116 +1405,8 @@ class ExtractSubtitlesUseCase:
                 ]
                 new_boxes.append(dataclasses.replace(box, polygon=reversed_poly))
             reversed_results.append(dataclasses.replace(result, text_boxes=new_boxes))
-            
+
         return reversed_results
-
-    def _save_annotated_raw_frames(
-        self,
-        batch_queue: list[SampledFrame],
-        ocr_results: list[OcrFrameResult],
-        raw_json_path: Path,
-    ) -> None:
-        try:
-            from PySide6.QtCore import QPoint
-            from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
-        except ImportError:
-            return
-
-        base_name = raw_json_path.name
-        for extension in (".gz", ".json", ".seraw"):
-            base_name = base_name.replace(extension, "")
-        image_directory = raw_json_path.parent / f"{base_name}_ocr_images"
-
-        input_directory = image_directory / "input"
-        output_directory = image_directory / "output"
-        input_directory.mkdir(parents=True, exist_ok=True)
-        output_directory.mkdir(parents=True, exist_ok=True)
-
-        box_color = QColor(0, 255, 0)
-        text_shadow_color = QColor(0, 0, 0)
-        text_fill_color = QColor(255, 255, 0)
-        conf_fill_color = QColor(0, 255, 255)
-
-        for sampled_frame, frame_result in zip(batch_queue, ocr_results, strict=True):
-            if sampled_frame.image_rgb.size == 0:
-                continue
-
-            file_name = (
-                f"frame_{sampled_frame.frame_index:06d}_"
-                f"{int(sampled_frame.timestamp_sec * 1000)}ms.jpg"
-            )
-
-            image_h, image_w = sampled_frame.image_rgb.shape[:2]
-            channels = (
-                sampled_frame.image_rgb.shape[2]
-                if sampled_frame.image_rgb.ndim == 3
-                else 1
-            )
-            if channels != 3:
-                logger.debug(
-                    "Bỏ qua frame #%d: cần ảnh RGB 3 kênh, nhận được %d kênh.",
-                    sampled_frame.frame_index, channels,
-                )
-                continue
-
-            contiguous_rgb = np.ascontiguousarray(sampled_frame.image_rgb, dtype=np.uint8)
-            qt_input_image = QImage(
-                contiguous_rgb.data, image_w, image_h, image_w * channels,
-                QImage.Format.Format_RGB888,
-            ).copy()
-
-            qt_input_image.save(str(input_directory / file_name), "JPG", quality=85)
-
-            qt_output_image = qt_input_image.copy()
-            painter = QPainter(qt_output_image)
-            try:
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-                box_pen = QPen(box_color, max(2, image_h // 300))
-                text_shadow_pen = QPen(text_shadow_color, 3)
-                text_fill_pen = QPen(text_fill_color, 1)
-                conf_shadow_pen = QPen(text_shadow_color, 2)
-                conf_fill_pen = QPen(conf_fill_color, 1)
-
-                large_font = QFont()
-                large_font.setPointSize(max(12, image_h // 35))
-                large_font.setBold(True)
-
-                small_font = QFont()
-                small_font.setPointSize(max(9, image_h // 60))
-                small_font.setBold(True)
-
-                for text_box in frame_result.text_boxes:
-                    if not text_box.polygon:
-                        continue
-
-                    points = [QPoint(int(x), int(y)) for x, y in text_box.polygon]
-
-                    painter.setPen(box_pen)
-                    point_count = len(points)
-                    for i in range(point_count):
-                        painter.drawLine(points[i], points[(i + 1) % point_count])
-
-                    anchor_x = points[0].x()
-                    anchor_y = points[0].y()
-                    text_y = max(0, anchor_y - 5)
-
-                    painter.setFont(large_font)
-                    painter.setPen(text_shadow_pen)
-                    painter.drawText(anchor_x + 1, text_y + 1, text_box.text)
-                    painter.setPen(text_fill_pen)
-                    painter.drawText(anchor_x, text_y, text_box.text)
-
-                    confidence_label = f"{float(text_box.confidence):.2f}"
-                    painter.setFont(small_font)
-                    painter.setPen(conf_shadow_pen)
-                    painter.drawText(anchor_x, anchor_y + 15, confidence_label)
-                    painter.setPen(conf_fill_pen)
-                    painter.drawText(anchor_x, anchor_y + 15, confidence_label)
-            finally:
-                painter.end()
-
-            qt_output_image.save(str(output_directory / file_name), "JPG", quality=85)
 
     @staticmethod
     def _save_raw_ocr_payload(
@@ -1101,7 +1420,7 @@ class ExtractSubtitlesUseCase:
                 save_raw_ocr,
             )
             roi_coordinates_list = [request.roi.x, request.roi.y, request.roi.width, request.roi.height] if request.roi else None
-            
+
             # [LƯU TRỮ CẤU HÌNH TIỀN XỬ LÝ VÀ OCR VÀO JSON]
             preprocess_dict = {
                 "upscale_small_text": request.ocr.preprocess.upscale_small_text or request.sampling.vram_upscale_small_text,

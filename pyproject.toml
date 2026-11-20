@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "subtitles-extractor"
-version = "3.23.726"
+version = "3.23.777"
 description = "Subtitle Studio — trích xuất, dịch, lồng tiếng và xuất bản phụ đề video (Clean Architecture)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,6 +31,11 @@ dependencies = [
     "paddlepaddle>=3.0",
     # [v3.23.595] PP-OCRv6 (model mặc định) chỉ có từ PaddleOCR 3.7.0.
     "paddleocr>=3.7.0",
+    # [v3.23.733] PaddleOCR-VL-1.6 (soát câu / chạy chính): tokenizer + bộ mã hoá ảnh.
+    "sentencepiece>=0.2",
+    "einops>=0.8",
+    "Jinja2>=3.1",
+    "safetensors>=0.4",
     # Video / ảnh / âm thanh
     "python-mpv>=1.0",
     "opencv-contrib-python>=4.9",

@@ -22,19 +22,13 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
-    QMessageBox,
 )
-from subtitles_extractor.presentation.fluent_compat import InfoBar, InfoBarPosition, themeColor
-from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
-from subtitles_extractor.presentation.theme import colors as _c
-from subtitles_extractor.presentation.theme import metrics as _m
-from subtitles_extractor.presentation.theme.styles import caption_style
-from subtitles_extractor.presentation.widgets.section_card import SectionCard
 
 from subtitles_extractor.composition.container import ApplicationContainer
 from subtitles_extractor.domain.value_objects.device_kind import (
@@ -42,13 +36,24 @@ from subtitles_extractor.domain.value_objects.device_kind import (
     PrecisionMode,
     SubtitleFormat,
 )
+from subtitles_extractor.domain.value_objects.ocr_model_names import PADDLE_VL_VERSION
 from subtitles_extractor.infrastructure.settings.application_settings import (
     ApplicationSettings,
 )
+from subtitles_extractor.presentation.fluent_compat import (
+    InfoBar,
+    InfoBarPosition,
+    themeColor,
+)
+from subtitles_extractor.presentation.theme import colors as _c
+from subtitles_extractor.presentation.theme import metrics as _m
+from subtitles_extractor.presentation.theme.styles import caption_style
+from subtitles_extractor.presentation.utils.wheel_guard import protect_scroll_widgets
 from subtitles_extractor.presentation.view_models.settings_page_view_model import (
     SettingsPageViewModel,
 )
-from subtitles_extractor.presentation.utils.wheel_guard import protect_scroll_widgets
+from subtitles_extractor.presentation.widgets.section_card import SectionCard
+from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +65,8 @@ class SettingsPage(QWidget):
         self.setObjectName("settingsPage")
         self._thread_keeper = WorkerThreadKeeper(self)
         self._translator = container.translator
+        # [v3.23.738] Ngôn ngữ giao diện đang hiển thị (dựng lúc khởi động) — đổi thì báo cần khởi động lại.
+        self._startup_locale = str(getattr(container.settings_service.current.ui, "locale", "") or "")
         self._view_model = SettingsPageViewModel(container, parent=self)
 
         # [V3.15 UX] Cờ khóa vòng lặp Event khi đang đổ dữ liệu vào Form
@@ -184,6 +191,7 @@ class SettingsPage(QWidget):
 
         self._cb_ocr_version = QComboBox()
         for label, key in[
+            (self._translator.translate("settings.co_paddle_vl"), PADDLE_VL_VERSION),
             (self._translator.translate("settings.co_ocrv6_medium"), "PP-OCRv6_medium"),
             (self._translator.translate("settings.co_ocrv6_small"), "PP-OCRv6_small"),
             (self._translator.translate("settings.co_ocrv6_tiny"), "PP-OCRv6_tiny"),
@@ -196,6 +204,24 @@ class SettingsPage(QWidget):
             self._translator.translate("settings.tip_ocr_model")
         )
         ocr_form.addRow(self._translator.translate("settings.rl_ocr_version"), self._cb_ocr_version)
+        # [v3.23.733] Soát câu nghi ngờ bằng PaddleOCR-VL-1.6.
+        self._chk_verify_vl = QCheckBox(self._translator.translate("settings.cb_verify_vl"))
+        self._chk_verify_vl.setToolTip(self._translator.translate("settings.tip_verify_vl"))
+        ocr_form.addRow("", self._chk_verify_vl)
+        # [v3.23.738] Hai hằng số của lượt soát đưa ra Cài đặt.
+        self._sp_verify_max = QSpinBox(); self._sp_verify_max.setRange(10, 5000); self._sp_verify_max.setSingleStep(50)
+        self._sp_verify_max.setToolTip(self._translator.translate("settings.tip_verify_max"))
+        ocr_form.addRow(self._translator.translate("settings.rl_verify_max"), self._sp_verify_max)
+        self._sp_vl_low_conf = QDoubleSpinBox(); self._sp_vl_low_conf.setRange(0.5, 1.0)
+        self._sp_vl_low_conf.setSingleStep(0.01); self._sp_vl_low_conf.setDecimals(2)
+        self._sp_vl_low_conf.setToolTip(self._translator.translate("settings.tip_vl_low_conf"))
+        ocr_form.addRow(self._translator.translate("settings.rl_vl_low_conf"), self._sp_vl_low_conf)
+        # [v3.23.745] Bộ đọc của gói kiểm định chất lượng ("Xuất dữ liệu thô OCR"): GLM-OCR tải khi dùng lần đầu.
+        self._cb_qa_reader = QComboBox()
+        self._cb_qa_reader.addItem(self._translator.translate("settings.qa_reader_paddle_vl"), userData="paddle_vl")
+        self._cb_qa_reader.addItem(self._translator.translate("settings.qa_reader_glm_ocr"), userData="glm_ocr")
+        self._cb_qa_reader.setToolTip(self._translator.translate("settings.tip_qa_reader"))
+        ocr_form.addRow(self._translator.translate("settings.rl_qa_reader"), self._cb_qa_reader)
 
         # [v3.23.657] Bộ dò chữ riêng (rỗng = theo phiên bản) — đề xuất của "Đo tốc độ OCR" ghi vào đây.
         self._cb_det_override = QComboBox()
@@ -299,6 +325,34 @@ class SettingsPage(QWidget):
 
         self._chk_tensorrt = QCheckBox(self._translator.translate("settings.cb_tensorrt"))
         hw_form.addRow(self._translator.translate("settings.rl_tensorrt"), self._chk_tensorrt)
+        # [v3.23.776] Cỡ lô engine TensorRT (chủ dự án: đưa vào cài đặt + gợi ý theo VRAM).
+        self._sp_trt_det_batch = QSpinBox(); self._sp_trt_det_batch.setRange(1, 64)
+        self._sp_trt_det_batch.setToolTip(self._translator.translate("settings.tip_trt_det_batch"))
+        hw_form.addRow(self._translator.translate("settings.rl_trt_det_batch"), self._sp_trt_det_batch)
+        self._sp_trt_rec_batch = QSpinBox(); self._sp_trt_rec_batch.setRange(8, 128)
+        self._sp_trt_rec_batch.setToolTip(self._translator.translate("settings.tip_trt_rec_batch"))
+        hw_form.addRow(self._translator.translate("settings.rl_trt_rec_batch"), self._sp_trt_rec_batch)
+        self._btn_trt_batch_suggest = QPushButton(self._translator.translate("settings.trt_batch_suggest_btn"))
+        self._btn_trt_batch_suggest.clicked.connect(self._on_suggest_trt_batches)
+        self._lbl_trt_batch_hint = QLabel(self._translator.translate("settings.trt_batch_hint"))
+        self._lbl_trt_batch_hint.setWordWrap(True)
+        hw_form.addRow("", self._btn_trt_batch_suggest)
+        hw_form.addRow("", self._lbl_trt_batch_hint)
+        self._chk_tensorrt.toggled.connect(self._update_trt_batch_enabled)
+        self._update_trt_batch_enabled(self._chk_tensorrt.isChecked())
+        # [v3.23.755] TensorRT không kèm trong bản paddle của ứng dụng — tải lúc chạy (~1,6 GB, kho NVIDIA).
+        from PySide6.QtWidgets import QHBoxLayout as _QHBoxLayout
+
+        trt_row = _QHBoxLayout()
+        self._btn_tensorrt = QPushButton(self._translator.translate("settings.trt_btn"))
+        self._btn_tensorrt.setToolTip(self._translator.translate("settings.trt_tip"))
+        self._btn_tensorrt.clicked.connect(self._on_install_tensorrt_clicked)
+        self._lbl_tensorrt_status = QLabel("")
+        self._lbl_tensorrt_status.setWordWrap(True)
+        trt_row.addWidget(self._btn_tensorrt)
+        trt_row.addWidget(self._lbl_tensorrt_status, 1)
+        hw_form.addRow(self._translator.translate("settings.trt_row"), trt_row)
+        self._refresh_tensorrt_status()
 
         # [v3.23.375] Bản build nhỏ KHÔNG nhúng CUDA (~2.3GB) — tải lúc chạy để bật GPU OCR.
         from PySide6.QtWidgets import QHBoxLayout
@@ -648,6 +702,7 @@ class SettingsPage(QWidget):
         form.addRow(self._translator.translate("settings.rl_line_sim"), self._sp_line_similarity)
 
         self._sp_drop_short = QSpinBox(); self._sp_drop_short.setRange(0, 20)
+        self._sp_drop_short.setToolTip(self._translator.translate("settings.tip_drop_short"))  # [v3.23.738]
         form.addRow(self._translator.translate("settings.rl_drop_short"), self._sp_drop_short)
 
         scroll_layout.addWidget(group)
@@ -1076,6 +1131,10 @@ class SettingsPage(QWidget):
 
         self._chk_keep_temp = QCheckBox(self._translator.translate("settings.cb_keep_temp"))
         form.addRow(self._translator.translate("settings.rl_temp_file"), self._chk_keep_temp)
+        # [v3.23.738] Chất lượng video vùng ROI (trước: hằng 24).
+        self._sp_roi_clip_quality = QSpinBox(); self._sp_roi_clip_quality.setRange(16, 34)
+        self._sp_roi_clip_quality.setToolTip(self._translator.translate("settings.tip_roi_clip_quality"))
+        form.addRow(self._translator.translate("settings.rl_roi_clip_quality"), self._sp_roi_clip_quality)
 
         self._chk_disable_pdx_check = QCheckBox(self._translator.translate("settings.cb_skip_pdx"))
         form.addRow(self._translator.translate("settings.rl_paddle_net"), self._chk_disable_pdx_check)
@@ -1200,6 +1259,10 @@ class SettingsPage(QWidget):
             self._sp_det_box_thresh.setValue(snapshot.ocr.det_box_thresh)
             self._sp_det_unclip_ratio.setValue(snapshot.ocr.det_unclip_ratio)
             self._chk_textline_orient.setChecked(snapshot.ocr.use_textline_orientation)
+            self._chk_verify_vl.setChecked(bool(getattr(snapshot.ocr, "verify_with_vl", True)))
+            self._sp_verify_max.setValue(int(snapshot.ocr.verify_max_lines))
+            self._sp_vl_low_conf.setValue(float(snapshot.ocr.vl_low_confidence))
+            _set_combo(self._cb_qa_reader, str(getattr(snapshot.ocr, "qa_reader", "paddle_vl")))
             self._chk_doc_orient.setChecked(snapshot.ocr.use_doc_orientation_classify)
             self._chk_doc_unwarp.setChecked(snapshot.ocr.use_doc_unwarping)
 
@@ -1212,6 +1275,9 @@ class SettingsPage(QWidget):
             self._chk_auto_tune.setChecked(snapshot.hardware.auto_tune_batch)
             self._chk_mkldnn.setChecked(snapshot.hardware.enable_mkldnn)
             self._chk_tensorrt.setChecked(snapshot.hardware.use_tensorrt)
+            self._sp_trt_det_batch.setValue(int(getattr(snapshot.hardware, "trt_det_batch", 16)))
+            self._sp_trt_rec_batch.setValue(int(getattr(snapshot.hardware, "trt_rec_batch", 32)))
+            self._update_trt_batch_enabled(snapshot.hardware.use_tensorrt)
             _set_combo(self._cb_frame_backend, snapshot.hardware.frame_decoder_backend)
             _set_combo(self._cb_metadata_backend, snapshot.hardware.metadata_reader_backend)
 
@@ -1307,6 +1373,7 @@ class SettingsPage(QWidget):
             self._le_debug_frames_dir.setEnabled(snapshot.advanced.save_debug_frames)
             self._btn_browse_debug.setEnabled(snapshot.advanced.save_debug_frames)
             self._chk_keep_temp.setChecked(snapshot.advanced.keep_temp_files)
+            self._sp_roi_clip_quality.setValue(int(snapshot.advanced.roi_clip_quality))
             self._chk_disable_pdx_check.setChecked(snapshot.advanced.disable_paddle_network_check)
 
             vc = getattr(snapshot, "video_context", None)
@@ -1353,6 +1420,10 @@ class SettingsPage(QWidget):
                 "det_box_thresh": self._sp_det_box_thresh.value(),
                 "det_unclip_ratio": self._sp_det_unclip_ratio.value(),
                 "use_textline_orientation": self._chk_textline_orient.isChecked(),
+                "verify_with_vl": self._chk_verify_vl.isChecked(),
+                "verify_max_lines": self._sp_verify_max.value(),
+                "vl_low_confidence": self._sp_vl_low_conf.value(),
+                "qa_reader": self._cb_qa_reader.currentData() or "paddle_vl",
                 "use_doc_orientation_classify": self._chk_doc_orient.isChecked(),
                 "use_doc_unwarping": self._chk_doc_unwarp.isChecked(),
             },
@@ -1366,6 +1437,8 @@ class SettingsPage(QWidget):
                 "auto_tune_batch": self._chk_auto_tune.isChecked(),
                 "enable_mkldnn": self._chk_mkldnn.isChecked(),
                 "use_tensorrt": self._chk_tensorrt.isChecked(),
+                "trt_det_batch": self._sp_trt_det_batch.value(),
+                "trt_rec_batch": self._sp_trt_rec_batch.value(),
                 "frame_decoder_backend": self._cb_frame_backend.currentData(),
                 "metadata_reader_backend": self._cb_metadata_backend.currentData(),
             },
@@ -1456,6 +1529,7 @@ class SettingsPage(QWidget):
                 "save_debug_frames": self._chk_save_debug.isChecked(),
                 "debug_frames_dir": self._le_debug_frames_dir.text().strip(),
                 "keep_temp_files": self._chk_keep_temp.isChecked(),
+                "roi_clip_quality": self._sp_roi_clip_quality.value(),
                 "disable_paddle_network_check": self._chk_disable_pdx_check.isChecked(),
             },
             "video_context": {
@@ -1497,6 +1571,14 @@ class SettingsPage(QWidget):
     def _on_saved(self, _snapshot: ApplicationSettings) -> None:
         # [v3.20.3 #4] Toast Fluent thay vì đổi chữ ở góc + khoá nút (Smart Dirty).
         self._mark_clean()
+        # [v3.23.738] Ngôn ngữ giao diện dựng một lần lúc khởi động: đổi mà không báo thì người dùng tưởng không ăn.
+        new_locale = getattr(getattr(_snapshot, "ui", None), "locale", None)
+        if new_locale and self._startup_locale and new_locale != self._startup_locale:
+            InfoBar.warning(
+                self._translator.translate("settings.dlg_saved_title"),
+                self._translator.translate("settings.msg_restart_locale"),
+                parent=self, position=InfoBarPosition.TOP_RIGHT, duration=8000,
+            )
         InfoBar.success(
             self._translator.translate("settings.dlg_saved_title"),
             self._translator.translate("settings.dlg_saved_body"),
@@ -1638,6 +1720,121 @@ class SettingsPage(QWidget):
         container_dir = self._view_model.user_data_dir
         MpvDllManager(app_data_dir=container_dir).remove()
         self._refresh_mpv_dll_status()
+
+    # ── [v3.23.755] Tải TensorRT lúc chạy (mẫu CUDA runtime) ─────────────────────────
+    def _tensorrt_dir(self) -> Path:
+        from subtitles_extractor.infrastructure.model_store import (
+            ensure_model_store_root,
+        )
+        from subtitles_extractor.infrastructure.ocr.tensorrt_runtime_plan import (
+            TENSORRT_RUNTIME_DIRNAME,
+        )
+
+        return ensure_model_store_root() / TENSORRT_RUNTIME_DIRNAME
+
+    def _refresh_tensorrt_status(self) -> None:
+        from subtitles_extractor.infrastructure.ocr.tensorrt_runtime_plan import (
+            is_tensorrt_installed,
+        )
+
+        try:
+            installed = is_tensorrt_installed(self._tensorrt_dir())
+        except OSError:
+            return
+        key = "settings.trt_installed" if installed else "settings.trt_needs"
+        self._lbl_tensorrt_status.setText(self._translator.translate(key))
+        self._btn_tensorrt.setEnabled(not installed)
+
+    def _update_trt_batch_enabled(self, enabled: bool) -> None:
+        """[v3.23.776] Cỡ lô engine chỉ có tác dụng khi bật TensorRT."""
+        for widget in (self._sp_trt_det_batch, self._sp_trt_rec_batch, self._btn_trt_batch_suggest):
+            widget.setEnabled(bool(enabled))
+
+    def _on_suggest_trt_batches(self) -> None:
+        """[v3.23.776] Điền cỡ lô engine gợi ý theo tổng VRAM GPU (``nvidia-smi``); người dùng bấm Lưu mới dùng."""
+        from subtitles_extractor.infrastructure.ocr.tensorrt_runtime_plan import (
+            suggest_trt_batches,
+        )
+        from subtitles_extractor.infrastructure.tts.vieneu_batch_tuning import (
+            detect_total_vram_gb,
+        )
+
+        vram = detect_total_vram_gb()
+        det, rec = suggest_trt_batches(vram)
+        self._sp_trt_det_batch.setValue(det)
+        self._sp_trt_rec_batch.setValue(rec)
+        if vram is None:
+            text = self._translator.translate("settings.trt_batch_no_gpu").format(det=det, rec=rec)
+        else:
+            text = self._translator.translate("settings.trt_batch_suggested").format(vram=vram, det=det, rec=rec)
+        self._lbl_trt_batch_hint.setText(text)
+
+    def _on_install_tensorrt_clicked(self) -> None:
+        from subtitles_extractor.infrastructure.process.embedded_python import (
+            resolve_installer_python,
+        )
+        from subtitles_extractor.infrastructure.stt.whisperx_installer import (
+            find_system_python,
+        )
+
+        if getattr(self, "_trt_thread", None) is not None:
+            return
+        python_exe = resolve_installer_python(find_system_python())
+        if not python_exe:
+            QMessageBox.warning(
+                self, self._translator.translate("settings.gpu_ocr_no_python_title"),
+                self._translator.translate("settings.gpu_ocr_no_python_body"),
+            )
+            return
+        answer = QMessageBox.question(
+            self, self._translator.translate("settings.trt_confirm_title"),
+            self._translator.translate("settings.trt_confirm_body"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        from PySide6.QtCore import QThread
+
+        from subtitles_extractor.presentation.workers.install_tensorrt_runtime_worker import (
+            InstallTensorRtRuntimeWorker,
+        )
+
+        self._btn_tensorrt.setEnabled(False)
+        self._lbl_tensorrt_status.setText(self._translator.translate("settings.trt_downloading"))
+        thread = QThread(self)
+        worker = InstallTensorRtRuntimeWorker(python_exe, self._tensorrt_dir())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_tensorrt_install_progress)
+        worker.finished.connect(self._on_tensorrt_install_finished)
+        worker.failed.connect(self._on_tensorrt_install_failed)
+        worker.done.connect(self._cleanup_tensorrt_thread, Qt.ConnectionType.QueuedConnection)
+        self._trt_thread = thread
+        self._trt_worker = worker
+        thread.start()
+
+    def _on_tensorrt_install_progress(self, pct: int, msg: str) -> None:
+        self._lbl_tensorrt_status.setText(f"{msg} ({pct}%)")
+
+    def _on_tensorrt_install_finished(self, _trt_dir: object) -> None:
+        QMessageBox.information(
+            self, self._translator.translate("settings.trt_done_title"),
+            self._translator.translate("settings.trt_done_body"),
+        )
+
+    def _on_tensorrt_install_failed(self, message: str) -> None:
+        self._lbl_tensorrt_status.setText(self._translator.translate("settings.trt_failed_status"))
+        QMessageBox.warning(self, self._translator.translate("settings.trt_failed_title"), message)
+
+    def _cleanup_tensorrt_thread(self) -> None:
+        thread = getattr(self, "_trt_thread", None)
+        if thread is not None:
+            thread.quit()
+            thread.wait(3000)
+        self._trt_thread = None
+        self._trt_worker = None
+        self._refresh_tensorrt_status()
 
     # ── [v3.23.375] Bật tăng tốc GPU (OCR): tải CUDA runtime lúc chạy ────────────
     def _cuda_dir(self) -> Path:

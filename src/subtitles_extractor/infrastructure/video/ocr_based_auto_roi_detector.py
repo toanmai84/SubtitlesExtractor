@@ -88,8 +88,12 @@ class OcrBasedAutoRoiDetector:
         parent_widget: object | None = None,
         analyzer_kwargs_provider: "Callable[[], dict] | None" = None,
         analysis_max_side: int | None = None,
+        translator: object | None = None,
     ) -> None:
         self._ocr_engine = ocr_engine
+        # [v3.23.736] Bộ dịch cho hộp thoại duyệt ROI của ``detect()`` (trước gọi ``review_clusters`` không truyền →
+        # hộp thoại hiện nguyên khoá chuỗi).
+        self._translator = translator
         # [v3.23.619] Cạnh dài tối đa của khung khi OCR để DÒ VỊ TRÍ phụ đề (None = nguyên
         # cỡ). Bước này chỉ cần toạ độ các ô chữ, không cần đọc đúng chữ; khung được thu
         # nhỏ trước khi OCR rồi quy toạ độ về khung gốc. Bước trích xuất chính không đổi.
@@ -203,7 +207,7 @@ class OcrBasedAutoRoiDetector:
         if not self._show_review_ui:
             return _clusters_to_rois(result.clusters)
 
-        return self.review_clusters(result, parent_widget=self._parent_widget)
+        return self.review_clusters(result, parent_widget=self._parent_widget, translator=self._translator)
 
     def detect_primary_subtitle_roi(
         self,

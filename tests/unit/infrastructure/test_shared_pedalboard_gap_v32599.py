@@ -53,16 +53,11 @@ def test_preserve_pitch_falls_back_when_pedalboard_missing(monkeypatch) -> None:
 
 
 def test_stretch_with_pedalboard_returns_none_when_missing(monkeypatch) -> None:
-    import builtins
+    # [v3.23.734] Giả lập thiếu module qua sys.modules, KHÔNG thay builtins.__import__: __feature_import__ của PySide6
+    # tạm tráo builtins.__import__ không an toàn đa luồng → luồng nền import đúng lúc sẽ ghi lại bản giả sau khi hoàn tác.
+    import sys
 
-    real_import = builtins.__import__
-
-    def _fake_import(name, *args, **kwargs):
-        if name == "pedalboard":
-            raise ImportError("No module named 'pedalboard'")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    monkeypatch.setitem(sys.modules, "pedalboard", None)
     assert stretch_with_pedalboard(_tone(0.5), _SR, 2.0) is None
 
 

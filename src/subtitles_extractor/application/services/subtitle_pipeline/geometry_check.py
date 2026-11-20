@@ -369,8 +369,93 @@ def accept_reocr_text(current: str, note: str, reread_texts: Sequence[str]) -> s
     return None
 
 
+def arbitrate_disputed_verdict(current: str, verdict: str, corpus: Sequence[str]) -> str:
+    """[v3.23.729] Bản cuối cho câu "hai bản đọc" sau khi bỏ phiếu đọc lại (hàm thuần).
+
+    Bỏ phiếu đọc lại dùng ảnh gốc với CÙNG mô hình nên vẫn mang thiên lệch của nó. Lượt chạy thật phim "[全集]" (bản
+    3.23.728, model small): 3 câu bị đổi thì 2 câu đổi SAI — "龌龊" → "握龊" (9 khung) và "注入" → "注人" (8 khung). Hai
+    lớp bảo vệ (giống hệt luật khâu dựng đã áp cho bản đang có):
+
+    * chữ "dính liền" (``restore_bound_words``): "握龊" được sửa lại thành "龌龊";
+    * [v3.23.730] kana trông giống chữ Hán ("ハ刀" — lượt thật phim "大乾悍刀行") quy về chữ Hán;
+    * bản đọc lại chỉ khác bản đang có ở cặp chữ dễ lẫn hình (人/入, 干/千…) mà ngữ liệu chính phim nghiêng hẳn về bản
+      đang có ("注入" có ở câu khác, "注人" thì không) → giữ bản đang có. Hoà → theo phiếu đọc lại như trước.
+    """
+    from subtitles_extractor.application.services.subtitle_pipeline.read_fusion import (
+        corpus_keeps_current,
+        corpus_prefers_current,
+    )
+    from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
+        _KANA_TO_HAN,
+        kana_to_han,
+        restore_bound_words,
+    )
+
+    current_key, verdict_key = _key(current), _key(restore_bound_words(verdict))
+    # [v3.23.730] Bản đọc lại trên ảnh gốc hay ra kana ("八刀" → "ハ刀"); bản đang có không chứa kana đó thì quy về chữ Hán.
+    if not any(ch in _KANA_TO_HAN for ch in current_key):
+        verdict_key = kana_to_han(verdict_key)
+    if not current_key or not verdict_key or verdict_key == current_key:
+        return verdict_key or verdict
+    corpus_keys = [_key(line) for line in corpus]
+    if corpus_keeps_current(current_key, verdict_key, corpus_keys):
+        return current_key
+    # [v3.23.736] Khác đúng một chữ ngoài bảng dễ lẫn ("吩咐" → "分咐"): ngữ liệu phim có cụm cũ, không có cụm mới → giữ.
+    if corpus_prefers_current(current_key, verdict_key, corpus_keys):
+        return current_key
+    return verdict_key
+
+
+#: [v3.23.733] Câu chữ Hán tin cậy dưới mức này được soát lại bằng PaddleOCR-VL (khi bật).
+OCR_NOTE_LOW_CONFIDENCE = "low_confidence"
+VL_LOW_CONFIDENCE = 0.90
+VL_MIN_AGREEING_READS = 2
+
+
+def accept_vl_reread(current: str, reread_texts: Sequence[str], corpus: Sequence[str] | None = None) -> str | None:
+    """[v3.23.733] Bản đọc PaddleOCR-VL thay cho câu tin cậy thấp, hoặc ``None`` (hàm thuần).
+
+    Nhận khi ≥ :data:`VL_MIN_AGREEING_READS` lần đọc VL cùng ra MỘT bản toàn chữ Hán, khác bản đang có, và hơn kém
+    nhiều nhất MỘT chữ (đổi chữ đọc nhầm "霍" → "嚯", "腌攒" → "腌臜"; không thay cả câu bằng chữ khác hẳn). Đo trên 148
+    dòng phụ đề thật: VL đúng 146/148 (PP-OCRv6 small 143/148).
+
+    [v3.23.736] Lượt thật phim "合欢宗…": VL ra chữ PHỒN THỂ ("接下来" → "接下來") → quy về giản thể trước khi so; có
+    ``corpus`` (các câu của phim) mà ngữ liệu nghiêng hẳn về bản đang có ("吩咐" → "分咐") → không đổi.
+    """
+    from subtitles_extractor.application.services.subtitle_pipeline.read_fusion import (
+        corpus_keeps_current,
+        corpus_prefers_current,
+    )
+    from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
+        normalize_traditional_to_simplified,
+    )
+
+    base = normalize_traditional_to_simplified(_key(current))
+    counts: dict[str, int] = {}
+    for text in reread_texts:
+        key = normalize_traditional_to_simplified(_key(text))
+        if key and _is_han(key):
+            counts[key] = counts.get(key, 0) + 1
+    if not base or not counts:
+        return None
+    best, votes = max(counts.items(), key=lambda item: item[1])
+    if votes < VL_MIN_AGREEING_READS or sum(1 for count in counts.values() if count == votes) > 1:
+        return None
+    if best == base or abs(len(best) - len(base)) > 1:
+        return None
+    if corpus is not None:
+        corpus_keys = [_key(line) for line in corpus]
+        if corpus_keeps_current(base, best, corpus_keys) or corpus_prefers_current(base, best, corpus_keys):
+            return None
+    return best
+
+
 __all__ = [
     "OCR_NOTE_DISPUTED",
+    "OCR_NOTE_LOW_CONFIDENCE",
+    "VL_LOW_CONFIDENCE",
+    "accept_vl_reread",
+    "arbitrate_disputed_verdict",
     "OCR_NOTE_REOCR_FIXED",
     "accept_disputed_reread",
     "accept_reocr_text",

@@ -74,7 +74,7 @@ class RawOcrMeta:
     score_threshold: float
     saved_at: str
     roi_xywh: list[int] | None = None
-    app_version: str = "3.23.726"
+    app_version: str = "3.23.777"
     preprocess: dict[str, Any] | None = None
     advanced_ocr: dict[str, Any] | None = None
     boundary: dict[str, Any] | None = None

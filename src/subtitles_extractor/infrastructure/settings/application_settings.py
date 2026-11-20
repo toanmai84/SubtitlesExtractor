@@ -51,6 +51,16 @@ class OcrSettings(BaseSettings):
     use_textline_orientation: bool = Field(default=False)
     use_doc_orientation_classify: bool = Field(default=False)
     use_doc_unwarping: bool = Field(default=False)
+    # [v3.23.733] Soát câu nghi ngờ bằng PaddleOCR-VL-1.6 (tải ~2 GB lần đầu, chỉ đọc vài chục–vài trăm câu mỗi phim).
+    verify_with_vl: bool = Field(default=True)
+    # [v3.23.738] Số câu tối đa được soát lại mỗi lượt (trước: hằng 200 — vượt thì BỎ soát cả lượt). Vượt giới hạn: soát
+    # câu đáng ngờ nhất trước (cờ hình học / hai bản đọc, rồi câu tin cậy thấp nhất).
+    verify_max_lines: int = Field(default=400, ge=10, le=5000)
+    # [v3.23.738] Câu chữ Hán tin cậy dưới ngưỡng này được PaddleOCR-VL soát lại (trước: hằng 0,90).
+    vl_low_confidence: float = Field(default=0.90, ge=0.5, le=1.0)
+    # [v3.23.745] Bộ đọc của gói kiểm định chất lượng: "paddle_vl" (có sẵn) hoặc "glm_ocr" (tải ~1,9 GB khi dùng lần
+    # đầu, chạy llama.cpp tiến trình riêng; đo 457 câu: GLM-OCR 57/57 câu bất đồng, PaddleOCR-VL 50/57).
+    qa_reader: str = Field(default="paddle_vl", pattern="^(paddle_vl|glm_ocr)$")
 
 class HardwareSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SE_HW_", extra="ignore")
@@ -66,6 +76,9 @@ class HardwareSettings(BaseSettings):
     auto_tune_batch: bool = False
     use_tensorrt: bool = False
     precision: PrecisionMode = PrecisionMode.FP32
+    # [v3.23.776] Lô lớn nhất engine TensorRT (bộ dò ảnh / bộ nhận dạng dòng) — gợi ý theo VRAM ở trang Cài đặt.
+    trt_det_batch: int = Field(default=16, ge=1, le=64)
+    trt_rec_batch: int = Field(default=32, ge=8, le=128)
 
     frame_decoder_backend: str = Field(default="pynvvideocodec")
     metadata_reader_backend: str = Field(default="pyav")
@@ -190,6 +203,9 @@ class AdvancedSettings(BaseSettings):
     debug_frames_dir: str = Field(default="")
     keep_temp_files: bool = False
     disable_paddle_network_check: bool = Field(default=True)
+    # [v3.23.738] Chất lượng video vùng ROI khi "Xuất dữ liệu thô OCR" (thang CRF x264: nhỏ = nét hơn, tệp lớn hơn;
+    # HEVC tự cộng 2). Trước: hằng 24 (≈ 1,5–2 MB/phút, đủ đọc lại chữ).
+    roi_clip_quality: int = Field(default=24, ge=16, le=34)
 
 class VideoContextSettings(BaseSettings):
     """Tham số xử lý video ngữ cảnh gửi lên Gemini (nén + cắt đoạn + dịch).

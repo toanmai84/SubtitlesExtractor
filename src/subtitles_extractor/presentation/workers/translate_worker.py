@@ -20,23 +20,24 @@ from subtitles_extractor.application.use_cases.translate_subtitles import (
     TranslateSubtitlesResponse,
     TranslateSubtitlesUseCase,
 )
+from subtitles_extractor.domain.ports.subtitle_translator_port import (
+    SubtitleTranslationError,
+    TranslationCancelledError,
+    TranslationStageKind,
+)
+from subtitles_extractor.infrastructure.process.keep_awake import keeps_awake
 from subtitles_extractor.infrastructure.translation.gemini_quota_clock import (
     describe_quota_reset,
 )
 from subtitles_extractor.infrastructure.translation.gemini_quota_manager import (
     QuotaExhaustedError,
 )
-from subtitles_extractor.domain.ports.subtitle_translator_port import (
-    SubtitleTranslationError,
-    TranslationCancelledError,
-    TranslationStageKind,
-)
-from subtitles_extractor.presentation.workers.video_reupload import (
-    make_video_reupload_callback,
-)
 from subtitles_extractor.presentation.workers.cancellation_outcome import (
     CancellationOutcome,
     classify_cancellation_outcome,
+)
+from subtitles_extractor.presentation.workers.video_reupload import (
+    make_video_reupload_callback,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,7 @@ class TranslateWorker(QThread):
                 return candidates[0].model_name
         return ""
 
+    @keeps_awake("Subtitles Extractor — Dịch phụ đề")  # [v3.23.747] màn hình tắt → GPU kẹt
     def run(self) -> None:  # noqa: D102 - QThread entry point
         try:
             request = self._request

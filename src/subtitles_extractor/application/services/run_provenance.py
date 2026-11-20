@@ -151,6 +151,8 @@ def collect_run_info(
             "frame_sampler": _sampler_name(frame_sampler),
             "frame_sampler_fallback_reason": _text_attr(frame_sampler, "last_fallback_reason"),
             "ocr_engine": type(ocr_engine).__name__ if ocr_engine is not None else None,
+            # [v3.23.777] Đường OCR thật sự chạy: cpu / gpu / gpu+tensorrt_direct (số lô TensorRT, số lô lùi Paddle GPU).
+            "ocr_acceleration": _text_attr(ocr_engine, "acceleration_description"),
         }
         info["video"] = _video_info(request.video_path, metadata)
         info["roi"] = _roi_info(getattr(request, "roi", None))
@@ -159,6 +161,7 @@ def collect_run_info(
         info["builder"] = to_jsonable(builder_config)
         info["options"] = {
             "verify_suspect_lines": bool(getattr(request, "verify_suspect_lines", False)),
+            "verify_with_vl": bool(getattr(request, "verify_with_vl", False)),
             "auto_tune_batch": bool(getattr(request, "auto_tune_batch", False)),
             "use_frame_cache": bool(getattr(request, "use_frame_cache", False)),
             "skip_export": bool(getattr(request, "skip_export", False)),

@@ -228,6 +228,21 @@ def _reset_publish_mode_settings() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_trt_engine_batches() -> Iterator[None]:
+    """[v3.23.776] Bộ chuyển đổi OCR ghi cỡ lô engine TensorRT vào biến môi trường (để tiến trình tự kiểm thừa hưởng):
+    một test dựng bộ chuyển đổi với lô khác không được làm hồ sơ engine của test sau đổi theo."""
+    import os
+
+    names = ("SE_TRT_DET_BATCH", "SE_TRT_REC_BATCH", "SE_TRT_REC_OPT")
+    saved = {name: os.environ.pop(name, None) for name in names}
+    yield
+    for name in names:
+        os.environ.pop(name, None)
+        if saved[name] is not None:
+            os.environ[name] = saved[name]  # type: ignore[assignment]
+
+
+@pytest.fixture(autouse=True)
 def _reset_ai_access_store() -> Iterator[None]:
     """[v3.23.677] Khoá API dùng chung nằm trong QSettings: một test đặt key không được làm test sau "đã có key"."""
     yield
@@ -283,3 +298,52 @@ def _flush_qt_leftovers(request: pytest.FixtureRequest) -> Iterator[None]:
         return
     gc.collect()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+#: [v3.23.734] ``builtins.__import__`` thật, chụp khi nạp conftest (trước mọi test).
+import builtins as _builtins  # noqa: E402
+
+_REAL_IMPORT = _builtins.__import__
+#: Tên các test để rò ``__import__`` giả (đọc trong test chốt chặn / khi gỡ lỗi).
+IMPORT_LEAKS: list[str] = []
+
+
+def restore_real_import(culprit: str) -> bool:
+    """[v3.23.734] Trả ``builtins.__import__`` về bản thật nếu đang là bản giả; True nếu đã phải sửa.
+
+    Bộ test toàn phần (14/11 và 17/11/2026) hai lần hỏng ``test_pedalboard_stretch_preserves_rms`` với
+    ``ImportError: No module named 'pedalboard'`` — đúng chuỗi của bản ``__import__`` giả trong
+    ``test_overlap_pedalboard_v32597`` — dù ``sys.modules`` có pedalboard thật và test pedalboard thật chạy sau
+    vẫn qua: bản giả (toàn tiến trình) còn hiệu lực ngoài test cài nó. Không tái hiện được theo thứ tự chạy riêng,
+    nên chặn ở gốc: mỗi test bắt đầu và kết thúc với ``__import__`` thật, rò ở đâu thì ghi tên và cảnh báo.
+    """
+    current = _builtins.__import__
+    if current is _REAL_IMPORT:
+        return False
+    _builtins.__import__ = _REAL_IMPORT
+    if current is getattr(_builtins, "__orig_import__", None):
+        # Hook ``__lazy_import__`` của shiboken bị luồng nền để lại (chuyển tiếp đúng tới import gốc) — vô hại.
+        return True
+    IMPORT_LEAKS.append(culprit)
+    import warnings
+
+    warnings.warn(
+        f"[v3.23.734] builtins.__import__ bị rò bản giả ({getattr(current, '__qualname__', current)!r} "
+        f"từ {getattr(current, '__module__', '?')}) — {culprit}; đã khôi phục bản thật.",
+        pytest.PytestWarning,
+        stacklevel=2,
+    )
+    return True
+
+
+_LAST_TEST_ID = "<trước test đầu tiên>"
+
+
+@pytest.fixture(autouse=True)
+def _guard_builtin_import(request: pytest.FixtureRequest) -> Iterator[None]:
+    """[v3.23.734] Mỗi test bắt đầu với ``__import__`` thật; teardown (sau monkeypatch hoàn tác) kiểm lại."""
+    global _LAST_TEST_ID
+    restore_real_import(f"phát hiện khi bắt đầu {request.node.nodeid} (test trước: {_LAST_TEST_ID})")
+    yield
+    _LAST_TEST_ID = request.node.nodeid
+    restore_real_import(f"còn sau teardown của {request.node.nodeid}")

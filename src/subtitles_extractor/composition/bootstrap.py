@@ -119,7 +119,12 @@ def bootstrap_for_gui(*, organization: str = "SubtitlesExtractor", application_n
     except (ImportError, ValueError) as exc:
         logger.warning("Không gắn được cầu nối log cho trang Nhật ký: %s.", exc)
 
-    logger.info("Bootstrap GUI hoàn tất — user_dir=%s, data_dir=%s.", user_dir, _resolve_data_dir())
+    from subtitles_extractor import __version__
+
+    # [v3.23.750] Ghi PHIÊN BẢN vào nhật ký: log 19/11 07:28 là exe 3.23.747 (lỗi đã sửa ở 3.23.748/749) mà nhật ký không
+    # cho biết bản nào đang chạy — chỉ nhận ra qua câu chữ của thông báo lỗi.
+    logger.info("Subtitles Extractor %s — Bootstrap GUI hoàn tất — user_dir=%s, data_dir=%s.", __version__, user_dir,
+                _resolve_data_dir())
     return container
 
 def _apply_saved_ui_settings(container: ApplicationContainer) -> None:
@@ -243,6 +248,7 @@ def _prioritize_paddle_cudnn() -> None:
     Bỏ qua mọi lỗi (no-op nếu không phải Windows / không có paddle).
     """
     import os
+    import sys
 
     if os.name != "nt":
         return
@@ -279,6 +285,11 @@ def _prioritize_paddle_cudnn() -> None:
                 CUDA_RUNTIME_DIRNAME,
                 cuda_runtime_dll_dirs,
             )
+            from subtitles_extractor.infrastructure.ocr.tensorrt_runtime_plan import (
+                TENSORRT_RUNTIME_DIRNAME,
+                is_tensorrt_installed,
+                tensorrt_dll_dirs,
+            )
 
             store = model_store_root()
             # [v3.23.384] Tìm CUDA runtime ở CẢ hai nơi (dedup): (1) model_store_root()
@@ -300,6 +311,13 @@ def _prioritize_paddle_cudnn() -> None:
                 candidate_dirs.extend(
                     cuda_runtime_dll_dirs(root / CUDA_RUNTIME_DIRNAME)
                 )
+                # [v3.23.755] TensorRT tải lúc chạy (models/tensorrt_runtime): DLL + mô-đun Python ``tensorrt``.
+                trt_dir = root / TENSORRT_RUNTIME_DIRNAME
+                if is_tensorrt_installed(trt_dir):
+                    candidate_dirs.extend(tensorrt_dll_dirs(trt_dir))
+                    if str(trt_dir) not in sys.path:
+                        sys.path.append(str(trt_dir))
+                    logger.debug("TensorRT tải về: %s.", trt_dir)
         except (ImportError, OSError, ValueError):
             pass
 

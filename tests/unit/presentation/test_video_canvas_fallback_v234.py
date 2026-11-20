@@ -205,7 +205,7 @@ class TestFactoryRuntime:
         from subtitles_extractor.presentation.widgets import create_video_widget
         from subtitles_extractor.presentation.widgets.video_canvas import VideoCanvas
 
-        widget = create_video_widget(force_fallback=True, parent=None)
+        widget = create_video_widget(force_fallback=True, parent=None, translator=None)
         assert isinstance(widget, VideoCanvas)
 
     def test_factory_returns_video_canvas_when_mpv_unavailable(self, qapp) -> None:
@@ -214,7 +214,7 @@ class TestFactoryRuntime:
         from subtitles_extractor.presentation.widgets.video_canvas import VideoCanvas
 
         with patch.object(widgets_module, "is_mpv_available", return_value=False):
-            widget = widgets_module.create_video_widget(parent=None)
+            widget = widgets_module.create_video_widget(parent=None, translator=None)
         assert isinstance(widget, VideoCanvas)
 
     def test_is_mpv_available_returns_bool(self) -> None:

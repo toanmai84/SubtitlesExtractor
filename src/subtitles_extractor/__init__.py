@@ -123,7 +123,7 @@ Changelog v3.0:
 
 from __future__ import annotations
 
-__version__ = "3.23.726"
+__version__ = "3.23.777"
 __all__ = ["__version__"]
 
 

@@ -460,20 +460,16 @@ def test_container_bat_tat_nha_cung_cap(tmp_path: Path) -> None:
 
 def test_chay_duoc_khi_may_khong_co_google_genai(monkeypatch: pytest.MonkeyPatch) -> None:
     """Nhà cung cấp tuỳ chỉnh không cần google-genai: dùng bộ types tối thiểu."""
-    import builtins
+    import sys
 
     from subtitles_extractor.infrastructure.translation.openai_compat_client import (
         FALLBACK_TYPES,
     )
 
-    real_import = builtins.__import__
-
-    def _no_genai(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name.startswith("google"):
-            raise ImportError("No module named 'google.genai'")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", _no_genai)
+    # [v3.23.734] Giả lập thiếu module qua sys.modules, KHÔNG thay builtins.__import__: __feature_import__ của PySide6
+    # tạm tráo builtins.__import__ không an toàn đa luồng → luồng nền import đúng lúc sẽ ghi lại bản giả sau khi hoàn tác.
+    monkeypatch.setitem(sys.modules, "google", None)
+    monkeypatch.setitem(sys.modules, "google.genai", None)
     with FakeOpenAIServer([chat_ok('{"subtitles": [{"line_no": 1, "text": "A"}]}')]) as server:
         translator = make_translator(server.base_url)
         assert translator._types_module is FALLBACK_TYPES

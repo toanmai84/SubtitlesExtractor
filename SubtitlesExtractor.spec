@@ -106,6 +106,14 @@ for _pkg in _paddle_packages:
 # paddle/paddleocr import ĐỘNG. Pillow là thủ phạm điển hình: thiếu PIL.ImageEnhance →
 # "cannot import name 'ImageEnhance' from 'PIL'" lúc chạy OCR (và làm paddle init lỗi dây
 # chuyền → libpaddle.pir). Thu TRỌN PIL (submodule + data + binary) để đủ mọi submodule.
+# [v3.23.733] PaddleOCR-VL-1.6: paddlex import sentencepiece (tokenizer) và einops (SigLIP) ĐỘNG lúc nạp mô hình.
+# [v3.23.741] + jinja2/markupsafe (mẫu hội thoại của bộ tách từ VL) và safetensors (đọc trọng số mô hình).
+for _vl_pkg in ("sentencepiece", "einops", "jinja2", "markupsafe", "safetensors"):
+    try:
+        _add_all(_vl_pkg)
+    except Exception as exc:  # noqa: BLE001 — build script, log & tiếp tục
+        print(f"[spec] Cảnh báo: không gom được {_vl_pkg} (PaddleOCR-VL sẽ lùi về PP-OCR): {exc}")
+
 try:
     _add_all("PIL")
 except Exception as exc:  # noqa: BLE001
@@ -254,6 +262,12 @@ _METADATA_PACKAGES = (
     # chung khi tạo pipeline OCR. Chẩn đoán v285 cho thấy lỗi ở gói mở rộng. paddleocr mặc
     # định chỉ dùng ocr-core (6 dep), không phải nhóm 'ocr' đầy đủ.
     "imagesize", "opencv-contrib-python", "pyclipper", "pypdfium2", "python-bidi", "shapely",
+    # [v3.23.733] PaddleOCR-VL-1.6 (bộ đọc dòng / soát câu): tokenizer cần sentencepiece, bộ mã hoá ảnh cần einops.
+    "sentencepiece", "einops",
+    # [v3.23.741] paddlex hỏi METADATA (is_dep_available), không thử import: thiếu metadata Jinja2 → bỏ qua
+    # "from jinja2.sandbox import ImmutableSandboxedEnvironment" → VL lỗi NameError (log 18/11 09:12); safetensors →
+    # require_deps khi đọc trọng số PaddleOCR-VL.
+    "Jinja2", "safetensors",
 )
 for _meta_pkg in _METADATA_PACKAGES:
     try:

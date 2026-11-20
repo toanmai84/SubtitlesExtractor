@@ -160,7 +160,7 @@ def apply_scenario(
         sampling = dataclasses.replace(sampling, white_text_luma=scenario.luma)
     return dataclasses.replace(
         base, ocr=ocr, sampling=sampling, skip_export=True, use_frame_cache=False, raw_ocr_output_path=None,
-        export_raw_images=False, save_debug_frames=False,
+        export_roi_clip=False, save_debug_frames=False,
     )
 
 

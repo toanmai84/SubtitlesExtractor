@@ -11,6 +11,7 @@ import logging
 
 from PySide6.QtCore import QObject, Signal
 
+from subtitles_extractor.infrastructure.process.keep_awake import keeps_awake
 from subtitles_extractor.infrastructure.video.ffmpeg_video_renderer import render_video
 from subtitles_extractor.infrastructure.video.video_render_command import (
     RenderRequest,
@@ -45,6 +46,7 @@ class RenderVideoWorker(QObject):
         """Yêu cầu dừng. An toàn khi gọi từ luồng giao diện."""
         self._cancelled = True
 
+    @keeps_awake("Subtitles Extractor — Xuất video")  # [v3.23.747] màn hình tắt → GPU kẹt
     def run(self) -> None:
         """Thực hiện xuất video. Gọi trong QThread, KHÔNG gọi trực tiếp."""
         try:

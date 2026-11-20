@@ -58,16 +58,11 @@ def test_master_tail_pad_covers_last_event_extension() -> None:
 
 def test_pedalboard_returns_none_when_missing(monkeypatch) -> None:
     # Giả lập pedalboard chưa cài -> None (caller fallback librosa/WSOLA).
-    import builtins
+    # [v3.23.734] Giả lập thiếu module qua sys.modules, KHÔNG thay builtins.__import__: __feature_import__ của PySide6
+    # tạm tráo builtins.__import__ không an toàn đa luồng → luồng nền import đúng lúc sẽ ghi lại bản giả sau khi hoàn tác.
+    import sys
 
-    real_import = builtins.__import__
-
-    def _fake_import(name, *args, **kwargs):
-        if name == "pedalboard":
-            raise ImportError("No module named 'pedalboard'")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    monkeypatch.setitem(sys.modules, "pedalboard", None)
     tone = np.zeros(_SR, dtype=np.float32)
     assert _stretch_with_pedalboard(tone, _SR, 2.0) is None
 

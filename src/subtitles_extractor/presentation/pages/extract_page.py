@@ -10,12 +10,12 @@ CẢI TIẾN ĐỘT PHÁ (V3.13.1 - ROI Rendering Fix):
 from __future__ import annotations
 
 import contextlib
-import time
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal, QObject, QEvent
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QImage, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,21 +30,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from subtitles_extractor.presentation.fluent_compat import (
-    CheckBox,
-    ComboBox,
-    LineEdit,
-    FluentIcon,
-    InfoBar,
-    InfoBarPosition,
-    PrimaryPushButton,
-    ProgressBar,
-    PushButton,
-    Slider,
-    ToolButton,
-    themeColor,
-)
-from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
 
 from subtitles_extractor.application.dtos.extract_subtitles_dto import (
     ExtractSubtitlesResponse,
@@ -53,22 +38,38 @@ from subtitles_extractor.composition.container import ApplicationContainer
 from subtitles_extractor.domain.entities.video_metadata import VideoMetadata
 from subtitles_extractor.domain.ports.hardsub_detector_port import HardsubDetectionResult
 from subtitles_extractor.domain.value_objects.roi import Roi, TextAlignment
+from subtitles_extractor.presentation.fluent_compat import (
+    CheckBox,
+    ComboBox,
+    FluentIcon,
+    InfoBar,
+    InfoBarPosition,
+    LineEdit,
+    PrimaryPushButton,
+    ProgressBar,
+    PushButton,
+    Slider,
+    ToolButton,
+    themeColor,
+)
+from subtitles_extractor.presentation.theme import colors as _c
+from subtitles_extractor.presentation.theme import metrics as _m
+from subtitles_extractor.presentation.theme.styles import caption_style, mono_label_style
+from subtitles_extractor.presentation.utils.accessibility import set_accessible_name
+from subtitles_extractor.presentation.utils.wheel_guard import protect_scroll_widgets
 from subtitles_extractor.presentation.view_models.extract_page_view_model import (
     ExtractPageViewModel,
 )
 from subtitles_extractor.presentation.widgets import create_video_widget
-from subtitles_extractor.presentation.theme import colors as _c
-from subtitles_extractor.presentation.theme.styles import caption_style, mono_label_style
-from subtitles_extractor.presentation.theme import metrics as _m
-from subtitles_extractor.presentation.widgets.section_card import SectionCard
-from subtitles_extractor.presentation.utils.accessibility import set_accessible_name
+
 # Import kiểu tường minh để type checker biết canvas có thể là MpvVideoWidget (v2.30 migration)
 from subtitles_extractor.presentation.widgets.mpv_video_widget import MpvVideoWidget  # noqa: F401
+from subtitles_extractor.presentation.widgets.section_card import SectionCard
 from subtitles_extractor.presentation.workers.seek_worker import (
     PersistentVideoReader,
     SeekWorker,
 )
-from subtitles_extractor.presentation.utils.wheel_guard import protect_scroll_widgets
+from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
 
 _SEEK_DEBOUNCE_MS: int = 80
 _SLIDER_RESOLUTION: int = 10000
@@ -193,7 +194,8 @@ class ExtractPage(QWidget):
 
         self._canvas = create_video_widget(
             mpv_options=self._container.build_mpv_player_kwargs(),
-            parent=self
+            parent=self,
+            translator=self._translator,  # [v3.23.736] thiếu → hiện khoá thô "common.video_placeholder"
         )
         self._canvas.roi_changed.connect(self._on_roi_drawn)
         self._canvas.roi_preview.connect(self._on_roi_preview)
@@ -918,11 +920,11 @@ class ExtractPage(QWidget):
 
         from PySide6.QtCore import QThread
 
-        from subtitles_extractor.presentation.workers.install_whisperx_worker import (
-            InstallWhisperXWorker,
-        )
         from subtitles_extractor.infrastructure.stt.whisperx_installer import (
             whisperx_env_root,
+        )
+        from subtitles_extractor.presentation.workers.install_whisperx_worker import (
+            InstallWhisperXWorker,
         )
 
         # [v3.23.403] Cài whisperx_env CẠNH exe (bền, portable) — không vào %TEMP% nữa.
@@ -1038,7 +1040,9 @@ class ExtractPage(QWidget):
             return
         if not self._run_preflight():
             return
-        from subtitles_extractor.presentation.widgets.ocr_benchmark_dialog import OcrBenchmarkDialog
+        from subtitles_extractor.presentation.widgets.ocr_benchmark_dialog import (
+            OcrBenchmarkDialog,
+        )
 
         self._canvas.pause()
         dialog = OcrBenchmarkDialog(self._view_model, self._translator, self)
@@ -1272,7 +1276,9 @@ class ExtractPage(QWidget):
             BatchItemStatus,
             build_batch_plan,
         )
-        from subtitles_extractor.presentation.view_models.series_pipeline_controller import StageRunResult
+        from subtitles_extractor.presentation.view_models.series_pipeline_controller import (
+            StageRunResult,
+        )
 
         video = self._view_model.video
         reference_roi = self._view_model.roi
@@ -1403,7 +1409,9 @@ class ExtractPage(QWidget):
         done = max(0, processed - len(failures))
         if getattr(self, "_series_batch", False):
             # [v3.23.658] Dây chuyền phim bộ: báo về bộ điều phối, không hiện hộp thoại tổng kết.
-            from subtitles_extractor.presentation.view_models.series_pipeline_controller import StageRunResult
+            from subtitles_extractor.presentation.view_models.series_pipeline_controller import (
+                StageRunResult,
+            )
 
             self._series_batch = False
             failed = dict(getattr(self, "_series_invalid", {}) or {})
@@ -2071,7 +2079,8 @@ class ExtractPage(QWidget):
         # 2) Lưu CSDL (thư viện) theo hash video — để mở lại và hiện đúng khâu.
         try:
             from subtitles_extractor.domain.entities.project_record import (
-                ProjectRecord, WorkflowStage,
+                ProjectRecord,
+                WorkflowStage,
             )
             from subtitles_extractor.infrastructure.video.video_hasher import (
                 compute_video_hash,
@@ -2281,7 +2290,9 @@ class ExtractPage(QWidget):
             )
 
     def _on_transcribe_clicked(self) -> None:
-        from subtitles_extractor.domain.ports.speech_to_text_port import TranscriptionConfig
+        from subtitles_extractor.domain.ports.speech_to_text_port import (
+            TranscriptionConfig,
+        )
 
         lang_map = {0: "", 1: "vi", 2: "en", 3: "zh", 4: "ja", 5: "ko"}
         language = lang_map.get(self._cb_stt_language.currentIndex(), "")
@@ -2353,20 +2364,21 @@ class ExtractPage(QWidget):
             InfoBar.warning("Thiếu Video", "Vui lòng trích xuất phụ đề trước khi xuất dữ liệu thô.", parent=self, duration=4000)
             return
 
+        # [v3.23.728] Video cắt đúng vùng ROI thay cho ảnh JPG từng khung (nhỏ hơn hàng chục lần, đủ để gỡ lỗi).
         reply = QMessageBox.question(
-            self, "Lưu kèm hình ảnh OCR?",
-            "Bạn có muốn xuất kèm hình ảnh (Input và Output) không?\n⚠️ Lưu ý: Tốn khá nhiều dung lượng ổ đĩa.",
+            self, self._translator.translate("extract.dlg_roi_clip_title"),
+            self._translator.translate("extract.dlg_roi_clip_body"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
+            QMessageBox.StandardButton.Yes
         )
-        export_images = (reply == QMessageBox.StandardButton.Yes)
+        export_roi_clip = (reply == QMessageBox.StandardButton.Yes)
 
         video_name = Path(self._view_model.video_path).stem
-        default_name = f"{video_name}.seraw.json"
+        default_name = f"{video_name}.seraw.json.gz"
         default_dir = Path(self._view_model.video_path).parent
 
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Lưu dữ liệu OCR thô", str(default_dir / default_name), "SubtitleExtractor Raw OCR (*.seraw.json *.seraw.json.gz);;Tất cả (*.*)",
+            self, "Lưu dữ liệu OCR thô", str(default_dir / default_name), "SubtitleExtractor Raw OCR (*.seraw.json.gz);;Tất cả (*.*)",
             options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not save_path: return
@@ -2377,7 +2389,10 @@ class ExtractPage(QWidget):
         if hasattr(self, '_btn_export_raw'): self._btn_export_raw.setEnabled(False)
 
         self._reset_eta()
-        self._view_model.start_extraction_with_raw_export(raw_ocr_output_path=Path(save_path), export_images=export_images)
+        # [v3.23.737] Đồng ý xuất video ROI = xuất cả gói kiểm định chất lượng (đọc lại mọi câu bằng VL + tiếng phim).
+        self._view_model.start_extraction_with_raw_export(
+            raw_ocr_output_path=Path(save_path), export_roi_clip=export_roi_clip, export_qa_data=export_roi_clip,
+        )
 
     def _on_raw_export_finished(self, raw_path: Path | None, response: ExtractSubtitlesResponse) -> None:
         if hasattr(self, '_btn_export_raw'): self._btn_export_raw.setEnabled(True)
@@ -2394,7 +2409,18 @@ class ExtractPage(QWidget):
             return
 
         size_mb = raw_path.stat().st_size / (1024 * 1024)
-        msg = f"Đã lưu dữ liệu OCR thô:\n\n  {raw_path.name}  ({size_mb:.2f} MB)\n\nNhấn OK để nạp dữ liệu và chuyển sang trang Chỉnh sửa."
+        saved = f"  {raw_path.name}  ({size_mb:.2f} MB)"
+        # [v3.23.728] Video vùng ROI đi kèm (gửi cùng tệp OCR thô khi cần gỡ lỗi).
+        from subtitles_extractor.infrastructure.video.roi_clip_exporter import (
+            clip_paths_for,
+        )
+
+        clip_path, sidecar_path = clip_paths_for(raw_path)
+        if clip_path.is_file():
+            saved += f"\n  {clip_path.name}  ({clip_path.stat().st_size / (1024 * 1024):.2f} MB)"
+            if sidecar_path.is_file():
+                saved += f"\n  {sidecar_path.name}"
+        msg = f"Đã lưu dữ liệu OCR thô:\n\n{saved}\n\nNhấn OK để nạp dữ liệu và chuyển sang trang Chỉnh sửa."
 
         QMessageBox.information(self, self._translator.translate("extract.dlg_rawok_title"), msg)
         self._on_extraction_finished(response)

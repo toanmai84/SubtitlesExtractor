@@ -30,6 +30,7 @@ from subtitles_extractor.application.use_cases.extract_subtitles import (
 from subtitles_extractor.domain.entities.subtitle_event import SubtitleEvent
 from subtitles_extractor.domain.exceptions import SubtitlesExtractorError
 from subtitles_extractor.domain.value_objects.roi import Roi
+from subtitles_extractor.infrastructure.process.keep_awake import keeps_awake
 from subtitles_extractor.presentation.workers.qt_progress_reporter import (
     QtProgressReporter,
 )
@@ -117,6 +118,7 @@ class ExtractSubtitlesWorker(QObject):
         self._reporter = reporter
         self._export_use_case = export_use_case
 
+    @keeps_awake("Subtitles Extractor — Trích xuất phụ đề")  # [v3.23.747] màn hình tắt → GPU kẹt
     def run(self) -> None:
         """Slot chạy trên thread mới (kết nối với ``QThread.started``)."""
         try:

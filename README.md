@@ -1,4 +1,4 @@
-# Subtitles Extractor — v3.23.726
+# Subtitles Extractor — v3.23.777
 
 **English** | [Tiếng Việt](README.vi.md)
 
@@ -18,6 +18,8 @@ The complete workflow in one app: **Extract → Edit → Translate → Dub**.
 - Automatic subtitle-region (ROI) detection; batch processing can validate and reuse a previous episode's ROI when appropriate.
 - Experimental/optional NVIDIA GPU path with NVDEC and CuPy for video decoding and image preprocessing on the GPU; falls back to PyAV/CPU when GPU components are unavailable.
 - OCR result voting counts independent OCR reads rather than duplicated frames, reducing bias when identical frames are reused.
+- TensorRT OCR can use direct TensorRT engine execution instead of Paddle's crashing C++ engine runner, with GPU-buffer sharing and per-batch fallback to Paddle GPU when needed.
+- Configure TensorRT detector/recognizer batch sizes in Hardware settings, with VRAM-based suggestions. Run metadata records whether TensorRT actually processed OCR batches or the app fell back to GPU OCR.
 - Handles CJK (Chinese, Japanese, and Korean) and Latin text throughout the pipeline.
 - Flags suspicious OCR lines for AI review and improves OCR safety when re-OCR or settings changes overlap with extraction.
 - Filters moving scene objects that can otherwise be mistaken for subtitles.
@@ -58,6 +60,7 @@ The complete workflow in one app: **Extract → Edit → Translate → Dub**.
 - Runtime settings use `pydantic-settings` and can be overridden with environment variables such as `SE_HW_*`, `SE_OCR_*`, `SE_VIDCTX_*`, and `SE_TRANS_*`.
 - Settings are saved automatically with QSettings. The interface supports Vietnamese and light, dark, and automatic themes.
 - The Windows build bundles CuPy's required Python modules while excluding large CUDA DLLs; CUDA runtime components are loaded separately when GPU acceleration is enabled.
+- TensorRT self-tests run in isolated child processes to keep native engine failures from closing the application; unsupported or failed TensorRT paths fall back to regular GPU OCR.
 - Safer MPV playback and throttled seeking help reduce Windows playback crashes; the app can fall back to another video preview backend when needed.
 - Native crash logs help diagnose unexpected exits.
 - SQLite databases are backed up and can be recovered when corruption is detected.

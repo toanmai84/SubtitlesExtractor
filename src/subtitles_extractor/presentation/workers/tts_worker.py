@@ -16,6 +16,7 @@ from subtitles_extractor.domain.ports.subtitle_tts_port import (
     TTSSegmentResult,
     TTSUnavailableError,
 )
+from subtitles_extractor.infrastructure.process.keep_awake import keeps_awake
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class TTSWorker(QThread):
         """Yêu cầu dừng TTS sớm."""
         self._cancel_event.set()
 
+    @keeps_awake("Subtitles Extractor — Lồng tiếng")  # [v3.23.747] màn hình tắt → GPU kẹt
     def run(self) -> None:
         try:
             results: list[TTSSegmentResult] = self._use_case.execute(

@@ -106,7 +106,7 @@ def _request(tmp_path: Path) -> ExtractSubtitlesRequest:
         video_path=tmp_path / "phim.mp4", output_path=tmp_path / "out.srt",
         sampling=FrameSamplingConfig(sample_step_sec=0.1),
         ocr=OcrEngineConfig(batch_size=4, use_textline_orientation=True),
-        builder=SubtitleBuilderConfig(), raw_ocr_output_path=tmp_path / "raw.json.gz", export_raw_images=True,
+        builder=SubtitleBuilderConfig(), raw_ocr_output_path=tmp_path / "raw.json.gz", export_roi_clip=True,
     )
 
 
@@ -117,7 +117,7 @@ class TestApplyScenario:
         assert request.ocr.det_batch_size == 8 and request.ocr.use_textline_orientation is False
         assert request.sampling.white_text_gate and request.sampling.white_text_luma == 200
         assert request.sampling.skip_intro_sec == window.skip_intro_sec
-        assert request.skip_export and request.raw_ocr_output_path is None and not request.export_raw_images
+        assert request.skip_export and request.raw_ocr_output_path is None and not request.export_roi_clip
         assert request.ocr.batch_size == 4 and request.sampling.sample_step_sec == 0.1       # phần còn lại giữ nguyên
 
     def test_current_keeps_the_user_configuration(self, tmp_path: Path) -> None:

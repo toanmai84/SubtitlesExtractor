@@ -52,6 +52,9 @@ class OcrEngineConfig:
     enable_mkldnn: bool = False
     use_tensorrt: bool = False
     precision: PrecisionMode = PrecisionMode.FP32
+    #: [v3.23.776] Lô lớn nhất engine TensorRT nhận: bộ dò (ảnh) / bộ nhận dạng (dòng). Đổi → dựng lại engine.
+    trt_det_batch: int = 16
+    trt_rec_batch: int = 32
     parallel_workers: int = 4
 
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)

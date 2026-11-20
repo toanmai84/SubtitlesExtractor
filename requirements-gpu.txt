@@ -19,6 +19,11 @@ setuptools<80
 # ── OCR Engine ──
 # paddlepaddle-gpu==3.3.1  <- CAI RIENG o buoc 2 (xem ghi chu dau file / build_windows.bat)
 paddleocr>=3.7.0  # [v3.23.595] PP-OCRv6 (model mac dinh) can 3.7.0+
+# [v3.23.733] PaddleOCR-VL-1.6 (soat cau / chay chinh). Apache-2.0 / MIT.
+sentencepiece>=0.2
+einops>=0.8
+Jinja2>=3.1
+safetensors>=0.4
 
 # ── Video player & decoder phần cứng ──
 # python-mpv: embed mpv vào widget Qt, hỗ trợ NVDEC/VAAPI/VideoToolbox/D3D11VA/Vulkan

@@ -34,9 +34,9 @@ import dataclasses
 import itertools
 import logging
 import math
-from dataclasses import replace
 import re
 from collections.abc import Sequence
+from dataclasses import replace
 from functools import lru_cache
 
 from subtitles_extractor.application.dtos.extract_subtitles_dto import (
@@ -50,25 +50,30 @@ from subtitles_extractor.application.services.subtitle_pipeline.box_filters impo
     pre_filter_garbage_boxes,
 )
 from subtitles_extractor.application.services.subtitle_pipeline.box_geometry import (
+    drop_clipped_offband_events,
     drop_drifting_events,
     drop_implausible_boxes,
+    drop_oversized_glyph_events,
+    drop_scene_text_block_events,
+    drop_tall_non_han_events,
+    strip_offcenter_latin_tail,
 )
 from subtitles_extractor.application.services.subtitle_pipeline.event_filters import (
     convert_groups_to_events,
     drop_mixed_noise_fragments,
     extend_ends_by_display_hold,
-    frame_text_scope,
     extend_group_timing_from_soft_drops,
     filter_echo_trail_events,
     filter_echo_trail_groups,
     filter_short_duration_events,
     filter_short_text_events,
     frame_display_hold,
+    frame_text_scope,
     merge_adjacent_duplicates,
     merge_misread_substitution_events,
-    sampled_frame_times,
     post_merge_duplicates,
     reindex_events,
+    sampled_frame_times,
     split_repeat_gap_groups,
     split_stable_variant_groups,
     strip_latin_watermark_prefix_from_cjk_events,
@@ -83,19 +88,21 @@ from subtitles_extractor.application.services.subtitle_pipeline.grouping import 
     group_using_viterbi,
 )
 from subtitles_extractor.application.services.subtitle_pipeline.read_fusion import (
+    fix_lone_interjections,
     fuse_same_pixel_reads,
     measure_char_pitch,
-    measure_text_height,
     measure_text_band,
+    measure_text_height,
+    relabel_single_char_sandwiches,
     snap_inflated_boxes_to_band,
     tighten_inflated_boxes,
     unify_confusable_variants,
 )
 from subtitles_extractor.application.services.subtitle_pipeline.spatial_filters import (
-    measure_subtitle_center,
     clean_spatial_outliers,
     filter_cross_frame_spatial_outliers,
     filter_noise_by_confidence,
+    measure_subtitle_center,
     strip_static_overlays,
 )
 from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
@@ -539,6 +546,10 @@ class SubtitleBuilder:
             frame_results, fusion_center, char_pitch, text_height, text_band,
         )
         tightened_frames += snapped_frames + presnapped_frames
+        # [v3.23.734] "亨" / "霍" / "厄" đứng một mình → "哼" / "嚯" / "呃" (chữ cảm thán đọc mất bộ 口).
+        frame_results, _interjections = fix_lone_interjections(frame_results)
+        # [v3.23.736] Chữ đơn đọc xen kẽ A | B | A ("阵" | "降" | "阵") → một câu, không rơi mảnh dưới ngưỡng.
+        frame_results, _sandwiches = relabel_single_char_sandwiches(frame_results)
         frame_results, confusable_texts = unify_confusable_variants(frame_results, fusion_center, char_pitch)
         confusable_texts |= disputed_texts
         if fused_frames or confusable_texts or tightened_frames:
@@ -764,6 +775,37 @@ class SubtitleBuilder:
                 )
                 if drifting:
                     logger.info("Bỏ %d câu có hộp chữ trôi theo cảnh (không phải phụ đề).", drifting)
+                # [v3.23.729] Logo/chữ ngoài dải phụ đề bị mép ROI cắt nửa ("一男王" đầu phim "[全集]").
+                subtitle_events, clipped = drop_clipped_offband_events(
+                    subtitle_events, sorted(frame_results, key=lambda f: f.timestamp_sec), text_band,
+                    float(roi.height) if roi is not None else None,
+                )
+                if clipped:
+                    logger.info("Bỏ %d câu chữ bị mép vùng ROI cắt và lệch dải phụ đề (logo / chữ trong cảnh).", clipped)
+                # [v3.23.730] Hoa văn trong cảnh: chữ to gấp đôi cỡ phụ đề theo cả hai chiều, đọc không chắc ("心福").
+                subtitle_events, oversized = drop_oversized_glyph_events(
+                    subtitle_events, sorted(frame_results, key=lambda f: f.timestamp_sec), text_height,
+                )
+                if oversized:
+                    logger.info("Bỏ %d câu chữ to bất thường cả hai chiều (hoa văn trong cảnh).", oversized)
+                # [v3.23.734] Hình khối trong cảnh đọc thành chữ Latin ("V" — cổ áo chữ V), hộp phủ trọn vùng ROI.
+                subtitle_events, tall = drop_tall_non_han_events(
+                    subtitle_events, sorted(frame_results, key=lambda f: f.timestamp_sec), text_height,
+                )
+                if tall:
+                    logger.info("Bỏ %d câu không chữ Hán có hộp cao bất thường (hình khối trong cảnh).", tall)
+                # [v3.23.734] Khối chữ trong cảnh (cuộn sách nền sáng): nhiều hộp cạnh nhau, hộp nào cũng phủ trọn ROI.
+                subtitle_events, blocks = drop_scene_text_block_events(
+                    subtitle_events, sorted(frame_results, key=lambda f: f.timestamp_sec), text_height,
+                )
+                if blocks:
+                    logger.info("Bỏ %d câu đọc từ khối chữ trong cảnh (nhiều hộp cao phủ vùng ROI).", blocks)
+                # [v3.23.731] Chữ Latin trong cảnh dính đuôi câu, kéo hộp chữ lệch tâm ("林娇娇这女人eet dream").
+                subtitle_events, tails = strip_offcenter_latin_tail(
+                    subtitle_events, sorted(frame_results, key=lambda f: f.timestamp_sec), fusion_center, text_height,
+                )
+                if tails:
+                    logger.info("Cắt đuôi chữ Latin trong cảnh dính vào %d câu (hộp chữ lệch tâm).", tails)
             # [v3.23.699] Mảnh rác chữ Latin/số/ký hiệu tin cậy thấp trong phim phụ đề chữ Hán ("色6%").
             subtitle_events, noise = drop_mixed_noise_fragments(subtitle_events)
             if noise:
@@ -819,6 +861,13 @@ class SubtitleBuilder:
             )
 
             for position, text in unify_minority_traditional([e.text for e in subtitle_events]).items():
+                subtitle_events[position] = replace(subtitle_events[position], text=text)
+            # [v3.23.730] Phim tiếng Trung: kana trông giống chữ Hán do OCR đọc nhầm ("三ニー" → "三二一").
+            from subtitles_extractor.application.services.subtitle_pipeline.text_correction import (
+                unify_minority_kana,
+            )
+
+            for position, text in unify_minority_kana([e.text for e in subtitle_events]).items():
                 subtitle_events[position] = replace(subtitle_events[position], text=text)
 
             # ── Stage 14: Reindex ──

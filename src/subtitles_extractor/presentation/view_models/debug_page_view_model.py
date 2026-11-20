@@ -74,6 +74,8 @@ _TRIAL_FIELDS = frozenset({
 })
 
 
+
+
 class _SingleFrameReocrWorker(QObject):
     success_result = Signal(object, object, object, str, str, bool)
     failed = Signal(str)
@@ -227,6 +229,8 @@ class _SingleFrameReocrWorker(QObject):
                 score_threshold=self.settings.ocr.score_threshold,
                 enable_mkldnn=self.settings.hardware.enable_mkldnn,
                 use_tensorrt=self.settings.hardware.use_tensorrt,
+                trt_det_batch=self.settings.hardware.trt_det_batch,
+                trt_rec_batch=self.settings.hardware.trt_rec_batch,
                 precision=PrecisionMode(self.settings.hardware.precision.value),
                 preprocess=temp_pre_cfg,
             )
@@ -403,6 +407,7 @@ class DebugPageViewModel(QObject):
         self._meta: RawOcrMeta | None = None
         self._current_idx: int = -1
         self._base_img_dir: Path | None = None
+        self._clip_reader: Any = None          # [v3.23.728] RoiClipReader của video vùng ROI cạnh tệp OCR thô
         self._async_thread: QThread | None = None
         self._reocr_target: tuple[list[OcrFrameResult], int] | None = None  # [v3.23.659]
 
@@ -439,6 +444,7 @@ class DebugPageViewModel(QObject):
             for ext in [".gz", ".json", ".seraw"]:
                 base_name = base_name.replace(ext, "")
             self._base_img_dir = file_path.parent / f"{base_name}_ocr_images"
+            self._open_roi_clip(file_path)
 
             self.file_loaded.emit(True, f"Đã nạp thành công {len(frames)} frames từ {file_path.name}")
             self.jump_to_frame(0)
@@ -475,6 +481,7 @@ class DebugPageViewModel(QObject):
 
             if in_p.exists(): input_img_path = str(in_p)
             if out_p.exists(): output_img_path = str(out_p)
+        clip_image = self._clip_frame(frame) if not input_img_path and self._clip_reader is not None else None
 
         boxes_data = [
             {
@@ -501,6 +508,42 @@ class DebugPageViewModel(QObject):
             output_img_path,
             json_txt
         )
+        if clip_image is not None:
+            # [v3.23.728] Khung lấy từ video vùng ROI (không có thư mục ảnh JPG): đưa thẳng ảnh vào hai khung xem —
+            # khung "output" tự vẽ hộp chữ OCR như với ảnh JPG cũ.
+            self.live_images_ready.emit(clip_image, clip_image)
+
+    def _open_roi_clip(self, raw_path: Path) -> None:
+        """[v3.23.728] Mở video vùng ROI (``<tên>.roi.mp4`` + ``.roi.json``) đi kèm tệp OCR thô, nếu có."""
+        from subtitles_extractor.infrastructure.video.roi_clip_reader import RoiClipReader, find_roi_clip
+
+        if self._clip_reader is not None:
+            self._clip_reader.close()
+        self._clip_reader = None
+        found = find_roi_clip(raw_path)
+        if found is None:
+            return
+        try:
+            self._clip_reader = RoiClipReader(*found)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("Không mở được video vùng ROI %s: %s", found[0].name, exc)
+            return
+        logger.info("Trang Gỡ lỗi OCR đọc khung từ video vùng ROI %s.", found[0].name)
+
+    def _clip_frame(self, frame: OcrFrameResult) -> QImage | None:
+        """Khung video vùng ROI tại mốc của ``frame``, cắt về ĐÚNG ROI (toạ độ hộp OCR khớp từng điểm ảnh)."""
+        image = self._clip_reader.frame_at(frame.timestamp_sec)
+        if image is None:
+            return None
+        dx, dy = self._clip_reader.box_offset
+        roi = self._clip_reader.roi_xywh
+        if roi is not None:
+            image = image[dy:dy + roi[3], dx:dx + roi[2]]
+        rgb = np.ascontiguousarray(image, dtype=np.uint8)
+        height, width = rgb.shape[:2]
+        if height == 0 or width == 0:
+            return None
+        return QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888).copy()
 
     def next_frame(self) -> None:
         self.jump_to_frame(self._current_idx + 1)

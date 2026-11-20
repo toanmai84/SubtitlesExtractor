@@ -1,4 +1,4 @@
-# Subtitles Extractor — v3.23.726
+# Subtitles Extractor — v3.23.777
 
 [English](README.md) | **Tiếng Việt**
 
@@ -23,6 +23,10 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
   nếu thiếu thành phần GPU cần thiết.
 - Bỏ phiếu kết quả OCR theo **lần đọc OCR độc lập**, không đếm các khung hình chỉ sao chép kết quả,
   giúp tránh thiên lệch khi có nhiều khung trùng nhau.
+- OCR TensorRT có thể chạy engine trực tiếp thay vì bộ chạy C++ gây sập của Paddle; dùng chung bộ đệm
+  GPU và tự lùi từng lô về Paddle GPU khi cần.
+- Có thể chọn cỡ lô bộ dò/bộ nhận dạng TensorRT trong Cài đặt, kèm gợi ý theo VRAM. Tệp mô tả lượt
+  chạy ghi rõ TensorRT có thật sự xử lý OCR hay ứng dụng đã lùi về OCR GPU thường.
 - Nhận biết và xử lý riêng văn bản **CJK** (Trung/Nhật/Hàn) và Latin xuyên suốt pipeline.
 - Có thể kiểm tra lại dòng OCR đáng ngờ bằng AI; điều phối Re-OCR và cài đặt an toàn hơn khi đang
   trích xuất.
@@ -88,6 +92,8 @@ Quy trình hoàn chỉnh trong một ứng dụng: **Trích xuất → Biên t�
   crash trên Windows. Có thể tự chuyển sang trình xem dự phòng nếu phát hiện lỗi mpv.
 - Bản Windows đóng gói đủ mô-đun Python cần cho CuPy nhưng loại các DLL CUDA dung lượng lớn; runtime
   CUDA được nạp riêng khi bật tăng tốc GPU.
+- Tự kiểm TensorRT chạy trong tiến trình con riêng để lỗi engine native không làm đóng ứng dụng;
+  đường TensorRT không dùng được sẽ tự lùi về OCR GPU thường.
 - Ghi nhật ký crash native và cảnh báo khi lần chạy trước kết thúc bất thường.
 - Sao lưu xoay vòng và phục hồi cơ sở dữ liệu SQLite khi phát hiện hỏng; giữ lại bản dữ liệu lỗi
   để có thể kiểm tra.

@@ -28,8 +28,8 @@ from subtitles_extractor.domain.entities.video_state import VideoState
 from subtitles_extractor.domain.exceptions import SubtitlesExtractorError
 from subtitles_extractor.domain.ports.frame_sampler_port import FrameSamplingConfig
 from subtitles_extractor.domain.ports.hardsub_detector_port import HardsubDetectionResult
-from subtitles_extractor.domain.value_objects.boundary_track import BoundaryTrack
 from subtitles_extractor.domain.ports.ocr_engine_port import OcrEngineConfig
+from subtitles_extractor.domain.value_objects.boundary_track import BoundaryTrack
 from subtitles_extractor.domain.value_objects.device_kind import (
     DeviceKind,
     PrecisionMode,
@@ -50,6 +50,21 @@ from subtitles_extractor.presentation.workers.qt_progress_reporter import (
 from subtitles_extractor.presentation.workers.thread_keeper import WorkerThreadKeeper
 
 logger = logging.getLogger(__name__)
+
+
+def compressed_raw_path(path: Path) -> Path:
+    """[v3.23.728] Tệp OCR thô luôn là ``.seraw.json.gz`` (nén gzip) — như lượt trích xuất thường ghi ra.
+
+    ``phim.seraw.json`` / ``phim.json`` / ``phim`` → ``phim.seraw.json.gz``; đã ``.gz`` thì giữ nguyên.
+    """
+    name = path.name
+    if name.lower().endswith(".gz"):
+        return path
+    for suffix in (".seraw.json", ".json"):
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return path.with_name(f"{name}.seraw.json.gz")
 
 
 def _roi_cache_path(cache_path: Path, index: int) -> Path:
@@ -81,9 +96,15 @@ class RebuildFromCacheWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:
-        from subtitles_extractor.application.dtos.extract_subtitles_dto import ExtractSubtitlesResponse
-        from subtitles_extractor.application.services.subtitle_builder import SubtitleBuilder
-        from subtitles_extractor.infrastructure.serializers.raw_ocr_serializer import load_raw_ocr
+        from subtitles_extractor.application.dtos.extract_subtitles_dto import (
+            ExtractSubtitlesResponse,
+        )
+        from subtitles_extractor.application.services.subtitle_builder import (
+            SubtitleBuilder,
+        )
+        from subtitles_extractor.infrastructure.serializers.raw_ocr_serializer import (
+            load_raw_ocr,
+        )
         from subtitles_extractor.presentation.workers.extract_subtitles_worker import (
             _merge_events,
             _shift_event_coordinates,
@@ -327,7 +348,10 @@ class ExtractPageViewModel(QObject):
         self._start_detection_worker(worker)
 
     def _auto_roi_vram_flags(self) -> FrameSamplingConfig | None:
-        from subtitles_extractor.composition.preprocess_routing import nvdec_sampler_selected, route_preprocessing
+        from subtitles_extractor.composition.preprocess_routing import (
+            nvdec_sampler_selected,
+            route_preprocessing,
+        )
 
         settings = self._container.settings_service.current
         if not nvdec_sampler_selected(settings):        # [v3.23.723] đúng điều kiện container chọn NVDEC
@@ -735,7 +759,9 @@ class ExtractPageViewModel(QObject):
         if request.roi is None:
             return None
         try:
-            from subtitles_extractor.application.use_cases.extract_subtitles import effective_roi
+            from subtitles_extractor.application.use_cases.extract_subtitles import (
+                effective_roi,
+            )
 
             meta = self._container.make_load_video_metadata_use_case().execute(request.video_path)
             return effective_roi(request.roi, meta.width, meta.height)
@@ -826,8 +852,12 @@ class ExtractPageViewModel(QObject):
         Returns:
             ``True`` nếu đã bắt đầu; ``False`` khi chưa có video / đang bận / không có kịch bản hợp lệ.
         """
-        from subtitles_extractor.application.services.ocr_benchmark import DEFAULT_SCENARIOS
-        from subtitles_extractor.application.services.ocr_probe_window import compute_probe_window
+        from subtitles_extractor.application.services.ocr_benchmark import (
+            DEFAULT_SCENARIOS,
+        )
+        from subtitles_extractor.application.services.ocr_probe_window import (
+            compute_probe_window,
+        )
 
         if self._video is None or self._is_busy:
             return False
@@ -843,7 +873,9 @@ class ExtractPageViewModel(QObject):
         reporter = QtProgressReporter()
         reporter.progress_changed.connect(self.benchmark_progress)
 
-        from subtitles_extractor.presentation.workers.ocr_benchmark_worker import OcrBenchmarkWorker
+        from subtitles_extractor.presentation.workers.ocr_benchmark_worker import (
+            OcrBenchmarkWorker,
+        )
 
         thread = QThread(self)
         worker = OcrBenchmarkWorker(use_case, requests[0], scenarios, window, reporter)
@@ -888,9 +920,15 @@ class ExtractPageViewModel(QObject):
         self.benchmark_settings_applied.emit()
         return True
 
-    def start_extraction_with_raw_export(self, raw_ocr_output_path: Path, export_images: bool = False) -> None:
+    def start_extraction_with_raw_export(
+        self, raw_ocr_output_path: Path, export_roi_clip: bool = False, export_qa_data: bool = False,
+    ) -> None:
         if self._video is None or self._is_busy: return
-        requests = self._build_requests(raw_ocr_output_path=raw_ocr_output_path, export_images=export_images)
+        # [v3.23.728] Dữ liệu thô luôn NÉN như lượt trích xuất thường (cùng một dạng tệp → gỡ lỗi đồng bộ).
+        requests = self._build_requests(
+            raw_ocr_output_path=compressed_raw_path(raw_ocr_output_path), export_roi_clip=export_roi_clip,
+            export_qa_data=export_qa_data,
+        )
         self._launch_extract_worker(requests, is_raw_export=True)
 
     def _launch_extract_worker(self, requests: list[ExtractSubtitlesRequest], is_raw_export: bool = False) -> None:
@@ -977,7 +1015,9 @@ class ExtractPageViewModel(QObject):
             self._is_busy = busy
             self.busy_changed.emit(busy)
 
-    def _build_requests(self, raw_ocr_output_path: Path | None = None, export_images: bool = False) -> list[ExtractSubtitlesRequest]:
+    def _build_requests(
+        self, raw_ocr_output_path: Path | None = None, export_roi_clip: bool = False, export_qa_data: bool = False,
+    ) -> list[ExtractSubtitlesRequest]:
         if self._video is None:
             raise RuntimeError("VideoMetadata phải được load trước khi build request.")
 
@@ -1000,18 +1040,26 @@ class ExtractPageViewModel(QObject):
                 else: new_name = f"{out_path.stem}_roi{i+1}{out_path.suffix}"
                 out_path = out_path.with_name(new_name)
 
-            requests.append(self._build_single_request(roi, raw_ocr_output_path=out_path, export_images=export_images))
+            requests.append(self._build_single_request(
+                roi, raw_ocr_output_path=out_path, export_roi_clip=export_roi_clip, export_qa_data=export_qa_data,
+            ))
 
         return requests
 
-    def _build_single_request(self, roi: Roi | None, raw_ocr_output_path: Path | None = None, export_images: bool = False) -> ExtractSubtitlesRequest:
+    def _build_single_request(
+        self, roi: Roi | None, raw_ocr_output_path: Path | None = None, export_roi_clip: bool = False,
+        export_qa_data: bool = False,
+    ) -> ExtractSubtitlesRequest:
         snapshot = self._container.settings_service.current
         from subtitles_extractor.application.services.ocr_model_resolver import (
             resolve_ocr_model_names,
         )
         det_model, rec_model = resolve_ocr_model_names(snapshot.ocr)
 
-        from subtitles_extractor.composition.preprocess_routing import nvdec_sampler_selected, route_preprocessing
+        from subtitles_extractor.composition.preprocess_routing import (
+            nvdec_sampler_selected,
+            route_preprocessing,
+        )
 
         # [v3.23.723] Giải mã NVDEC → mọi tiền xử lý chạy CUDA trên VRAM (phóng, CLAHE, làm nét, tương phản, viền), chỉ chép
         # về RAM một lần. Điều kiện NVDEC lấy đúng như container chọn bộ giải mã (trước đây lệch → mất tiền xử lý).
@@ -1043,6 +1091,8 @@ class ExtractPageViewModel(QObject):
                 score_threshold=snapshot.ocr.score_threshold,
                 enable_mkldnn=snapshot.hardware.enable_mkldnn,
                 use_tensorrt=snapshot.hardware.use_tensorrt,
+                trt_det_batch=snapshot.hardware.trt_det_batch,
+                trt_rec_batch=snapshot.hardware.trt_rec_batch,
                 precision=PrecisionMode(snapshot.hardware.precision.value),
                 batch_size=snapshot.hardware.batch_size_ocr,
                 det_batch_size=snapshot.hardware.det_batch_size,
@@ -1052,7 +1102,13 @@ class ExtractPageViewModel(QObject):
             builder=builder_config_from_settings(snapshot),
             auto_tune_batch=snapshot.hardware.auto_tune_batch, save_debug_frames=snapshot.advanced.save_debug_frames,
             debug_frames_dir=snapshot.advanced.debug_frames_dir, keep_temp_files=snapshot.advanced.keep_temp_files,
-            skip_export=True, raw_ocr_output_path=raw_ocr_output_path, export_raw_images=export_images,
+            skip_export=True, raw_ocr_output_path=raw_ocr_output_path, export_roi_clip=export_roi_clip,
+            export_qa_data=export_qa_data and export_roi_clip,
+            verify_max_lines=int(getattr(snapshot.ocr, "verify_max_lines", 400)),
+            vl_low_confidence=float(getattr(snapshot.ocr, "vl_low_confidence", 0.90)),
+            roi_clip_quality=int(getattr(snapshot.advanced, "roi_clip_quality", 24)),
+            verify_with_vl=bool(getattr(snapshot.ocr, "verify_with_vl", False)),
+            qa_reader=str(getattr(snapshot.ocr, "qa_reader", "paddle_vl")),
         )
 
 __all__ = ["ExtractPageViewModel"]

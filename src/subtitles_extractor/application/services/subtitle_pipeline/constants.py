@@ -99,6 +99,24 @@ OCR_HALLUCINATION_TYPO_MAP: dict[str, str] = {
     "去不还能": "去了还能",  # '去不还能' ngữ pháp sai, '去了还能' đúng
     # Extra char insertion — OCR thêm '开' vào giữa từ '府上' thành '府开上'.
     "府开上": "府上",   # '开' là nhiễu giữa '府' và '上'
+    # [v3.23.742] "攒" trông giống "臜"; "腌攒" không phải từ (ảnh: phim nối 86 tập 4996,9 s và phim "[全集]"). Không thể
+    # khai báo "腌" luôn đi với "臜" vì có 腌制 / 腌菜.
+    "腌攒": "腌臜",
+    # [v3.23.753] Phim 大乾悍刀行 (gói kiểm định GLM-OCR, xem ảnh từng câu): chữ nhìn giống nhau, cụm sai không phải từ.
+    # Đếm trên kết quả 6 phim: các cụm SAI chỉ xuất hiện ở đúng chỗ đọc nhầm; "剔" đúng nghĩa (削骨剔髓) KHÔNG bị đụng —
+    # chỉ sửa "剔" ĐỨNG TRƯỚC động từ / tính từ (câu cấm "别…").
+    "筒直": "简直",       # 筒/简 — 813,5 s "筒直就是卑鄙下流"
+    "叫器": "叫嚣",       # 器/嚣 — 4288,3 s "嘴硬叫器"
+    "千旱": "干旱",       # 千/干 — 6849,4 s "我大乾确实千旱少雨"
+    "一千二净": "一干二净",  # 千/干 — 8833,1 s; cùng lỗi ở phim "[全集]"
+    "剔高兴": "别高兴",    # 剔/别 — 5079,3 s
+    "剔冲动": "别冲动",    # 剔/别 — 5427,9 s
+    "剔担心": "别担心",
+    "剔生气": "别生气",
+    "剔害怕": "别害怕",
+    "剔胡说": "别胡说",
+    "剔过来": "别过来",
+    "剔走": "别走",
     # '失踪二年' → '失踪二十二年' — OCR drop '十二' — KHÔNG sửa ở đây
     # (quá nhiều context cần biết) — để algorithm restore xử lý.
 }

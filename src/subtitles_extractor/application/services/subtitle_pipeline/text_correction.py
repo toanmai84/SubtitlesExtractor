@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import re
 from collections.abc import Iterator
 
 from loguru import logger
@@ -192,6 +193,48 @@ def unify_minority_traditional(texts: list[str]) -> dict[int, str]:
         i: "".join(ch if ch in _VALID_IN_SIMPLIFIED else HAN_TRADITIONAL_TO_SIMPLIFIED.get(ch, ch) for ch in texts[i])
         for i in trad_lines
     }
+
+
+#: [v3.23.730] Chữ kana / chữ Hán dạng Nhật mà OCR đọc nhầm từ chữ Hán giản thể trông giống hệt (phim "大乾悍刀行", 84 tập:
+#: "三 二一" → "三ニー", "八八八" → "ハ八八", "八刀" → "ハ刀", "防弹衣" → "防弾衣"; seraw có 238 lần đọc ra kana).
+_KANA_TO_HAN: dict[str, str] = {
+    "ニ": "二", "ー": "一", "ハ": "八", "カ": "力", "エ": "工", "ロ": "口", "タ": "夕", "ト": "卜", "弾": "弹",
+}
+_HIRAGANA_RE = re.compile(r"[\u3040-\u309f]")
+#: Phim coi là tiếng Trung khi dòng có hiragana (chữ chỉ tiếng Nhật mới có) ≤ tỉ lệ này so với dòng có chữ Hán.
+KANA_MAX_HIRAGANA_RATIO = 0.02
+KANA_MIN_HAN_LINES = 20
+
+
+def _is_han(ch: str) -> bool:
+    return "\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf"
+
+
+def kana_to_han(text: str) -> str:
+    """Đổi kana trông giống chữ Hán về chữ Hán trong một dòng CÓ chữ Hán (dòng toàn kana giữ nguyên — không đủ căn cứ)."""
+    if not text or not any(ch in _KANA_TO_HAN for ch in text) or not any(_is_han(ch) for ch in text if ch != "弾"):
+        return text
+    return "".join(_KANA_TO_HAN.get(ch, ch) for ch in text)
+
+
+def unify_minority_kana(texts: list[str]) -> dict[int, str]:
+    """[v3.23.730] Phim phụ đề tiếng Trung mà OCR đọc lẻ tẻ chữ Hán thành kana trông giống ("二" → "ニ", "一" → "ー",
+    "八" → "ハ") → đổi lại. Trả ``{vị trí: chữ mới}``.
+
+    Chỉ đổi khi phim KHÔNG phải tiếng Nhật: dòng có hiragana ≤ :data:`KANA_MAX_HIRAGANA_RATIO` số dòng có chữ Hán (phim
+    tiếng Nhật thì hầu như dòng nào cũng có hiragana) và có ít nhất :data:`KANA_MIN_HAN_LINES` dòng chữ Hán.
+    """
+    han_lines = sum(1 for text in texts if any(_is_han(ch) for ch in text))
+    if han_lines < KANA_MIN_HAN_LINES:
+        return {}
+    if sum(1 for text in texts if _HIRAGANA_RE.search(text)) > KANA_MAX_HIRAGANA_RATIO * han_lines:
+        return {}
+    changes: dict[int, str] = {}
+    for position, text in enumerate(texts):
+        fixed = kana_to_han(text)
+        if fixed != text:
+            changes[position] = fixed
+    return changes
 
 
 def clean_edge_noise(text_input: str) -> str:
@@ -597,6 +640,8 @@ __all__ = [
     "restore_bound_words",
     "is_single_cjk_char",
     "normalize_traditional_to_simplified",
+    "kana_to_han",
+    "unify_minority_kana",
     "unify_minority_traditional",
     "restore_dropped_space",
     "restore_dropped_yi_prefix",

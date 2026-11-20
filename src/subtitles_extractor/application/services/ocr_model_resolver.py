@@ -12,6 +12,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from subtitles_extractor.domain.value_objects.ocr_model_names import (
+    PADDLE_VL_DETECTION_MODEL,
+    PADDLE_VL_RECOGNITION_MODEL,
+    PADDLE_VL_VERSION,
+)
+
 if TYPE_CHECKING:
     from subtitles_extractor.infrastructure.settings.application_settings import (
         OcrSettings,
@@ -33,6 +39,7 @@ _DEFAULT_MODEL_NAMES: frozenset[str] = frozenset(
         "PP-OCRv5_server_rec",
         "PP-OCRv4_det",
         "PP-OCRv4_rec",
+        PADDLE_VL_RECOGNITION_MODEL,
     }
 )
 
@@ -53,6 +60,9 @@ def default_models_for_version(version: str) -> tuple[str, str]:
         return "PP-OCRv5_server_det", "PP-OCRv5_server_rec"
     if version == "PP-OCRv5_mobile":
         return "PP-OCRv5_mobile_det", "PP-OCRv5_mobile_rec"
+    if version == PADDLE_VL_VERSION:
+        # [v3.23.733] Bộ dò PP-OCRv6 small tìm hộp từng dòng, PaddleOCR-VL-1.6 đọc chữ trong hộp.
+        return PADDLE_VL_DETECTION_MODEL, PADDLE_VL_RECOGNITION_MODEL
     if version == "PP-OCRv4":
         return "PP-OCRv4_det", "PP-OCRv4_rec"
     # Mặc định an toàn: PP-OCRv6 medium (mới nhất, đa ngôn ngữ, chính xác cao).

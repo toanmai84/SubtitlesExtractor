@@ -584,6 +584,8 @@ class EditorPageViewModel(QObject):
             score_threshold=min_conf,
             enable_mkldnn=snapshot.hardware.enable_mkldnn,
             use_tensorrt=snapshot.hardware.use_tensorrt,
+            trt_det_batch=snapshot.hardware.trt_det_batch,
+            trt_rec_batch=snapshot.hardware.trt_rec_batch,
             precision=PrecisionMode(snapshot.hardware.precision.value),
             batch_size=snapshot.hardware.batch_size_ocr,
             det_batch_size=snapshot.hardware.det_batch_size,

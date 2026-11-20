@@ -21,16 +21,11 @@ import subtitles_extractor.infrastructure.tts.time_stretch as ts
 @pytest.fixture
 def _khong_co_pedalboard(monkeypatch: pytest.MonkeyPatch) -> None:
     # Ép "from pedalboard import ..." ném ImportError, và reset cờ nhắc.
-    import builtins
+    # [v3.23.734] Giả lập thiếu module qua sys.modules, KHÔNG thay builtins.__import__: __feature_import__ của PySide6
+    # tạm tráo builtins.__import__ không an toàn đa luồng → luồng nền import đúng lúc sẽ ghi lại bản giả sau khi hoàn tác.
+    import sys
 
-    that = builtins.__import__
-
-    def gia_lap(name: str, *args: object, **kwargs: object) -> object:
-        if name == "pedalboard":
-            raise ImportError("giả lập thiếu pedalboard")
-        return that(name, *args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(builtins, "__import__", gia_lap)
+    monkeypatch.setitem(sys.modules, "pedalboard", None)
     monkeypatch.setattr(ts, "_pedalboard_hint_shown", False)
 
 

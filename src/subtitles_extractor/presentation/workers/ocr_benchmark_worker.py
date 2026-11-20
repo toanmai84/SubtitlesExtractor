@@ -7,7 +7,9 @@ from collections.abc import Sequence
 
 from PySide6.QtCore import QObject, Signal
 
-from subtitles_extractor.application.dtos.extract_subtitles_dto import ExtractSubtitlesRequest
+from subtitles_extractor.application.dtos.extract_subtitles_dto import (
+    ExtractSubtitlesRequest,
+)
 from subtitles_extractor.application.services.ocr_benchmark import (
     BenchmarkScenario,
     current_settings_values,
@@ -16,7 +18,10 @@ from subtitles_extractor.application.services.ocr_benchmark import (
 from subtitles_extractor.application.services.ocr_probe_window import ProbeWindow
 from subtitles_extractor.application.use_cases.benchmark_ocr import BenchmarkOcrUseCase
 from subtitles_extractor.domain.exceptions import SubtitlesExtractorError
-from subtitles_extractor.presentation.workers.qt_progress_reporter import QtProgressReporter
+from subtitles_extractor.infrastructure.process.keep_awake import keeps_awake
+from subtitles_extractor.presentation.workers.qt_progress_reporter import (
+    QtProgressReporter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +47,7 @@ class OcrBenchmarkWorker(QObject):
         self._window = window
         self._reporter = reporter
 
+    @keeps_awake("Subtitles Extractor — Đo tốc độ OCR")  # [v3.23.747] màn hình tắt → GPU kẹt
     def run(self) -> None:
         try:
             results = self._use_case.execute(self._request, self._scenarios, self._window, self._reporter)

@@ -8,14 +8,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from subtitles_extractor.application.use_cases.benchmark_ocr import BenchmarkOcrUseCase
-    from subtitles_extractor.application.use_cases.reocr import ReOcrUseCase
+    from subtitles_extractor.application.use_cases.benchmark_ocr import (
+        BenchmarkOcrUseCase,
+    )
     from subtitles_extractor.application.use_cases.extract_embedded_subtitles import (
         ExtractEmbeddedSubtitlesUseCase,
     )
     from subtitles_extractor.application.use_cases.load_sidecar_subtitles import (
         LoadSidecarSubtitlesUseCase,
     )
+    from subtitles_extractor.application.use_cases.reocr import ReOcrUseCase
     from subtitles_extractor.application.use_cases.transcribe_speech import (
         TranscribeSpeechUseCase,
     )
@@ -49,6 +51,9 @@ from subtitles_extractor.domain.ports.ocr_engine_port import (
     OcrEngineConfig,
     OcrEnginePort,
 )
+from subtitles_extractor.domain.ports.project_repository_port import (
+    ProjectRepositoryPort,
+)
 from subtitles_extractor.domain.ports.settings_repository_port import (
     SettingsRepositoryPort,
 )
@@ -65,20 +70,17 @@ from subtitles_extractor.domain.ports.video_state_repository_port import (
     VideoStateRepositoryPort,
 )
 from subtitles_extractor.domain.value_objects.device_kind import DeviceKind, PrecisionMode
+from subtitles_extractor.infrastructure.database.sqlite_project_repository import (
+    SqliteProjectRepository,
+)
 from subtitles_extractor.infrastructure.database.sqlite_subtitle_repository import (
     SqliteSubtitleRepository,
 )
 from subtitles_extractor.infrastructure.database.sqlite_video_state_repository import (
     SqliteVideoStateRepository,
 )
-from subtitles_extractor.infrastructure.database.sqlite_project_repository import (
-    SqliteProjectRepository,
-)
-from subtitles_extractor.domain.ports.project_repository_port import (
-    ProjectRepositoryPort,
-)
-from subtitles_extractor.infrastructure.logging.qt_log_handler import QtLogBridge
 from subtitles_extractor.infrastructure.i18n.json_translator import JsonTranslator
+from subtitles_extractor.infrastructure.logging.qt_log_handler import QtLogBridge
 from subtitles_extractor.infrastructure.ocr.paddle_ocr_adapter import PaddleOcrAdapter
 from subtitles_extractor.infrastructure.settings.settings_service import SettingsService
 from subtitles_extractor.infrastructure.subtitle.exporters.ass_exporter import AssExporter
@@ -361,6 +363,7 @@ class ApplicationContainer:
                 # lệch ≤ 1 px so với nguyên cỡ (3 tập, gồm tập 30 fps). 736 px nhanh hơn
                 # nữa nhưng chữ phụ đề video 1920x1080 còn ~15 px → dễ sót.
                 analysis_max_side=960,
+                translator=self.translator,  # [v3.23.736] hộp thoại duyệt ROI không hiện khoá thô
             )
         return self._auto_roi_detector
 
@@ -458,15 +461,50 @@ class ApplicationContainer:
                 self._ocr_engine = None
 
     def make_extract_subtitles_use_case(self) -> ExtractSubtitlesUseCase:
+        from subtitles_extractor.infrastructure.quality.audio_exporter import (
+            FfmpegAudioExporter,
+        )
+        from subtitles_extractor.infrastructure.quality.quality_auditor import (
+            VlQualityAuditor,
+        )
+        from subtitles_extractor.infrastructure.video.roi_clip_exporter import (
+            FfmpegRoiClipExporter,
+        )
+
         builder = SubtitleBuilder(config=self._build_subtitle_builder_config())
         return ExtractSubtitlesUseCase(
             metadata_reader=self.metadata_reader, frame_sampler=self.frame_sampler,
             ocr_engine=self.ocr_engine, builder=builder, exporters=self.exporters,
+            roi_clip_exporter=FfmpegRoiClipExporter(),   # [v3.23.728] video vùng ROI cho "Xuất dữ liệu thô OCR"
+            # [v3.23.737] Gói kiểm định chất lượng: mọi câu đọc lại bằng PaddleOCR-VL + tiếng phim.
+            quality_auditor=VlQualityAuditor(self.ocr_engine), audio_exporter=FfmpegAudioExporter(),
+            glm_auditor_factory=self._glm_auditor_factory,   # [v3.23.745] GLM-OCR tải khi dùng
+            glm_line_reader_factory=self._glm_line_reader_factory,   # [v3.23.758] soát câu bằng GLM-OCR
         )
+
+    def _glm_line_reader_factory(self, **kwargs: Any) -> Any:
+        """[v3.23.758] Bộ đọc dòng GLM-OCR cho bước soát câu (cùng chỗ cài với gói kiểm định)."""
+        from subtitles_extractor.infrastructure.quality.glm_ocr_runtime import (
+            GlmOcrInstaller,
+            glm_ocr_line_reader,
+        )
+
+        return glm_ocr_line_reader(GlmOcrInstaller(self._user_data_dir / "models" / "glm_ocr"), **kwargs)
+
+    def _glm_auditor_factory(self, **kwargs: Any) -> Any:
+        """[v3.23.745] Bộ kiểm định GLM-OCR (llama-server) — mô hình tải về ``<dữ liệu>/models/glm_ocr`` khi dùng lần đầu."""
+        from subtitles_extractor.infrastructure.quality.glm_ocr_runtime import (
+            GlmOcrInstaller,
+            glm_ocr_auditor,
+        )
+
+        return glm_ocr_auditor(GlmOcrInstaller(self._user_data_dir / "models" / "glm_ocr"), **kwargs)
 
     def make_benchmark_ocr_use_case(self) -> BenchmarkOcrUseCase:
         """[v3.23.645] Use case đo A/B OCR: dùng engine + bộ lấy mẫu của ứng dụng, mỗi kịch bản một lượt trích xuất thật."""
-        from subtitles_extractor.application.use_cases.benchmark_ocr import BenchmarkOcrUseCase
+        from subtitles_extractor.application.use_cases.benchmark_ocr import (
+            BenchmarkOcrUseCase,
+        )
 
         engine = self.ocr_engine
         configure = getattr(engine, "apply_config", None) or engine.update_preprocess_config
@@ -584,7 +622,9 @@ class ApplicationContainer:
         from subtitles_extractor.application.use_cases.transcribe_speech import (
             TranscribeSpeechUseCase,
         )
-        from subtitles_extractor.infrastructure.stt.whisperx_adapter import WhisperXAdapter
+        from subtitles_extractor.infrastructure.stt.whisperx_adapter import (
+            WhisperXAdapter,
+        )
 
         return TranscribeSpeechUseCase(stt_engine=WhisperXAdapter())
 
@@ -614,7 +654,9 @@ class ApplicationContainer:
             retry_count:       Số lần retry tối đa; None → lấy từ Cài đặt.
             request_timeout_s: Thời gian chờ tối đa mỗi request (giây); None → từ Cài đặt.
         """
-        from subtitles_extractor.infrastructure.translation import GeminiSubtitleTranslator
+        from subtitles_extractor.infrastructure.translation import (
+            GeminiSubtitleTranslator,
+        )
 
         # [v3.23.39] Lấy retry/timeout từ Cài đặt khi caller không chỉ định.
         tr = self.settings_service.current.translation
@@ -938,7 +980,9 @@ class ApplicationContainer:
 
     def make_gemini_tts_adapter(self, api_key: str = ""):
         """Tạo adapter Gemini TTS (online — 30+ voices, 40+ ngôn ngữ)."""
-        from subtitles_extractor.infrastructure.tts.gemini_tts_adapter import GeminiTTSAdapter
+        from subtitles_extractor.infrastructure.tts.gemini_tts_adapter import (
+            GeminiTTSAdapter,
+        )
         return GeminiTTSAdapter(api_key=api_key)
 
     def make_vieneu_tts_adapter(
@@ -968,7 +1012,9 @@ class ApplicationContainer:
 
     def make_generate_tts_use_case(self, adapter=None):
         """Tạo use case TTS. Nếu không truyền adapter, dùng Edge TTS."""
-        from subtitles_extractor.application.use_cases.generate_tts import GenerateTTSUseCase
+        from subtitles_extractor.application.use_cases.generate_tts import (
+            GenerateTTSUseCase,
+        )
         if adapter is None:
             adapter = self.make_edge_tts_adapter()
         return GenerateTTSUseCase(adapter=adapter)
@@ -1050,7 +1096,9 @@ class ApplicationContainer:
         # stream). Thieu CuPy -> np.from_dlpack(stream=0) gay loi "ExternalBuffer::dlpack
         # Passed value of 0". Chi chon PyNvVideoCodec khi co CA hai; nguoc lai fallback PyAV
         # (van dung NVDEC qua FFmpeg neu co, on dinh hon).
-        from subtitles_extractor.composition.preprocess_routing import nvdec_sampler_selected
+        from subtitles_extractor.composition.preprocess_routing import (
+            nvdec_sampler_selected,
+        )
 
         # [v3.23.723] Cùng điều kiện với nơi chia tiền xử lý VRAM/CPU (``preprocess_routing``).
         if nvdec_sampler_selected(snapshot):
@@ -1062,7 +1110,9 @@ class ApplicationContainer:
                 from subtitles_extractor.infrastructure.video.decoders.fallback_frame_sampler import (
                     FallbackFrameSampler,
                 )
-                from subtitles_extractor.infrastructure.video.decoders.pyav_frame_sampler import PyAvFrameSampler
+                from subtitles_extractor.infrastructure.video.decoders.pyav_frame_sampler import (
+                    PyAvFrameSampler,
+                )
 
                 # [v3.23.723] NVDEC hỏng (codec, NVRTC, CUDA) → PyAV tiếp tục, giữ nguyên tiền xử lý.
                 return FallbackFrameSampler(PyNvVideoCodecFrameSampler(gpu_id=0), PyAvFrameSampler)
@@ -1071,7 +1121,9 @@ class ApplicationContainer:
             # [v3.23.723] Trước đây âm thầm lùi về PyAV (máy chủ dự án chạy lượt 717 bằng PyAV mà không biết vì thiếu CuPy).
             missing = [name for name in ("PyNvVideoCodec", "cupy") if not self._is_module_available(name)]
             if not missing:     # [v3.23.724] có gói CuPy nhưng không nạp được / không thấy GPU: nêu đúng lý do
-                from subtitles_extractor.infrastructure.ocr.preprocessing import gpu_image_filters
+                from subtitles_extractor.infrastructure.ocr.preprocessing import (
+                    gpu_image_filters,
+                )
 
                 missing = [f"CuPy dùng được ({gpu_image_filters.CUPY_UNAVAILABLE_REASON or 'không rõ'})"]
             # [v3.23.725] Chỉ khuyên cài gói khi thật sự THIẾU gói; có gói mà nạp hỏng thì lý do đã nêu ở trên.
@@ -1124,6 +1176,8 @@ class ApplicationContainer:
             score_threshold=snapshot.ocr.score_threshold,
             enable_mkldnn=snapshot.hardware.enable_mkldnn,
             use_tensorrt=snapshot.hardware.use_tensorrt,
+            trt_det_batch=snapshot.hardware.trt_det_batch,
+            trt_rec_batch=snapshot.hardware.trt_rec_batch,
             precision=PrecisionMode(snapshot.hardware.precision.value),
             batch_size=snapshot.hardware.batch_size_ocr,
             det_batch_size=snapshot.hardware.det_batch_size,
@@ -1138,13 +1192,18 @@ class ApplicationContainer:
 
     @staticmethod
     def _routed_cpu_preprocess(snapshot: Any, pre: Any) -> Any:
-        from subtitles_extractor.composition.preprocess_routing import nvdec_sampler_selected, route_preprocessing
+        from subtitles_extractor.composition.preprocess_routing import (
+            nvdec_sampler_selected,
+            route_preprocessing,
+        )
 
         _, cpu = route_preprocessing(pre, on_gpu=nvdec_sampler_selected(snapshot))
         return cpu
 
     def _build_subtitle_builder_config(self) -> SubtitleBuilderConfig:
-        from subtitles_extractor.composition.builder_config import builder_config_from_settings
+        from subtitles_extractor.composition.builder_config import (
+            builder_config_from_settings,
+        )
 
         return builder_config_from_settings(self.settings_service.current)
 
